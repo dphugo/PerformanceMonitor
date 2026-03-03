@@ -150,6 +150,7 @@ namespace PerformanceMonitorDashboard
             PoisonWaitThresholdTextBox.Text = prefs.PoisonWaitThresholdMs.ToString(CultureInfo.InvariantCulture);
             NotifyOnLongRunningQueriesCheckBox.IsChecked = prefs.NotifyOnLongRunningQueries;
             LongRunningQueryThresholdTextBox.Text = prefs.LongRunningQueryThresholdMinutes.ToString(CultureInfo.InvariantCulture);
+            LongRunningQueryMaxResultsTextBox.Text = prefs.LongRunningQueryMaxResults.ToString(CultureInfo.InvariantCulture);
             NotifyOnTempDbSpaceCheckBox.IsChecked = prefs.NotifyOnTempDbSpace;
             TempDbSpaceThresholdTextBox.Text = prefs.TempDbSpaceThresholdPercent.ToString(CultureInfo.InvariantCulture);
             NotifyOnLongRunningJobsCheckBox.IsChecked = prefs.NotifyOnLongRunningJobs;
@@ -560,6 +561,15 @@ namespace PerformanceMonitorDashboard
                 prefs.LongRunningQueryThresholdMinutes = lrqThreshold;
             else if (prefs.NotifyOnLongRunningQueries)
                 validationErrors.Add("Long-running query threshold must be a positive number");
+
+            if (int.TryParse(LongRunningQueryMaxResultsTextBox.Text, out int lrqMaxResults) && lrqMaxResults > 0)
+            {
+                prefs.LongRunningQueryMaxResults = lrqMaxResults;
+            }
+            else
+            {
+                validationErrors.Add("Long-running query max results must be a positive number");
+            }
 
             prefs.NotifyOnTempDbSpace = NotifyOnTempDbSpaceCheckBox.IsChecked == true;
             if (int.TryParse(TempDbSpaceThresholdTextBox.Text, out int tempDbThreshold) && tempDbThreshold > 0 && tempDbThreshold <= 100)

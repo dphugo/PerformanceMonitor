@@ -206,7 +206,13 @@
                                          Margin="8,0,8,0"
                                          VerticalAlignment="Center"
                                          TextAlignment="Center"/>
-                                <TextBlock Text="minutes" VerticalAlignment="Center"/>
+                                <TextBlock Text="minutes," VerticalAlignment="Center"/>
+                                <TextBlock Text="return up to" VerticalAlignment="Center" Margin="8,0,8,0"/>
+                                <TextBox x:Name="LongRunningQueryMaxResultsTextBox"
+                                         Width="50"
+                                         VerticalAlignment="Center"
+                                         TextAlignment="Center"/>
+                                <TextBlock Text="results" VerticalAlignment="Center" Margin="8,0,0,0"/>
                             </StackPanel>
                             <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                 <CheckBox x:Name="NotifyOnTempDbSpaceCheckBox"

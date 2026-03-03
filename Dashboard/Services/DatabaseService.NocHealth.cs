@@ -121,7 +121,7 @@ namespace PerformanceMonitorDashboard.Services
         /// Lightweight alert-only health check. Runs 3 queries instead of 9.
         /// Used by MainWindow's independent alert timer.
         /// </summary>
-        public async Task<AlertHealthResult> GetAlertHealthAsync(int engineEdition = 0, int longRunningQueryThresholdMinutes = 30, int longRunningJobMultiplier = 3)
+        public async Task<AlertHealthResult> GetAlertHealthAsync(int engineEdition = 0, int longRunningQueryThresholdMinutes = 30, int longRunningJobMultiplier = 3, int longRunningQueryMaxResults = 5)
         {
             var result = new AlertHealthResult();
 
@@ -136,7 +136,7 @@ namespace PerformanceMonitorDashboard.Services
                 var blockingTask = GetBlockingValuesAsync(connection);
                 var deadlockTask = GetDeadlockCountAsync(connection);
                 var poisonWaitTask = GetPoisonWaitDeltasAsync(connection);
-                var longRunningTask = GetLongRunningQueriesAsync(connection, longRunningQueryThresholdMinutes);
+                var longRunningTask = GetLongRunningQueriesAsync(connection, longRunningQueryThresholdMinutes, longRunningQueryMaxResults);
                 var tempDbTask = GetTempDbSpaceAsync(connection);
                 var anomalousJobTask = GetAnomalousJobsAsync(connection, longRunningJobMultiplier);
 
@@ -603,7 +603,7 @@ namespace PerformanceMonitorDashboard.Services
         /// Gets currently running queries that exceed the duration threshold.
         /// Uses live DMV data (sys.dm_exec_requests) for immediate detection.
         /// </summary>
-        private async Task<List<LongRunningQueryInfo>> GetLongRunningQueriesAsync(SqlConnection connection, int thresholdMinutes)
+        private async Task<List<LongRunningQueryInfo>> GetLongRunningQueriesAsync(SqlConnection connection, int thresholdMinutes, int maxResults = 5)
         {
 
             // Exclude internal SP_SERVER_DIAGNOSTICS queries by default, as they often run long and aren't actionable.
@@ -620,7 +620,7 @@ namespace PerformanceMonitorDashboard.Services
 
             string query = @$"SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-                SELECT TOP(5)
+                SELECT TOP({maxResults})
                     r.session_id,
                     DB_NAME(r.database_id) AS database_name,
                     SUBSTRING(t.text, 1, 300) AS query_text,

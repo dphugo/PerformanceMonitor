@@ -1051,7 +1051,7 @@ namespace PerformanceMonitorDashboard
                     var connectionString = server.GetConnectionString(_credentialService);
                     var databaseService = new DatabaseService(connectionString);
                     var connStatus = _serverManager.GetConnectionStatus(server.Id);
-                    var health = await databaseService.GetAlertHealthAsync(connStatus.SqlEngineEdition, prefs.LongRunningQueryThresholdMinutes, prefs.LongRunningJobMultiplier);
+                    var health = await databaseService.GetAlertHealthAsync(connStatus.SqlEngineEdition, prefs.LongRunningQueryThresholdMinutes, prefs.LongRunningJobMultiplier, prefs.LongRunningQueryMaxResults);
 
                     if (health.IsOnline)
                     {
