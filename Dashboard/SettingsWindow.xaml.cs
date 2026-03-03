@@ -151,6 +151,10 @@ namespace PerformanceMonitorDashboard
             NotifyOnLongRunningQueriesCheckBox.IsChecked = prefs.NotifyOnLongRunningQueries;
             LongRunningQueryThresholdTextBox.Text = prefs.LongRunningQueryThresholdMinutes.ToString(CultureInfo.InvariantCulture);
             LongRunningQueryMaxResultsTextBox.Text = prefs.LongRunningQueryMaxResults.ToString(CultureInfo.InvariantCulture);
+            LrqExcludeSpServerDiagnosticsCheckBox.IsChecked = prefs.LongRunningQueryExcludeSpServerDiagnostics;
+            LrqExcludeWaitForCheckBox.IsChecked = prefs.LongRunningQueryExcludeWaitFor;
+            LrqExcludeBackupsCheckBox.IsChecked = prefs.LongRunningQueryExcludeBackups;
+            LrqExcludeMiscWaitsCheckBox.IsChecked = prefs.LongRunningQueryExcludeMiscWaits;
             NotifyOnTempDbSpaceCheckBox.IsChecked = prefs.NotifyOnTempDbSpace;
             TempDbSpaceThresholdTextBox.Text = prefs.TempDbSpaceThresholdPercent.ToString(CultureInfo.InvariantCulture);
             NotifyOnLongRunningJobsCheckBox.IsChecked = prefs.NotifyOnLongRunningJobs;
@@ -570,6 +574,11 @@ namespace PerformanceMonitorDashboard
             {
                 validationErrors.Add($"Long-running query max results must be between 1 and {int.MaxValue}");
             }
+
+            prefs.LongRunningQueryExcludeSpServerDiagnostics = LrqExcludeSpServerDiagnosticsCheckBox.IsChecked == true;
+            prefs.LongRunningQueryExcludeWaitFor = LrqExcludeWaitForCheckBox.IsChecked == true;
+            prefs.LongRunningQueryExcludeBackups = LrqExcludeBackupsCheckBox.IsChecked == true;
+            prefs.LongRunningQueryExcludeMiscWaits = LrqExcludeMiscWaitsCheckBox.IsChecked == true;
 
             prefs.NotifyOnTempDbSpace = NotifyOnTempDbSpaceCheckBox.IsChecked == true;
             if (int.TryParse(TempDbSpaceThresholdTextBox.Text, out int tempDbThreshold) && tempDbThreshold > 0 && tempDbThreshold <= 100)

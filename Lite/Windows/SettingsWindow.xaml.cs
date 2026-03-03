@@ -387,6 +387,10 @@ public partial class SettingsWindow : Window
         AlertLongRunningQueryCheckBox.IsChecked = App.AlertLongRunningQueryEnabled;
         AlertLongRunningQueryThresholdBox.Text = App.AlertLongRunningQueryThresholdMinutes.ToString();
         AlertLongRunningQueryMaxResultsBox.Text = App.AlertLongRunningQueryMaxResults.ToString();
+        LrqExcludeSpServerDiagnosticsCheckBox.IsChecked = App.AlertLongRunningQueryExcludeSpServerDiagnostics;
+        LrqExcludeWaitForCheckBox.IsChecked = App.AlertLongRunningQueryExcludeWaitFor;
+        LrqExcludeBackupsCheckBox.IsChecked = App.AlertLongRunningQueryExcludeBackups;
+        LrqExcludeMiscWaitsCheckBox.IsChecked = App.AlertLongRunningQueryExcludeMiscWaits;
         AlertTempDbSpaceCheckBox.IsChecked = App.AlertTempDbSpaceEnabled;
         AlertTempDbSpaceThresholdBox.Text = App.AlertTempDbSpaceThresholdPercent.ToString();
         AlertLongRunningJobCheckBox.IsChecked = App.AlertLongRunningJobEnabled;
@@ -416,6 +420,10 @@ public partial class SettingsWindow : Window
             App.AlertLongRunningQueryThresholdMinutes = lrq;
         if (int.TryParse(AlertLongRunningQueryMaxResultsBox.Text, out var lrqMax) && lrqMax >= 1 && lrqMax <= int.MaxValue)
             App.AlertLongRunningQueryMaxResults = lrqMax;
+        App.AlertLongRunningQueryExcludeSpServerDiagnostics = LrqExcludeSpServerDiagnosticsCheckBox.IsChecked == true;
+        App.AlertLongRunningQueryExcludeWaitFor = LrqExcludeWaitForCheckBox.IsChecked == true;
+        App.AlertLongRunningQueryExcludeBackups = LrqExcludeBackupsCheckBox.IsChecked == true;
+        App.AlertLongRunningQueryExcludeMiscWaits = LrqExcludeMiscWaitsCheckBox.IsChecked == true;
         App.AlertTempDbSpaceEnabled = AlertTempDbSpaceCheckBox.IsChecked == true;
         if (int.TryParse(AlertTempDbSpaceThresholdBox.Text, out var tempDb) && tempDb > 0 && tempDb <= 100)
             App.AlertTempDbSpaceThresholdPercent = tempDb;
@@ -451,6 +459,10 @@ public partial class SettingsWindow : Window
             root["alert_long_running_query_enabled"] = App.AlertLongRunningQueryEnabled;
             root["alert_long_running_query_threshold_minutes"] = App.AlertLongRunningQueryThresholdMinutes;
             root["alert_long_running_query_max_results"] = App.AlertLongRunningQueryMaxResults;
+            root["alert_long_running_query_exclude_sp_server_diagnostics"] = App.AlertLongRunningQueryExcludeSpServerDiagnostics;
+            root["alert_long_running_query_exclude_waitfor"] = App.AlertLongRunningQueryExcludeWaitFor;
+            root["alert_long_running_query_exclude_backups"] = App.AlertLongRunningQueryExcludeBackups;
+            root["alert_long_running_query_exclude_misc_waits"] = App.AlertLongRunningQueryExcludeMiscWaits;
             root["alert_tempdb_space_enabled"] = App.AlertTempDbSpaceEnabled;
             root["alert_tempdb_space_threshold_percent"] = App.AlertTempDbSpaceThresholdPercent;
             root["alert_long_running_job_enabled"] = App.AlertLongRunningJobEnabled;
