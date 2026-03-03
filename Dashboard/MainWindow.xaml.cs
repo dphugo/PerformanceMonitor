@@ -1991,29 +1991,6 @@ namespace PerformanceMonitorDashboard
             return _mainPlanTabControl.SelectedItem as TabItem;
         }
 
-        public void OpenMainWindowPlanTab(string planXml, string label, string? queryText = null)
-        {
-            if (_planViewerTab == null || !ServerTabControl.Items.Contains(_planViewerTab))
-                OpenPlanViewerTab();
-
-            var activeSubTab = GetActivePlanSubTab();
-            if (activeSubTab?.Content is Grid g &&
-                g.Children.Count >= 2 &&
-                g.Children[1] is Controls.PlanViewerControl { Visibility: Visibility.Collapsed })
-            {
-                // Active sub-tab is empty — load into it
-                LoadPlanIntoSubTab(activeSubTab, planXml, label, queryText);
-            }
-            else
-            {
-                // Active sub-tab already has a plan — open a new one
-                var newSubTab = AddNewEmptyPlanSubTab();
-                LoadPlanIntoSubTab(newSubTab, planXml, label, queryText);
-            }
-
-            ServerTabControl.SelectedItem = _planViewerTab;
-        }
-
         private void MainWindowPlanViewer_DragOver(object sender, DragEventArgs e)
         {
             if (e.Data.GetDataPresent(DataFormats.FileDrop))

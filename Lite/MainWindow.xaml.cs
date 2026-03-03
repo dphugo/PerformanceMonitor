@@ -1752,28 +1752,6 @@ public partial class MainWindow : Window
             return MainWindowPlanTabControl.SelectedItem as TabItem;
         }
 
-        public void OpenMainWindowPlanTab(string planXml, string label, string? queryText = null)
-        {
-            EnsurePlanTabControlInitialized();
-            MainWindowPlanViewerTab.Visibility = Visibility.Visible;
-
-            var activeSubTab = GetActivePlanSubTab();
-            if (activeSubTab?.Content is Grid g &&
-                g.Children.Count >= 2 &&
-                g.Children[1] is Controls.PlanViewerControl { Visibility: Visibility.Collapsed })
-            {
-                LoadPlanIntoSubTab(activeSubTab, planXml, label, queryText);
-            }
-            else
-            {
-                var newSubTab = AddNewEmptyPlanSubTab();
-                LoadPlanIntoSubTab(newSubTab, planXml, label, queryText);
-            }
-
-            MainWindowPlanViewerTab.IsSelected = true;
-            ServerTabControl.Visibility = Visibility.Visible;
-        }
-
         private void MainWindowPlanViewer_DragOver(object sender, DragEventArgs e)
         {
             if (e.Data.GetDataPresent(DataFormats.FileDrop))
