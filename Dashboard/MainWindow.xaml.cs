@@ -1691,7 +1691,6 @@ namespace PerformanceMonitorDashboard
             }
 
             _mainPlanTabControl = new TabControl
-
             {
                 Background = System.Windows.Media.Brushes.Transparent,
                 BorderThickness = new Thickness(0)
