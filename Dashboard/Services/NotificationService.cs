@@ -42,29 +42,10 @@ namespace PerformanceMonitorDashboard.Services
 
             _trayIcon = new TaskbarIcon();
 
-            bool HasLightBackground = Helpers.ThemeManager.HasLightBackground;
-
-            /* Custom tooltip styled to match current theme */
-            _trayIcon.TrayToolTip = new Border
-            {
-                Background = new SolidColorBrush(HasLightBackground
-                    ? (Color)ColorConverter.ConvertFromString("#FFFFFF")
-                    : (Color)ColorConverter.ConvertFromString("#22252b")),
-                BorderBrush = new SolidColorBrush(HasLightBackground
-                    ? (Color)ColorConverter.ConvertFromString("#DEE2E6")
-                    : (Color)ColorConverter.ConvertFromString("#33363e")),
-                BorderThickness = new Thickness(1),
-                Padding = new Thickness(10, 8, 10, 8),
-                CornerRadius = new CornerRadius(4),
-                Child = new TextBlock
-                {
-                    Text = "SQL Server Performance Monitor",
-                    Foreground = new SolidColorBrush(HasLightBackground
-                        ? (Color)ColorConverter.ConvertFromString("#1A1D23")
-                        : (Color)ColorConverter.ConvertFromString("#E4E6EB")),
-                    FontSize = 12
-                }
-            };
+            /* Use plain string tooltip to avoid Hardcodet TrayToolTip crash (issue #422).
+               Custom visual tooltips trigger a race condition in Popup.CreateWindow
+               that throws "The root Visual of a VisualTarget cannot have a parent." */
+            _trayIcon.ToolTipText = "SQL Server Performance Monitor";
 
             // Load icon from embedded resource using pack URI
             try
