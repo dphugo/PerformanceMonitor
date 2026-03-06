@@ -73,6 +73,8 @@ public partial class App : Application
     public static int AlertTempDbSpaceThresholdPercent { get; set; } = 80;
     public static bool AlertLongRunningJobEnabled { get; set; } = true;
     public static int AlertLongRunningJobMultiplier { get; set; } = 3;
+    public static int AlertCooldownMinutes { get; set; } = 5;  // Tray notification cooldown between repeated alerts
+    public static int EmailCooldownMinutes { get; set; } = 15; // Email cooldown between repeated alerts
 
     /* Connection settings */
     public static int ConnectionTimeoutSeconds { get; set; } = 5;
@@ -256,6 +258,8 @@ public partial class App : Application
             if (root.TryGetProperty("alert_tempdb_space_threshold_percent", out v)) AlertTempDbSpaceThresholdPercent = v.GetInt32();
             if (root.TryGetProperty("alert_long_running_job_enabled", out v)) AlertLongRunningJobEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_long_running_job_multiplier", out v)) AlertLongRunningJobMultiplier = v.GetInt32();
+            if (root.TryGetProperty("alert_cooldown_minutes", out v)) AlertCooldownMinutes = (int)Math.Clamp(v.GetInt64(), 1, 120);
+            if (root.TryGetProperty("email_cooldown_minutes", out v)) EmailCooldownMinutes = (int)Math.Clamp(v.GetInt64(), 1, 120);
 
             /* Connection settings */
             if (root.TryGetProperty("connection_timeout_seconds", out v))

@@ -330,8 +330,10 @@ All thresholds are configurable in Settings.
 
 ### Notification Channels
 
-- **System tray** — balloon notifications with 5-minute per-metric cooldown
-- **Email (SMTP)** — styled HTML emails with 15-minute per-metric cooldown, configurable SMTP settings (server, port, SSL, authentication, recipients)
+- **System tray** — balloon notifications with a configurable per-metric cooldown (default: 5 minutes)
+- **Email (SMTP)** — styled HTML emails with a configurable per-metric cooldown (default: 15 minutes), plus configurable SMTP settings (server, port, SSL, authentication, recipients)
+
+Both cooldown periods are independently configurable in Settings under the Performance Alerts section.
 
 ### Email Alerts
 
