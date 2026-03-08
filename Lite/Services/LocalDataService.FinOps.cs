@@ -18,13 +18,12 @@ public partial class LocalDataService
     /// <summary>
     /// Gets the latest database size snapshot per server per file (cross-server).
     /// </summary>
-    public async Task<List<DatabaseSizeRow>> GetDatabaseSizeLatestAsync()
+    public async Task<List<DatabaseSizeRow>> GetDatabaseSizeLatestAsync(int serverId)
     {
         using var connection = await OpenConnectionAsync();
         using var command = connection.CreateCommand();
         command.CommandText = @"
 SELECT
-    server_name,
     database_name,
     file_type_desc,
     file_name,
@@ -35,12 +34,15 @@ SELECT
     volume_free_mb,
     recovery_model_desc
 FROM v_database_size_stats
-WHERE (server_id, collection_time) IN (
-    SELECT server_id, MAX(collection_time)
+WHERE server_id = $1
+AND   collection_time = (
+    SELECT MAX(collection_time)
     FROM v_database_size_stats
-    GROUP BY server_id
+    WHERE server_id = $1
 )
-ORDER BY server_name, database_name, file_type_desc, file_name";
+ORDER BY database_name, file_type_desc, file_name";
+
+        command.Parameters.Add(new DuckDBParameter { Value = serverId });
 
         var items = new List<DatabaseSizeRow>();
         using var reader = await command.ExecuteReaderAsync();
@@ -48,16 +50,15 @@ ORDER BY server_name, database_name, file_type_desc, file_name";
         {
             items.Add(new DatabaseSizeRow
             {
-                ServerName = reader.IsDBNull(0) ? "" : reader.GetString(0),
-                DatabaseName = reader.IsDBNull(1) ? "" : reader.GetString(1),
-                FileTypeDesc = reader.IsDBNull(2) ? "" : reader.GetString(2),
-                FileName = reader.IsDBNull(3) ? "" : reader.GetString(3),
-                TotalSizeMb = reader.IsDBNull(4) ? 0m : Convert.ToDecimal(reader.GetValue(4)),
-                UsedSizeMb = reader.IsDBNull(5) ? null : Convert.ToDecimal(reader.GetValue(5)),
-                VolumeMountPoint = reader.IsDBNull(6) ? null : reader.GetString(6),
-                VolumeTotalMb = reader.IsDBNull(7) ? null : Convert.ToDecimal(reader.GetValue(7)),
-                VolumeFreeMb = reader.IsDBNull(8) ? null : Convert.ToDecimal(reader.GetValue(8)),
-                RecoveryModel = reader.IsDBNull(9) ? null : reader.GetString(9)
+                DatabaseName = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                FileTypeDesc = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                FileName = reader.IsDBNull(2) ? "" : reader.GetString(2),
+                TotalSizeMb = reader.IsDBNull(3) ? 0m : Convert.ToDecimal(reader.GetValue(3)),
+                UsedSizeMb = reader.IsDBNull(4) ? null : Convert.ToDecimal(reader.GetValue(4)),
+                VolumeMountPoint = reader.IsDBNull(5) ? null : reader.GetString(5),
+                VolumeTotalMb = reader.IsDBNull(6) ? null : Convert.ToDecimal(reader.GetValue(6)),
+                VolumeFreeMb = reader.IsDBNull(7) ? null : Convert.ToDecimal(reader.GetValue(7)),
+                RecoveryModel = reader.IsDBNull(8) ? null : reader.GetString(8)
             });
         }
 
@@ -189,6 +190,13 @@ mem_latest AS (
     WHERE server_id = $1
     ORDER BY collection_time DESC
     LIMIT 1
+),
+server_info AS (
+    SELECT cpu_count
+    FROM v_server_properties
+    WHERE server_id = $1
+    ORDER BY collection_time DESC
+    LIMIT 1
 )
 SELECT
     c.avg_cpu_pct,
@@ -201,9 +209,11 @@ SELECT
     m.buffer_pool_mb,
     m.memory_ratio,
     m.max_workers_count,
-    m.current_workers_count
+    m.current_workers_count,
+    s.cpu_count
 FROM cpu_stats c
-CROSS JOIN mem_latest m";
+CROSS JOIN mem_latest m
+CROSS JOIN server_info s";
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = cutoff });
@@ -235,7 +245,8 @@ CROSS JOIN mem_latest m";
             MemoryRatio = memRatio,
             ProvisioningStatus = status,
             MaxWorkersCount = reader.IsDBNull(9) ? 0 : Convert.ToInt32(reader.GetValue(9)),
-            CurrentWorkersCount = reader.IsDBNull(10) ? 0 : Convert.ToInt32(reader.GetValue(10))
+            CurrentWorkersCount = reader.IsDBNull(10) ? 0 : Convert.ToInt32(reader.GetValue(10)),
+            CpuCount = reader.IsDBNull(11) ? 0 : Convert.ToInt32(reader.GetValue(11))
         };
     }
 
@@ -613,6 +624,7 @@ public class UtilizationEfficiencyRow
     public decimal MemoryRatio { get; set; }
     public int MaxWorkersCount { get; set; }
     public int CurrentWorkersCount { get; set; }
+    public int CpuCount { get; set; }
     public string ProvisioningStatus { get; set; } = "";
 }
 
@@ -645,7 +657,6 @@ public class ApplicationConnectionRow
 
 public class DatabaseSizeRow
 {
-    public string ServerName { get; set; } = "";
     public string DatabaseName { get; set; } = "";
     public string FileTypeDesc { get; set; } = "";
     public string FileName { get; set; } = "";
