@@ -154,6 +154,8 @@
                             </Grid>
                             <!-- CPU Details -->
                             <TextBlock Foreground="{DynamicResource ForegroundMutedBrush}" FontSize="11.5" Margin="0,2,0,0">
+                                <Run x:Name="CpuCountText" Text="-"/>
+                                <Run Text=" CPUs,"/>
                                 <Run x:Name="WorkerThreadsText" Text="-"/>
                                 <Run Text=" workers,"/>
                                 <Run x:Name="CpuSamplesText" Text="-"/>
@@ -615,7 +617,6 @@
                               SelectionMode="Extended"
                               RowStyle="{StaticResource DefaultRowStyle}">
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="Server" Binding="{Binding ServerName}" Width="140"/>
                             <DataGridTextColumn Header="Database" Binding="{Binding DatabaseName}" Width="160"/>
                             <DataGridTextColumn Header="File Type" Binding="{Binding FileTypeDesc}" Width="80"/>
                             <DataGridTextColumn Header="File Name" Binding="{Binding FileName}" Width="160"/>

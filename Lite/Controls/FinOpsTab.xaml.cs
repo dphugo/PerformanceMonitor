@@ -65,7 +65,6 @@ public partial class FinOpsTab : UserControl
     /// </summary>
     public async void RefreshData()
     {
-        await LoadDatabaseSizesAsync();
         await LoadServerInventoryAsync();
         await LoadPerServerDataAsync();
     }
@@ -80,6 +79,7 @@ public partial class FinOpsTab : UserControl
         await LoadUtilizationAsync(serverId);
         await LoadDatabaseResourcesAsync(serverId);
         await LoadApplicationConnectionsAsync(serverId);
+        await LoadDatabaseSizesAsync(serverId);
     }
 
     private async System.Threading.Tasks.Task LoadUtilizationAsync(int serverId)
@@ -118,6 +118,7 @@ public partial class FinOpsTab : UserControl
             ProvisioningStatusText.Text = "No Data";
             ProvisioningStatusBorder.Background = new SolidColorBrush(Colors.Gray);
             AvgCpuText.Text = P95CpuText.Text = MaxCpuText.Text = CpuSamplesText.Text = "-";
+            CpuCountText.Text = "-";
             WorkerThreadsText.Text = "-";
             AvgCpuBar.Width = P95CpuBar.Width = MaxCpuBar.Width = 0;
             MemoryUtilBar.Width = MemoryRatioBar.Width = 0;
@@ -156,6 +157,7 @@ public partial class FinOpsTab : UserControl
         P95CpuText.Text = $"{data.P95CpuPct:N2}%";
         MaxCpuText.Text = $"{data.MaxCpuPct}%";
         CpuSamplesText.Text = data.CpuSamples.ToString("N0");
+        CpuCountText.Text = data.CpuCount.ToString("N0");
         WorkerThreadsText.Text = $"{data.CurrentWorkersCount:N0} / {data.MaxWorkersCount:N0}";
 
         SetBar(AvgCpuBar, AvgCpuFilled, AvgCpuEmpty, (double)data.AvgCpuPct);
@@ -267,13 +269,13 @@ public partial class FinOpsTab : UserControl
         }
     }
 
-    private async System.Threading.Tasks.Task LoadDatabaseSizesAsync()
+    private async System.Threading.Tasks.Task LoadDatabaseSizesAsync(int serverId)
     {
         if (_dataService == null) return;
 
         try
         {
-            var data = await _dataService.GetDatabaseSizeLatestAsync();
+            var data = await _dataService.GetDatabaseSizeLatestAsync(serverId);
             DatabaseSizesDataGrid.ItemsSource = data;
 
             NoDbSizesMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -332,7 +334,8 @@ public partial class FinOpsTab : UserControl
 
     private async void RefreshDatabaseSizes_Click(object sender, RoutedEventArgs e)
     {
-        await LoadDatabaseSizesAsync();
+        var serverId = GetSelectedServerId();
+        if (serverId != 0) await LoadDatabaseSizesAsync(serverId);
     }
 
     private async void RefreshServerInventory_Click(object sender, RoutedEventArgs e)

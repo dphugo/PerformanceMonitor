@@ -332,7 +332,7 @@ OPTION(MAXDOP 1, RECOMPILE);";
                 ORDER BY
                     database_name,
                     file_type_desc,
-                    file_id
+                    file_name
                 OPTION(MAXDOP 1, RECOMPILE);";
 
             using var command = new SqlCommand(query, connection);
