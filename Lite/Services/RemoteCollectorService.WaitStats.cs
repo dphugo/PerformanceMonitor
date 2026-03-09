@@ -127,9 +127,9 @@ OPTION(RECOMPILE);";
                 foreach (var stat in waitStats)
                 {
                     var deltaKey = stat.WaitType;
-                    var deltaWaitingTasks = _deltaCalculator.CalculateDelta(serverId, "wait_stats_tasks", deltaKey, stat.WaitingTasks);
-                    var deltaWaitTimeMs = _deltaCalculator.CalculateDelta(serverId, "wait_stats_time", deltaKey, stat.WaitTimeMs);
-                    var deltaSignalWaitTimeMs = _deltaCalculator.CalculateDelta(serverId, "wait_stats_signal", deltaKey, stat.SignalWaitTimeMs);
+                    var deltaWaitingTasks = _deltaCalculator.CalculateDelta(serverId, "wait_stats_tasks", deltaKey, stat.WaitingTasks, baselineOnly: true);
+                    var deltaWaitTimeMs = _deltaCalculator.CalculateDelta(serverId, "wait_stats_time", deltaKey, stat.WaitTimeMs, baselineOnly: true);
+                    var deltaSignalWaitTimeMs = _deltaCalculator.CalculateDelta(serverId, "wait_stats_signal", deltaKey, stat.SignalWaitTimeMs, baselineOnly: true);
 
                     var row = appender.CreateRow();
                     row.AppendValue(GenerateCollectionId())    /* collection_id BIGINT */
