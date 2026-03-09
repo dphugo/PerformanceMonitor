@@ -9,6 +9,10 @@
         <ResourceDictionary>
             <!-- Context Menu for DataGrid Copy/Export -->
             <ContextMenu x:Key="DataGridContextMenu">
+                <MenuItem Header="View Details..." Click="ViewAlertDetails_Click">
+                    <MenuItem.Icon><TextBlock Text="&#x1F50D;"/></MenuItem.Icon>
+                </MenuItem>
+                <Separator/>
                 <MenuItem Header="Copy Cell" Click="CopyCell_Click">
                     <MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon>
                 </MenuItem>

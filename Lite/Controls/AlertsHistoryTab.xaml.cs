@@ -401,6 +401,16 @@ public partial class AlertsHistoryTab : UserControl
 
     #region Mute Handlers
 
+    private void ViewAlertDetails_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem menuItem) return;
+        var dataGrid = FindParentDataGrid(menuItem);
+        if (dataGrid?.SelectedItem is not AlertHistoryRow item) return;
+
+        var detailWindow = new Windows.AlertDetailWindow(item) { Owner = Window.GetWindow(this) };
+        detailWindow.ShowDialog();
+    }
+
     private async void MuteThisAlert_Click(object sender, RoutedEventArgs e)
     {
         if (MuteRuleService == null) return;

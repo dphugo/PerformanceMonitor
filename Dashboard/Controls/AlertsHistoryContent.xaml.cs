@@ -438,6 +438,17 @@ namespace PerformanceMonitorDashboard.Controls
 
         #region Mute Handlers
 
+        private void ViewAlertDetails_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not MenuItem menuItem) return;
+            var contextMenu = menuItem.Parent as ContextMenu;
+            var dataGrid = TabHelpers.FindDataGridFromContextMenu(contextMenu!);
+            if (dataGrid?.SelectedItem is not AlertHistoryDisplayItem item) return;
+
+            var detailWindow = new AlertDetailWindow(item) { Owner = Window.GetWindow(this) };
+            detailWindow.ShowDialog();
+        }
+
         private void MuteThisAlert_Click(object sender, RoutedEventArgs e)
         {
             if (MuteRuleService == null) return;
