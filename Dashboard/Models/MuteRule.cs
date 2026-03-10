@@ -97,5 +97,26 @@ namespace PerformanceMonitorDashboard.Models
         public string? QueryText { get; set; }
         public string? WaitType { get; set; }
         public string? JobName { get; set; }
+
+        /// <summary>
+        /// Extracts context fields (Database, Query, Wait Type, Job Name) from the
+        /// structured detail_text stored with each alert. The format is label/value
+        /// pairs indented with two spaces, e.g. "  Database: MyDB".
+        /// </summary>
+        public void PopulateFromDetailText(string? detailText)
+        {
+            if (string.IsNullOrEmpty(detailText)) return;
+
+            foreach (var line in detailText.Split('\n'))
+            {
+                var trimmed = line.TrimStart();
+                if (DatabaseName == null && trimmed.StartsWith("Database: ", StringComparison.Ordinal))
+                    DatabaseName = trimmed.Substring("Database: ".Length).Trim();
+                else if (QueryText == null && trimmed.StartsWith("Query: ", StringComparison.Ordinal))
+                    QueryText = trimmed.Substring("Query: ".Length).Trim();
+                else if (WaitType == null && trimmed.StartsWith("Wait Type: ", StringComparison.Ordinal))
+                    WaitType = trimmed.Substring("Wait Type: ".Length).Trim();
+            }
+        }
     }
 }

@@ -151,6 +151,7 @@ namespace PerformanceMonitorDashboard
             // Sync preferences
             var startupPrefs = _preferencesService.GetPreferences();
             TabHelpers.CsvSeparator = startupPrefs.CsvSeparator;
+            MuteRuleDialog.DefaultExpiration = startupPrefs.MuteRuleDefaultExpiration;
             if (Enum.TryParse<Helpers.TimeDisplayMode>(startupPrefs.TimeDisplayMode, out var tdm))
                 Helpers.ServerTimeHelper.CurrentDisplayMode = tdm;
 
