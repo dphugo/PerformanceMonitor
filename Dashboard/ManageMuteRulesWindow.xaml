@@ -23,38 +23,45 @@
         <!-- Rules Grid -->
         <DataGrid Grid.Row="2" x:Name="RulesGrid"
                   AutoGenerateColumns="False"
-                  IsReadOnly="False"
+                  IsReadOnly="True"
                   SelectionMode="Single"
                   CanUserAddRows="False"
                   CanUserDeleteRows="False"
                   HeadersVisibility="Column"
                   GridLinesVisibility="Horizontal"
-                  MouseDoubleClick="RulesGrid_MouseDoubleClick"
-                  CellEditEnding="RulesGrid_CellEditEnding">
+                  MouseDoubleClick="RulesGrid_MouseDoubleClick">
             <DataGrid.Columns>
-                <DataGridCheckBoxColumn Header="Enabled" Binding="{Binding Enabled}" Width="60"/>
-                <DataGridTextColumn Header="Metric" Binding="{Binding MetricName}" Width="130" IsReadOnly="True">
+                <DataGridTemplateColumn Header="Enabled" Width="60">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <CheckBox IsChecked="{Binding Enabled, UpdateSourceTrigger=PropertyChanged}"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      Click="EnabledCheckBox_Click"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="Metric" Binding="{Binding MetricName}" Width="130">
                     <DataGridTextColumn.ElementStyle>
                         <Style TargetType="TextBlock">
                             <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}"/>
                         </Style>
                     </DataGridTextColumn.ElementStyle>
                 </DataGridTextColumn>
-                <DataGridTextColumn Header="Server" Binding="{Binding ServerName}" Width="120" IsReadOnly="True">
+                <DataGridTextColumn Header="Server" Binding="{Binding ServerName}" Width="120">
                     <DataGridTextColumn.ElementStyle>
                         <Style TargetType="TextBlock">
                             <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}"/>
                         </Style>
                     </DataGridTextColumn.ElementStyle>
                 </DataGridTextColumn>
-                <DataGridTextColumn Header="Reason" Binding="{Binding Reason}" Width="*" IsReadOnly="True">
+                <DataGridTextColumn Header="Reason" Binding="{Binding Reason}" Width="*">
                     <DataGridTextColumn.ElementStyle>
                         <Style TargetType="TextBlock">
                             <Setter Property="Foreground" Value="{DynamicResource ForegroundDimBrush}"/>
                         </Style>
                     </DataGridTextColumn.ElementStyle>
                 </DataGridTextColumn>
-                <DataGridTextColumn Header="Expires" Binding="{Binding ExpiresDisplay}" Width="120" IsReadOnly="True">
+                <DataGridTextColumn Header="Expires" Binding="{Binding ExpiresDisplay}" Width="120">
                     <DataGridTextColumn.ElementStyle>
                         <Style TargetType="TextBlock">
                             <Setter Property="Foreground" Value="{DynamicResource ForegroundDimBrush}"/>

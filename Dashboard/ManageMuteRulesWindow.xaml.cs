@@ -7,7 +7,6 @@
  */
 
 using System.Collections.ObjectModel;
-using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -89,13 +88,11 @@ namespace PerformanceMonitorDashboard
             }
         }
 
-        private void RulesGrid_CellEditEnding(object sender, DataGridCellEditEndingEventArgs e)
+        private void EnabledCheckBox_Click(object sender, RoutedEventArgs e)
         {
-            if (e.EditAction == DataGridEditAction.Commit && e.Row.Item is MuteRule rule)
+            if (sender is CheckBox cb && cb.DataContext is MuteRule rule)
             {
-                // The checkbox binding hasn't committed yet, so toggle the opposite of the current service state
-                var currentState = _muteRuleService.GetRules().FirstOrDefault(r => r.Id == rule.Id)?.Enabled ?? true;
-                _muteRuleService.SetRuleEnabled(rule.Id, !currentState);
+                _muteRuleService.SetRuleEnabled(rule.Id, rule.Enabled);
             }
         }
 

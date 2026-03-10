@@ -88,16 +88,11 @@ public partial class ManageMuteRulesWindow : Window
         }
     }
 
-    private void RulesGrid_CellEditEnding(object sender, DataGridCellEditEndingEventArgs e)
+    private async void EnabledCheckBox_Click(object sender, RoutedEventArgs e)
     {
-        if (e.EditAction == DataGridEditAction.Commit && e.Row.Item is MuteRule rule)
+        if (sender is CheckBox cb && cb.DataContext is MuteRule rule)
         {
-            // The checkbox binding hasn't committed yet, so toggle the opposite of the current service state
-            var currentState = _muteRuleService.GetRules().FirstOrDefault(r => r.Id == rule.Id)?.Enabled ?? true;
-            Dispatcher.BeginInvoke(async () =>
-            {
-                await _muteRuleService.SetRuleEnabledAsync(rule.Id, !currentState);
-            });
+            await _muteRuleService.SetRuleEnabledAsync(rule.Id, rule.Enabled);
         }
     }
 
