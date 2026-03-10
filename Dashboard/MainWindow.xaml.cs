@@ -1227,7 +1227,10 @@ namespace PerformanceMonitorDashboard
                     var muteCtx = new AlertMuteContext { ServerName = serverName, MetricName = "Blocking Detected" };
                     bool isMuted = _muteRuleService.IsAlertMuted(muteCtx);
                     _lastBlockingAlert[serverId] = now;
-                    var detailText = $"Blocked Sessions: {(int)health.TotalBlocked}\nLongest Wait: {(int)health.LongestBlockedSeconds}s";
+
+                    var blockingContext = await BuildBlockingContextAsync(databaseService, prefs.AlertExcludedDatabases);
+                    var detailText = ContextToDetailText(blockingContext)
+                        ?? $"Blocked Sessions: {(int)health.TotalBlocked}\nLongest Wait: {(int)health.LongestBlockedSeconds}s";
 
                     if (!isMuted)
                     {
@@ -1243,8 +1246,6 @@ namespace PerformanceMonitorDashboard
 
                     if (!isMuted)
                     {
-                        var blockingContext = await BuildBlockingContextAsync(databaseService, prefs.AlertExcludedDatabases);
-
                         await _emailAlertService.TrySendAlertEmailAsync(
                             "Blocking Detected",
                             serverName,
@@ -1288,7 +1289,10 @@ namespace PerformanceMonitorDashboard
                     var muteCtx = new AlertMuteContext { ServerName = serverName, MetricName = "Deadlocks Detected" };
                     bool isMuted = _muteRuleService.IsAlertMuted(muteCtx);
                     _lastDeadlockAlert[serverId] = now;
-                    var detailText = $"New Deadlocks: {effectiveDeadlockDelta}";
+
+                    var deadlockContext = await BuildDeadlockContextAsync(databaseService, prefs.AlertExcludedDatabases);
+                    var detailText = ContextToDetailText(deadlockContext)
+                        ?? $"New Deadlocks: {effectiveDeadlockDelta}";
 
                     if (!isMuted)
                     {
@@ -1303,8 +1307,6 @@ namespace PerformanceMonitorDashboard
 
                     if (!isMuted)
                     {
-                        var deadlockContext = await BuildDeadlockContextAsync(databaseService, prefs.AlertExcludedDatabases);
-
                         await _emailAlertService.TrySendAlertEmailAsync(
                             "Deadlocks Detected",
                             serverName,
