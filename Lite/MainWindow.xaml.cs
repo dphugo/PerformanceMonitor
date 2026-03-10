@@ -229,6 +229,9 @@ public partial class MainWindow : Window
 
     private void ServerTabControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        // Only respond to tab selection changes, not child control selection events that bubble up
+        if (e.OriginalSource != ServerTabControl) return;
+
         /* Restore the selected tab's UTC offset so charts use the correct server timezone */
         if (ServerTabControl.SelectedItem is TabItem { Content: ServerTab serverTab })
         {

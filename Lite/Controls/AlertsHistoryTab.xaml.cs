@@ -403,10 +403,20 @@ public partial class AlertsHistoryTab : UserControl
 
     private void AlertsDataGrid_MouseDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
-        if (sender is not DataGrid dataGrid) return;
-        if (dataGrid.SelectedItem is not AlertHistoryRow item) return;
+        if (sender is not DataGrid) return;
 
-        var detailWindow = new Windows.AlertDetailWindow(item) { Owner = Window.GetWindow(this) };
+        // Walk up the visual tree from the click target to find the DataGridRow
+        var source = e.OriginalSource as DependencyObject;
+        while (source != null && source is not DataGridRow && source is not DataGridColumnHeader)
+            source = System.Windows.Media.VisualTreeHelper.GetParent(source);
+
+        // Ignore clicks on column headers or outside rows
+        if (source is not DataGridRow row) return;
+        if (row.DataContext is not AlertHistoryRow item) return;
+
+        var owner = Window.GetWindow(this);
+        var detailWindow = new Windows.AlertDetailWindow(item);
+        if (owner != null) detailWindow.Owner = owner;
         detailWindow.ShowDialog();
     }
 
@@ -416,7 +426,9 @@ public partial class AlertsHistoryTab : UserControl
         var dataGrid = FindParentDataGrid(menuItem);
         if (dataGrid?.SelectedItem is not AlertHistoryRow item) return;
 
-        var detailWindow = new Windows.AlertDetailWindow(item) { Owner = Window.GetWindow(this) };
+        var owner = Window.GetWindow(this);
+        var detailWindow = new Windows.AlertDetailWindow(item);
+        if (owner != null) detailWindow.Owner = owner;
         detailWindow.ShowDialog();
     }
 
