@@ -158,4 +158,48 @@ public class DuckDbSchemaTests : IDisposable
         /* We create 18 indexes */
         Assert.True(indexCount >= 18, $"Expected >= 18 indexes, found {indexCount}");
     }
+
+    /// <summary>
+    /// DuckDB does not support NOT NULL on ALTER TABLE ADD COLUMN.
+    /// This test scans the migration source code to prevent regressions.
+    /// </summary>
+    [Fact]
+    public void Migrations_DoNotUseNotNullOnAlterTableAddColumn()
+    {
+        var sourceFile = FindSourceFile("DuckDbInitializer.cs");
+        Assert.True(sourceFile != null, "Could not find DuckDbInitializer.cs in the Lite project tree");
+
+        var lines = File.ReadAllLines(sourceFile!);
+        var violations = new System.Collections.Generic.List<string>();
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (line.Contains("ADD COLUMN", StringComparison.OrdinalIgnoreCase)
+                && line.Contains("NOT NULL", StringComparison.OrdinalIgnoreCase)
+                && !line.TrimStart().StartsWith("/*") && !line.TrimStart().StartsWith("//") && !line.TrimStart().StartsWith("*"))
+            {
+                violations.Add($"Line {i + 1}: {line.Trim()}");
+            }
+        }
+
+        Assert.True(violations.Count == 0,
+            "DuckDB does not support NOT NULL on ALTER TABLE ADD COLUMN. " +
+            "Use a nullable column with DEFAULT instead.\n\nViolations:\n" +
+            string.Join("\n", violations));
+    }
+
+    private static string? FindSourceFile(string fileName)
+    {
+        var dir = AppContext.BaseDirectory;
+        for (int i = 0; i < 8; i++)
+        {
+            var candidate = Path.Combine(dir, "Lite", "Database", fileName);
+            if (File.Exists(candidate)) return candidate;
+            var parent = Directory.GetParent(dir);
+            if (parent == null) break;
+            dir = parent.FullName;
+        }
+        return null;
+    }
 }
