@@ -26,6 +26,8 @@ public partial class FinOpsTab : UserControl
     private LocalDataService? _dataService;
     private ServerManager? _serverManager;
     private CredentialService? _credentialService;
+    private List<ServerPropertyRow>? _serverInventoryCache;
+    private DateTime _serverInventoryCacheTime;
 
     public FinOpsTab()
     {
@@ -52,6 +54,7 @@ public partial class FinOpsTab : UserControl
     public void RefreshServerList()
     {
         if (_serverManager == null) return;
+        _serverInventoryCache = null; // Invalidate cache when server list changes
 
         var previousSelection = ServerSelector.SelectedItem as ServerConnection;
         var servers = _serverManager.GetAllServers();
@@ -101,6 +104,7 @@ public partial class FinOpsTab : UserControl
 
     private async System.Threading.Tasks.Task LoadPerServerDataAsync()
     {
+        using var _profiler = Helpers.MethodProfiler.StartTiming("FinOps-PerServerData");
         var serverId = GetSelectedServerId();
         if (serverId == 0 || _dataService == null) return;
 
@@ -123,14 +127,10 @@ public partial class FinOpsTab : UserControl
 
             if (data != null)
             {
-                var topTotal = await _dataService.GetTopResourceConsumersByTotalAsync(serverId);
-                TopTotalGrid.ItemsSource = topTotal;
-
-                var topAvg = await _dataService.GetTopResourceConsumersByAvgAsync(serverId);
-                TopAvgGrid.ItemsSource = topAvg;
-
-                var sizes = await _dataService.GetDatabaseSizeSummaryAsync(serverId);
-                DbSizeChart.ItemsSource = sizes;
+                TopTotalGrid.ItemsSource = await _dataService.GetTopResourceConsumersByTotalAsync(serverId);
+                TopAvgGrid.ItemsSource = await _dataService.GetTopResourceConsumersByAvgAsync(serverId);
+                DbSizeChart.ItemsSource = await _dataService.GetDatabaseSizeSummaryAsync(serverId);
+                ProvisioningTrendGrid.ItemsSource = await _dataService.GetProvisioningTrendAsync(serverId);
             }
         }
         catch (Exception ex)
@@ -315,15 +315,66 @@ public partial class FinOpsTab : UserControl
         }
     }
 
-    private async System.Threading.Tasks.Task LoadServerInventoryAsync()
+    private async System.Threading.Tasks.Task LoadServerInventoryAsync(bool forceRefresh = false)
     {
-        if (_dataService == null) return;
+        using var _profiler = Helpers.MethodProfiler.StartTiming("FinOps-ServerInventory");
+        if (_dataService == null || _serverManager == null || _credentialService == null) return;
+
+        // Use cache if available and less than 5 minutes old
+        if (!forceRefresh && _serverInventoryCache != null
+            && (DateTime.Now - _serverInventoryCacheTime).TotalMinutes < 5)
+        {
+            ServerInventoryDataGrid.ItemsSource = _serverInventoryCache;
+            NoServerInventoryMessage.Visibility = _serverInventoryCache.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            ServerInventoryCountIndicator.Text = _serverInventoryCache.Count > 0 ? $"{_serverInventoryCache.Count} server(s)" : "";
+            return;
+        }
 
         try
         {
-            var data = await _dataService.GetServerPropertiesLatestAsync();
-            ServerInventoryDataGrid.ItemsSource = data;
+            var servers = _serverManager.GetAllServers();
 
+            var tasks = servers.Select(async server =>
+            {
+                try
+                {
+                    var connStr = server.GetConnectionString(_credentialService);
+
+                    // Step 1: Query live server properties
+                    var item = await LocalDataService.GetServerPropertiesLiveAsync(connStr);
+                    item.ServerName = server.DisplayName;
+
+                    // Step 2: Get collected metrics from DuckDB
+                    try
+                    {
+                        var serverId = RemoteCollectorService.GetDeterministicHashCode(server.ServerName);
+                        var (avgCpu, storageGb, idleDbs, status) = await _dataService!.GetServerMetricsAsync(serverId);
+                        if (avgCpu.HasValue) item.AvgCpuPct = avgCpu;
+                        if (storageGb.HasValue) item.StorageTotalGb = storageGb;
+                        if (idleDbs.HasValue) item.IdleDbCount = idleDbs;
+                        if (status != null) item.ProvisioningStatus = status;
+                    }
+                    catch
+                    {
+                        // DuckDB metrics may not exist yet — that's OK
+                    }
+
+                    return item;
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Error("FinOps", $"Failed to query {server.DisplayName}: {ex.Message}");
+                    return (ServerPropertyRow?)null;
+                }
+            });
+
+            var results = await System.Threading.Tasks.Task.WhenAll(tasks);
+            var data = results.Where(r => r != null).Cast<ServerPropertyRow>().ToList();
+
+            _serverInventoryCache = data;
+            _serverInventoryCacheTime = DateTime.Now;
+
+            ServerInventoryDataGrid.ItemsSource = data;
             NoServerInventoryMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             ServerInventoryCountIndicator.Text = data.Count > 0 ? $"{data.Count} server(s)" : "";
         }
@@ -383,13 +434,40 @@ public partial class FinOpsTab : UserControl
         }
     }
 
+    private int GetWaitStatsHoursBack()
+    {
+        return WaitStatsTimeRangeCombo.SelectedIndex switch
+        {
+            0 => 1,
+            1 => 4,
+            2 => 12,
+            3 => 24,
+            4 => 168,
+            _ => 24
+        };
+    }
+
+    private int GetExpensiveQueriesHoursBack()
+    {
+        return ExpensiveQueriesTimeRangeCombo.SelectedIndex switch
+        {
+            0 => 1,
+            1 => 4,
+            2 => 12,
+            3 => 24,
+            4 => 168,
+            _ => 24
+        };
+    }
+
     private async System.Threading.Tasks.Task LoadWaitCategorySummaryAsync(int serverId)
     {
         if (_dataService == null) return;
 
         try
         {
-            var data = await _dataService.GetWaitCategorySummaryAsync(serverId);
+            var hoursBack = GetWaitStatsHoursBack();
+            var data = await _dataService.GetWaitCategorySummaryAsync(serverId, hoursBack);
             WaitCategorySummaryDataGrid.ItemsSource = data;
             WaitCategorySummaryNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
@@ -405,7 +483,8 @@ public partial class FinOpsTab : UserControl
 
         try
         {
-            var data = await _dataService.GetExpensiveQueriesAsync(serverId);
+            var hoursBack = GetExpensiveQueriesHoursBack();
+            var data = await _dataService.GetExpensiveQueriesAsync(serverId, hoursBack);
             ExpensiveQueriesDataGrid.ItemsSource = data;
             ExpensiveQueriesNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             ExpensiveQueriesCountIndicator.Text = data.Count > 0 ? $"{data.Count} query(s)" : "";
@@ -413,6 +492,22 @@ public partial class FinOpsTab : UserControl
         catch (Exception ex)
         {
             AppLogger.Error("FinOps", $"Failed to load expensive queries: {ex.Message}");
+        }
+    }
+
+    private async System.Threading.Tasks.Task LoadMemoryGrantEfficiencyAsync(int serverId)
+    {
+        if (_dataService == null) return;
+
+        try
+        {
+            var data = await _dataService.GetMemoryGrantEfficiencyAsync(serverId);
+            MemoryGrantEfficiencyDataGrid.ItemsSource = data;
+            MemoryGrantEfficiencyNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("FinOps", $"Failed to load memory grant efficiency: {ex.Message}");
         }
     }
 
@@ -451,7 +546,7 @@ public partial class FinOpsTab : UserControl
 
     private async void RefreshServerInventory_Click(object sender, RoutedEventArgs e)
     {
-        await LoadServerInventoryAsync();
+        await LoadServerInventoryAsync(forceRefresh: true);
     }
 
     private async void RefreshStorageGrowth_Click(object sender, RoutedEventArgs e)
@@ -460,8 +555,25 @@ public partial class FinOpsTab : UserControl
         if (serverId != 0) await LoadStorageGrowthAsync(serverId);
     }
 
+    private async void WaitStatsTimeRange_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded || _dataService == null) return;
+        var serverId = GetSelectedServerId();
+        if (serverId == 0) return;
+        await LoadWaitCategorySummaryAsync(serverId);
+    }
+
+    private async void ExpensiveQueriesTimeRange_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded || _dataService == null) return;
+        var serverId = GetSelectedServerId();
+        if (serverId == 0) return;
+        await LoadExpensiveQueriesAsync(serverId);
+    }
+
     private async void OptimizationRefresh_Click(object sender, RoutedEventArgs e)
     {
+        using var _profiler = Helpers.MethodProfiler.StartTiming("FinOps-OptimizationRefresh");
         var serverId = GetSelectedServerId();
         if (serverId == 0 || _dataService == null) return;
 
@@ -469,12 +581,14 @@ public partial class FinOpsTab : UserControl
             LoadIdleDatabasesAsync(serverId),
             LoadTempdbSummaryAsync(serverId),
             LoadWaitCategorySummaryAsync(serverId),
-            LoadExpensiveQueriesAsync(serverId)
+            LoadExpensiveQueriesAsync(serverId),
+            LoadMemoryGrantEfficiencyAsync(serverId)
         );
     }
 
     private async void RunIndexAnalysis_Click(object sender, RoutedEventArgs e)
     {
+        using var _profiler = Helpers.MethodProfiler.StartTiming("FinOps-IndexAnalysis");
         if (_serverManager == null || _credentialService == null) return;
 
         var server = ServerSelector.SelectedItem as ServerConnection;

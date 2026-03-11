@@ -651,6 +651,10 @@ public static class ShowPlanParser
         var physicalOpEl = GetOperatorElement(relOpEl);
         if (physicalOpEl != null)
         {
+            // Top N Sort — XML element is <TopSort> but PhysicalOp is "Sort"
+            if (physicalOpEl.Name.LocalName == "TopSort")
+                node.LogicalOp = "Top N Sort";
+
             // Object reference (table/index name) — scoped to stop at child RelOps
             var objEl = ScopedDescendants(physicalOpEl, Ns + "Object").FirstOrDefault();
             if (objEl != null)
@@ -1444,8 +1448,8 @@ public static class ShowPlanParser
             result.Add(new PlanWarning
             {
                 WarningType = "No Join Predicate",
-                Message = "This join has no join predicate (possible cross join)",
-                Severity = PlanWarningSeverity.Critical
+                Message = "This join triggered a no join predicate warning, which is worth checking on, but is often misleading. The optimizer may have removed a redundant predicate after simplification.",
+                Severity = PlanWarningSeverity.Warning
             });
         }
 

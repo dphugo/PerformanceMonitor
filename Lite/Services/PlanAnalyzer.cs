@@ -188,48 +188,44 @@ public static partial class PlanAnalyzer
             });
         }
 
-        // Rule 25: Ineffective parallelism — parallel plan where CPU ≈ elapsed
+        // Rule 25: Ineffective parallelism — DOP-aware efficiency scoring
+        // Efficiency = (speedup - 1) / (DOP - 1) * 100
+        // where speedup = CPU / Elapsed. At DOP 1 speedup=1 (0%), at DOP=speedup (100%).
+        // Rule 31: Parallel wait bottleneck — elapsed >> CPU means threads waiting, not working.
         if (stmt.DegreeOfParallelism > 1 && stmt.QueryTimeStats != null)
         {
             var cpu = stmt.QueryTimeStats.CpuTimeMs;
             var elapsed = stmt.QueryTimeStats.ElapsedTimeMs;
+            var dop = stmt.DegreeOfParallelism;
 
             if (elapsed >= 1000 && cpu > 0)
             {
-                var ratio = (double)cpu / elapsed;
-                if (ratio >= 0.8 && ratio <= 1.3)
-                {
-                    stmt.PlanWarnings.Add(new PlanWarning
-                    {
-                        WarningType = "Ineffective Parallelism",
-                        Message = $"Parallel plan (DOP {stmt.DegreeOfParallelism}) but CPU time ({cpu:N0}ms) is nearly equal to elapsed time ({elapsed:N0}ms). " +
-                                  $"The work ran essentially serially despite the overhead of parallelism. " +
-                                  $"Look for parallel thread skew, blocking exchanges, or serial zones in the plan that prevent effective parallel execution.",
-                        Severity = PlanWarningSeverity.Warning
-                    });
-                }
-            }
-        }
+                var speedup = (double)cpu / elapsed;
+                var efficiency = Math.Max(0.0, Math.Min(100.0, (speedup - 1.0) / (dop - 1.0) * 100.0));
 
-        // Rule 31: Parallel wait bottleneck — elapsed time significantly exceeds CPU time
-        if (stmt.DegreeOfParallelism > 1 && stmt.QueryTimeStats != null)
-        {
-            var cpu = stmt.QueryTimeStats.CpuTimeMs;
-            var elapsed = stmt.QueryTimeStats.ElapsedTimeMs;
-
-            if (elapsed >= 1000 && cpu > 0)
-            {
-                var ratio = (double)cpu / elapsed;
-                if (ratio < 0.8)
+                if (speedup < 0.5)
                 {
-                    var waitPct = (1.0 - ratio) * 100;
+                    // CPU well below Elapsed: threads are waiting, not doing CPU work
+                    var waitPct = (1.0 - speedup) * 100;
                     stmt.PlanWarnings.Add(new PlanWarning
                     {
                         WarningType = "Parallel Wait Bottleneck",
-                        Message = $"Parallel plan (DOP {stmt.DegreeOfParallelism}) with elapsed time ({elapsed:N0}ms) significantly exceeding CPU time ({cpu:N0}ms). " +
+                        Message = $"Parallel plan (DOP {dop}, {efficiency:N0}% efficient) with elapsed time ({elapsed:N0}ms) exceeding CPU time ({cpu:N0}ms). " +
                                   $"Approximately {waitPct:N0}% of elapsed time was spent waiting rather than on CPU. " +
                                   $"Common causes include spills to tempdb, physical I/O reads, lock or latch contention, and memory grant waits.",
                         Severity = PlanWarningSeverity.Warning
+                    });
+                }
+                else if (efficiency < 40)
+                {
+                    // CPU >= Elapsed but well below DOP potential — parallelism is ineffective
+                    stmt.PlanWarnings.Add(new PlanWarning
+                    {
+                        WarningType = "Ineffective Parallelism",
+                        Message = $"Parallel plan (DOP {dop}) is only {efficiency:N0}% efficient — CPU time ({cpu:N0}ms) vs elapsed time ({elapsed:N0}ms). " +
+                                  $"At DOP {dop}, ideal CPU time would be ~{elapsed * dop:N0}ms. " +
+                                  $"Look for parallel thread skew, blocking exchanges, or serial zones in the plan that prevent effective parallel execution.",
+                        Severity = efficiency < 20 ? PlanWarningSeverity.Critical : PlanWarningSeverity.Warning
                     });
                 }
             }
@@ -295,6 +291,53 @@ public static partial class PlanAnalyzer
                 }
             }
         }
+
+        // Rule 22 (statement-level): Table variable warnings
+        if (stmt.RootNode != null)
+        {
+            var hasTableVar = false;
+            var isModification = stmt.StatementType is "INSERT" or "UPDATE" or "DELETE" or "MERGE";
+            var modifiesTableVar = false;
+            CheckForTableVariables(stmt.RootNode, isModification, ref hasTableVar, ref modifiesTableVar);
+
+            if (hasTableVar && !modifiesTableVar)
+            {
+                stmt.PlanWarnings.Add(new PlanWarning
+                {
+                    WarningType = "Table Variable",
+                    Message = "Table variable detected. Table variables lack column-level statistics, which causes bad row estimates, join choices, and memory grant decisions. Replace with a #temp table.",
+                    Severity = PlanWarningSeverity.Warning
+                });
+            }
+
+            if (modifiesTableVar)
+            {
+                stmt.PlanWarnings.Add(new PlanWarning
+                {
+                    WarningType = "Table Variable",
+                    Message = "This query modifies a table variable, which forces the entire plan to run single-threaded. SQL Server cannot use parallelism for modifications to table variables. Replace with a #temp table to allow parallel execution.",
+                    Severity = PlanWarningSeverity.Critical
+                });
+            }
+        }
+    }
+
+    private static void CheckForTableVariables(PlanNode node, bool isModification,
+        ref bool hasTableVar, ref bool modifiesTableVar)
+    {
+        if (!string.IsNullOrEmpty(node.ObjectName) && node.ObjectName.StartsWith("@"))
+        {
+            hasTableVar = true;
+            if (isModification && (node.PhysicalOp.Contains("Insert", StringComparison.OrdinalIgnoreCase)
+                || node.PhysicalOp.Contains("Update", StringComparison.OrdinalIgnoreCase)
+                || node.PhysicalOp.Contains("Delete", StringComparison.OrdinalIgnoreCase)
+                || node.PhysicalOp.Contains("Merge", StringComparison.OrdinalIgnoreCase)))
+            {
+                modifiesTableVar = true;
+            }
+        }
+        foreach (var child in node.Children)
+            CheckForTableVariables(child, isModification, ref hasTableVar, ref modifiesTableVar);
     }
 
     private static void AnalyzeNodeTree(PlanNode node, PlanStatement stmt)
@@ -466,15 +509,19 @@ public static partial class PlanAnalyzer
 
         // Rule 8: Parallel thread skew (actual plans with per-thread stats)
         // Only warn when there are enough rows to meaningfully distribute across threads
+        // Filter out thread 0 (coordinator) which typically does 0 rows in parallel operators
         if (node.PerThreadStats.Count > 1)
         {
-            var totalRows = node.PerThreadStats.Sum(t => t.ActualRows);
-            var minRowsForSkew = node.PerThreadStats.Count * 1000;
+            var workerThreads = node.PerThreadStats.Where(t => t.ThreadId > 0).ToList();
+            if (workerThreads.Count < 2) workerThreads = node.PerThreadStats; // fallback
+            var totalRows = workerThreads.Sum(t => t.ActualRows);
+            var minRowsForSkew = workerThreads.Count * 1000;
             if (totalRows >= minRowsForSkew)
             {
-                var maxThread = node.PerThreadStats.OrderByDescending(t => t.ActualRows).First();
+                var maxThread = workerThreads.OrderByDescending(t => t.ActualRows).First();
                 var skewRatio = (double)maxThread.ActualRows / totalRows;
-                var skewThreshold = node.PerThreadStats.Count == 2 ? 0.75 : 0.50;
+                // At DOP 2, a 60/40 split is normal — use higher threshold
+                var skewThreshold = workerThreads.Count <= 2 ? 0.80 : 0.50;
                 if (skewRatio >= skewThreshold)
                 {
                     node.Warnings.Add(new PlanWarning
@@ -508,7 +555,7 @@ public static partial class PlanAnalyzer
             {
                 WarningType = "Key Lookup",
                 Message = $"Key Lookup — SQL Server found rows via a nonclustered index but had to go back to the clustered index for additional columns. Alter the nonclustered index to add the predicate column as a key column or as an INCLUDE column.\nPredicate: {Truncate(node.Predicate, 200)}",
-                Severity = PlanWarningSeverity.Warning
+                Severity = PlanWarningSeverity.Critical
             });
         }
 
@@ -577,7 +624,7 @@ public static partial class PlanAnalyzer
 
         // Rule 14: Lazy Table Spool unfavorable rebind/rewind ratio
         // Rebinds = cache misses (child re-executes), rewinds = cache hits (reuse cached result)
-        if (node.LogicalOp == "Lazy Spool")
+        if (node.LogicalOp == "Lazy Spool" && !node.PhysicalOp.Contains("Index", StringComparison.OrdinalIgnoreCase))
         {
             var rebinds = node.HasActualStats ? (double)node.ActualRebinds : node.EstimateRebinds;
             var rewinds = node.HasActualStats ? (double)node.ActualRewinds : node.EstimateRewinds;
@@ -711,11 +758,17 @@ public static partial class PlanAnalyzer
         if (!string.IsNullOrEmpty(node.ObjectName) &&
             node.ObjectName.StartsWith('@'))
         {
+            var isModificationOp = node.PhysicalOp.Contains("Insert", StringComparison.OrdinalIgnoreCase)
+                || node.PhysicalOp.Contains("Update", StringComparison.OrdinalIgnoreCase)
+                || node.PhysicalOp.Contains("Delete", StringComparison.OrdinalIgnoreCase);
+
             node.Warnings.Add(new PlanWarning
             {
                 WarningType = "Table Variable",
-                Message = "Table variable detected. Table variables lack column-level statistics, which causes bad row estimates, join choices, and memory grant decisions. Replace with a #temp table.",
-                Severity = PlanWarningSeverity.Warning
+                Message = isModificationOp
+                    ? "Modifying a table variable forces the entire plan to run single-threaded. Replace with a #temp table to allow parallel execution."
+                    : "Table variable detected. Table variables lack column-level statistics, which causes bad row estimates, join choices, and memory grant decisions. Replace with a #temp table.",
+                Severity = isModificationOp ? PlanWarningSeverity.Critical : PlanWarningSeverity.Warning
             });
         }
 
@@ -731,35 +784,38 @@ public static partial class PlanAnalyzer
             });
         }
 
-        // Rule 24: Top above a scan on the inner side of Nested Loops
-        // This pattern means the scan executes once per outer row, and the Top
-        // limits each iteration — but with no supporting index the scan is a
-        // linear search repeated potentially millions of times.
-        if (node.PhysicalOp == "Nested Loops" && node.Children.Count >= 2)
+        // Rule 24: Top above a scan
+        // Detects Top or Top N Sort operators feeding from a scan. This often means the
+        // query is scanning the entire table/index and sorting just to return a few rows,
+        // when an appropriate index could satisfy the request directly.
         {
-            var inner = node.Children[1];
+            var isTop = node.PhysicalOp == "Top";
+            var isTopNSort = node.LogicalOp == "Top N Sort";
 
-            // Walk through pass-through operators to find Top
-            while (inner.PhysicalOp == "Compute Scalar" && inner.Children.Count > 0)
-                inner = inner.Children[0];
-
-            if (inner.PhysicalOp == "Top" && inner.Children.Count > 0)
+            if ((isTop || isTopNSort) && node.Children.Count > 0)
             {
                 // Walk through pass-through operators below the Top to find the scan
-                var scanCandidate = inner.Children[0];
-                while (scanCandidate.PhysicalOp == "Compute Scalar" && scanCandidate.Children.Count > 0)
+                var scanCandidate = node.Children[0];
+                while ((scanCandidate.PhysicalOp == "Compute Scalar" || scanCandidate.PhysicalOp == "Parallelism")
+                    && scanCandidate.Children.Count > 0)
                     scanCandidate = scanCandidate.Children[0];
 
                 if (IsScanOperator(scanCandidate))
                 {
+                    var topLabel = isTopNSort ? "Top N Sort" : "Top";
+                    var onInner = node.Parent?.PhysicalOp == "Nested Loops" && node.Parent.Children.Count >= 2
+                        && node.Parent.Children[1] == node;
+                    var innerNote = onInner
+                        ? $" This is on the inner side of Nested Loops (Node {node.Parent!.NodeId}), so the scan repeats for every outer row."
+                        : "";
                     var predInfo = !string.IsNullOrEmpty(scanCandidate.Predicate)
                         ? " The scan has a residual predicate, so it may read many rows before the Top is satisfied."
                         : "";
-                    inner.Warnings.Add(new PlanWarning
+                    node.Warnings.Add(new PlanWarning
                     {
                         WarningType = "Top Above Scan",
-                        Message = $"Top operator reads from {scanCandidate.PhysicalOp} (Node {scanCandidate.NodeId}) on the inner side of Nested Loops (Node {node.NodeId}).{predInfo} Check that you have appropriate indexes to convert the scan into a seek.",
-                        Severity = PlanWarningSeverity.Warning
+                        Message = $"{topLabel} reads from {scanCandidate.PhysicalOp} (Node {scanCandidate.NodeId}).{innerNote}{predInfo} An index on the ORDER BY columns could eliminate the scan and sort entirely.",
+                        Severity = onInner ? PlanWarningSeverity.Critical : PlanWarningSeverity.Warning
                     });
                 }
             }
@@ -996,8 +1052,8 @@ public static partial class PlanAnalyzer
         while (parent != null && parent.PhysicalOp == "Compute Scalar")
             parent = parent.Parent;
 
-        // Expect TopN Sort
-        if (parent == null || parent.LogicalOp != "TopN Sort")
+        // Expect TopN Sort (XML says "TopN Sort", parser normalizes to "Top N Sort")
+        if (parent == null || parent.LogicalOp != "Top N Sort")
             return false;
 
         // Walk up to Merge Interval
@@ -1217,8 +1273,8 @@ public static partial class PlanAnalyzer
         if (node.LogicalOp.Contains("Join", StringComparison.OrdinalIgnoreCase) && !node.IsAdaptive)
         {
             return ratio >= 10.0
-                ? "The underestimate may have caused the optimizer to choose a suboptimal join strategy."
-                : "The overestimate may have caused the optimizer to choose a suboptimal join strategy.";
+                ? "The underestimate may have caused the optimizer to make poor choices."
+                : "The overestimate may have caused the optimizer to make poor choices.";
         }
 
         // Walk up to check if a parent was harmed by this bad estimate
@@ -1245,8 +1301,8 @@ public static partial class PlanAnalyzer
                     return null; // Adaptive join self-corrects — no harm
 
                 return ratio >= 10.0
-                    ? $"The underestimate may have caused the optimizer to choose {ancestor.PhysicalOp} when a different join type would be more efficient."
-                    : $"The overestimate may have caused the optimizer to choose {ancestor.PhysicalOp} when a different join type would be more efficient.";
+                    ? "The underestimate may have caused the optimizer to make poor choices."
+                    : "The overestimate may have caused the optimizer to make poor choices.";
             }
 
             // Parent Sort/Hash that spilled — downstream bad estimate caused the spill

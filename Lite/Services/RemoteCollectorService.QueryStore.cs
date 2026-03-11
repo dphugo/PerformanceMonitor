@@ -41,7 +41,8 @@ DECLARE
 
 DECLARE
     @db sysname,
-    @sql NVARCHAR(500);
+    @sql NVARCHAR(500),
+    @exec_sp nvarchar(256);
 
 DECLARE db_check CURSOR LOCAL FAST_FORWARD FOR
     SELECT /* PerformanceMonitorLite */
@@ -70,8 +71,7 @@ INTO @db;
 WHILE @@FETCH_STATUS = 0
 BEGIN
     BEGIN TRY
-        SET @sql =
-            N'USE ' + QUOTENAME(@db) + N';
+        SET @sql = N'
             SELECT ' + QUOTENAME(@db, '''') + N'
             WHERE EXISTS
             (
@@ -81,8 +81,10 @@ BEGIN
                 WHERE actual_state > 0
             );';
 
+        SET @exec_sp = QUOTENAME(@db) + N'.sys.sp_executesql';
+
         INSERT @result (name)
-        EXEC(@sql);
+        EXECUTE @exec_sp @sql;
     END TRY
     BEGIN CATCH
     END CATCH;
@@ -110,7 +112,8 @@ DECLARE
 
 DECLARE
     @db sysname,
-    @sql NVARCHAR(500);
+    @sql NVARCHAR(500),
+    @exec_sp nvarchar(256);
 
 DECLARE db_check CURSOR LOCAL FAST_FORWARD FOR
     SELECT /* PerformanceMonitorLite */
@@ -131,8 +134,7 @@ INTO @db;
 WHILE @@FETCH_STATUS = 0
 BEGIN
     BEGIN TRY
-        SET @sql =
-            N'USE ' + QUOTENAME(@db) + N';
+        SET @sql = N'
             SELECT ' + QUOTENAME(@db, '''') + N'
             WHERE EXISTS
             (
@@ -142,8 +144,10 @@ BEGIN
                 WHERE actual_state > 0
             );';
 
+        SET @exec_sp = QUOTENAME(@db) + N'.sys.sp_executesql';
+
         INSERT @result (name)
-        EXEC(@sql);
+        EXECUTE @exec_sp @sql;
     END TRY
     BEGIN CATCH
     END CATCH;
@@ -311,7 +315,7 @@ EXECUTE [{escapedDbName}].sys.sp_executesql
          force_failure_count = qsp.force_failure_count,
          last_force_failure_reason = qsp.last_force_failure_reason_desc,
          compatibility_level = qsp.compatibility_level,
-         query_plan_text = CONVERT(nvarchar(max), qsp.query_plan),
+         query_plan_text = CONVERT(nvarchar(1), NULL),
          query_plan_hash = CONVERT(varchar(64), qsp.query_plan_hash, 1)
      FROM sys.query_store_runtime_stats AS qsrs
      JOIN sys.query_store_plan AS qsp
@@ -322,7 +326,7 @@ EXECUTE [{escapedDbName}].sys.sp_executesql
        ON qst.query_text_id = qsq.query_text_id
      WHERE qsrs.last_execution_time > @cutoff_time
      AND   qst.query_sql_text NOT LIKE N''%PerformanceMonitorLite%''
-     OPTION(RECOMPILE);',
+     OPTION(RECOMPILE, LOOP JOIN);',
     N'@cutoff_time datetime2(7)',
     @cutoff_time;";
 
