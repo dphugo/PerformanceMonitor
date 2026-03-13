@@ -107,19 +107,32 @@ internal static class McpInstructions
         |------|---------|----------------|
         | `get_running_jobs` | Currently running SQL Agent jobs with duration vs historical average/p95 | `server_name` |
 
+        ### Diagnostic Analysis Tools
+        | Tool | Purpose | Key Parameters |
+        |------|---------|----------------|
+        | `analyze_server` | Runs the inference engine: scores facts, traverses relationship graph, returns evidence-backed findings with severity and recommended next tools | `server_name`, `hours_back` (default 4) |
+        | `get_analysis_facts` | Exposes raw scored facts from the collect+score pipeline — every observation the engine sees with base severity, amplifiers, and metadata | `server_name`, `hours_back` (default 4), `source` (filter), `min_severity` |
+        | `compare_analysis` | Compares two time periods (e.g., peak vs off-peak, before vs after a change) showing severity deltas for each fact | `server_name`, `hours_back` (default 4), `baseline_hours_back` (default 28) |
+        | `audit_config` | Edition-aware configuration audit: evaluates CTFP, MAXDOP, max memory, and max worker threads against best practices | `server_name` |
+        | `get_analysis_findings` | Retrieves persisted findings from previous analysis runs | `server_name`, `hours_back` (default 24) |
+        | `mute_analysis_finding` | Mutes a finding pattern by story_path_hash so it won't appear in future runs | `story_path_hash` (required), `server_name`, `reason` |
+
         ## Recommended Workflow
 
         1. **Start**: `list_servers` — see what's monitored and which servers are online
         2. **Verify**: `get_collection_health` — check collectors are running successfully
-        3. **Overview**: `get_server_summary` — quick health check (CPU, memory, blocking, deadlocks)
-        4. **Drill down** based on findings:
+        3. **Diagnose**: `analyze_server` — run the inference engine for an evidence-backed assessment. Each finding includes `next_tools` — a list of recommended MCP tools to call for deeper investigation. Follow those recommendations.
+        4. **Drill down** using the `next_tools` from findings, or manually:
            - High waits → `get_wait_stats` → `get_wait_trend` for specific wait type
            - CPU pressure → `get_cpu_utilization` → `get_top_queries_by_cpu`
            - Blocking → `get_blocked_process_reports` for details
            - Memory issues → `get_memory_stats` → `get_memory_clerks` → `get_memory_grants`
            - I/O latency → `get_file_io_stats` → `get_file_io_trend`
            - TempDB pressure → `get_tempdb_trend`
-        5. **Query investigation**: After finding a problematic query via `get_top_queries_by_cpu`, use `get_query_trend` with its `query_hash` to see performance history
+        5. **Deep dive**: Use `get_analysis_facts` to inspect what the engine sees, including amplifier details and raw metric values
+        6. **Compare**: Use `compare_analysis` to see if problems are new (compare last 4 hours vs yesterday same time)
+        7. **Config**: Use `audit_config` for edition-aware configuration recommendations
+        8. **Query investigation**: After finding a problematic query via `get_top_queries_by_cpu`, use `get_query_trend` with its `query_hash` to see performance history
 
         ## Wait Type to Tool Mapping
 

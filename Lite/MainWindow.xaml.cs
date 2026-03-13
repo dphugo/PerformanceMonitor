@@ -262,7 +262,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            _mcpService = new McpHostService(_dataService!, _serverManager, _muteRuleService, mcpSettings.Port);
+            _mcpService = new McpHostService(_dataService!, _serverManager, _muteRuleService, _databaseInitializer, mcpSettings.Port);
             _ = _mcpService.StartAsync(_backgroundCts!.Token);
         }
         catch (Exception ex)

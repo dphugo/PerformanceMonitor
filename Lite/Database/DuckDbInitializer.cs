@@ -192,6 +192,8 @@ public class DuckDbInitializer
         }
 
         await CreateArchiveViewsAsync();
+
+        await InitializeAnalysisSchemaAsync();
     }
 
     /// <summary>
@@ -696,6 +698,57 @@ public class DuckDbInitializer
         }
 
         _logger?.LogDebug("Archive views created/refreshed for {Count} tables", ArchivableTables.Length);
+    }
+
+    /// <summary>
+    /// Initializes the analysis engine schema (separate version track from main schema).
+    /// Only called when App.AnalysisEnabled is true.
+    /// Internal for test access.
+    /// </summary>
+    internal async Task InitializeAnalysisSchemaAsync()
+    {
+        using var connection = CreateConnection();
+        await connection.OpenAsync();
+
+        await ExecuteNonQueryAsync(connection,
+            "CREATE TABLE IF NOT EXISTS analysis_schema_version (version INTEGER NOT NULL)");
+
+        var existingVersion = 0;
+        try
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT COALESCE(MAX(version), 0) FROM analysis_schema_version";
+            var result = await cmd.ExecuteScalarAsync();
+            existingVersion = Convert.ToInt32(result);
+        }
+        catch { /* Table doesn't exist yet */ }
+
+        foreach (var tableStatement in AnalysisSchema.GetAllTableStatements())
+        {
+            await ExecuteNonQueryAsync(connection, tableStatement);
+        }
+
+        foreach (var indexStatement in AnalysisSchema.GetAllIndexStatements())
+        {
+            await ExecuteNonQueryAsync(connection, indexStatement);
+        }
+
+        if (existingVersion < AnalysisSchema.CurrentVersion)
+        {
+            // Run migrations for version upgrades
+            foreach (var migration in AnalysisSchema.GetMigrationStatements(existingVersion))
+            {
+                try { await ExecuteNonQueryAsync(connection, migration); }
+                catch { /* Column/table may already exist */ }
+            }
+
+            await ExecuteNonQueryAsync(connection, "DELETE FROM analysis_schema_version");
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "INSERT INTO analysis_schema_version (version) VALUES ($1)";
+            cmd.Parameters.Add(new DuckDBParameter { Value = AnalysisSchema.CurrentVersion });
+            await cmd.ExecuteNonQueryAsync();
+            _logger?.LogInformation("Analysis schema initialized at version {Version}", AnalysisSchema.CurrentVersion);
+        }
     }
 
     /// <summary>

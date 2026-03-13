@@ -279,6 +279,9 @@ public partial class RemoteCollectorService
         await EnsureBlockedProcessXeSessionAsync(server, engineEdition, cancellationToken);
         await EnsureDeadlockXeSessionAsync(server, engineEdition, cancellationToken);
 
+        /* Persist edition/version to DuckDB for the analysis engine */
+        await PersistServerMetadataAsync(server, serverStatus);
+
         AppLogger.Info("Collector", $"Running {enabledSchedules.Count} collectors for '{server.DisplayName}' (serverId={GetServerId(server)})");
         _logger?.LogInformation("Running {Count} collectors for server '{Server}' (initial load)",
             enabledSchedules.Count, server.DisplayName);
@@ -422,6 +425,40 @@ public partial class RemoteCollectorService
 
         // Log the collection attempt
         await LogCollectionAsync(GetServerId(server), server.DisplayName, collectorName, startTime, status, errorMessage, rowsCollected, _lastSqlMs, _lastDuckDbMs);
+    }
+
+    /// <summary>
+    /// Persists SQL Server edition and major version to the servers table.
+    /// Called once per collection cycle so the analysis engine can provide
+    /// edition-specific recommendations (e.g., memory caps for Standard edition).
+    /// </summary>
+    private async Task PersistServerMetadataAsync(ServerConnection server, ServerConnectionStatus status)
+    {
+        if (status.SqlEngineEdition == 0 && status.SqlMajorVersion == 0) return;
+
+        try
+        {
+            var serverId = GetServerId(server);
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+UPDATE servers
+SET sql_engine_edition = $1,
+    sql_major_version = $2
+WHERE server_id = $3";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = status.SqlEngineEdition });
+            cmd.Parameters.Add(new DuckDBParameter { Value = status.SqlMajorVersion });
+            cmd.Parameters.Add(new DuckDBParameter { Value = serverId });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("Collector", $"Failed to persist server metadata for '{server.DisplayName}': {ex.Message}");
+        }
     }
 
     /// <summary>
