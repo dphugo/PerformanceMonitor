@@ -39,6 +39,16 @@ public class DuckDbFactCollector : IFactCollector
         await CollectTempDbFactsAsync(context, facts);
         await CollectMemoryGrantFactsAsync(context, facts);
         await CollectQueryStatsFactsAsync(context, facts);
+        await CollectPerfmonFactsAsync(context, facts);
+        await CollectMemoryClerkFactsAsync(context, facts);
+        await CollectDatabaseConfigFactsAsync(context, facts);
+        await CollectProcedureStatsFactsAsync(context, facts);
+        await CollectActiveQueryFactsAsync(context, facts);
+        await CollectRunningJobFactsAsync(context, facts);
+        await CollectSessionFactsAsync(context, facts);
+        await CollectTraceFlagFactsAsync(context, facts);
+        await CollectServerPropertiesFactsAsync(context, facts);
+        await CollectDiskSpaceFactsAsync(context, facts);
 
         return facts;
     }
@@ -719,6 +729,627 @@ AND   delta_execution_count > 0";
                     }
                 });
             }
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects key perfmon counters: Page Life Expectancy, Batch Requests/sec, compilations.
+    /// PLE is scored; others are throughput context for the AI.
+    /// </summary>
+    private async Task CollectPerfmonFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+WITH latest AS (
+    SELECT counter_name, cntr_value, delta_cntr_value,
+           ROW_NUMBER() OVER (PARTITION BY counter_name ORDER BY collection_time DESC) AS rn
+    FROM perfmon_stats
+    WHERE server_id = $1
+    AND   collection_time >= $2
+    AND   collection_time <= $3
+    AND   counter_name IN ('Page life expectancy', 'Batch Requests/sec', 'SQL Compilations/sec', 'SQL Re-Compilations/sec')
+)
+SELECT counter_name, cntr_value, delta_cntr_value
+FROM latest WHERE rn = 1";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var counterName = reader.GetString(0);
+                var cntrValue = reader.IsDBNull(1) ? 0L : ToInt64(reader.GetValue(1));
+                var deltaValue = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+
+                var (factKey, source) = counterName switch
+                {
+                    "Page life expectancy" => ("PERFMON_PLE", "perfmon"),
+                    "Batch Requests/sec" => ("PERFMON_BATCH_REQ_SEC", "perfmon"),
+                    "SQL Compilations/sec" => ("PERFMON_COMPILATIONS_SEC", "perfmon"),
+                    "SQL Re-Compilations/sec" => ("PERFMON_RECOMPILATIONS_SEC", "perfmon"),
+                    _ => (null, null)
+                };
+
+                if (factKey == null) continue;
+
+                // For PLE, use the absolute value. For rate counters, use delta.
+                var value = counterName == "Page life expectancy" ? (double)cntrValue : (double)deltaValue;
+
+                facts.Add(new Fact
+                {
+                    Source = source!,
+                    Key = factKey,
+                    Value = value,
+                    ServerId = context.ServerId,
+                    Metadata = new Dictionary<string, double>
+                    {
+                        ["cntr_value"] = cntrValue,
+                        ["delta_cntr_value"] = deltaValue
+                    }
+                });
+            }
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects top memory clerks by size. Context for understanding where memory is allocated.
+    /// </summary>
+    private async Task CollectMemoryClerkFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+WITH latest AS (
+    SELECT clerk_type, memory_mb,
+           ROW_NUMBER() OVER (PARTITION BY clerk_type ORDER BY collection_time DESC) AS rn
+    FROM memory_clerks
+    WHERE server_id = $1
+    AND   collection_time <= $2
+)
+SELECT clerk_type, memory_mb
+FROM latest WHERE rn = 1 AND memory_mb > 0
+ORDER BY memory_mb DESC
+LIMIT 10";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            var metadata = new Dictionary<string, double>();
+            var totalMb = 0.0;
+            var clerkCount = 0;
+
+            while (await reader.ReadAsync())
+            {
+                var clerkType = reader.GetString(0);
+                var memoryMb = Convert.ToDouble(reader.GetValue(1));
+                metadata[clerkType] = memoryMb;
+                totalMb += memoryMb;
+                clerkCount++;
+            }
+
+            if (clerkCount == 0) return;
+
+            metadata["total_top_clerks_mb"] = totalMb;
+            metadata["clerk_count"] = clerkCount;
+
+            facts.Add(new Fact
+            {
+                Source = "memory",
+                Key = "MEMORY_CLERKS",
+                Value = totalMb,
+                ServerId = context.ServerId,
+                Metadata = metadata
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects database configuration facts: RCSI status, auto_shrink, auto_close,
+    /// recovery model. Aggregates counts across databases.
+    /// </summary>
+    private async Task CollectDatabaseConfigFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+WITH latest AS (
+    SELECT database_name, recovery_model, is_auto_shrink_on, is_auto_close_on,
+           is_read_committed_snapshot_on, is_auto_create_stats_on, is_auto_update_stats_on,
+           is_query_store_on, compatibility_level, page_verify_option,
+           is_accelerated_database_recovery_on,
+           ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY capture_time DESC) AS rn
+    FROM database_config
+    WHERE server_id = $1
+)
+SELECT
+    COUNT(*) AS database_count,
+    COUNT(CASE WHEN is_auto_shrink_on THEN 1 END) AS auto_shrink_count,
+    COUNT(CASE WHEN is_auto_close_on THEN 1 END) AS auto_close_count,
+    COUNT(CASE WHEN NOT is_read_committed_snapshot_on THEN 1 END) AS rcsi_off_count,
+    COUNT(CASE WHEN NOT is_auto_create_stats_on THEN 1 END) AS auto_create_stats_off_count,
+    COUNT(CASE WHEN NOT is_auto_update_stats_on THEN 1 END) AS auto_update_stats_off_count,
+    COUNT(CASE WHEN page_verify_option != 'CHECKSUM' THEN 1 END) AS page_verify_not_checksum_count,
+    COUNT(CASE WHEN recovery_model = 'FULL' THEN 1 END) AS full_recovery_count,
+    COUNT(CASE WHEN recovery_model = 'SIMPLE' THEN 1 END) AS simple_recovery_count,
+    COUNT(CASE WHEN is_query_store_on THEN 1 END) AS query_store_on_count
+FROM latest WHERE rn = 1
+AND database_name NOT IN ('master', 'msdb', 'model', 'tempdb')";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var dbCount = reader.IsDBNull(0) ? 0L : ToInt64(reader.GetValue(0));
+            if (dbCount == 0) return;
+
+            var autoShrink = reader.IsDBNull(1) ? 0L : ToInt64(reader.GetValue(1));
+            var autoClose = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+            var rcsiOff = reader.IsDBNull(3) ? 0L : ToInt64(reader.GetValue(3));
+            var autoCreateOff = reader.IsDBNull(4) ? 0L : ToInt64(reader.GetValue(4));
+            var autoUpdateOff = reader.IsDBNull(5) ? 0L : ToInt64(reader.GetValue(5));
+            var pageVerifyBad = reader.IsDBNull(6) ? 0L : ToInt64(reader.GetValue(6));
+            var fullRecovery = reader.IsDBNull(7) ? 0L : ToInt64(reader.GetValue(7));
+            var simpleRecovery = reader.IsDBNull(8) ? 0L : ToInt64(reader.GetValue(8));
+            var queryStoreOn = reader.IsDBNull(9) ? 0L : ToInt64(reader.GetValue(9));
+
+            facts.Add(new Fact
+            {
+                Source = "database_config",
+                Key = "DB_CONFIG",
+                Value = dbCount,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["database_count"] = dbCount,
+                    ["auto_shrink_on_count"] = autoShrink,
+                    ["auto_close_on_count"] = autoClose,
+                    ["rcsi_off_count"] = rcsiOff,
+                    ["auto_create_stats_off_count"] = autoCreateOff,
+                    ["auto_update_stats_off_count"] = autoUpdateOff,
+                    ["page_verify_not_checksum_count"] = pageVerifyBad,
+                    ["full_recovery_count"] = fullRecovery,
+                    ["simple_recovery_count"] = simpleRecovery,
+                    ["query_store_on_count"] = queryStoreOn
+                }
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects procedure stats: top procedure by delta CPU time in the period.
+    /// </summary>
+    private async Task CollectProcedureStatsFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+SELECT
+    COUNT(DISTINCT object_name) AS distinct_procs,
+    SUM(delta_execution_count) AS total_executions,
+    SUM(delta_worker_time) AS total_cpu_time_us,
+    SUM(delta_elapsed_time) AS total_elapsed_time_us,
+    SUM(delta_logical_reads) AS total_logical_reads
+FROM procedure_stats
+WHERE server_id = $1
+AND   collection_time >= $2
+AND   collection_time <= $3
+AND   delta_execution_count > 0";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var distinctProcs = reader.IsDBNull(0) ? 0L : ToInt64(reader.GetValue(0));
+            var totalExecs = reader.IsDBNull(1) ? 0L : ToInt64(reader.GetValue(1));
+            var totalCpuUs = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+            var totalElapsedUs = reader.IsDBNull(3) ? 0L : ToInt64(reader.GetValue(3));
+            var totalReads = reader.IsDBNull(4) ? 0L : ToInt64(reader.GetValue(4));
+
+            if (totalExecs == 0) return;
+
+            facts.Add(new Fact
+            {
+                Source = "queries",
+                Key = "PROCEDURE_STATS",
+                Value = totalCpuUs,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["distinct_procedures"] = distinctProcs,
+                    ["total_executions"] = totalExecs,
+                    ["total_cpu_time_us"] = totalCpuUs,
+                    ["total_elapsed_time_us"] = totalElapsedUs,
+                    ["total_logical_reads"] = totalReads,
+                    ["avg_cpu_per_exec_us"] = totalExecs > 0 ? (double)totalCpuUs / totalExecs : 0
+                }
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects active query snapshot facts: long-running queries, blocked sessions, high DOP.
+    /// </summary>
+    private async Task CollectActiveQueryFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+SELECT
+    COUNT(*) AS total_snapshots,
+    COUNT(CASE WHEN total_elapsed_time_ms > 30000 THEN 1 END) AS long_running_count,
+    COUNT(CASE WHEN blocking_session_id > 0 THEN 1 END) AS blocked_count,
+    MAX(total_elapsed_time_ms) AS max_elapsed_ms,
+    COUNT(CASE WHEN dop > 1 THEN 1 END) AS parallel_count,
+    MAX(dop) AS max_dop,
+    COUNT(DISTINCT session_id) AS distinct_sessions
+FROM query_snapshots
+WHERE server_id = $1
+AND   collection_time >= $2
+AND   collection_time <= $3";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var totalSnapshots = reader.IsDBNull(0) ? 0L : ToInt64(reader.GetValue(0));
+            if (totalSnapshots == 0) return;
+
+            var longRunning = reader.IsDBNull(1) ? 0L : ToInt64(reader.GetValue(1));
+            var blocked = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+            var maxElapsed = reader.IsDBNull(3) ? 0L : ToInt64(reader.GetValue(3));
+            var parallel = reader.IsDBNull(4) ? 0L : ToInt64(reader.GetValue(4));
+            var maxDop = reader.IsDBNull(5) ? 0L : ToInt64(reader.GetValue(5));
+            var distinctSessions = reader.IsDBNull(6) ? 0L : ToInt64(reader.GetValue(6));
+
+            facts.Add(new Fact
+            {
+                Source = "queries",
+                Key = "ACTIVE_QUERIES",
+                Value = longRunning,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["total_snapshots"] = totalSnapshots,
+                    ["long_running_count"] = longRunning,
+                    ["blocked_count"] = blocked,
+                    ["max_elapsed_ms"] = maxElapsed,
+                    ["parallel_count"] = parallel,
+                    ["max_dop"] = maxDop,
+                    ["distinct_sessions"] = distinctSessions
+                }
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects running job facts: jobs currently running long vs historical averages.
+    /// </summary>
+    private async Task CollectRunningJobFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+SELECT
+    COUNT(*) AS running_count,
+    COUNT(CASE WHEN is_running_long THEN 1 END) AS running_long_count,
+    MAX(percent_of_average) AS max_percent_of_avg,
+    MAX(current_duration_seconds) AS max_duration_seconds
+FROM running_jobs
+WHERE server_id = $1
+AND   collection_time >= $2
+AND   collection_time <= $3";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var runningCount = reader.IsDBNull(0) ? 0L : ToInt64(reader.GetValue(0));
+            if (runningCount == 0) return;
+
+            var runningLong = reader.IsDBNull(1) ? 0L : ToInt64(reader.GetValue(1));
+            var maxPctAvg = reader.IsDBNull(2) ? 0.0 : Convert.ToDouble(reader.GetValue(2));
+            var maxDuration = reader.IsDBNull(3) ? 0L : ToInt64(reader.GetValue(3));
+
+            facts.Add(new Fact
+            {
+                Source = "jobs",
+                Key = "RUNNING_JOBS",
+                Value = runningLong,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["running_count"] = runningCount,
+                    ["running_long_count"] = runningLong,
+                    ["max_percent_of_average"] = maxPctAvg,
+                    ["max_duration_seconds"] = maxDuration
+                }
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects session stats: connection counts per application, total connections.
+    /// </summary>
+    private async Task CollectSessionFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+WITH latest AS (
+    SELECT program_name, connection_count, running_count, sleeping_count, dormant_count,
+           ROW_NUMBER() OVER (PARTITION BY program_name ORDER BY collection_time DESC) AS rn
+    FROM session_stats
+    WHERE server_id = $1
+    AND   collection_time >= $2
+    AND   collection_time <= $3
+)
+SELECT
+    SUM(connection_count) AS total_connections,
+    SUM(running_count) AS total_running,
+    SUM(sleeping_count) AS total_sleeping,
+    SUM(dormant_count) AS total_dormant,
+    COUNT(*) AS distinct_apps,
+    MAX(connection_count) AS max_app_connections
+FROM latest WHERE rn = 1";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var totalConns = reader.IsDBNull(0) ? 0L : ToInt64(reader.GetValue(0));
+            if (totalConns == 0) return;
+
+            var totalRunning = reader.IsDBNull(1) ? 0L : ToInt64(reader.GetValue(1));
+            var totalSleeping = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+            var totalDormant = reader.IsDBNull(3) ? 0L : ToInt64(reader.GetValue(3));
+            var distinctApps = reader.IsDBNull(4) ? 0L : ToInt64(reader.GetValue(4));
+            var maxAppConns = reader.IsDBNull(5) ? 0L : ToInt64(reader.GetValue(5));
+
+            facts.Add(new Fact
+            {
+                Source = "sessions",
+                Key = "SESSION_STATS",
+                Value = totalConns,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["total_connections"] = totalConns,
+                    ["total_running"] = totalRunning,
+                    ["total_sleeping"] = totalSleeping,
+                    ["total_dormant"] = totalDormant,
+                    ["distinct_applications"] = distinctApps,
+                    ["max_app_connections"] = maxAppConns
+                }
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects active global trace flags. Context for the AI to factor into recommendations.
+    /// </summary>
+    private async Task CollectTraceFlagFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+WITH latest AS (
+    SELECT trace_flag, status,
+           ROW_NUMBER() OVER (PARTITION BY trace_flag ORDER BY capture_time DESC) AS rn
+    FROM trace_flags
+    WHERE server_id = $1
+    AND   is_global = true
+)
+SELECT trace_flag
+FROM latest WHERE rn = 1 AND status = true
+ORDER BY trace_flag";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            var metadata = new Dictionary<string, double>();
+            var flagCount = 0;
+
+            while (await reader.ReadAsync())
+            {
+                var flag = Convert.ToInt32(reader.GetValue(0));
+                metadata[$"TF_{flag}"] = 1;
+                flagCount++;
+            }
+
+            if (flagCount == 0) return;
+
+            metadata["flag_count"] = flagCount;
+
+            facts.Add(new Fact
+            {
+                Source = "config",
+                Key = "TRACE_FLAGS",
+                Value = flagCount,
+                ServerId = context.ServerId,
+                Metadata = metadata
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects server hardware properties: CPU count, cores, sockets, memory.
+    /// Critical context for MAXDOP and memory recommendations.
+    /// </summary>
+    private async Task CollectServerPropertiesFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+SELECT cpu_count, hyperthread_ratio, physical_memory_mb, socket_count, cores_per_socket,
+       is_hadr_enabled, edition, product_version
+FROM server_properties
+WHERE server_id = $1
+ORDER BY collection_time DESC
+LIMIT 1";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var cpuCount = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetValue(0));
+            var htRatio = reader.IsDBNull(1) ? 0 : Convert.ToInt32(reader.GetValue(1));
+            var physicalMemMb = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+            var socketCount = reader.IsDBNull(3) ? 0 : Convert.ToInt32(reader.GetValue(3));
+            var coresPerSocket = reader.IsDBNull(4) ? 0 : Convert.ToInt32(reader.GetValue(4));
+            var hadrEnabled = !reader.IsDBNull(5) && Convert.ToBoolean(reader.GetValue(5));
+
+            if (cpuCount == 0) return;
+
+            facts.Add(new Fact
+            {
+                Source = "config",
+                Key = "SERVER_HARDWARE",
+                Value = cpuCount,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["cpu_count"] = cpuCount,
+                    ["hyperthread_ratio"] = htRatio,
+                    ["physical_memory_mb"] = physicalMemMb,
+                    ["socket_count"] = socketCount,
+                    ["cores_per_socket"] = coresPerSocket,
+                    ["hadr_enabled"] = hadrEnabled ? 1 : 0
+                }
+            });
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Collects disk space facts from database_size_stats: volume free space, file sizes.
+    /// </summary>
+    private async Task CollectDiskSpaceFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+WITH latest AS (
+    SELECT volume_mount_point, volume_total_mb, volume_free_mb,
+           ROW_NUMBER() OVER (PARTITION BY volume_mount_point ORDER BY collection_time DESC) AS rn
+    FROM database_size_stats
+    WHERE server_id = $1
+    AND   collection_time <= $2
+    AND   volume_total_mb > 0
+)
+SELECT
+    MIN(volume_free_mb * 1.0 / volume_total_mb) AS min_free_pct,
+    MIN(volume_free_mb) AS min_free_mb,
+    COUNT(DISTINCT volume_mount_point) AS volume_count,
+    SUM(volume_total_mb) AS total_volume_mb,
+    SUM(volume_free_mb) AS total_free_mb
+FROM latest WHERE rn = 1";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var minFreePct = reader.IsDBNull(0) ? 1.0 : Convert.ToDouble(reader.GetValue(0));
+            var minFreeMb = reader.IsDBNull(1) ? 0.0 : Convert.ToDouble(reader.GetValue(1));
+            var volumeCount = reader.IsDBNull(2) ? 0L : ToInt64(reader.GetValue(2));
+            var totalVolumeMb = reader.IsDBNull(3) ? 0.0 : Convert.ToDouble(reader.GetValue(3));
+            var totalFreeMb = reader.IsDBNull(4) ? 0.0 : Convert.ToDouble(reader.GetValue(4));
+
+            if (volumeCount == 0) return;
+
+            facts.Add(new Fact
+            {
+                Source = "disk",
+                Key = "DISK_SPACE",
+                Value = minFreePct,
+                ServerId = context.ServerId,
+                Metadata = new Dictionary<string, double>
+                {
+                    ["min_free_pct"] = minFreePct,
+                    ["min_free_mb"] = minFreeMb,
+                    ["volume_count"] = volumeCount,
+                    ["total_volume_mb"] = totalVolumeMb,
+                    ["total_free_mb"] = totalFreeMb
+                }
+            });
         }
         catch { /* Table may not exist or have no data */ }
     }

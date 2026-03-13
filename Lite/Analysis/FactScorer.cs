@@ -32,12 +32,18 @@ public class FactScorer
                 "tempdb" => ScoreTempDbFact(fact),
                 "memory" => ScoreMemoryFact(fact),
                 "queries" => ScoreQueryFact(fact),
+                "perfmon" => ScorePerfmonFact(fact),
+                "database_config" => ScoreDatabaseConfigFact(fact),
+                "jobs" => ScoreJobFact(fact),
+                "disk" => ScoreDiskFact(fact),
                 _ => 0.0
             };
         }
 
         // Build lookup for amplifier evaluation (include context facts that amplifiers reference)
-        var contextSources = new HashSet<string> { "config", "cpu", "io", "tempdb", "memory", "queries" };
+        var contextSources = new HashSet<string>
+            { "config", "cpu", "io", "tempdb", "memory", "queries", "perfmon",
+              "database_config", "jobs", "sessions", "disk" };
         var factsByKey = facts
             .Where(f => f.BaseSeverity > 0 || contextSources.Contains(f.Source))
             .ToDictionary(f => f.Key, f => f);
@@ -183,6 +189,68 @@ public class FactScorer
     }
 
     /// <summary>
+    /// Scores perfmon counter facts. PLE is the classic memory pressure indicator.
+    /// </summary>
+    private static double ScorePerfmonFact(Fact fact)
+    {
+        return fact.Key switch
+        {
+            // PLE: lower is worse. Invert: concerning < 300, critical < 60
+            "PERFMON_PLE" when fact.Value <= 0 => 0.0,
+            "PERFMON_PLE" when fact.Value < 60 => 1.0,
+            "PERFMON_PLE" when fact.Value < 300 => 0.5 + 0.5 * (300 - fact.Value) / 240,
+            "PERFMON_PLE" => 0.0,
+            _ => 0.0
+        };
+    }
+
+    /// <summary>
+    /// Scores database configuration facts. Auto-shrink and auto-close are always bad.
+    /// </summary>
+    private static double ScoreDatabaseConfigFact(Fact fact)
+    {
+        if (fact.Key != "DB_CONFIG") return 0.0;
+
+        var autoShrink = fact.Metadata.GetValueOrDefault("auto_shrink_on_count");
+        var autoClose = fact.Metadata.GetValueOrDefault("auto_close_on_count");
+        var pageVerifyBad = fact.Metadata.GetValueOrDefault("page_verify_not_checksum_count");
+
+        // Any auto_shrink or auto_close is concerning
+        if (autoShrink > 0 || autoClose > 0 || pageVerifyBad > 0)
+            return Math.Min((autoShrink + autoClose + pageVerifyBad) * 0.3, 1.0);
+
+        return 0.0;
+    }
+
+    /// <summary>
+    /// Scores running job facts. Long-running jobs are a signal.
+    /// </summary>
+    private static double ScoreJobFact(Fact fact)
+    {
+        return fact.Key switch
+        {
+            // Long-running jobs: concerning at 1, critical at 3
+            "RUNNING_JOBS" => ApplyThresholdFormula(fact.Value, 1, 3),
+            _ => 0.0
+        };
+    }
+
+    /// <summary>
+    /// Scores disk space facts. Low free space is critical.
+    /// </summary>
+    private static double ScoreDiskFact(Fact fact)
+    {
+        if (fact.Key != "DISK_SPACE") return 0.0;
+
+        var freePct = fact.Value;
+        // Invert: lower free space is worse. Critical < 5%, concerning < 10%
+        if (freePct < 0.05) return 1.0;
+        if (freePct < 0.10) return 0.5 + 0.5 * (0.10 - freePct) / 0.05;
+        if (freePct < 0.20) return 0.5 * (0.20 - freePct) / 0.10;
+        return 0.0;
+    }
+
+    /// <summary>
     /// Generic threshold formula used by waits, latency, and count-based metrics.
     /// Critical == null means "concerning only" — hitting concerning = 1.0.
     /// </summary>
@@ -223,6 +291,9 @@ public class FactScorer
             "IO_WRITE_LATENCY_MS" => IoWriteLatencyAmplifiers(),
             "MEMORY_GRANT_PENDING" => MemoryGrantAmplifiers(),
             "QUERY_SPILLS" => QuerySpillAmplifiers(),
+            "PERFMON_PLE" => PleAmplifiers(),
+            "DB_CONFIG" => DbConfigAmplifiers(),
+            "DISK_SPACE" => DiskSpaceAmplifiers(),
             _ => []
         };
     }
@@ -380,6 +451,12 @@ public class FactScorer
             Boost = 0.3,
             Predicate = facts => (facts.ContainsKey("LCK_M_S") && facts["LCK_M_S"].BaseSeverity > 0)
                               || (facts.ContainsKey("LCK_M_IS") && facts["LCK_M_IS"].BaseSeverity > 0)
+        },
+        new()
+        {
+            Description = "Databases without RCSI — reader/writer isolation amplifying deadlocks",
+            Boost = 0.2,
+            Predicate = facts => facts.TryGetValue("DB_CONFIG", out var db) && db.Metadata.GetValueOrDefault("rcsi_off_count") > 0
         }
     ];
 
@@ -405,6 +482,58 @@ public class FactScorer
             Description = "THREADPOOL waits present — blocking causing thread exhaustion",
             Boost = 0.3,
             Predicate = facts => facts.ContainsKey("THREADPOOL") && facts["THREADPOOL"].BaseSeverity > 0
+        }
+    ];
+
+    /// <summary>
+    /// PLE: memory pressure confirmed by PAGEIOLATCH and RESOURCE_SEMAPHORE.
+    /// </summary>
+    private static List<AmplifierDefinition> PleAmplifiers() =>
+    [
+        new()
+        {
+            Description = "PAGEIOLATCH waits present — buffer pool misses confirm memory pressure",
+            Boost = 0.3,
+            Predicate = facts => HasSignificantWait(facts, "PAGEIOLATCH_SH", 0.10)
+                              || HasSignificantWait(facts, "PAGEIOLATCH_EX", 0.10)
+        },
+        new()
+        {
+            Description = "RESOURCE_SEMAPHORE waits — memory grants competing with buffer pool",
+            Boost = 0.2,
+            Predicate = facts => facts.ContainsKey("RESOURCE_SEMAPHORE") && facts["RESOURCE_SEMAPHORE"].BaseSeverity > 0
+        }
+    ];
+
+    /// <summary>
+    /// DB_CONFIG: database misconfiguration amplified by related symptoms.
+    /// </summary>
+    private static List<AmplifierDefinition> DbConfigAmplifiers() =>
+    [
+        new()
+        {
+            Description = "I/O latency elevated — auto_shrink may be causing fragmentation and I/O pressure",
+            Boost = 0.3,
+            Predicate = facts => facts.TryGetValue("IO_READ_LATENCY_MS", out var io) && io.BaseSeverity > 0
+        }
+    ];
+
+    /// <summary>
+    /// DISK_SPACE: low disk space amplified by I/O activity and TempDB pressure.
+    /// </summary>
+    private static List<AmplifierDefinition> DiskSpaceAmplifiers() =>
+    [
+        new()
+        {
+            Description = "TempDB usage elevated — growing TempDB on a nearly full volume",
+            Boost = 0.3,
+            Predicate = facts => facts.TryGetValue("TEMPDB_USAGE", out var t) && t.BaseSeverity > 0
+        },
+        new()
+        {
+            Description = "Query spills present — spills to disk on a nearly full volume",
+            Boost = 0.2,
+            Predicate = facts => facts.TryGetValue("QUERY_SPILLS", out var s) && s.BaseSeverity > 0
         }
     ];
 

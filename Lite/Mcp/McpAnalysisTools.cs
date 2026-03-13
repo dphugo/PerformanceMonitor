@@ -707,6 +707,27 @@ internal static class ToolRecommendations
         [
             new("get_top_queries_by_cpu", "Find high-DOP queries", new() { ["parallel_only"] = "true" }),
             new("audit_config", "Check CTFP and MAXDOP settings")
+        ],
+        ["PERFMON_PLE"] =
+        [
+            new("get_memory_stats", "Check buffer pool and memory allocation"),
+            new("get_memory_clerks", "See where memory is allocated"),
+            new("get_memory_trend", "Track memory usage over time")
+        ],
+        ["DB_CONFIG"] =
+        [
+            new("audit_config", "Check server-level configuration"),
+            new("get_blocked_process_reports", "Check if RCSI-off databases have blocking")
+        ],
+        ["RUNNING_JOBS"] =
+        [
+            new("get_running_jobs", "See currently running jobs with duration vs historical"),
+            new("get_cpu_utilization", "Check if long-running jobs are consuming CPU")
+        ],
+        ["DISK_SPACE"] =
+        [
+            new("get_file_io_stats", "Check per-file sizes and I/O"),
+            new("get_tempdb_trend", "Check TempDB growth on the volume")
         ]
     };
 
