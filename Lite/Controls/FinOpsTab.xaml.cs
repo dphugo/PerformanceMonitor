@@ -13,6 +13,7 @@ using System.Linq;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Media;
 using Microsoft.Win32;
@@ -29,9 +30,23 @@ public partial class FinOpsTab : UserControl
     private List<ServerPropertyRow>? _serverInventoryCache;
     private DateTime _serverInventoryCacheTime;
 
+    private readonly Dictionary<DataGrid, IDataGridFilterManager> _filterManagers = new();
+    private Popup? _filterPopup;
+    private ColumnFilterPopup? _filterPopupContent;
+    private DataGrid? _currentFilterGrid;
+
+    private DataGridFilterManager<DatabaseResourceUsageRow>? _dbResourcesFilterMgr;
+    private DataGridFilterManager<StorageGrowthRow>? _storageGrowthFilterMgr;
+    private DataGridFilterManager<DatabaseSizeRow>? _dbSizesFilterMgr;
+    private DataGridFilterManager<IndexCleanupSummaryRow>? _indexSummaryFilterMgr;
+    private DataGridFilterManager<IndexCleanupResultRow>? _indexDetailFilterMgr;
+    private DataGridFilterManager<ApplicationConnectionRow>? _appConnectionsFilterMgr;
+    private DataGridFilterManager<ServerPropertyRow>? _serverInventoryFilterMgr;
+
     public FinOpsTab()
     {
         InitializeComponent();
+        InitializeFilterManagers();
     }
 
     /// <summary>
@@ -285,7 +300,7 @@ public partial class FinOpsTab : UserControl
         {
             var hoursBack = GetResourceUsageHoursBack();
             var data = await _dataService.GetDatabaseResourceUsageAsync(serverId, hoursBack);
-            DatabaseResourcesDataGrid.ItemsSource = data;
+            _dbResourcesFilterMgr!.UpdateData(data);
             NoDatabaseResourcesMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             DbResourcesCountIndicator.Text = data.Count > 0 ? $"{data.Count} database(s)" : "";
         }
@@ -302,7 +317,7 @@ public partial class FinOpsTab : UserControl
         try
         {
             var data = await _dataService.GetApplicationConnectionsAsync(serverId);
-            ApplicationConnectionsDataGrid.ItemsSource = data;
+            _appConnectionsFilterMgr!.UpdateData(data);
             NoAppConnectionsMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             AppConnectionsCountIndicator.Text = data.Count > 0 ? $"{data.Count} application(s)" : "";
         }
@@ -319,7 +334,7 @@ public partial class FinOpsTab : UserControl
         try
         {
             var data = await _dataService.GetDatabaseSizeLatestAsync(serverId);
-            DatabaseSizesDataGrid.ItemsSource = data;
+            _dbSizesFilterMgr!.UpdateData(data);
 
             NoDbSizesMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             DbSizeCountIndicator.Text = data.Count > 0 ? $"{data.Count} file(s)" : "";
@@ -339,7 +354,7 @@ public partial class FinOpsTab : UserControl
         if (!forceRefresh && _serverInventoryCache != null
             && (DateTime.Now - _serverInventoryCacheTime).TotalMinutes < 5)
         {
-            ServerInventoryDataGrid.ItemsSource = _serverInventoryCache;
+            _serverInventoryFilterMgr!.UpdateData(_serverInventoryCache);
             NoServerInventoryMessage.Visibility = _serverInventoryCache.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             ServerInventoryCountIndicator.Text = _serverInventoryCache.Count > 0 ? $"{_serverInventoryCache.Count} server(s)" : "";
             return;
@@ -389,7 +404,7 @@ public partial class FinOpsTab : UserControl
             _serverInventoryCache = data;
             _serverInventoryCacheTime = DateTime.Now;
 
-            ServerInventoryDataGrid.ItemsSource = data;
+            _serverInventoryFilterMgr!.UpdateData(data);
             NoServerInventoryMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             ServerInventoryCountIndicator.Text = data.Count > 0 ? $"{data.Count} server(s)" : "";
         }
@@ -406,7 +421,7 @@ public partial class FinOpsTab : UserControl
         try
         {
             var data = await _dataService.GetStorageGrowthAsync(serverId);
-            StorageGrowthDataGrid.ItemsSource = data;
+            _storageGrowthFilterMgr!.UpdateData(data);
             NoStorageGrowthMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             StorageGrowthCountIndicator.Text = data.Count > 0 ? $"{data.Count} database(s)" : "";
         }
@@ -618,8 +633,8 @@ public partial class FinOpsTab : UserControl
             {
                 IndexAnalysisNotInstalledMessage.Visibility = Visibility.Visible;
                 IndexAnalysisNoDataMessage.Visibility = Visibility.Collapsed;
-                IndexAnalysisSummaryGrid.ItemsSource = null;
-                IndexAnalysisDetailGrid.ItemsSource = null;
+                _indexSummaryFilterMgr!.UpdateData(new List<IndexCleanupSummaryRow>());
+                _indexDetailFilterMgr!.UpdateData(new List<IndexCleanupResultRow>());
                 return;
             }
 
@@ -636,8 +651,8 @@ public partial class FinOpsTab : UserControl
                 string.IsNullOrWhiteSpace(databaseName) ? null : databaseName,
                 getAllDatabases);
 
-            IndexAnalysisSummaryGrid.ItemsSource = summaries;
-            IndexAnalysisDetailGrid.ItemsSource = details;
+            _indexSummaryFilterMgr!.UpdateData(summaries);
+            _indexDetailFilterMgr!.UpdateData(details);
             IndexAnalysisNoDataMessage.Visibility = details.Count == 0 && summaries.Count == 0
                 ? Visibility.Visible : Visibility.Collapsed;
             IndexAnalysisStatusText.Text = details.Count > 0
@@ -760,6 +775,96 @@ public partial class FinOpsTab : UserControl
             MessageBox.Show($"Failed to export: {ex.Message}", "Export Error",
                 MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    #endregion
+
+    #region Column Filtering
+
+    private void InitializeFilterManagers()
+    {
+        _dbResourcesFilterMgr = new DataGridFilterManager<DatabaseResourceUsageRow>(DatabaseResourcesDataGrid);
+        _storageGrowthFilterMgr = new DataGridFilterManager<StorageGrowthRow>(StorageGrowthDataGrid);
+        _dbSizesFilterMgr = new DataGridFilterManager<DatabaseSizeRow>(DatabaseSizesDataGrid);
+        _indexSummaryFilterMgr = new DataGridFilterManager<IndexCleanupSummaryRow>(IndexAnalysisSummaryGrid);
+        _indexDetailFilterMgr = new DataGridFilterManager<IndexCleanupResultRow>(IndexAnalysisDetailGrid);
+        _appConnectionsFilterMgr = new DataGridFilterManager<ApplicationConnectionRow>(ApplicationConnectionsDataGrid);
+        _serverInventoryFilterMgr = new DataGridFilterManager<ServerPropertyRow>(ServerInventoryDataGrid);
+
+        _filterManagers[DatabaseResourcesDataGrid] = _dbResourcesFilterMgr;
+        _filterManagers[StorageGrowthDataGrid] = _storageGrowthFilterMgr;
+        _filterManagers[DatabaseSizesDataGrid] = _dbSizesFilterMgr;
+        _filterManagers[IndexAnalysisSummaryGrid] = _indexSummaryFilterMgr;
+        _filterManagers[IndexAnalysisDetailGrid] = _indexDetailFilterMgr;
+        _filterManagers[ApplicationConnectionsDataGrid] = _appConnectionsFilterMgr;
+        _filterManagers[ServerInventoryDataGrid] = _serverInventoryFilterMgr;
+    }
+
+    private void EnsureFilterPopup()
+    {
+        if (_filterPopup == null)
+        {
+            _filterPopupContent = new ColumnFilterPopup();
+            _filterPopup = new Popup
+            {
+                Child = _filterPopupContent,
+                StaysOpen = false,
+                Placement = PlacementMode.Bottom,
+                AllowsTransparency = true
+            };
+        }
+    }
+
+    private void FilterButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button || button.Tag is not string columnName) return;
+
+        var dataGrid = FindParentDataGridFromElement(button);
+        if (dataGrid == null || !_filterManagers.TryGetValue(dataGrid, out var manager)) return;
+
+        _currentFilterGrid = dataGrid;
+
+        EnsureFilterPopup();
+
+        _filterPopupContent!.FilterApplied -= FilterPopup_FilterApplied;
+        _filterPopupContent.FilterCleared -= FilterPopup_FilterCleared;
+        _filterPopupContent.FilterApplied += FilterPopup_FilterApplied;
+        _filterPopupContent.FilterCleared += FilterPopup_FilterCleared;
+
+        manager.Filters.TryGetValue(columnName, out var existingFilter);
+        _filterPopupContent.Initialize(columnName, existingFilter);
+
+        _filterPopup!.PlacementTarget = button;
+        _filterPopup.IsOpen = true;
+    }
+
+    private void FilterPopup_FilterApplied(object? sender, FilterAppliedEventArgs e)
+    {
+        if (_filterPopup != null)
+            _filterPopup.IsOpen = false;
+
+        if (_currentFilterGrid != null && _filterManagers.TryGetValue(_currentFilterGrid, out var manager))
+        {
+            manager.SetFilter(e.FilterState);
+        }
+    }
+
+    private void FilterPopup_FilterCleared(object? sender, EventArgs e)
+    {
+        if (_filterPopup != null)
+            _filterPopup.IsOpen = false;
+    }
+
+    private static DataGrid? FindParentDataGridFromElement(DependencyObject element)
+    {
+        var current = element;
+        while (current != null)
+        {
+            if (current is DataGrid dg)
+                return dg;
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return null;
     }
 
     #endregion
