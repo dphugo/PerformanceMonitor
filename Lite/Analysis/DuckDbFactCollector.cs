@@ -374,9 +374,12 @@ WHERE rn = 1";
 
             using var cmd = connection.CreateCommand();
             cmd.CommandText = @"
-SELECT sql_engine_edition, sql_major_version
-FROM servers
-WHERE server_id = $1";
+SELECT engine_edition,
+       CAST(SPLIT_PART(product_version, '.', 1) AS INTEGER) AS major_version
+FROM server_properties
+WHERE server_id = $1
+ORDER BY collection_time DESC
+LIMIT 1";
 
             cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
 
