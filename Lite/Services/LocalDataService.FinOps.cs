@@ -2529,7 +2529,7 @@ public static class HighImpactScorer
     {
         if (sortedValues.Count <= 1) return 0;
         int rank = sortedValues.Count(v => v < value);
-        return (decimal)rank / (sortedValues.Count - 1);
+        return Math.Min(1.0m, (decimal)rank / (sortedValues.Count - 1));
     }
 }
 
