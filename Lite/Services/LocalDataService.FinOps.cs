@@ -1520,6 +1520,110 @@ FROM sys.dm_db_persisted_sku_features", sqlConn);
                         EstMonthlySavings = monthlyCost > 0 ? monthlyCost * 0.40m : null
                     });
                 }
+                else
+                {
+                    // Check 8: Enterprise feature detail report — list what blocks a downgrade
+                    recommendations.Add(new RecommendationRow
+                    {
+                        Category = "Licensing",
+                        Severity = "Low",
+                        Confidence = "High",
+                        Finding = "Enterprise features in use — downgrade blockers identified",
+                        Detail = $"The following databases use Enterprise-only features: {string.Join("; ", features.Take(20))}" +
+                                 (features.Count > 20 ? $" and {features.Count - 20} more" : "") +
+                                 ". Address these before considering a Standard Edition downgrade."
+                    });
+
+                    // Check 10: License cost impact estimate (only when features ARE in use)
+                    using var cpuInfoCmd = new SqlCommand(
+                        "SELECT cpu_count FROM sys.dm_os_sys_info", sqlConn);
+                    cpuInfoCmd.CommandTimeout = 30;
+                    var cpuCountObj = await cpuInfoCmd.ExecuteScalarAsync();
+                    var coreLicenseCount = cpuCountObj != null ? Convert.ToInt32(cpuCountObj) : 0;
+                    if (coreLicenseCount > 0)
+                    {
+                        var monthlySavings = coreLicenseCount * 5000m / 12m;
+                        recommendations.Add(new RecommendationRow
+                        {
+                            Category = "Licensing",
+                            Severity = "Low",
+                            Confidence = "Low",
+                            Finding = $"Enterprise to Standard would save ~${monthlySavings:N0}/mo at list pricing ({coreLicenseCount} cores)",
+                            Detail = "Based on list pricing differential of ~$5,000/core/year between Enterprise and Standard. " +
+                                     "Actual savings depend on your licensing agreement. See Enterprise feature audit for downgrade blockers.",
+                            EstMonthlySavings = monthlySavings
+                        });
+                    }
+                }
+            }
+            else if (edition.Contains("Standard", StringComparison.OrdinalIgnoreCase))
+            {
+                // Check 9: Standard → Express feasibility
+                var blockers = new List<string>();
+
+                using var sizeCmd = new SqlCommand(@"
+SELECT
+    d.name AS database_name,
+    SUM(f.size) * 8.0 / 1024 AS size_mb
+FROM sys.databases d
+JOIN sys.master_files f ON d.database_id = f.database_id
+WHERE d.database_id > 4
+GROUP BY d.name
+HAVING SUM(f.size) * 8.0 / 1024 > 10240", sqlConn);
+                sizeCmd.CommandTimeout = 30;
+
+                var largeDbs = new List<string>();
+                using var sizeReader = await sizeCmd.ExecuteReaderAsync();
+                while (await sizeReader.ReadAsync())
+                {
+                    var dbName = sizeReader.IsDBNull(0) ? "" : sizeReader.GetString(0);
+                    var sizeMb = sizeReader.IsDBNull(1) ? 0m : Convert.ToDecimal(sizeReader.GetValue(1));
+                    largeDbs.Add($"{dbName} ({sizeMb / 1024:N1}GB)");
+                }
+
+                if (largeDbs.Count > 0)
+                    blockers.Add($"Databases over 10GB: {string.Join(", ", largeDbs.Take(5))}" +
+                                 (largeDbs.Count > 5 ? $" and {largeDbs.Count - 5} more" : ""));
+
+                using var sysInfoCmd = new SqlCommand(
+                    "SELECT cpu_count, physical_memory_kb / 1024 AS physical_memory_mb FROM sys.dm_os_sys_info", sqlConn);
+                sysInfoCmd.CommandTimeout = 30;
+                using var sysReader = await sysInfoCmd.ExecuteReaderAsync();
+                if (await sysReader.ReadAsync())
+                {
+                    var cpuCount = sysReader.IsDBNull(0) ? 0 : Convert.ToInt32(sysReader.GetValue(0));
+                    var physMemMb = sysReader.IsDBNull(1) ? 0 : Convert.ToInt32(sysReader.GetValue(1));
+
+                    if (cpuCount > 4)
+                        blockers.Add($"CPU count ({cpuCount}) exceeds Express limit of 4");
+                    if (physMemMb > 1024)
+                        blockers.Add($"Physical memory ({physMemMb:N0}MB) exceeds Express buffer pool limit of 1,410MB");
+                }
+
+                if (blockers.Count == 0)
+                {
+                    recommendations.Add(new RecommendationRow
+                    {
+                        Category = "Licensing",
+                        Severity = "Medium",
+                        Confidence = "Medium",
+                        Finding = "Standard Edition may be downgradable to Express",
+                        Detail = "All databases are under 10GB, CPU count is 4 or fewer, and memory is within Express limits. " +
+                                 "SQL Server Express is free — review workload compatibility before migrating.",
+                        EstMonthlySavings = monthlyCost > 0 ? monthlyCost : null
+                    });
+                }
+                else
+                {
+                    recommendations.Add(new RecommendationRow
+                    {
+                        Category = "Licensing",
+                        Severity = "Low",
+                        Confidence = "Medium",
+                        Finding = "Standard Edition — Express downgrade blockers",
+                        Detail = $"Express Edition limits prevent downgrade: {string.Join("; ", blockers)}."
+                    });
+                }
             }
         }
         catch (Exception ex)
@@ -1745,7 +1849,66 @@ AND   database_id > 4", sqlConn);
             AppLogger.Error("FinOps", $"Recommendation check failed (Dev/test detection): {ex.Message}");
         }
 
+        // 11. Maintenance window efficiency — jobs running long (from DuckDB)
+        try
+        {
+            using var jobConn = await OpenConnectionAsync();
+            using var jobCmd = jobConn.CreateCommand();
+            jobCmd.CommandText = @"
+SELECT
+    job_name,
+    COUNT(*) AS avg_runs,
+    AVG(current_duration_seconds) AS avg_duration_seconds,
+    MAX(current_duration_seconds) AS max_duration_seconds,
+    AVG(avg_duration_seconds) AS avg_historical,
+    SUM(CASE WHEN is_running_long THEN 1 ELSE 0 END) AS times_ran_long
+FROM running_jobs
+WHERE server_id = $1
+AND   collection_time >= $2
+AND   avg_duration_seconds > 0
+GROUP BY job_name
+HAVING SUM(CASE WHEN is_running_long THEN 1 ELSE 0 END) >= 3
+ORDER BY times_ran_long DESC
+LIMIT 10";
+            jobCmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = serverId });
+            jobCmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = DateTime.UtcNow.AddDays(-7) });
+
+            using var jobReader = await jobCmd.ExecuteReaderAsync();
+            while (await jobReader.ReadAsync())
+            {
+                var jobName = jobReader.IsDBNull(0) ? "" : jobReader.GetString(0);
+                var avgDuration = jobReader.IsDBNull(2) ? 0L : Convert.ToInt64(jobReader.GetValue(2));
+                var maxDuration = jobReader.IsDBNull(3) ? 0L : Convert.ToInt64(jobReader.GetValue(3));
+                var avgHistorical = jobReader.IsDBNull(4) ? 0L : Convert.ToInt64(jobReader.GetValue(4));
+                var timesLong = jobReader.IsDBNull(5) ? 0 : Convert.ToInt32(jobReader.GetValue(5));
+
+                recommendations.Add(new RecommendationRow
+                {
+                    Category = "Maintenance",
+                    Severity = timesLong >= 5 ? "Medium" : "Low",
+                    Confidence = "High",
+                    Finding = $"{jobName} ran long {timesLong} times in 7 days",
+                    Detail = $"Average duration: {FormatDuration(avgDuration)}, max: {FormatDuration(maxDuration)}, " +
+                             $"historical average: {FormatDuration(avgHistorical)}. " +
+                             "Review whether this job's schedule or operations need tuning."
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("FinOps", $"Recommendation check failed (Maintenance window): {ex.Message}");
+        }
+
         return recommendations;
+    }
+
+    private static string FormatDuration(long seconds)
+    {
+        if (seconds >= 3600)
+            return $"{seconds / 3600}h {(seconds % 3600) / 60}m {seconds % 60}s";
+        if (seconds >= 60)
+            return $"{seconds / 60}m {seconds % 60}s";
+        return $"{seconds}s";
     }
 }
 
