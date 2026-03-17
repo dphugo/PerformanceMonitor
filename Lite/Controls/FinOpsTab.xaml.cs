@@ -43,6 +43,11 @@ public partial class FinOpsTab : UserControl
     private DataGridFilterManager<ApplicationConnectionRow>? _appConnectionsFilterMgr;
     private DataGridFilterManager<ServerPropertyRow>? _serverInventoryFilterMgr;
     private DataGridFilterManager<HighImpactQueryRow>? _highImpactFilterMgr;
+    private DataGridFilterManager<IdleDatabaseRow>? _idleDbsFilterMgr;
+    private DataGridFilterManager<TempdbSummaryRow>? _tempdbFilterMgr;
+    private DataGridFilterManager<WaitCategorySummaryRow>? _waitCategoryFilterMgr;
+    private DataGridFilterManager<ExpensiveQueryRow>? _expensiveQueriesFilterMgr;
+    private DataGridFilterManager<MemoryGrantEfficiencyRow>? _memoryGrantFilterMgr;
 
     public FinOpsTab()
     {
@@ -531,7 +536,7 @@ public partial class FinOpsTab : UserControl
         try
         {
             var data = await _dataService.GetIdleDatabasesAsync(serverId);
-            IdleDatabasesDataGrid.ItemsSource = data;
+            _idleDbsFilterMgr!.UpdateData(data);
             IdleDatabasesNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             IdleDatabasesCountIndicator.Text = data.Count > 0 ? $"{data.Count} idle database(s)" : "";
         }
@@ -548,7 +553,7 @@ public partial class FinOpsTab : UserControl
         try
         {
             var data = await _dataService.GetTempdbSummaryAsync(serverId);
-            TempdbPressureDataGrid.ItemsSource = data;
+            _tempdbFilterMgr!.UpdateData(data);
             TempdbPressureNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         catch (Exception ex)
@@ -635,7 +640,7 @@ public partial class FinOpsTab : UserControl
                 }
             }
 
-            WaitCategorySummaryDataGrid.ItemsSource = data;
+            _waitCategoryFilterMgr!.UpdateData(data);
             WaitCategorySummaryNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         catch (Exception ex)
@@ -665,7 +670,7 @@ public partial class FinOpsTab : UserControl
                 }
             }
 
-            ExpensiveQueriesDataGrid.ItemsSource = data;
+            _expensiveQueriesFilterMgr!.UpdateData(data);
             ExpensiveQueriesNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             ExpensiveQueriesCountIndicator.Text = data.Count > 0 ? $"{data.Count} query(s)" : "";
         }
@@ -682,7 +687,7 @@ public partial class FinOpsTab : UserControl
         try
         {
             var data = await _dataService.GetMemoryGrantEfficiencyAsync(serverId);
-            MemoryGrantEfficiencyDataGrid.ItemsSource = data;
+            _memoryGrantFilterMgr!.UpdateData(data);
             MemoryGrantEfficiencyNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         catch (Exception ex)
@@ -961,6 +966,11 @@ public partial class FinOpsTab : UserControl
         _appConnectionsFilterMgr = new DataGridFilterManager<ApplicationConnectionRow>(ApplicationConnectionsDataGrid);
         _serverInventoryFilterMgr = new DataGridFilterManager<ServerPropertyRow>(ServerInventoryDataGrid);
         _highImpactFilterMgr = new DataGridFilterManager<HighImpactQueryRow>(HighImpactDataGrid);
+        _idleDbsFilterMgr = new DataGridFilterManager<IdleDatabaseRow>(IdleDatabasesDataGrid);
+        _tempdbFilterMgr = new DataGridFilterManager<TempdbSummaryRow>(TempdbPressureDataGrid);
+        _waitCategoryFilterMgr = new DataGridFilterManager<WaitCategorySummaryRow>(WaitCategorySummaryDataGrid);
+        _expensiveQueriesFilterMgr = new DataGridFilterManager<ExpensiveQueryRow>(ExpensiveQueriesDataGrid);
+        _memoryGrantFilterMgr = new DataGridFilterManager<MemoryGrantEfficiencyRow>(MemoryGrantEfficiencyDataGrid);
 
         _filterManagers[DatabaseResourcesDataGrid] = _dbResourcesFilterMgr;
         _filterManagers[StorageGrowthDataGrid] = _storageGrowthFilterMgr;
@@ -970,6 +980,11 @@ public partial class FinOpsTab : UserControl
         _filterManagers[ApplicationConnectionsDataGrid] = _appConnectionsFilterMgr;
         _filterManagers[ServerInventoryDataGrid] = _serverInventoryFilterMgr;
         _filterManagers[HighImpactDataGrid] = _highImpactFilterMgr;
+        _filterManagers[IdleDatabasesDataGrid] = _idleDbsFilterMgr;
+        _filterManagers[TempdbPressureDataGrid] = _tempdbFilterMgr;
+        _filterManagers[WaitCategorySummaryDataGrid] = _waitCategoryFilterMgr;
+        _filterManagers[ExpensiveQueriesDataGrid] = _expensiveQueriesFilterMgr;
+        _filterManagers[MemoryGrantEfficiencyDataGrid] = _memoryGrantFilterMgr;
     }
 
     private void EnsureFilterPopup()
