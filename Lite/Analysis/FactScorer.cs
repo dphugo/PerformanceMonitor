@@ -128,6 +128,9 @@ public class FactScorer
         {
             // CPU %: concerning at 75%, critical at 95%
             "CPU_SQL_PERCENT" => ApplyThresholdFormula(fact.Value, 75, 95),
+            // CPU spike: value is max CPU %. Concerning at 80%, critical at 95%.
+            // Only emitted when max is significantly above average (bursty).
+            "CPU_SPIKE" => ApplyThresholdFormula(fact.Value, 80, 95),
             _ => 0.0
         };
     }
@@ -300,6 +303,7 @@ public class FactScorer
             "DEADLOCKS" => DeadlockAmplifiers(),
             "LCK" => LckAmplifiers(),
             "CPU_SQL_PERCENT" => CpuSqlPercentAmplifiers(),
+            "CPU_SPIKE" => CpuSpikeAmplifiers(),
             "IO_READ_LATENCY_MS" => IoReadLatencyAmplifiers(),
             "IO_WRITE_LATENCY_MS" => IoWriteLatencyAmplifiers(),
             "MEMORY_GRANT_PENDING" => MemoryGrantAmplifiers(),
@@ -623,6 +627,32 @@ public class FactScorer
             Description = "CXPACKET significant — parallelism contributing to CPU load",
             Boost = 0.2,
             Predicate = facts => HasSignificantWait(facts, "CXPACKET", 0.10)
+        }
+    ];
+
+    /// <summary>
+    /// CPU_SPIKE: bursty CPU event (max >> average) confirmed by scheduler
+    /// pressure, parallelism, or query spills during the spike.
+    /// </summary>
+    private static List<AmplifierDefinition> CpuSpikeAmplifiers() =>
+    [
+        new()
+        {
+            Description = "SOS_SCHEDULER_YIELD present — scheduler pressure during CPU spike",
+            Boost = 0.3,
+            Predicate = facts => facts.ContainsKey("SOS_SCHEDULER_YIELD") && facts["SOS_SCHEDULER_YIELD"].BaseSeverity > 0
+        },
+        new()
+        {
+            Description = "CXPACKET significant — parallelism contributing to CPU spike",
+            Boost = 0.2,
+            Predicate = facts => HasSignificantWait(facts, "CXPACKET", 0.10)
+        },
+        new()
+        {
+            Description = "THREADPOOL waits present — CPU spike causing thread exhaustion",
+            Boost = 0.4,
+            Predicate = facts => facts.ContainsKey("THREADPOOL") && facts["THREADPOOL"].BaseSeverity > 0
         }
     ];
 

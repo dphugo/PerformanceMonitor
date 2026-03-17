@@ -437,22 +437,39 @@ AND   collection_time <= $3";
 
             if (sampleCount == 0) return;
 
+            var cpuMetadata = new Dictionary<string, double>
+            {
+                ["avg_sql_cpu"] = avgSqlCpu,
+                ["max_sql_cpu"] = maxSqlCpu,
+                ["avg_other_cpu"] = avgOtherCpu,
+                ["max_other_cpu"] = maxOtherCpu,
+                ["avg_total_cpu"] = avgSqlCpu + avgOtherCpu,
+                ["sample_count"] = sampleCount
+            };
+
             facts.Add(new Fact
             {
                 Source = "cpu",
                 Key = "CPU_SQL_PERCENT",
                 Value = avgSqlCpu,
                 ServerId = context.ServerId,
-                Metadata = new Dictionary<string, double>
-                {
-                    ["avg_sql_cpu"] = avgSqlCpu,
-                    ["max_sql_cpu"] = maxSqlCpu,
-                    ["avg_other_cpu"] = avgOtherCpu,
-                    ["max_other_cpu"] = maxOtherCpu,
-                    ["avg_total_cpu"] = avgSqlCpu + avgOtherCpu,
-                    ["sample_count"] = sampleCount
-                }
+                Metadata = cpuMetadata
             });
+
+            // Emit a CPU_SPIKE fact when max is high and significantly above average.
+            // This catches bursty CPU events that average-based scoring misses entirely.
+            // Requires max >= 80% AND at least 3x the average (or avg < 20% with max >= 80%).
+            if (maxSqlCpu >= 80 && (avgSqlCpu < 20 || maxSqlCpu / Math.Max(avgSqlCpu, 1) >= 3))
+            {
+                facts.Add(new Fact
+                {
+                    Source = "cpu",
+                    Key = "CPU_SPIKE",
+                    Value = maxSqlCpu,
+                    ServerId = context.ServerId,
+                    Metadata = cpuMetadata
+                });
+            }
         }
         catch { /* Table may not exist or have no data */ }
     }

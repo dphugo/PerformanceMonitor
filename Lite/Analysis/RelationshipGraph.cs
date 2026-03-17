@@ -122,6 +122,16 @@ public class RelationshipGraph
         AddEdge("SOS_SCHEDULER_YIELD", "CPU_SQL_PERCENT", "cpu_pressure",
             "SQL CPU > 80% — confirms CPU is the bottleneck",
             facts => HasFact(facts, "CPU_SQL_PERCENT") && facts["CPU_SQL_PERCENT"].Value >= 80);
+
+        // CPU_SPIKE → SOS_SCHEDULER_YIELD (spike confirmed by scheduler pressure)
+        AddEdge("CPU_SPIKE", "SOS_SCHEDULER_YIELD", "cpu_spike",
+            "Scheduler yields — CPU spike caused scheduler starvation",
+            facts => HasFact(facts, "SOS_SCHEDULER_YIELD") && facts["SOS_SCHEDULER_YIELD"].BaseSeverity > 0);
+
+        // CPU_SPIKE → CXPACKET (spike from parallelism)
+        AddEdge("CPU_SPIKE", "CXPACKET", "cpu_spike",
+            "Parallelism waits — parallel queries contributing to CPU spike",
+            facts => HasFact(facts, "CXPACKET") && facts["CXPACKET"].Severity >= 0.3);
     }
 
     /* ── Memory Pressure ── */

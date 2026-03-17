@@ -675,6 +675,12 @@ internal static class ToolRecommendations
             new("get_top_queries_by_cpu", "Find queries consuming the most CPU"),
             new("get_perfmon_trend", "Check batch requests/sec for throughput context", new() { ["counter_name"] = "Batch Requests/sec" })
         ],
+        ["CPU_SPIKE"] =
+        [
+            new("get_cpu_utilization", "See CPU trend to identify when the spike occurred"),
+            new("get_top_queries_by_cpu", "Find queries that drove the CPU spike"),
+            new("get_query_duration_trend", "Check if query durations spiked at the same time")
+        ],
         ["IO_READ_LATENCY_MS"] =
         [
             new("get_file_io_stats", "Check per-file read latency"),
