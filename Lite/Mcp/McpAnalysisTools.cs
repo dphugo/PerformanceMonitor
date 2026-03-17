@@ -742,6 +742,30 @@ internal static class ToolRecommendations
             new("get_running_jobs", "See currently running jobs with duration vs historical"),
             new("get_cpu_utilization", "Check if long-running jobs are consuming CPU")
         ],
+        ["ANOMALY_CPU"] =
+        [
+            new("get_cpu_utilization", "See CPU trend to identify when the spike occurred"),
+            new("get_active_queries", "Find what queries were running during the spike"),
+            new("get_top_queries_by_cpu", "Find the most CPU-expensive queries in the period")
+        ],
+        ["ANOMALY_WAIT"] =
+        [
+            new("get_wait_stats", "See full wait stats breakdown"),
+            new("get_wait_trend", "Track the anomalous wait type over time"),
+            new("compare_analysis", "Compare current vs baseline to see what changed")
+        ],
+        ["ANOMALY_BLOCKING"] =
+        [
+            new("get_blocked_process_reports", "Get detailed blocking event reports"),
+            new("get_deadlocks", "Get recent deadlock events"),
+            new("get_blocking_trend", "Track blocking frequency over time")
+        ],
+        ["ANOMALY_IO"] =
+        [
+            new("get_file_io_stats", "Check per-file I/O latency"),
+            new("get_file_io_trend", "Track I/O latency over time"),
+            new("get_memory_stats", "Check if buffer pool is undersized")
+        ],
         ["BAD_ACTOR"] =
         [
             new("get_top_queries_by_cpu", "See full query stats for this query"),
@@ -769,9 +793,17 @@ internal static class ToolRecommendations
         {
             if (!ByFactKey.TryGetValue(key, out var recommendations))
             {
-                // Handle dynamic keys like BAD_ACTOR_0x... by checking prefix
+                // Handle dynamic keys by checking prefix
                 if (key.StartsWith("BAD_ACTOR_"))
                     ByFactKey.TryGetValue("BAD_ACTOR", out recommendations);
+                else if (key.StartsWith("ANOMALY_CPU"))
+                    ByFactKey.TryGetValue("ANOMALY_CPU", out recommendations);
+                else if (key.StartsWith("ANOMALY_WAIT_"))
+                    ByFactKey.TryGetValue("ANOMALY_WAIT", out recommendations);
+                else if (key.StartsWith("ANOMALY_BLOCKING") || key.StartsWith("ANOMALY_DEADLOCK"))
+                    ByFactKey.TryGetValue("ANOMALY_BLOCKING", out recommendations);
+                else if (key.StartsWith("ANOMALY_READ") || key.StartsWith("ANOMALY_WRITE"))
+                    ByFactKey.TryGetValue("ANOMALY_IO", out recommendations);
                 if (recommendations == null) continue;
             }
 

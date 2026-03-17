@@ -22,6 +22,7 @@ public class AnalysisService
     private readonly RelationshipGraph _graph;
     private readonly InferenceEngine _engine;
     private readonly DrillDownCollector _drillDown;
+    private readonly AnomalyDetector _anomalyDetector;
     /// <summary>
     /// Minimum hours of collected data required before analysis will run.
     /// Short collection windows distort fraction-of-period calculations —
@@ -59,6 +60,7 @@ public class AnalysisService
         _graph = new RelationshipGraph();
         _engine = new InferenceEngine(_graph);
         _drillDown = new DrillDownCollector(duckDb);
+        _anomalyDetector = new AnomalyDetector(duckDb);
     }
 
     /// <summary>
@@ -125,6 +127,10 @@ public class AnalysisService
                 LastAnalysisTime = DateTime.UtcNow;
                 return [];
             }
+
+            // 1.5. Detect anomalies (compare analysis window against baseline)
+            var anomalies = await _anomalyDetector.DetectAnomaliesAsync(context);
+            facts.AddRange(anomalies);
 
             // 2. Score facts (base severity + amplifiers)
             _scorer.ScoreAll(facts);

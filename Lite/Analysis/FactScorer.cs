@@ -37,6 +37,7 @@ public class FactScorer
                 "jobs" => ScoreJobFact(fact),
                 "disk" => ScoreDiskFact(fact),
                 "bad_actor" => ScoreBadActorFact(fact),
+                "anomaly" => ScoreAnomalyFact(fact),
                 _ => 0.0
             };
         }
@@ -44,7 +45,7 @@ public class FactScorer
         // Build lookup for amplifier evaluation (include context facts that amplifiers reference)
         var contextSources = new HashSet<string>
             { "config", "cpu", "io", "tempdb", "memory", "queries", "perfmon",
-              "database_config", "jobs", "sessions", "disk", "bad_actor" };
+              "database_config", "jobs", "sessions", "disk", "bad_actor", "anomaly" };
         var factsByKey = facts
             .Where(f => f.BaseSeverity > 0 || contextSources.Contains(f.Source))
             .ToDictionary(f => f.Key, f => f);
@@ -298,6 +299,43 @@ public class FactScorer
         // A high-frequency query with trivial per-execution cost won't score.
         // A heavy query that only runs once won't score high either.
         return tierBase * impact;
+    }
+
+    /// <summary>
+    /// Scores anomaly facts based on deviation from baseline.
+    /// At 2σ → 0.5, at 4σ → 1.0. Higher deviations are more severe.
+    /// For count-based anomalies (blocking/deadlock spikes), uses ratio instead.
+    /// </summary>
+    private static double ScoreAnomalyFact(Fact fact)
+    {
+        if (fact.Key.StartsWith("ANOMALY_CPU_SPIKE") || fact.Key.StartsWith("ANOMALY_READ_LATENCY")
+            || fact.Key.StartsWith("ANOMALY_WRITE_LATENCY"))
+        {
+            // Deviation-based scoring: 2σ = 0.5, 4σ = 1.0
+            var deviation = fact.Metadata.GetValueOrDefault("deviation_sigma");
+            var confidence = fact.Metadata.GetValueOrDefault("confidence", 1.0);
+            if (deviation < 2.0) return 0.0;
+            var base_score = 0.5 + 0.5 * Math.Min((deviation - 2.0) / 2.0, 1.0);
+            return base_score * confidence;
+        }
+
+        if (fact.Key.StartsWith("ANOMALY_WAIT_"))
+        {
+            // Ratio-based scoring: 5x = 0.5, 20x = 1.0
+            var ratio = fact.Metadata.GetValueOrDefault("ratio");
+            if (ratio < 5) return 0.0;
+            return 0.5 + 0.5 * Math.Min((ratio - 5.0) / 15.0, 1.0);
+        }
+
+        if (fact.Key.StartsWith("ANOMALY_BLOCKING_SPIKE") || fact.Key.StartsWith("ANOMALY_DEADLOCK_SPIKE"))
+        {
+            // Ratio-based: 3x = 0.5, 10x = 1.0
+            var ratio = fact.Metadata.GetValueOrDefault("ratio");
+            if (ratio < 3) return 0.0;
+            return 0.5 + 0.5 * Math.Min((ratio - 3.0) / 7.0, 1.0);
+        }
+
+        return 0.0;
     }
 
     /// <summary>

@@ -359,6 +359,110 @@ public class ScenarioTests : IDisposable
         return (stories, factsByKey);
     }
 
+    /* ── Anomaly Detection: CPU Spike ── */
+
+    [Fact]
+    public async Task CpuSpikeAnomaly_DetectsCpuDeviation()
+    {
+        var (stories, facts) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedCpuSpikeAnomalyAsync());
+        PrintStories("CPU SPIKE ANOMALY", stories);
+
+        Assert.True(facts.ContainsKey("ANOMALY_CPU_SPIKE"), "Should detect CPU anomaly");
+        Assert.True(facts["ANOMALY_CPU_SPIKE"].Severity >= 0.5, "CPU anomaly severity should be significant");
+    }
+
+    [Fact]
+    public async Task CpuSpikeAnomaly_HighDeviation()
+    {
+        var (_, facts) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedCpuSpikeAnomalyAsync());
+
+        var deviation = facts["ANOMALY_CPU_SPIKE"].Metadata["deviation_sigma"];
+        Assert.True(deviation > 5.0, $"Expected large deviation (>5σ), got {deviation:F1}σ");
+    }
+
+    [Fact]
+    public async Task CpuSpikeAnomaly_AppearsAsStory()
+    {
+        var (stories, _) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedCpuSpikeAnomalyAsync());
+
+        Assert.Contains(stories, s => s.RootFactKey == "ANOMALY_CPU_SPIKE");
+    }
+
+    /* ── Anomaly Detection: Blocking Spike ── */
+
+    [Fact]
+    public async Task BlockingSpikeAnomaly_DetectsBlockingBurst()
+    {
+        var (stories, facts) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedBlockingSpikeAnomalyAsync());
+        PrintStories("BLOCKING SPIKE ANOMALY", stories);
+
+        Assert.True(facts.ContainsKey("ANOMALY_BLOCKING_SPIKE"), "Should detect blocking spike");
+        Assert.True(facts["ANOMALY_BLOCKING_SPIKE"].Severity >= 0.5, "Blocking spike should be significant");
+    }
+
+    [Fact]
+    public async Task BlockingSpikeAnomaly_DetectsDeadlockSpike()
+    {
+        var (_, facts) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedBlockingSpikeAnomalyAsync());
+
+        Assert.True(facts.ContainsKey("ANOMALY_DEADLOCK_SPIKE"), "Should detect deadlock spike");
+    }
+
+    /* ── Anomaly Detection: Wait Spike ── */
+
+    [Fact]
+    public async Task WaitSpikeAnomaly_DetectsPageiolatchFlood()
+    {
+        var (stories, facts) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedWaitSpikeAnomalyAsync());
+        PrintStories("WAIT SPIKE ANOMALY", stories);
+
+        Assert.True(facts.ContainsKey("ANOMALY_WAIT_PAGEIOLATCH_SH"), "Should detect PAGEIOLATCH spike");
+        Assert.True(facts["ANOMALY_WAIT_PAGEIOLATCH_SH"].Severity >= 0.5, "PAGEIOLATCH anomaly should be significant");
+    }
+
+    [Fact]
+    public async Task WaitSpikeAnomaly_HighRatio()
+    {
+        var (_, facts) = await RunFullPipelineWithAnomaliesAsync(s => s.SeedWaitSpikeAnomalyAsync());
+
+        var ratio = facts["ANOMALY_WAIT_PAGEIOLATCH_SH"].Metadata["ratio"];
+        Assert.True(ratio >= 5.0, $"Expected >= 5x increase, got {ratio:F1}x");
+    }
+
+    /* ── Helpers ── */
+
+    private async Task<(List<AnalysisStory> Stories, Dictionary<string, Fact> Facts)> RunFullPipelineWithAnomaliesAsync(
+        Func<TestDataSeeder, Task> seedAction)
+    {
+        await _duckDb.InitializeAsync();
+        await _duckDb.InitializeAnalysisSchemaAsync();
+
+        var seeder = new TestDataSeeder(_duckDb);
+        await seedAction(seeder);
+
+        var collector = new DuckDbFactCollector(_duckDb);
+        var context = TestDataSeeder.CreateTestContext();
+        var facts = await collector.CollectFactsAsync(context);
+
+        // Run anomaly detection (compares analysis window against baseline)
+        var anomalyDetector = new AnomalyDetector(_duckDb);
+        var anomalies = await anomalyDetector.DetectAnomaliesAsync(context);
+        facts.AddRange(anomalies);
+
+        var scorer = new FactScorer();
+        scorer.ScoreAll(facts);
+
+        var graph = new RelationshipGraph();
+        var engine = new InferenceEngine(graph);
+        var stories = engine.BuildStories(facts);
+
+        var factsByKey = facts
+            .Where(f => f.Severity > 0)
+            .ToDictionary(f => f.Key, f => f);
+
+        return (stories, factsByKey);
+    }
+
     private static void PrintStories(string scenario, List<AnalysisStory> stories)
     {
         var output = TestContext.Current.TestOutputHelper!;

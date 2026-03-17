@@ -32,6 +32,12 @@ public class TestDataSeeder
     public static DateTime TestPeriodStart => _periodEnd.AddHours(-4);
     public static double TestPeriodDurationMs => (TestPeriodEnd - TestPeriodStart).TotalMilliseconds;
 
+    /// <summary>
+    /// Baseline period for anomaly detection: 24 hours before the analysis window.
+    /// </summary>
+    public static DateTime BaselineStart => TestPeriodStart.AddHours(-24);
+    public static DateTime BaselineEnd => TestPeriodStart;
+
     private long _nextId = -1_000_000;
 
     public TestDataSeeder(DuckDbInitializer duckDb)
@@ -501,6 +507,194 @@ public class TestDataSeeder
         await SeedDiskSpaceAsync(
             ("C:\\", 500_000, 35_000),   // 7% free — critical
             ("D:\\", 2_000_000, 140_000)); // 7% free — critical
+    }
+
+    /// <summary>
+    /// CPU spike anomaly: server normally runs at 10% CPU, then spikes to 95%.
+    /// Baseline: 24h of steady ~10% CPU.
+    /// Analysis window: 4h with 95% peak CPU.
+    ///
+    /// Expected: ANOMALY_CPU_SPIKE with high deviation (~10σ+).
+    /// </summary>
+    public async Task SeedCpuSpikeAnomalyAsync()
+    {
+        await ClearTestDataAsync();
+        await SeedTestServerAsync();
+
+        // Baseline: 24h of steady low CPU (10% avg, small variance)
+        await SeedCpuUtilizationInRangeAsync(BaselineStart, BaselineEnd, avgCpu: 10, variance: 3, samples: 96);
+
+        // Analysis window: spike to 95%
+        await SeedCpuUtilizationInRangeAsync(TestPeriodStart, TestPeriodEnd, avgCpu: 95, variance: 5, samples: 16);
+
+        // Need basic config for the analysis to run
+        await SeedServerConfigAsync(ctfp: 50, maxdop: 8, maxMemoryMb: 122_880);
+        await SeedMemoryStatsAsync(totalPhysicalMb: 131_072, bufferPoolMb: 100_000, targetMb: 122_880);
+        await SeedFileSizeAsync(totalDataSizeMb: 102_400);
+        await SeedServerEditionAsync(edition: 3, majorVersion: 16);
+        await SeedServerPropertiesAsync(cpuCount: 8, htRatio: 1, physicalMemMb: 131_072);
+    }
+
+    /// <summary>
+    /// Blocking spike anomaly: normally no blocking, then sudden burst.
+    /// Baseline: 24h with 0 blocking events.
+    /// Analysis window: 4h with 50 blocking events and 10 deadlocks.
+    ///
+    /// Expected: ANOMALY_BLOCKING_SPIKE, ANOMALY_DEADLOCK_SPIKE.
+    /// </summary>
+    public async Task SeedBlockingSpikeAnomalyAsync()
+    {
+        await ClearTestDataAsync();
+        await SeedTestServerAsync();
+
+        // Baseline: some normal wait activity (no blocking/deadlocks)
+        await SeedWaitStatsInRangeAsync(BaselineStart, BaselineEnd,
+            new Dictionary<string, (long waitTimeMs, long waitingTasks, long signalMs)>
+            {
+                ["SOS_SCHEDULER_YIELD"] = (100_000, 500_000, 0),
+            }, samples: 24);
+
+        // Analysis window: sudden blocking burst
+        await SeedBlockingEventsAsync(50, avgWaitTimeMs: 15_000, sleepingBlockerCount: 5);
+        await SeedDeadlocksAsync(10);
+
+        // Some lock waits to corroborate
+        var waits = new Dictionary<string, (long waitTimeMs, long waitingTasks, long signalMs)>
+        {
+            ["LCK_M_X"]  = (5_000_000, 200_000, 50_000),
+            ["LCK_M_S"]  = (1_000_000, 100_000, 10_000),
+        };
+        await SeedWaitStatsAsync(waits);
+
+        await SeedServerConfigAsync(ctfp: 50, maxdop: 8, maxMemoryMb: 122_880);
+        await SeedMemoryStatsAsync(totalPhysicalMb: 131_072, bufferPoolMb: 100_000, targetMb: 122_880);
+        await SeedFileSizeAsync(totalDataSizeMb: 102_400);
+        await SeedServerEditionAsync(edition: 3, majorVersion: 16);
+        await SeedServerPropertiesAsync(cpuCount: 8, htRatio: 1, physicalMemMb: 131_072);
+        await SeedDatabaseConfigAsync(
+            ("AppDB1", false, false, false, "CHECKSUM"),
+            ("AppDB2", false, false, false, "CHECKSUM"));
+    }
+
+    /// <summary>
+    /// Wait spike anomaly: normally low waits, then sudden PAGEIOLATCH flood.
+    /// Baseline: 24h with minimal PAGEIOLATCH.
+    /// Analysis window: 4h with massive PAGEIOLATCH.
+    ///
+    /// Expected: ANOMALY_WAIT_PAGEIOLATCH_SH with high ratio.
+    /// </summary>
+    public async Task SeedWaitSpikeAnomalyAsync()
+    {
+        await ClearTestDataAsync();
+        await SeedTestServerAsync();
+
+        // Baseline: 24h with minimal PAGEIOLATCH
+        await SeedWaitStatsInRangeAsync(BaselineStart, BaselineEnd,
+            new Dictionary<string, (long waitTimeMs, long waitingTasks, long signalMs)>
+            {
+                ["PAGEIOLATCH_SH"] = (50_000, 25_000, 1_000),  // 50 seconds over 24h = noise
+                ["SOS_SCHEDULER_YIELD"] = (100_000, 500_000, 0),
+            }, samples: 24);
+
+        // Analysis window: massive PAGEIOLATCH spike
+        var waits = new Dictionary<string, (long waitTimeMs, long waitingTasks, long signalMs)>
+        {
+            ["PAGEIOLATCH_SH"] = (8_000_000, 4_000_000, 100_000),  // 8 million ms in 4h
+            ["SOS_SCHEDULER_YIELD"] = (100_000, 500_000, 0),        // Normal
+        };
+        await SeedWaitStatsAsync(waits);
+
+        await SeedServerConfigAsync(ctfp: 50, maxdop: 8, maxMemoryMb: 122_880);
+        await SeedMemoryStatsAsync(totalPhysicalMb: 131_072, bufferPoolMb: 100_000, targetMb: 122_880);
+        await SeedFileSizeAsync(totalDataSizeMb: 102_400);
+        await SeedServerEditionAsync(edition: 3, majorVersion: 16);
+        await SeedServerPropertiesAsync(cpuCount: 8, htRatio: 1, physicalMemMb: 131_072);
+    }
+
+    /// <summary>
+    /// Seeds CPU utilization data in a specific time range with variance.
+    /// Used for baseline + spike anomaly scenarios.
+    /// </summary>
+    internal async Task SeedCpuUtilizationInRangeAsync(DateTime start, DateTime end,
+        int avgCpu, int variance, int samples)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var interval = (end - start).TotalMinutes / samples;
+        var rng = new Random(42); // Deterministic for reproducibility
+
+        for (var i = 0; i < samples; i++)
+        {
+            var t = start.AddMinutes(i * interval);
+            var cpu = Math.Clamp(avgCpu + rng.Next(-variance, variance + 1), 0, 100);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO cpu_utilization_stats
+    (collection_id, collection_time, server_id, server_name,
+     sample_time, sqlserver_cpu_utilization, other_process_cpu_utilization)
+VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = cpu });
+            cmd.Parameters.Add(new DuckDBParameter { Value = 2 }); // other CPU
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds wait stats in a specific time range. Used for baseline periods
+    /// in anomaly detection scenarios.
+    /// </summary>
+    internal async Task SeedWaitStatsInRangeAsync(DateTime start, DateTime end,
+        Dictionary<string, (long waitTimeMs, long waitingTasks, long signalMs)> waits, int samples)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var interval = (end - start).TotalMinutes / samples;
+
+        foreach (var (waitType, (totalWaitTimeMs, totalWaitingTasks, totalSignalMs)) in waits)
+        {
+            var perSampleWaitMs = totalWaitTimeMs / samples;
+            var perSampleTasks = totalWaitingTasks / samples;
+            var perSampleSignal = totalSignalMs / samples;
+
+            for (var i = 0; i < samples; i++)
+            {
+                var t = start.AddMinutes(i * interval);
+
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = @"
+INSERT INTO wait_stats
+    (collection_id, collection_time, server_id, server_name,
+     wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms,
+     delta_waiting_tasks, delta_wait_time_ms, delta_signal_wait_time_ms)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+
+                cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+                cmd.Parameters.Add(new DuckDBParameter { Value = t });
+                cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+                cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+                cmd.Parameters.Add(new DuckDBParameter { Value = waitType });
+                cmd.Parameters.Add(new DuckDBParameter { Value = totalWaitingTasks }); // cumulative
+                cmd.Parameters.Add(new DuckDBParameter { Value = totalWaitTimeMs });   // cumulative
+                cmd.Parameters.Add(new DuckDBParameter { Value = totalSignalMs });     // cumulative
+                cmd.Parameters.Add(new DuckDBParameter { Value = perSampleTasks });    // delta
+                cmd.Parameters.Add(new DuckDBParameter { Value = perSampleWaitMs });   // delta
+                cmd.Parameters.Add(new DuckDBParameter { Value = perSampleSignal });   // delta
+
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
     }
 
     /// <summary>
