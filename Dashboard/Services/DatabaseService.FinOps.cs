@@ -1678,9 +1678,9 @@ FROM sys.dm_db_persisted_sku_features", connection);
                             Category = "Licensing",
                             Severity = "High",
                             Confidence = "High",
-                            Finding = "Enterprise Edition with no Enterprise-only features",
-                            Detail = "No database uses Enterprise-only features (partitioning, compression, etc.). " +
-                                     "Consider downgrading to Standard Edition for significant license savings.",
+                            Finding = "Enterprise Edition with no Enterprise-only features detected",
+                            Detail = "sys.dm_db_persisted_sku_features reports no Enterprise-only feature usage. " +
+                                     "Review whether Standard Edition would meet workload requirements for potential license savings.",
                             EstMonthlySavings = monthlyCost > 0 ? monthlyCost * 0.40m : null
                         });
                     }
