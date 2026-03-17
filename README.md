@@ -48,7 +48,7 @@ All release binaries are digitally signed via [SignPath](https://signpath.io) �
 
 📋 **Graphical plan viewer** with native ShowPlan rendering, 30-rule PlanAnalyzer, operator-level cost breakdown, and a standalone mode for opening `.sqlplan` files without a server connection
 
-🤖 **Built-in MCP server** with 45-47 read-only tools for AI analysis — ask Claude Code or Cursor "what are the top wait types on my server?" and get answers from your actual monitoring data
+🤖 **Built-in MCP server** with 51-57 read-only tools for AI analysis — ask Claude Code or Cursor "what are the top wait types on my server?" and get answers from your actual monitoring data
 
 🧰 **Community tools installed automatically** — sp_WhoIsActive, sp_BlitzLock, sp_HealthParser, sp_HumanEventsBlockViewer
 
@@ -300,7 +300,7 @@ The Full Edition supports Azure SQL Managed Instance and AWS RDS for SQL Server 
 | Dashboard | Separate app | Built-in |
 | Themes | Dark and light | Dark and light |
 | Portability | Server-bound | Single executable |
-| MCP server (LLM integration) | Built into Dashboard (47 tools) | Built-in (45 tools) |
+| MCP server (LLM integration) | Built into Dashboard (57 tools) | Built-in (51 tools) |
 
 ---
 
@@ -428,7 +428,7 @@ claude mcp add --transport http --scope user sql-monitor http://localhost:5151/
 
 ### Available Tools
 
-Full Edition exposes 47 tools, Lite Edition exposes 45. Core tools are shared across both editions.
+Full Edition exposes 57 tools, Lite Edition exposes 51. Core tools are shared across both editions.
 
 | Category | Tools |
 |---|---|
