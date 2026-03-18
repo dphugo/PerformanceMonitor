@@ -73,7 +73,7 @@
                            Foreground="{DynamicResource ForegroundMutedBrush}" FontStyle="Italic"/>
 
                 <!-- Recommendations DataGrid -->
-                <DataGrid x:Name="RecommendationsDataGrid" Grid.Row="2" Margin="10,4,10,10"
+                <DataGrid x:Name="RecommendationsDataGrid" Grid.Row="2" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="10,4,10,10"
                           AutoGenerateColumns="False" IsReadOnly="True"
                           CanUserSortColumns="True" CanUserResizeColumns="True"
                           HeadersVisibility="Column" GridLinesVisibility="Horizontal"
@@ -605,7 +605,7 @@
 
                 <!-- DataGrid -->
                 <Grid Grid.Row="1" Margin="10,0,10,10">
-                    <DataGrid x:Name="DatabaseResourcesDataGrid"
+                    <DataGrid x:Name="DatabaseResourcesDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                               AutoGenerateColumns="False"
                               IsReadOnly="True"
                               CanUserSortColumns="True"
@@ -786,7 +786,7 @@
                 </StackPanel>
 
                 <Grid Grid.Row="1" Margin="10,0,10,10">
-                    <DataGrid x:Name="StorageGrowthDataGrid"
+                    <DataGrid x:Name="StorageGrowthDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                               AutoGenerateColumns="False"
                               IsReadOnly="True"
                               CanUserSortColumns="True"
@@ -929,7 +929,7 @@
 
                 <!-- DataGrid -->
                 <Grid Grid.Row="1" Margin="10,0,10,10">
-                    <DataGrid x:Name="DatabaseSizesDataGrid"
+                    <DataGrid x:Name="DatabaseSizesDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                               AutoGenerateColumns="False"
                               IsReadOnly="True"
                               CanUserSortColumns="True"
@@ -1576,7 +1576,7 @@
                                 <TextBlock x:Name="IdleDatabasesCountIndicator" Text=""
                                            FontStyle="Italic" Foreground="{DynamicResource AccentBrush}" FontWeight="SemiBold"/>
                             </StackPanel>
-                            <DataGrid x:Name="IdleDatabasesDataGrid"
+                            <DataGrid x:Name="IdleDatabasesDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                       AutoGenerateColumns="False"
                                       IsReadOnly="True"
                                       CanUserSortColumns="True"
@@ -1641,7 +1641,7 @@
                     <!-- Tempdb Pressure -->
                     <Expander Header="Tempdb Pressure" IsExpanded="True" Margin="0,0,0,8">
                         <StackPanel>
-                            <DataGrid x:Name="TempdbPressureDataGrid"
+                            <DataGrid x:Name="TempdbPressureDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                       AutoGenerateColumns="False"
                                       IsReadOnly="True"
                                       CanUserSortColumns="True"
@@ -1720,7 +1720,7 @@
                             </StackPanel>
                         </Expander.Header>
                         <StackPanel>
-                            <DataGrid x:Name="WaitCategorySummaryDataGrid"
+                            <DataGrid x:Name="WaitCategorySummaryDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                       AutoGenerateColumns="False"
                                       IsReadOnly="True"
                                       CanUserSortColumns="True"
@@ -1843,7 +1843,7 @@
                                 <TextBlock x:Name="ExpensiveQueriesCountIndicator" Text=""
                                            FontStyle="Italic" Foreground="{DynamicResource AccentBrush}" FontWeight="SemiBold"/>
                             </StackPanel>
-                            <DataGrid x:Name="ExpensiveQueriesDataGrid"
+                            <DataGrid x:Name="ExpensiveQueriesDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                       AutoGenerateColumns="False"
                                       IsReadOnly="True"
                                       CanUserSortColumns="True"
@@ -1959,7 +1959,7 @@
                     <!-- Memory Grant Efficiency -->
                     <Expander Header="Memory Grant Efficiency" IsExpanded="True" Margin="0,0,0,8">
                         <StackPanel>
-                            <DataGrid x:Name="MemoryGrantEfficiencyDataGrid"
+                            <DataGrid x:Name="MemoryGrantEfficiencyDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                       AutoGenerateColumns="False"
                                       IsReadOnly="True"
                                       CanUserSortColumns="True"
@@ -2109,7 +2109,7 @@
                            Foreground="{DynamicResource ForegroundMutedBrush}" FontStyle="Italic"/>
 
                 <!-- High Impact DataGrid -->
-                <DataGrid x:Name="HighImpactDataGrid" Grid.Row="2" Margin="10,4,10,10"
+                <DataGrid x:Name="HighImpactDataGrid" Grid.Row="2" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="10,4,10,10"
                           AutoGenerateColumns="False" IsReadOnly="True"
                           CanUserSortColumns="True" CanUserResizeColumns="True"
                           HeadersVisibility="Column" GridLinesVisibility="Horizontal"
@@ -2284,7 +2284,7 @@
 
                 <!-- DataGrid -->
                 <Grid Grid.Row="1" Margin="10,0,10,10">
-                    <DataGrid x:Name="ApplicationConnectionsDataGrid"
+                    <DataGrid x:Name="ApplicationConnectionsDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                               AutoGenerateColumns="False"
                               IsReadOnly="True"
                               CanUserSortColumns="True"
@@ -2392,7 +2392,7 @@
 
                 <!-- DataGrid -->
                 <Grid Grid.Row="1" Margin="10,0,10,10">
-                    <DataGrid x:Name="ServerInventoryDataGrid"
+                    <DataGrid x:Name="ServerInventoryDataGrid" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                               AutoGenerateColumns="False"
                               IsReadOnly="True"
                               CanUserSortColumns="True"
