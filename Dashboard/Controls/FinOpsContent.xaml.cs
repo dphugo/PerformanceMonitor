@@ -408,6 +408,7 @@ namespace PerformanceMonitorDashboard.Controls
             {
                 var data = await _databaseService.GetFinOpsIdleDatabasesAsync();
                 IdleDatabasesDataGrid.ItemsSource = data;
+                IdleDatabasesDataGrid.Visibility = data.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
                 IdleDatabasesNoDataMessage.Visibility = data.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
                 IdleDatabasesCountIndicator.Text = data.Count > 0 ? $"{data.Count} idle database(s)" : "";
             }
