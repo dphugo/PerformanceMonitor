@@ -937,7 +937,12 @@ public partial class MainWindow : Window
 
             if (result.Success)
             {
+                StatusText.Text = "Import complete — refreshing views...";
+                await _serverManager.CheckAllConnectionsAsync();
+                RefreshServerList();
+                UpdateStatusBar();
                 StatusText.Text = "Import complete";
+
                 MessageBox.Show(
                     $"Import completed successfully.\n\n" +
                     $"Tables flushed from old database: {result.TablesFlushed}\n" +
