@@ -222,38 +222,6 @@ BEGIN
             row_hash binary(32) NULL
         );
 
-        /*
-        Pre-build list of ONLINE, accessible database IDs.
-        This prevents any downstream DMV calls (dm_exec_sql_text,
-        dm_exec_plan_attributes) from touching RESTORING databases
-        on passive mirror servers — which triggers severity 22 dumps.
-        */
-        CREATE TABLE 
-            #online_databases
-        (
-            database_id integer NOT NULL PRIMARY KEY,
-            database_name sysname NOT NULL
-        );
-
-        INSERT INTO 
-            #online_databases
-        (
-            database_id,
-            database_name
-        )
-        SELECT
-            d.database_id,
-            d.name
-        FROM sys.databases AS d
-        WHERE d.state = 0
-        AND   HAS_DBACCESS(d.name) = 1
-        AND   d.database_id NOT IN
-        (
-            1, 2, 3, 4, 32761, 32767,
-            DB_ID(N'PerformanceMonitor')
-        )
-        AND   d.database_id < 32761;
-
         INSERT INTO
             #query_stats_staging
         (
@@ -306,7 +274,7 @@ BEGIN
         )
         SELECT
             server_start_time = @server_start_time,
-            database_name = od.database_name,
+            database_name = d.name,
             sql_handle = qs.sql_handle,
             statement_start_offset = qs.statement_start_offset,
             statement_end_offset = qs.statement_end_offset,
@@ -385,9 +353,23 @@ BEGIN
                 qs.statement_start_offset,
                 qs.statement_end_offset
             ) AS tqp
-        INNER JOIN #online_databases AS od
-          ON st.dbid = od.database_id
+        CROSS APPLY
+        (
+            SELECT
+                dbid = CONVERT(integer, pa.value)
+            FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
+            WHERE pa.attribute = N'dbid'
+        ) AS pa
+        INNER JOIN sys.databases AS d
+          ON pa.dbid = d.database_id
         WHERE qs.last_execution_time >= @cutoff_time
+        AND   d.state = 0 /*ONLINE only — skip RESTORING databases (mirroring/AG secondary)*/
+        AND   pa.dbid NOT IN
+        (
+            1, 2, 3, 4, 32761, 32767,
+            DB_ID(N'PerformanceMonitor')
+        )
+        AND   pa.dbid < 32761 /*exclude contained AG system databases*/
         OPTION(RECOMPILE);
 
         /*
