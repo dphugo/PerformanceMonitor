@@ -176,6 +176,8 @@ namespace PerformanceMonitorDashboard
         {
             try
             {
+                await Task.Delay(5000); // Don't slow down startup
+
                 var prefs = _preferencesService.GetPreferences();
                 if (!prefs.CheckForUpdatesOnStartup) return;
 
