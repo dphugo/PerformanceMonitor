@@ -165,25 +165,40 @@ public partial class MainWindow : Window
     {
         try
         {
+            await Task.Delay(5000); // Don't slow down startup
+
             if (!App.CheckForUpdatesOnStartup) return;
 
+            // Try Velopack first (supports download + apply)
+            try
+            {
+                var mgr = new Velopack.UpdateManager(
+                    new Velopack.Sources.GithubSource(
+                        "https://github.com/erikdarlingdata/PerformanceMonitor", null, false));
+
+                var newVersion = await mgr.CheckForUpdatesAsync();
+                if (newVersion != null)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        Title = $"Performance Monitor Lite — Update v{newVersion.TargetFullRelease.Version} available (Help > About)";
+                    });
+                    return;
+                }
+            }
+            catch
+            {
+                // Velopack packages may not exist yet — fall through
+            }
+
+            // Fallback: GitHub Releases API check
             var result = await UpdateCheckService.CheckForUpdateAsync();
             if (result?.IsUpdateAvailable == true)
             {
-                var answer = MessageBox.Show(
-                    $"Performance Monitor {result.LatestVersion} is available (you have {result.CurrentVersion}).\n\nWould you like to open the download page?",
-                    "Update Available",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Information);
-
-                if (answer == MessageBoxResult.Yes)
+                Dispatcher.Invoke(() =>
                 {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = result.ReleaseUrl,
-                        UseShellExecute = true
-                    });
-                }
+                    Title = $"Performance Monitor Lite — Update {result.LatestVersion} available (Help > About)";
+                });
             }
         }
         catch

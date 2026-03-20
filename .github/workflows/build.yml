@@ -49,6 +49,10 @@ jobs:
       - name: Publish Lite
         run: dotnet publish Lite/PerformanceMonitorLite.csproj -c Release -o publish/Lite
 
+      - name: Publish Lite (self-contained for Velopack)
+        if: github.event_name == 'release'
+        run: dotnet publish Lite/PerformanceMonitorLite.csproj -c Release -r win-x64 --self-contained -o publish/Lite-velopack
+
       - name: Publish CLI Installer
         run: dotnet publish Installer/PerformanceMonitorInstaller.csproj -c Release
 
@@ -168,13 +172,16 @@ jobs:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           dotnet tool install -g vpk
-          New-Item -ItemType Directory -Force -Path releases/velopack
+          New-Item -ItemType Directory -Force -Path releases/velopack-dashboard
+          New-Item -ItemType Directory -Force -Path releases/velopack-lite
 
-          # Download previous release for delta generation
-          vpk download github --repoUrl https://github.com/${{ github.repository }} --channel win -o releases/velopack --token $env:GH_TOKEN
+          # Dashboard: download previous + pack
+          vpk download github --repoUrl https://github.com/${{ github.repository }} --channel dashboard -o releases/velopack-dashboard --token $env:GH_TOKEN
+          vpk pack -u PerformanceMonitorDashboard -v $env:VERSION -p publish/Dashboard-velopack -e PerformanceMonitorDashboard.exe -o releases/velopack-dashboard --channel dashboard
 
-          # Pack Dashboard (use self-contained publish output)
-          vpk pack -u PerformanceMonitorDashboard -v $env:VERSION -p publish/Dashboard-velopack -e PerformanceMonitorDashboard.exe -o releases/velopack --channel win
+          # Lite: download previous + pack
+          vpk download github --repoUrl https://github.com/${{ github.repository }} --channel lite -o releases/velopack-lite --token $env:GH_TOKEN
+          vpk pack -u PerformanceMonitorLite -v $env:VERSION -p publish/Lite-velopack -e PerformanceMonitorLite.exe -o releases/velopack-lite --channel lite
 
       - name: Generate checksums
         if: github.event_name == 'release'
@@ -202,4 +209,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          vpk upload github --repoUrl https://github.com/${{ github.repository }} --channel win -o releases/velopack --releaseName "v$env:VERSION" --tag "v$env:VERSION" --merge --token $env:GH_TOKEN
+          vpk upload github --repoUrl https://github.com/${{ github.repository }} --channel dashboard -o releases/velopack-dashboard --releaseName "v$env:VERSION" --tag "v$env:VERSION" --merge --token $env:GH_TOKEN
+          vpk upload github --repoUrl https://github.com/${{ github.repository }} --channel lite -o releases/velopack-lite --releaseName "v$env:VERSION" --tag "v$env:VERSION" --merge --token $env:GH_TOKEN
