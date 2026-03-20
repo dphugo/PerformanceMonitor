@@ -4242,7 +4242,7 @@ public partial class ServerTab : UserControl
 
     private void OpenLogFile_Click(object sender, RoutedEventArgs e)
     {
-        var logDir = System.IO.Path.Combine(AppContext.BaseDirectory, "logs");
+        var logDir = System.IO.Path.Combine(App.DataDirectory, "logs");
         var logFile = System.IO.Path.Combine(logDir, $"lite_{DateTime.Now:yyyyMMdd}.log");
 
         if (File.Exists(logFile))
