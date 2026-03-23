@@ -163,6 +163,36 @@ public partial class RemoteCollectorService
     }
 
     /// <summary>
+    /// Clears collector health entries for a server that has been removed.
+    /// Prevents stale error counts from showing in the status bar.
+    /// </summary>
+    public void ClearHealthForServer(int serverId)
+    {
+        lock (_healthLock)
+        {
+            var keys = _collectorHealth.Keys.Where(k => k.ServerId == serverId).ToList();
+            foreach (var key in keys)
+                _collectorHealth.Remove(key);
+        }
+    }
+
+    /// <summary>
+    /// Clears collector health entries for all servers NOT in the provided set.
+    /// Used after Manage Servers to purge stale entries for removed servers.
+    /// </summary>
+    public void ClearHealthExcept(HashSet<int> activeServerIds)
+    {
+        lock (_healthLock)
+        {
+            var keys = _collectorHealth.Keys
+                .Where(k => !activeServerIds.Contains(k.ServerId))
+                .ToList();
+            foreach (var key in keys)
+                _collectorHealth.Remove(key);
+        }
+    }
+
+    /// <summary>
     /// Records a collector execution result for health tracking.
     /// </summary>
     private void RecordCollectorResult(int serverId, string collectorName, string status, string? errorMessage = null)

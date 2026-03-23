@@ -202,7 +202,7 @@ jobs:
         run: |
           gh release upload ${{ github.event.release.tag_name }} releases/*.zip releases/SHA256SUMS.txt --clobber
 
-      - name: Upload Velopack artifacts
+      - name: Upload Dashboard Velopack artifacts
         if: github.event_name == 'release'
         shell: pwsh
         env:
@@ -210,4 +210,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           vpk upload github --repoUrl https://github.com/${{ github.repository }} --channel dashboard -o releases/velopack-dashboard --releaseName "v$env:VERSION" --tag "v$env:VERSION" --merge --token $env:GH_TOKEN
+
+      - name: Upload Lite Velopack artifacts
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
           vpk upload github --repoUrl https://github.com/${{ github.repository }} --channel lite -o releases/velopack-lite --releaseName "v$env:VERSION" --tag "v$env:VERSION" --merge --token $env:GH_TOKEN
