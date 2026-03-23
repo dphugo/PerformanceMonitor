@@ -832,6 +832,16 @@ public partial class MainWindow : Window
 
         if (window.ServersChanged)
         {
+            // Purge collector health for servers that were removed
+            if (_collectorService != null)
+            {
+                var currentServerIds = new HashSet<int>(
+                    _serverManager.GetAllServers().Select(s =>
+                        RemoteCollectorService.GetDeterministicHashCode(
+                            RemoteCollectorService.GetServerNameForStorage(s))));
+                _collectorService.ClearHealthExcept(currentServerIds);
+            }
+
             RefreshServerList();
         }
     }
@@ -1087,6 +1097,9 @@ public partial class MainWindow : Window
         if (result == MessageBoxResult.Yes)
         {
             CloseServerTab(server.Id);
+            _collectorService?.ClearHealthForServer(
+                RemoteCollectorService.GetDeterministicHashCode(
+                    RemoteCollectorService.GetServerNameForStorage(server)));
             _serverManager.DeleteServer(server.Id);
             RefreshServerList();
             StatusText.Text = $"Removed server: {server.DisplayNameWithIntent}";
