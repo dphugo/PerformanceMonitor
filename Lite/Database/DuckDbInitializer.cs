@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
@@ -76,6 +77,13 @@ public partial class DuckDbInitializer : IDisposable
     /// it directly instead of inferring "did the cycle run" from a side effect that holds either way.
     /// </summary>
     internal int CompletedTrimCycleCount;
+
+    /* #5650: a busy-skipped trim cycle used to log only at Debug. RecordTrimSkip counts both skip paths and writes
+       one Information line at most an hour, counted from the first skip; the line resets the count and the hour. */
+    private static readonly TimeSpan TrimSkipLogInterval = TimeSpan.FromHours(1);
+    private readonly object _trimSkipGate = new();
+    private int _trimSkipCount;
+    private DateTime? _trimSkipSinceUtc;
 
     /// <summary>
     /// How often the trim timer checks the sentinel's memory usage (#4262 round 1 finding 1). Not const —
@@ -187,7 +195,9 @@ public partial class DuckDbInitializer : IDisposable
     /// If the current thread already owns a read lock (e.g., leaked by an unhandled exception),
     /// returns a no-op disposable to allow the operation to proceed.
     /// </summary>
-    public IDisposable AcquireReadLock() => AcquireReadLock(CancellationToken.None);
+    public IDisposable AcquireReadLock(
+        [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
+        => AcquireReadLock(CancellationToken.None, holderMember, holderFile);
 
     /// <summary>
     /// The same read lock, abandonable (#2443). <see cref="AcquireWriteLock"/> has taken a timeout
@@ -204,7 +214,9 @@ public partial class DuckDbInitializer : IDisposable
     /// <see cref="CancellationToken.None"/> takes the original uninterruptible path, so the fourteen
     /// callers outside the analysis pass are unchanged rather than quietly re-timed.</para>
     /// </summary>
-    public IDisposable AcquireReadLock(CancellationToken cancellationToken)
+    public IDisposable AcquireReadLock(
+        CancellationToken cancellationToken,
+        [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
     {
         try
         {
@@ -229,7 +241,7 @@ public partial class DuckDbInitializer : IDisposable
                proceeds normally. */
             return NoOpDisposable.Instance;
         }
-        return new LockReleaser(s_dbLock, write: false);
+        return new LockReleaser(s_dbLock, write: false, StoreLockHolders.Register(holderMember, holderFile, write: false));
     }
 
     /// <summary>
@@ -255,7 +267,8 @@ public partial class DuckDbInitializer : IDisposable
     /// because this caller genuinely has a number to pick: it is bounded by what a UI thread may spend,
     /// not by a caller's remaining budget.</para>
     /// </summary>
-    public IDisposable? TryAcquireReadLock(TimeSpan timeout)
+    public IDisposable? TryAcquireReadLock(
+        TimeSpan timeout, [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
     {
         try
         {
@@ -271,7 +284,7 @@ public partial class DuckDbInitializer : IDisposable
             return NoOpDisposable.Instance;
         }
 
-        return new LockReleaser(s_dbLock, write: false);
+        return new LockReleaser(s_dbLock, write: false, StoreLockHolders.Register(holderMember, holderFile, write: false));
     }
 
     /// <summary>
@@ -288,19 +301,27 @@ public partial class DuckDbInitializer : IDisposable
     /// When a timeout is specified, throws <see cref="TimeoutException"/> if the lock
     /// cannot be acquired within the given duration (e.g., archival is in progress).
     /// </summary>
-    public IDisposable AcquireWriteLock(TimeSpan? timeout = null)
+    public IDisposable AcquireWriteLock(
+        TimeSpan? timeout = null, [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
     {
         if (timeout.HasValue)
         {
+            var waitStarted = Stopwatch.GetTimestamp();
             if (!s_dbLock.TryEnterWriteLock(timeout.Value))
-                throw new TimeoutException(
-                    "Could not acquire database write lock — another operation (archival or maintenance) may be in progress. Please try again in a few moments.");
+            {
+                /* #5650: say who holds the lock and for how long, from the registry every acquisition writes
+                   to. The old text named "archival or maintenance" whatever the holder was. */
+                throw new StoreLockTimeoutException(
+                    Stopwatch.GetElapsedTime(waitStarted),
+                    StoreLockHolders.Snapshot(),
+                    StoreLockHolders.Name(holderMember, holderFile));
+            }
         }
         else
         {
             s_dbLock.EnterWriteLock();
         }
-        return new LockReleaser(s_dbLock, write: true);
+        return new LockReleaser(s_dbLock, write: true, StoreLockHolders.Register(holderMember, holderFile, write: true));
     }
 
     private sealed class NoOpDisposable : IDisposable
@@ -342,18 +363,21 @@ public partial class DuckDbInitializer : IDisposable
     {
         private readonly ReaderWriterLockSlim _lock;
         private readonly bool _write;
+        private readonly long _holdId;
         private bool _disposed;
 
-        public LockReleaser(ReaderWriterLockSlim rwLock, bool write)
+        public LockReleaser(ReaderWriterLockSlim rwLock, bool write, long holdId)
         {
             _lock = rwLock;
             _write = write;
+            _holdId = holdId;
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+            StoreLockHolders.Unregister(_holdId);
             if (_write) _lock.ExitWriteLock();
             else _lock.ExitReadLock();
         }
@@ -378,7 +402,7 @@ public partial class DuckDbInitializer : IDisposable
     /// </summary>
     internal Func<string, long?> AvailableFreeBytesProvider { get; set; } = DataVolumeSpace.GetAvailableFreeBytes;
 
-    /// <summary>The clock the volume warning's cadence reads; a test replaces it.</summary>
+    /// <summary>The clock the volume warning's cadence and the trim skip log read (#5650); a test replaces it.</summary>
     internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
 
     /// <summary>How long a volume that stays low goes without repeating its warning.</summary>
@@ -505,7 +529,11 @@ public partial class DuckDbInitializer : IDisposable
            lock is busy, skip this cycle and try again in TrimInterval. Released before the write-lock
            attempt below so the trim never holds both locks at once. */
         if (!s_dbLock.TryEnterReadLock(0))
+        {
+            RecordTrimSkip();
             return;
+        }
+        var readHoldId = StoreLockHolders.Register(nameof(RunMemoryTrimCycle), "DuckDbInitializer.cs", write: false);
 
         double? beforeBytes;
         try
@@ -520,6 +548,7 @@ public partial class DuckDbInitializer : IDisposable
         finally
         {
             s_dbLock.ExitReadLock();
+            StoreLockHolders.Unregister(readHoldId);
         }
 
         if (beforeBytes is null || beforeBytes < TrimThresholdBytes)
@@ -529,11 +558,13 @@ public partial class DuckDbInitializer : IDisposable
            lock is busy, skip this cycle; the next one TrimInterval later gets another try. */
         if (!s_dbLock.TryEnterWriteLock(0))
         {
+            RecordTrimSkip();
             _logger?.LogDebug(
-                "Trim cycle: skipped, write lock unavailable ({BeforeMb:F0} MB in use)",
+                "Trim cycle: skipped, write lock unavailable ({BeforeMb:F0} MiB in use)",
                 beforeBytes.Value / (1024.0 * 1024.0));
             return;
         }
+        var writeHoldId = StoreLockHolders.Register(nameof(RunMemoryTrimCycle), "DuckDbInitializer.cs", write: true);
 
         var stopwatch = Stopwatch.StartNew();
         try
@@ -568,7 +599,7 @@ public partial class DuckDbInitializer : IDisposable
             stopwatch.Stop();
             var afterBytes = ReadSentinelMemoryUsageBytes(lockedSentinel);
             _logger?.LogDebug(
-                "Trim cycle: {BeforeMb:F0} MB -> {AfterMb:F0} MB in {ElapsedMs}ms (memory_limit {Target} -> {Configured})",
+                "Trim cycle: {BeforeMb:F0} MiB -> {AfterMb:F0} MiB in {ElapsedMs}ms (memory_limit {Target} -> {Configured})",
                 beforeBytes.Value / (1024.0 * 1024.0),
                 (afterBytes ?? 0) / (1024.0 * 1024.0),
                 stopwatch.ElapsedMilliseconds,
@@ -578,6 +609,30 @@ public partial class DuckDbInitializer : IDisposable
         finally
         {
             s_dbLock.ExitWriteLock();
+            StoreLockHolders.Unregister(writeHoldId);
+        }
+    }
+
+    /// <summary>
+    /// Counts one busy-skipped trim cycle and writes the hourly Information line (#5650). Locked because the
+    /// read-lock skip runs with no lock held, so two callers can reach it at once.
+    /// </summary>
+    private void RecordTrimSkip()
+    {
+        lock (_trimSkipGate)
+        {
+            var now = UtcNow();
+            _trimSkipSinceUtc ??= now;
+            _trimSkipCount++;
+            var span = now - _trimSkipSinceUtc.Value;
+            if (span < TrimSkipLogInterval)
+                return;
+
+            _logger?.LogInformation(
+                "Memory trim skipped {Count} time(s) in the last {Minutes:F0} min because the local database was busy",
+                _trimSkipCount, span.TotalMinutes);
+            _trimSkipCount = 0;
+            _trimSkipSinceUtc = null;
         }
     }
 
@@ -725,6 +780,7 @@ public partial class DuckDbInitializer : IDisposable
                 return;
             }
 
+            /* #5650: not registered with StoreLockHolders, because Dispose runs at shutdown only. */
             if (s_dbLock.TryEnterWriteLock(DisposeWriteLockTimeout))
             {
                 try

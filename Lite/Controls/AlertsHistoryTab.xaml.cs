@@ -385,12 +385,33 @@ public partial class AlertsHistoryTab : UserControl
     {
         var selected = AlertsDataGrid.SelectedItems.OfType<AlertHistoryRow>().ToList();
         var liveCount = selected.Count(a => !a.IsArchived);
-        DismissSelectedButton.IsEnabled = liveCount > 0;
+        DismissSelectedButton.IsEnabled = liveCount > 0 && !_dismissInFlight;
+    }
+
+    /* #5650: a dismiss can wait up to 30 s for the local database (LocalDataService.OpenUserWriteConnectionAsync) while
+       archival or a collector write holds it. While it waits, both buttons are off, the line beside them says so, and a
+       second click (the context menu's too) is refused rather than queued behind the first. The flag is read and set on
+       the dispatcher, so it needs no lock; the write itself runs inside Task.Run, so the window stays responsive. */
+    private bool _dismissInFlight;
+
+    private void SetDismissInFlight(bool inFlight)
+    {
+        _dismissInFlight = inFlight;
+        DismissAllButton.IsEnabled = !inFlight;
+        DismissWaitIndicator.Visibility = inFlight ? Visibility.Visible : Visibility.Collapsed;
+        if (inFlight)
+        {
+            DismissSelectedButton.IsEnabled = false;
+        }
+        else
+        {
+            AlertsDataGrid_SelectionChanged(this, null!);
+        }
     }
 
     private async void DismissSelected_Click(object sender, RoutedEventArgs e)
     {
-        if (_dataService == null) return;
+        if (_dataService == null || _dismissInFlight) return;
 
         var selected = AlertsDataGrid.SelectedItems
             .OfType<AlertHistoryRow>()
@@ -422,6 +443,7 @@ public partial class AlertsHistoryTab : UserControl
             if (confirmResult != MessageBoxResult.Yes) return;
         }
 
+        SetDismissInFlight(true);
         try
         {
             var affected = await System.Threading.Tasks.Task.Run(() => _dataService.DismissAlertsAsync(liveAlerts));
@@ -437,10 +459,11 @@ public partial class AlertsHistoryTab : UserControl
             foreach (var dismissedServerId in liveAlerts.Select(a => a.ServerId).Distinct())
                 AlertsDismissed?.Invoke(dismissedServerId);
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
+            AppLogger.Warn("AlertsHistory", StoreBusyReport.LogLine("Dismiss selected", ex));
             MessageBox.Show(
-                "The database is currently busy (archival or maintenance in progress).\n\nPlease try again in a few moments.",
+                StoreBusyReport.DialogText(ex),
                 "Dismiss Unavailable",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
@@ -453,11 +476,15 @@ public partial class AlertsHistoryTab : UserControl
         {
             AppLogger.Error("AlertsHistory", $"Failed to dismiss selected alerts: {ex.Message}");
         }
+        finally
+        {
+            SetDismissInFlight(false);
+        }
     }
 
     private async void DismissAll_Click(object sender, RoutedEventArgs e)
     {
-        if (_dataService == null) return;
+        if (_dataService == null || _dismissInFlight) return;
 
         var allAlerts = (AlertsDataGrid.ItemsSource as IEnumerable<AlertHistoryRow>)?.ToList();
         if (allAlerts == null || allAlerts.Count == 0) return;
@@ -488,6 +515,7 @@ public partial class AlertsHistoryTab : UserControl
 
         if (result != MessageBoxResult.Yes) return;
 
+        SetDismissInFlight(true);
         try
         {
             /* The same window the grid read (#5562): a range that ended in the past dismisses only the rows up to its end. */
@@ -503,10 +531,11 @@ public partial class AlertsHistoryTab : UserControl
             /* Clear the matching server tab badge(s) so the indicator matches the cleared list (issue #1092). */
             AlertsDismissed?.Invoke(serverId);
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
+            AppLogger.Warn("AlertsHistory", StoreBusyReport.LogLine("Dismiss all", ex));
             MessageBox.Show(
-                "The database is currently busy (archival or maintenance in progress).\n\nPlease try again in a few moments.",
+                StoreBusyReport.DialogText(ex),
                 "Dismiss Unavailable",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
@@ -518,6 +547,10 @@ public partial class AlertsHistoryTab : UserControl
         catch (Exception ex)
         {
             AppLogger.Error("AlertsHistory", $"Failed to dismiss all alerts: {ex.Message}");
+        }
+        finally
+        {
+            SetDismissInFlight(false);
         }
     }
 

@@ -7,6 +7,7 @@
  */
 
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
 using PerformanceMonitor.Alerting;
@@ -119,6 +120,16 @@ SELECT
     }
 
     /// <summary>
+    /// The Warning for a skipped maintenance cycle (#2266). <paramref name="budget"/> is the write-lock wait the call really
+    /// had (5 s in the shipped app, two minutes in Lite.Tests), not a number written into the text.
+    /// </summary>
+    internal static string MaintenanceSkippedWarning(int serverId, string holder, TimeSpan budget) =>
+        $"server {serverId}: skipped this cycle's database-state maintenance — could not acquire the " +
+            $"store write lock within {budget.TotalSeconds.ToString("0.##", CultureInfo.InvariantCulture)}s ({holder}). Baselines are not being " +
+            "seeded or healed while this persists (#2189/#2203); deviations are still read. Expected " +
+            "occasionally — if it repeats, the write lock is contended.";
+
+    /// <summary>
     /// The databases whose collected state deviates from their expected state, for the baseline-deviation
     /// database-state alert. Fires only when the deviation is present in the TWO most recent collections
     /// (so a restart's RECOVERY_PENDING / RECOVERING transients — and a standby secondary's per-restore
@@ -172,6 +183,7 @@ SELECT
            the alert memory for all of them. Skipping maintenance is the only failure mode here that loses
            nothing. */
         var maintenanceSkipped = false;
+        var skipHolder = "holder unknown";
         var judged = false;
         List<DatabaseStateInfo>? deviations = null;
         try
@@ -180,11 +192,15 @@ SELECT
             deviations = await SweepDatabaseStatesAsync(maintenance, serverId);
             judged = true;
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
-            /* Archival or compaction holds the write lock. Skip this cycle's maintenance and read anyway —
+            /* Something holds the write lock (#5650: named when the lock registry knows who). Skip this cycle's maintenance and read anyway —
                see the block comment at the top of the method for why skipping is the only lossless option. */
             maintenanceSkipped = true;
+            if (ex is StoreLockTimeoutException typed && typed.Holders.Count > 0)
+            {
+                skipHolder = StoreLockTimeoutException.FormatHolders(typed.Holders);
+            }
         }
 
         /* #2266: report the skip, on the TRANSITION. Warn rather than Error, because a single skipped cycle is
@@ -198,10 +214,7 @@ SELECT
             {
                 _lastMaintenanceSkipped[serverId] = true;
                 AppLogger.Warn(nameof(GetDatabaseStateDeviationsAsync),
-                    $"server {serverId}: skipped this cycle's database-state maintenance — could not acquire the " +
-                    "store write lock within 5s (archival or compaction holds it). Baselines are not being " +
-                    "seeded or healed while this persists (#2189/#2203); deviations are still read. Expected " +
-                    "occasionally — if it repeats, the write lock is contended.");
+                    MaintenanceSkippedWarning(serverId, skipHolder, _backgroundWriteLockBudget));
             }
         }
         else if (_lastMaintenanceSkipped.TryGetValue(serverId, out var hadSkipped) && hadSkipped)
@@ -494,10 +507,10 @@ ORDER BY l.database_name";
     public async Task SetDatabaseStateExpectedAsync(int serverId, string databaseName, string expectedState)
     {
         /* #2208: an upsert, so the WRITE lock. Unlike the deviation read's maintenance prologue this one does
-           NOT swallow a timeout: it is a user action, and TimeoutException's message ("try again in a few
-           moments") is written to be shown. Silently dropping an operator's declared expected state would be
+           NOT swallow a timeout: it is a user action, and StoreLockTimeoutException says how long it
+           waited and who held the lock (#5650), so the caller can show it. Silently dropping an operator's declared expected state would be
            the worst outcome available here. */
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         using var command = connection.CreateCommand();
         /* now()::TIMESTAMP, not a bare current_timestamp: DuckDB resolves a bare current_timestamp against
            the table's columns (and errors) inside a VALUES row and an ON CONFLICT DO UPDATE SET, so the
@@ -524,7 +537,7 @@ DO UPDATE SET expected_state = EXCLUDED.expected_state, is_user_override = true,
     {
         /* #2208: an upsert, so the WRITE lock, and the timeout surfaces for the same reason as the override
            write above — this is the operator pressing a button. */
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         /* Chosen under the write lock this write holds, so the archive-and-reset cannot empty it in between. */
         var src = (await ChooseDatabaseStatesSourceAsync(connection, serverId)).Table;
         using var command = connection.CreateCommand();
