@@ -54,7 +54,7 @@
 -- re-running blindly are the single-table grants in steps 3b-3f: each names a table (or, for the
 -- beacon columns, a trigger dependency) a specific migration creates -- custom_views is V31,
 -- database_state_expected is V49, custom_alert_rules is V116, the mute-rule reload-beacon trigger is
--- V117, config_notification_routes is V131 and config_collector_run_times is V160 and the password key tables (step 3g) are V165 -- so re-run this script after upgrading past each.
+-- V117, config_notification_routes is V131 (its scope_server_id and scope_tag_id columns are V181, #5750: run this script only after the store has migrated to V181, since the route column grants name them) and config_collector_run_times is V160 and the password key tables (step 3g) are V165 -- so re-run this script after upgrading past each.
 --
 -- BEFORE RUNNING:
 --   1. Replace CHANGE_ME_ADMIN_PASSWORD, CHANGE_ME_VIEWER_PASSWORD and CHANGE_ME_MCP_PASSWORD with strong
@@ -576,7 +576,7 @@ BEGIN
    IF to_regclass('config.config_notification_routes') IS NOT NULL THEN
       EXECUTE $v131$
 REVOKE SELECT ON config.config_notification_routes FROM viewer;
-GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at)
+GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at, scope_server_id, scope_tag_id)
     ON config.config_notification_routes TO viewer;
 $v131$;
    END IF;
@@ -611,7 +611,7 @@ BEGIN
    IF to_regclass('config.config_notification_routes') IS NOT NULL THEN
       EXECUTE $v131$
 REVOKE SELECT ON config.config_notification_routes FROM mcp;
-GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at)
+GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at, scope_server_id, scope_tag_id)
     ON config.config_notification_routes TO mcp;
 $v131$;
    END IF;
@@ -692,7 +692,8 @@ GRANT UPDATE (config_version, updated_at) ON config.config_service TO viewer;
 GRANT INSERT, UPDATE, DELETE ON config.config_mute_rules TO mcp;
 GRANT UPDATE (config_version, updated_at) ON config.config_service TO mcp;
 -- #5085: the fleet server-tag write tools run as mcp; these two single-table grants are the admin gate. Both
---     tables are non-secret with no beacon trigger, and server_tags.id is an identity column (no sequence grant).
+--     tables are non-secret, and server_tags.id is an identity column (no sequence grant). V181 (#5750) put a
+--     statement-level reload-beacon trigger on each, so a tag write bumps config_service; the config_service column grant above covers it.
 GRANT INSERT, UPDATE, DELETE ON config.server_tags TO mcp;
 GRANT INSERT, UPDATE, DELETE ON config.server_tag_map TO mcp;
 

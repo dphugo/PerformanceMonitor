@@ -114,6 +114,8 @@ public partial class MainWindow : Window
     private readonly AlertStateService _alertStateService = new();
     private readonly IAlertSettings _alertSettings = new AppAlertSettings();
     private readonly MuteRuleService _muteRuleService;
+    /// <summary>#5750: the scoped notification-route store, for the Settings window (its writes invalidate the route cache).</summary>
+    internal DuckDbNotificationRouteStore NotificationRouteStore { get; private set; } = null!;
     private EmailAlertService _emailAlertService;
 
     /// <summary>The webhook service the email service fans out to, held so the status timer can read each
@@ -149,6 +151,18 @@ public partial class MainWindow : Window
             new DuckDbMuteRuleStore(_databaseInitializer),
             new AppLoggerAdapter<MuteRuleService>());
         _serverManager = new ServerManager(App.SharedConfigDirectory, logger: new AppLoggerAdapter<ServerManager>());
+        /* #5750: the scoped notification routes. Any route, tag or server edit invalidates the cache, which starts one
+           background reload (see NotificationRouteCache); a read that still finds it stale reloads on the calling thread.
+           Task.Run keeps that reload off the UI thread's synchronization context. */
+        /* The route secrets go to CredentialService.TrySaveCredential (RouteSecretAccess), the same write App.SaveWebhookUrl
+           uses (#5772), so a refused save names Windows's reason in the edit dialog and the route stays unchanged (#5750);
+           a value of up to CredentialStore.MaxSecretLength characters is stored. */
+        NotificationRouteStore = new DuckDbNotificationRouteStore(
+            _databaseInitializer,
+            _serverManager.GetKnownServerIds,
+            RouteSecretAccess.CredentialManager());
+        var routeStore = NotificationRouteStore;
+        NotificationRouteCache.Configure(() => Task.Run(() => routeStore.ListAsync()).GetAwaiter().GetResult());
         /* The edition comes from _engineEditions, the same as the alert sweep's: the live status when it has read
            one, else the edition seeded from the store in MainWindow_Loaded. */
         PerformanceMonitorLite.Analysis.AnalysisService.SeparatelyMonitoredDatabasesProvider = serverId =>
@@ -217,6 +231,11 @@ public partial class MainWindow : Window
 
             // Initialize the DuckDB database
             await _databaseInitializer.InitializeAsync();
+
+            /* #5775: remove route credentials no route points at (a crash between writing a new generation and the row, or a
+               delete that failed). Off the UI thread and not awaited: the sweep takes the write lock briefly, logs only a count
+               and never throws. It runs once the file is open, which the store's constructor above cannot wait for. */
+            _ = Task.Run(() => NotificationRouteStore.SweepOrphanedSecretsAsync());
 
             /* The stored engine editions, for the Azure master scope. Awaited here, before anything below that reads
                the scope starts, so the first alert sweep and the first analysis already have them. The wait is
@@ -1694,7 +1713,7 @@ public partial class MainWindow : Window
 
     private async void SettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        var window = new SettingsWindow(_scheduleManager, _serverManager, _backgroundService, _mcpService, _muteRuleService) { Owner = this };
+        var window = new SettingsWindow(_scheduleManager, _serverManager, _backgroundService, _mcpService, _muteRuleService, NotificationRouteStore, _dataService) { Owner = this };
         window.ShowDialog();
         UpdateStatusBar();
 
@@ -2174,7 +2193,7 @@ public partial class MainWindow : Window
     /// The tray notice for a webhook channel that keeps failing (#4750), on the same status timer as
     /// <see cref="CheckConnectionsAndNotify"/>: one notice when a channel reaches
     /// <see cref="WebhookAlertService.FailingChannelThreshold"/> failures in a row, one when it delivers again
-    /// or is turned off (no destination left in the settings; Lite has no routes), and none in between — an
+    /// or is turned off (no destination left in the settings or on an enabled route), and none in between — an
     /// edge like the server-down notice, decided by the same
     /// <see cref="WebhookChannelFailurePolicy"/> Darling's "Notification Channel Failing" alert uses. A channel
     /// can fail for weeks while another one delivers every alert, and nothing else told the user.

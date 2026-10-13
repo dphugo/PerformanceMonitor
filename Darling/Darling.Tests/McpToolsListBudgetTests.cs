@@ -258,7 +258,12 @@ public sealed class McpToolsListBudgetTests
     /* #5640 Lane F: get_client_timeouts gains its reading guide (the 31-byte guide pointer; the head names not_collected on both SKUs and is
        byte-identical to Lite's): 394 -> 422 bytes, the measured total went to 198,632 bytes. */
     /* #5654 D2: create_mute_rule also gains external_source (a 117-character description, +162 bytes). */
-    private const int TotalCeilingBytes = 198_817;
+    /* #5750: get_notification_routes' head names the scope tier in its resolution order and says routes report scope and orphaned
+       (the tool's line 502 -> 555 bytes); the per-route scope fields are in the guide after the marker. The measured total went
+       198,817 -> 198,869 bytes. */
+    /* #5750 F10: re-measured at the head of the shared branch: 198,844 bytes, so the 198,869 above no longer holds (the head text changed
+       since it was measured). Constant set to the measured value. */
+    private const int TotalCeilingBytes = 198_844;
 
 
 

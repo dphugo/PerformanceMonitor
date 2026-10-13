@@ -353,6 +353,64 @@ public class CredentialStore
         return $"{_credentialPrefix}{serverId}";
     }
 
+    /// <summary>
+    /// Lists the keys of this store's Generic credentials whose key starts with <paramref name="keyPrefix"/> (#5775). A key is
+    /// what <see cref="SaveCredential"/> took as <c>serverId</c>: the Credential Manager target without this store's prefix, so
+    /// the result feeds <see cref="DeleteCredential"/> and <see cref="GetCredential"/> as it is. Only this store's own prefix is
+    /// searched, so another app's credentials (Dashboard's <c>PerformanceMonitor_</c> against Lite's
+    /// <c>PerformanceMonitorLite_</c>) never appear. A failure to enumerate is logged and returns an empty list: the caller
+    /// then does nothing, which is the safe outcome for a cleanup.
+    /// </summary>
+    /// <param name="keyPrefix">The start of the key to look for; may not be empty.</param>
+    public System.Collections.Generic.IReadOnlyList<string> ListKeys(string keyPrefix)
+    {
+        if (string.IsNullOrWhiteSpace(keyPrefix))
+        {
+            throw new ArgumentException("Key prefix cannot be null or empty", nameof(keyPrefix));
+        }
+
+        var keys = new System.Collections.Generic.List<string>();
+        try
+        {
+            var wanted = GetCredentialTarget(keyPrefix);
+            if (!NativeMethods.CredEnumerate(wanted + "*", 0, out var count, out var list))
+            {
+                var error = Marshal.GetLastWin32Error();
+                if (error != ErrorNotFound)
+                {
+                    _logger?.LogWarning("Failed to list credentials starting with {KeyPrefix}: Windows returned error {Error}", keyPrefix, error);
+                }
+
+                return Array.Empty<string>();
+            }
+
+            try
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    var entry = Marshal.ReadIntPtr(list, i * IntPtr.Size);
+                    var native = Marshal.PtrToStructure<NativeCredential>(entry);
+                    var target = native.TargetName ?? "";
+                    if (native.Type == CredTypeGeneric && target.StartsWith(wanted, StringComparison.Ordinal))
+                    {
+                        keys.Add(target[_credentialPrefix.Length..]);
+                    }
+                }
+            }
+            finally
+            {
+                NativeMethods.CredFree(list);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Failed to list credentials starting with {KeyPrefix}: {Error}", keyPrefix, ex.Message);
+            return Array.Empty<string>();
+        }
+
+        return keys;
+    }
+
     private const int CredTypeGeneric = 1;
     private const int CredPersistLocalMachine = 2;
     private const int ErrorNotFound = 1168;
@@ -387,6 +445,10 @@ public class CredentialStore
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "CredDeleteW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool CredDelete(string target, int type, int flags);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "CredEnumerateW", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CredEnumerate(string filter, int flags, out int count, out IntPtr credentials);
 
         [DllImport("advapi32.dll", SetLastError = true)]
         internal static extern void CredFree(IntPtr buffer);

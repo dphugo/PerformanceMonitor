@@ -419,7 +419,7 @@ public partial class DuckDbInitializer : IDisposable
     /// <summary>
     /// Current schema version. Increment this when schema changes require table rebuilds.
     /// </summary>
-    internal const int CurrentSchemaVersion = 68;
+    internal const int CurrentSchemaVersion = 69;
 
     private readonly string _archivePath;
 
@@ -2943,6 +2943,27 @@ public partial class DuckDbInitializer : IDisposable
             _logger?.LogInformation("Running migration to v68: config_mute_rules.client_app_pattern (Client Timeouts alert)");
             await AddMissingColumnsAsync(connection, AddedColumnsForVersion(68));
         }
+
+        if (fromVersion < 69)
+        {
+            /* v69 (#5750): notification_routes, the scoped notification routes. A new table with no row to backfill: a
+               database older than v69 has no routes, which is exactly the state before the feature. Non-fatal, matching v58:
+               without the table the route store's load fails, the cache keeps serving no routes, and every alert goes to
+               the app-wide destinations as it did before; the table statements that follow retry the CREATE on the next start. */
+            _logger?.LogInformation("Running migration to v69: adding notification_routes (scoped notification routes)");
+            try
+            {
+                await ExecuteNonQueryAsync(connection, Schema.CreateNotificationRoutesTable);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning("Migration to v69 encountered an error (non-fatal): {Error}", ex.Message);
+            }
+
+            /* #5775: a table that an earlier build of this unreleased step already created has no generation columns; the
+               shared list adds them (a fresh table has them from the CREATE). */
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(69));
+        }
     }
 
     /// <summary>
@@ -2972,6 +2993,12 @@ public partial class DuckDbInitializer : IDisposable
         (65, "ag_database_replica_states", "group_id", "VARCHAR"),
         (66, "query_store_stats", "interval_end_time_utc", "TIMESTAMP"),
         (68, "config_mute_rules", "client_app_pattern", "VARCHAR"),
+        /* #5775: the generation token of each route channel's Credential Manager key. Version 69 is unreleased, so these ride
+           with its table rather than a new step; a file that already ran the first v69 gets them from this list on its next start. */
+        (69, "notification_routes", "teams_secret_gen", "VARCHAR"),
+        (69, "notification_routes", "slack_secret_gen", "VARCHAR"),
+        (69, "notification_routes", "generic_secret_gen", "VARCHAR"),
+        (69, "notification_routes", "pagerduty_secret_gen", "VARCHAR"),
     };
 
     internal static IEnumerable<(int Version, string Table, string Column, string Type)> AddedColumnsForVersion(int version) =>
