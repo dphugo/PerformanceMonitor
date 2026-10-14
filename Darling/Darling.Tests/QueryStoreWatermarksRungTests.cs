@@ -51,8 +51,8 @@ public sealed class QueryStoreWatermarksRungTests
         Assert.Single(PgMigrations.Scripts, m => m.Name == RungName);
         Assert.Equal(versions.Distinct().OrderBy(v => v), versions);
         Assert.Equal(StorageVersion.SchemaVersion, versions[^1]);
-        /* V179 (#5640), V180 (#5654) and V181 (#5750) sit above this rung, so it is the fourth from the top. */
-        Assert.Equal(new[] { 178, 179, 180, 181 }, versions.TakeLast(4).ToArray());
+        /* V179 (#5640), V180 (#5654), V181 (#5750) and V182 (#5506) sit above this rung, so it is the fifth from the top. */
+        Assert.Equal(new[] { 178, 179, 180, 181, 182 }, versions.TakeLast(5).ToArray());
         Assert.Equal(QueryStoreWatermarks.CreateSql, Rung.Sql);
     }
 
@@ -95,9 +95,10 @@ public sealed class QueryStoreWatermarksRungTests
         /* V179's (#5640) and V180's (#5654) sentinels are appended after this one, so this rung is no longer the top. */
         Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 1})", viewer, StringComparison.Ordinal);
         Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 2})", viewer, StringComparison.Ordinal);
-        /* V181's sentinel (#5750) is the probe's last ordinal. */
+        /* V181's sentinel (#5750) is next; V182's (#5506) is the probe's last ordinal. */
         Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 3})", viewer, StringComparison.Ordinal);
-        Assert.DoesNotContain($"reader.GetBoolean({ProbeOrdinal + 4})", viewer, StringComparison.Ordinal);
+        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 4})", viewer, StringComparison.Ordinal);
+        Assert.DoesNotContain($"reader.GetBoolean({ProbeOrdinal + 5})", viewer, StringComparison.Ordinal);
 
         var method = typeof(ViewerDataService).GetMethod("MapProbedSchemaVersion", BindingFlags.NonPublic | BindingFlags.Static)!;
         var parameters = method.GetParameters();
@@ -106,14 +107,20 @@ public sealed class QueryStoreWatermarksRungTests
         Assert.Equal("hasClientTimeoutSettings", parameters[ProbeOrdinal + 1].Name);
         Assert.Equal("hasExternalAlerts", parameters[ProbeOrdinal + 2].Name);
         Assert.Equal("hasNotificationRouteScope", parameters[ProbeOrdinal + 3].Name);
-        Assert.Equal(ProbeOrdinal + 3, parameters.Length - 1);
+        Assert.Equal("hasReadLatencyCapacityFields", parameters[ProbeOrdinal + 4].Name);
+        Assert.Equal(ProbeOrdinal + 4, parameters.Length - 1);
 
         /* Every sentinel present maps to exactly this build's version; with V180's (the top) absent the answer is V179's; with V179's
            absent too this rung is the answer; with this sentinel absent as well, one rung back. */
         var all = Enumerable.Repeat((object)true, parameters.Length).ToArray();
         Assert.Equal(StorageVersion.SchemaVersion, (int)method.Invoke(null, all)!);
 
-        var withoutV181 = (object[])all.Clone();
+        /* V182's sentinel (#5506) is the top: with it absent the answer is V181's. */
+        var withoutV182 = (object[])all.Clone();
+        withoutV182[ProbeOrdinal + 4] = false;
+        Assert.Equal(181, (int)method.Invoke(null, withoutV182)!);
+
+        var withoutV181 = (object[])withoutV182.Clone();
         withoutV181[ProbeOrdinal + 3] = false;
         Assert.Equal(180, (int)method.Invoke(null, withoutV181)!);
 
@@ -153,6 +160,7 @@ public sealed class QueryStoreWatermarksRungTests
             Assert.Equal(StorageVersion.SchemaVersion, Convert.ToInt32(await ScalarAsync(connection, "SELECT MAX(version) FROM darling_schema_version", ct)));
             Assert.Equal(StorageVersion.SchemaVersion, await ProbedVersionAsync(connection, ct));
 
+            await RungRewindArtifacts.DropV182SentinelAsync(connection, ct);
             await RungRewindArtifacts.DropV181SentinelAsync(connection, ct);
             /* V180's (#5654) and V179's (#5640) sentinels are above this rung's; removed, this rung's table is the newest sentinel left. */
             await RungRewindArtifacts.DropV180SentinelAsync(connection, ct);
