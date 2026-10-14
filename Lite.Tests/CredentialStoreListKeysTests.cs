@@ -18,6 +18,7 @@ namespace PerformanceMonitorLite.Tests;
 /// fresh GUID so nothing of the user's is read or touched, and cleaned up in a finally. Skips when this session cannot write a
 /// credential (a service account or a locked-down runner), because then there is nothing to enumerate.
 /// </summary>
+[Collection("credential-manager")]
 public sealed class CredentialStoreListKeysTests
 {
     [Fact]
