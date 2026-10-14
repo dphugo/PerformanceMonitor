@@ -11,7 +11,18 @@ These readers use the same code:
   test-map-select job writes it as an artifact), and `map-keep` reads that artifact for one suite: the Darling PG,
   Lite and no-store Darling passes of a pull request keep only those classes, and run everything when the answer
   is FULL, missing or unreadable. See map_select() for the map's schema. `--replay --map FILE` also replays the
-  corpus against such a map and reports what it would miss (it does not fail on that yet).
+  corpus against such a map and reports what it would miss (it does not fail on that yet); with `--symbols BASE`
+  it also prints the classes each row selects before and after the changed-symbol reason (#5798).
+* `local-classes` and `local-filter` are for a lane on its own machine. `local-classes` lists, most specific first,
+  the test classes whose source names a symbol the branch declares or edits (#5776). `local-filter` (#5798) prints
+  the filter CI's selection gives the branch: per suite, one line is the test executable's arguments
+  (`darling: -class "*.A" -class "*.B"`) and the next is the class list (`darling classes: A B`), and the last line
+  is the guard set (`guard: -trait Stage=Guard`). With `--map` (the nightly test map) it is map-select's own answer;
+  without one, or when that answer is FULL or over 300 classes, it is the part a lane can run, at most 300: the
+  classes of a changed test file, the map's text-pattern classes for the changed files (with `--map`) and the
+  classes that name a changed symbol, which CI selects too. A note on stderr says which. A suite with more than 40
+  classes gets one filter line per 40. Run it as
+  `python .github/scripts/ci-select.py local-filter [--base origin/dev] [--map test-map.json.gz]`.
 * `--replay` reads .github/ci-history/failures.jsonl (a trimmed record of every run with a real test failure)
   and checks that each failing class would have been selected for that run's changed files. A cut to the rules
   lands only while the replay finds 0 misses. A Guard-tagged test runs it on every pull request.
@@ -706,6 +717,38 @@ def _parse_time(text: object) -> "datetime.datetime | None":
     return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
 
 
+def _pattern_hit(g: object, live: list[str], docs_changed: list[str]) -> bool:
+    """Whether a class's text patterns `g` (a glob list) match a changed file: `live` are the changed files outside
+    the documentation allowlist, `docs_changed` the rest."""
+    if not isinstance(g, list):
+        return False
+    # A class that reads a documentation file by name (the migration ladder reads CHANGELOG.md) is selected by a
+    # change to exactly that file; the documentation allowlist only keeps wildcard patterns from matching it.
+    return (any(matches(p, f) for p in g for f in live)
+            or any(p == f for p in g if "*" not in p for f in docs_changed))
+
+
+def text_pattern_classes(test_map: object, changed: list[str], doc_patterns: "tuple[str, ...] | list[str]") -> dict:
+    """{suite: {Class, ...}} of the map's classes whose text patterns (a glob list, not "tree") match a changed
+    file: the classes map_select() gives the reason "text pattern" (#5798). Read straight from the map, so it
+    answers when map_select() is FULL too; an unreadable map gives nothing."""
+    if not isinstance(test_map, dict):
+        return {}
+    classes, patterns = test_map.get("classes"), test_map.get("text_patterns")
+    if not isinstance(classes, dict) or not isinstance(patterns, dict):
+        return {}
+    live = [f for f in changed if not any(matches(p, f) for p in doc_patterns)]
+    live_names = set(live)
+    docs_changed = [f for f in changed if f not in live_names]
+    out: dict[str, set[str]] = {}
+    for suite, entries in classes.items():
+        for cls in entries if isinstance(entries, dict) else ():
+            g = patterns.get(cls)
+            if isinstance(g, list) and all(isinstance(p, str) for p in g) and _pattern_hit(g, live, docs_changed):
+                out.setdefault(suite, set()).add(cls)
+    return out
+
+
 def map_select(test_map: object, changed: list[str], drift: "list[str] | None", discovered: dict,
                *, event: str = "pull_request", keep_full: "tuple[str, ...] | list[str]" = KEEP_FULL,
                doc_patterns: "tuple[str, ...] | list[str]" = DOC_PATTERNS,
@@ -806,12 +849,7 @@ def map_select(test_map: object, changed: list[str], drift: "list[str] | None", 
         g = globs.get(cls)
         if g == "tree":
             return bool(live)
-        if not isinstance(g, list):
-            return False
-        # A class that reads a documentation file by name (the migration ladder reads CHANGELOG.md) is selected by a
-        # change to exactly that file; the documentation allowlist only keeps wildcard patterns from matching it.
-        return (any(matches(p, f) for p in g for f in live)
-                or any(p == f for p in g if "*" not in p for f in docs_changed))
+        return _pattern_hit(g, live, docs_changed)
 
     new_classes = any(cls not in parsed.get(suite, {}) for suite, found in discovered.items() for cls in found)
     for f in live:
@@ -896,18 +934,46 @@ def selection_args(rules: Rules) -> dict:
     return {"keep_full": tuple(dict.fromkeys(keep)), "doc_patterns": tuple(rules.build["docs"])}
 
 
+def _median(values: list) -> float:
+    v = sorted(values)
+    n = len(v)
+    return 0.0 if not n else float(v[n // 2]) if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def _selected_count(sel: dict, size: int) -> int:
+    """How many classes a map_select() answer runs: `size` (every class of the tree) when it is FULL."""
+    return size if sel["full"] else sum(len(v) for v in sel["selected"].values())
+
+
 def map_replay(test_map: "dict | None", corpus: str = CORPUS, root: str = ROOT, quiet: bool = False,
-               misses_out: "str | None" = None) -> int:
+               misses_out: "str | None" = None, symbols_base: "str | None" = None) -> int:
     """Like replay(), but asks the map: would each failing class of each corpus row have been selected, taking the map
     as current (no drift, no age check)? Returns the miss count. Reports only; the caller does not fail on it yet.
     The printed list is capped at 40; `misses_out` names a file that gets EVERY miss as one JSON row per line
-    (date, event, head_sha, suite, class, changed_files), so none goes unclassified (#5459)."""
+    (date, event, head_sha, suite, class, changed_files), so none goes unclassified (#5459).
+
+    With `symbols_base` (#5798), each row whose head commit this clone has is also asked with the classes that name
+    a symbol the commit changed against its merge base with `symbols_base` (map_select()'s `named`), and the
+    report prints the classes selected per row before and after that rule (median and maximum) and how many the
+    rule names on its own. A miss is still counted on the selection without it, so the rule cannot hide one."""
     extra = selection_args(Rules())
     accepted = load_accepted()
     tree = scan_classes(root)
+    if isinstance(test_map, dict) and isinstance(test_map.get("classes"), dict):
+        tree_sel = {s: v for s, v in tree.items() if s in test_map["classes"]}
+    else:
+        tree_sel = tree
     rows = checked = misses = full_rows = accepted_seen = 0
     missed: list[str] = []
     rows_out: list[dict] = []
+    index = test_file_index(root) if symbols_base else None
+    size = sum(len(v) for v in tree_sel.values())
+    before: list[int] = []
+    after: list[int] = []
+    named_counts: list[int] = []
+    partial_before: list[int] = []
+    partial_after: list[int] = []
+    no_commit = 0
     with open(corpus, encoding="utf-8") as fh:
         for line in fh:
             if not line.strip():
@@ -916,6 +982,22 @@ def map_replay(test_map: "dict | None", corpus: str = CORPUS, root: str = ROOT, 
             rows += 1
             sel = map_select(test_map, row["changed_files"], [], tree, event=row["event"], max_age_days=None, **extra)
             full_rows += bool(sel["full"])
+            if symbols_base:
+                named = symbol_classes(root, symbols_base, head=row["head_sha"], index=index)
+                if named is None:
+                    no_commit += 1
+                else:
+                    with_named = map_select(test_map, row["changed_files"], [], tree_sel, event=row["event"],
+                                            max_age_days=None, named=named, **extra)
+                    without = map_select(test_map, row["changed_files"], [], tree_sel, event=row["event"],
+                                         max_age_days=None, **extra)
+                    b, a = _selected_count(without, size), _selected_count(with_named, size)
+                    before.append(b)
+                    after.append(a)
+                    named_counts.append(sum(len(v) for v in named.values()))
+                    if not without["full"]:
+                        partial_before.append(b)
+                        partial_after.append(a)
             for cls in row["failed_classes"]:
                 prefix, simple = split_failed_class(cls)
                 suite = SUITE_BY_PREFIX.get(prefix)
@@ -939,6 +1021,18 @@ def map_replay(test_map: "dict | None", corpus: str = CORPUS, root: str = ROOT, 
             print("MAP-MISS", m)
         if len(missed) > 40:
             print(f"... {len(missed) - 40} more misses not printed; --misses-out FILE lists every one")
+        if symbols_base:
+            print(f"symbol rule (#5798): {len(before)} rows measured ({no_commit} without their head commit here), "
+                  f"{size} classes in the tree, cap {symbol_cap(index)} test files")
+            if before:
+                print(f"  selected per row: before median {_median(before):g} max {max(before)}, after median "
+                      f"{_median(after):g} max {max(after)}")
+                print(f"  the rule names on its own: median {_median(named_counts):g} max {max(named_counts)}")
+            if partial_before:
+                added = [a - b for a, b in zip(partial_after, partial_before)]
+                print(f"  rows not FULL ({len(partial_before)}): before median {_median(partial_before):g} max "
+                      f"{max(partial_before)}, after median {_median(partial_after):g} max {max(partial_after)}, "
+                      f"added median {_median(added):g} max {max(added)}")
     if misses_out:
         with open(misses_out, "w", encoding="utf-8", newline="\n") as out:
             for r in rows_out:
@@ -1119,6 +1213,11 @@ def shadow_row(selection: "dict | None", failed: "dict[str, set[str]]", seen: "d
 SYMBOL_EXTENSIONS = (".cs", ".sql", ".js", ".xaml")
 SYMBOL_SUITES = ("darling", "lite")
 SYMBOL_CAP = 25
+# #5798: the cap is a share of the test files, so it grows with the tree: 1% of the 3,023 test files of 2026-10-14
+# is 30. SYMBOL_CAP is its floor. Measured on the corpus (`--replay --map FILE --symbols origin/dev`, 414 rows),
+# the rule names a median of 51 classes on its own (at most 700, 18% of the 3,826) and adds a median of 1 (at most
+# 202) to a map answer that is not FULL, well under the third of the tree that would call for a tighter cap.
+SYMBOL_CAP_SHARE = 0.01
 SYMBOL_MIN_LEN = 4
 WIDE_MIN_LEN = 6
 LOCAL_CLASS_LIMIT = 300
@@ -1166,6 +1265,14 @@ _XAML_DECL = re.compile(r'x:Name="(\w+)"|x:Class="[\w.]*?(\w+)"|\{Binding\s+(?:P
 _SQL_OBJECT = re.compile(r"\b(?:CREATE|ALTER)\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?(?:MATERIALIZED\s+)?"
                          r"(?:TABLE|VIEW|FUNCTION|PROCEDURE|PROC)\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w\[\]\".]+)", re.I)
 _SQL_VIEW = re.compile(r"\bv_\w+")
+# #5798: a store migration is `private const string V183Sql = ...` plus `new Migration(183, ...)`; the tests name it
+# V183 (in a rung pin, a sentinel or a comment), so both give the token V183. `V183Sql` matches a reference too
+# (`sb.Append(V183Sql)`), wanted: a line that uses a migration's SQL touches that migration. The V-number comes on
+# top of what the other rules take from the line (`new Migration(` still gives `Migration`, which so many test files
+# name that the cap drops it as noisy): a rule here may only add tokens, never take one away, or the selection
+# could run fewer classes than before. A known limit: an edit inside an existing migration's verbatim SQL body
+# (the lines between `V183Sql = @"` and its closing quote) declares nothing, so it gives no token.
+_MIGRATION = re.compile(r"\bV(\d+)Sql\b|\bnew\s+Migration\s*\(\s*(\d+)\s*,")
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@ ?(.*)$")
 
@@ -1242,6 +1349,7 @@ def _declared(path: str, line: str) -> set[str]:
     elif path.endswith(".cs"):
         out.update(_DECL_TYPE.findall(line))
         out.update(_DECL_CONST.findall(line))
+        out.update(f"V{a or b}" for a, b in _MIGRATION.findall(line))
         m = _DECL_MEMBER.match(line)
         if m:
             out.add(m.group(1))
@@ -1315,9 +1423,18 @@ def test_file_index(root: str = ROOT) -> "list[tuple[str, str, list[str], bool, 
     return out
 
 
-def symbol_matches(tokens: "dict[str, set[str]]", test_files: set[str], index: list, cap: int = SYMBOL_CAP) -> dict:
+def symbol_cap(index: list) -> int:
+    """The most test files a token may be named in and still select (#5798): SYMBOL_CAP_SHARE of the test files of
+    `index`, never under SYMBOL_CAP."""
+    return max(SYMBOL_CAP, round(SYMBOL_CAP_SHARE * len(index)))
+
+
+def symbol_matches(tokens: "dict[str, set[str]]", test_files: set[str], index: list, cap: "int | None" = None) -> dict:
     """Match tokens to test classes. Returns {"hits": {(suite, Class): {"tokens": set, "rig": bool, "own": bool}},
-    "counts": {token: test files naming it}, "noisy": {token: count}} (a token over `cap` files is noisy and unused)."""
+    "counts": {token: test files naming it}, "noisy": {token: count}, "cap": the cap used} (a token over `cap`
+    files is noisy and unused; None takes symbol_cap(index))."""
+    if cap is None:
+        cap = symbol_cap(index)
     counts = {t: 0 for t in tokens}
     for _suite, _rel, _classes, _rig, words in index:
         for t in tokens.keys() & words:
@@ -1335,7 +1452,7 @@ def symbol_matches(tokens: "dict[str, set[str]]", test_files: set[str], index: l
             h["tokens"] |= named
             h["rig"] = h["rig"] or rig
             h["own"] = h["own"] or own
-    return {"hits": hits, "counts": counts, "noisy": noisy}
+    return {"hits": hits, "counts": counts, "noisy": noisy, "cap": cap}
 
 
 def ordered_hits(match: dict) -> "list[tuple[str, str, dict]]":
@@ -1351,14 +1468,8 @@ def ordered_hits(match: dict) -> "list[tuple[str, str, dict]]":
     return [(s, c, h) for (s, c), h in sorted(match["hits"].items(), key=key)]
 
 
-def symbol_classes(root: str, base: str, cap: int = SYMBOL_CAP) -> "dict[str, set[str]] | None":
-    """map_select()'s `named`: {suite: {Class, ...}} whose source names a TIGHT token of the change against `base`
-    (tracked files only). None when git cannot say, so the selection is what it was without this reason."""
-    diff = symbol_diff(root, base, untracked=False)
-    if diff is None:
-        return None
-    tokens, _tests = changed_symbols(diff[1])
-    match = symbol_matches(tokens, set(), test_file_index(root), cap)
+def named_classes(match: dict) -> "dict[str, set[str]]":
+    """{suite: {Class, ...}} of the hits that name a token (a changed test file's own classes alone are not named)."""
     out: dict[str, set[str]] = {}
     for (suite, cls), h in match["hits"].items():
         if h["tokens"]:
@@ -1366,12 +1477,32 @@ def symbol_classes(root: str, base: str, cap: int = SYMBOL_CAP) -> "dict[str, se
     return out
 
 
+def symbol_classes(root: str, base: str, cap: "int | None" = None, head: "str | None" = None,
+                   index: "list | None" = None) -> "dict[str, set[str]] | None":
+    """map_select()'s `named`: {suite: {Class, ...}} whose source names a TIGHT token of the change against `base`
+    (tracked files only). With `head`, the change is `head` against its merge base with `base` (the replay's
+    measure, #5798); without it, the working tree. None when git cannot say, so the selection is what it was
+    without this reason."""
+    if head is None:
+        diff = symbol_diff(root, base, untracked=False)
+        if diff is None:
+            return None
+        text = diff[1]
+    else:
+        mb = _git(root, "merge-base", base, head)
+        text = symbol_diff_text(root, mb.strip(), head) if mb and mb.strip() else None
+        if text is None:
+            return None
+    tokens, _tests = changed_symbols(text)
+    return named_classes(symbol_matches(tokens, set(), test_file_index(root) if index is None else index, cap))
+
+
 def _class_args(names: list[str]) -> list[str]:
     """`-class` argument lines for an MTP test executable, 40 classes a line."""
     return [" ".join(f'-class "*.{c}"' for c in names[i:i + 40]) for i in range(0, len(names), 40)]
 
 
-def local_classes(root: str, base: str, map_path: "str | None" = None, wide: bool = False, cap: int = SYMBOL_CAP,
+def local_classes(root: str, base: str, map_path: "str | None" = None, wide: bool = False, cap: "int | None" = None,
                   limit: int = LOCAL_CLASS_LIMIT) -> "tuple[int, list[str]]":
     """The `local-classes` report as (exit code, lines). See the section comment above."""
     diff = symbol_diff(root, base)
@@ -1380,6 +1511,7 @@ def local_classes(root: str, base: str, map_path: "str | None" = None, wide: boo
     mb, text, paths = diff
     tokens, test_files = changed_symbols(text, wide)
     match = symbol_matches(tokens, test_files, test_file_index(root), cap)
+    cap = match["cap"]
     rows = ordered_hits(match)
     usable = sum(1 for t, n in match["counts"].items() if 0 < n <= cap)
     lines = [f"local-classes: merge base {mb[:10]} of {base}, {len(paths)} changed files, "
@@ -1410,11 +1542,7 @@ def local_classes(root: str, base: str, map_path: "str | None" = None, wide: boo
         discovered = scan_classes(root)
         if isinstance(test_map, dict) and isinstance(test_map.get("classes"), dict):
             discovered = {s: v for s, v in discovered.items() if s in test_map["classes"]}
-        named: dict[str, set[str]] = {}
-        for (suite, cls), h in match["hits"].items():
-            if h["tokens"]:
-                named.setdefault(suite, set()).add(cls)
-        sel = map_select(test_map, paths, drift, discovered, named=named, **selection_args(Rules()))
+        sel = map_select(test_map, paths, drift, discovered, named=named_classes(match), **selection_args(Rules()))
         lines.append(f"MAP coverage answer ({map_path}):")
         if sel["full"]:
             lines.append(f"MAP FULL: {sel['reason']}")
@@ -1427,6 +1555,130 @@ def local_classes(root: str, base: str, map_path: "str | None" = None, wide: boo
     return 0, lines
 
 
+GUARD_FILTER = "-trait Stage=Guard"
+_TEST_ATTRIBUTE = re.compile(r"\[(?:Fact|Theory)\b")
+
+
+def _test_holders(root: str, index: list, files: set[str]) -> set[str]:
+    """The classes of `files` that hold a test: a [Fact] or [Theory] between the class's declaration and the next
+    one. A helper class a test file also declares (a fake, a fixture row) has no test, so a filter skips it."""
+    out: set[str] = set()
+    for _suite, rel, _classes, _rig, _words in index:
+        if rel not in files:
+            continue
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8-sig", errors="replace") as fh:
+                lines = fh.read().split("\n")
+        except OSError:
+            continue
+        # (indent, class) of the classes open at this line, by indentation: a test attribute belongs to the nearest
+        # class indented less than it, so a nested helper declared above more tests does not take them.
+        stack: list[tuple[int, str]] = []
+        for line in lines:
+            indent = len(line) - len(line.lstrip(" \t"))
+            m = _CLASS_DECL.match(line)
+            if m or _TEST_ATTRIBUTE.match(line.strip()):
+                while stack and stack[-1][0] >= indent:
+                    stack.pop()
+            if m:
+                stack.append((indent, m.group(1)))
+            elif stack and _TEST_ATTRIBUTE.match(line.strip()):
+                out.add(stack[-1][1])
+    return out
+
+
+def local_filter(root: str, base: str, map_path: "str | None" = None, cap: "int | None" = None,
+                 limit: int = LOCAL_CLASS_LIMIT) -> "tuple[int, list[str], list[str]]":
+    """The `local-filter` answer (#5798) as (exit code, stdout lines, stderr notes). Per suite, the test
+    executable's filter (`<suite>: -class "*.A" -class "*.B"`, a line per 40 classes), then a line that lists the
+    classes (`<suite> classes: A B`); the last line is the guard set, which CI's guard job runs on every pull request.
+
+    The classes are CI's own selection for the branch: with `map_path`, map_select() over the changed files with the
+    changed-symbol reason, exactly as the test-map-select job asks it. Without a map, or when that answer is FULL or
+    over `limit` classes (a lane does not run the whole suite), they are the part of it a lane can run: the
+    classes of a changed test file, then (with `map_path`) the classes whose text pattern in the map matches a
+    changed file, then the classes that name a changed symbol, most specific first and cut at `limit`. CI selects
+    each of them too. A note on stderr says which. Stage=Guard classes are left to the guard line. A suite's filter
+    takes 40 classes a line, so one line stays well under Windows' command-line limit."""
+    diff = symbol_diff(root, base)
+    if diff is None:
+        return 2, [], [f"local-filter: git could not diff the working tree against the merge base of {base} and HEAD"]
+    mb, text, paths = diff
+    tokens, test_files = changed_symbols(text)
+    index = test_file_index(root)
+    match = symbol_matches(tokens, test_files, index, cap)
+    holders = _test_holders(root, index, {rel for _s, rel, _c, _r, _w in index
+                                          if rel in test_files or match["hits"].keys() & {(_s, c) for c in _c}})
+    discovered = scan_classes(root)
+
+    def runnable(suite: str, cls: str) -> bool:
+        # Stage=Guard classes are left to the guard line.
+        return "Stage=Guard" not in discovered.get(suite, {}).get(cls, set())
+
+    # The part a lane can run, most specific first: a changed test file's classes, then the map's text-pattern
+    # classes, then the classes that name a changed symbol (in ordered_hits' order).
+    ranked = ordered_hits(match)
+    own = [(s, c) for s, c, h in ranked if h["own"] and c in holders and runnable(s, c)]
+    named = [(s, c) for s, c, h in ranked if not h["own"] and c in holders and runnable(s, c)]
+    pattern: list[tuple[str, str]] = []
+    chosen: dict[str, set[str]] = {}
+    notes = [f"local-filter: merge base {mb[:10]} of {base}, {len(paths)} changed files"]
+    fallback = True
+    if map_path:
+        test_map = load_map(map_path)
+        sha = test_map.get("sha") if isinstance(test_map, dict) else None
+        drift = git_drift(sha, mb, root) if isinstance(sha, str) else None
+        mapped = discovered
+        if isinstance(test_map, dict) and isinstance(test_map.get("classes"), dict):
+            mapped = {s: v for s, v in discovered.items() if s in test_map["classes"]}
+        args = selection_args(Rules())
+        sel = map_select(test_map, paths, drift, mapped, named=named_classes(match), **args)
+        count = sum(len(v) for v in sel["selected"].values())
+        part = ("the classes that name a changed symbol, sit in a changed test file or have a text pattern in the "
+                "map that matches a changed file")
+        if sel["full"]:
+            notes.append(f"CI's map answer is FULL ({sel['reason']}): CI runs every class; below is the part a lane "
+                         f"runs ({part})")
+        elif count > limit:
+            notes.append(f"CI's map answer runs {count} classes, over {limit}: below is the part a lane runs ({part})")
+        else:
+            fallback = False
+            for suite, cls in own + named:
+                chosen.setdefault(suite, set()).add(cls)
+            for suite, names in sel["selected"].items():
+                chosen.setdefault(suite, set()).update(c for c in names if runnable(suite, c))
+            notes.append(f"CI's map answer: {count} classes")
+        if fallback:
+            # #5798: a class that reads a source file as text (the web tests read wwwroot/js/**) names no symbol, so
+            # the symbol rule misses it; CI selects it through the map's text_patterns, and so does a lane.
+            hits = text_pattern_classes(test_map, list(dict.fromkeys(paths + (drift or []))), args["doc_patterns"])
+            pattern = [(s, c) for s in sorted(hits) for c in sorted(hits[s])
+                       if c in discovered.get(s, {}) and runnable(s, c)]
+    else:
+        notes.append("no --map: below are the classes that name a changed symbol or sit in a changed test file, "
+                     "which CI selects too; pass the nightly test map for CI's whole answer")
+    if fallback:
+        order = list(dict.fromkeys(own + pattern + named))
+        if len(order) > limit:
+            notes.append(f"{len(order)} classes, over {limit}: below are the first {limit}, most specific first")
+            order = order[:limit]
+        for suite, cls in order:
+            chosen.setdefault(suite, set()).add(cls)
+    lines: list[str] = []
+    for suite in SYMBOL_SUITES:
+        names = sorted(chosen.get(suite, ()))
+        # 40 classes a line, as local-classes prints them: 700 `-class "*.X"` arguments on one line come near
+        # Windows' 32,767-character command line (#5100).
+        for arg_line in _class_args(names):
+            lines.append(f"{suite}: {arg_line}")
+        if names:
+            lines.append(f"{suite} classes: " + " ".join(names))
+    if not lines:
+        notes.append("no class outside the guard set is selected")
+    lines.append(f"guard: {GUARD_FILTER}")
+    return 0, lines, notes
+
+
 def _bool(s: str) -> bool:
     return s.strip().lower() == "true"
 
@@ -1437,6 +1689,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--corpus", default=CORPUS)
     ap.add_argument("--map", help="with --replay: also replay the corpus against this class-to-file map (reports only)")
     ap.add_argument("--misses-out", help="with --map: write every map miss, one JSON row per line, to this file")
+    ap.add_argument("--symbols", metavar="BASE", help="with --map: also count the classes each row selects before and "
+                                                      "after the changed-symbol rule, diffing each head commit this "
+                                                      "clone has against its merge base with BASE (#5798)")
     sub = ap.add_subparsers(dest="cmd")
 
     ls = sub.add_parser("lite-scope", help="how much of the Lite suite a leg runs (workflow step)")
@@ -1489,8 +1744,15 @@ def main(argv: list[str]) -> int:
     lc.add_argument("--base", default="origin/dev", help="diff the working tree against the merge base of this and HEAD")
     lc.add_argument("--map", help="also print this test map's coverage answer for the changed files (JSON, or .gz)")
     lc.add_argument("--wide", action="store_true", help="also match every identifier of 6+ characters on a changed line")
-    lc.add_argument("--cap", type=int, default=SYMBOL_CAP, help="drop (and print as NOISY) a token named in more test files")
+    lc.add_argument("--cap", type=int, help="drop (and print as NOISY) a token named in more test files "
+                                         "(default: 1%% of the test files, at least 25)")
     lc.add_argument("--root", default=ROOT, help="the repository (default: this one)")
+
+    lf = sub.add_parser("local-filter", help="the test filter CI's selection gives this branch, per suite, for a lane (#5798)")
+    lf.add_argument("--base", default="origin/dev", help="diff the working tree against the merge base of this and HEAD")
+    lf.add_argument("--map", help="the nightly test map (JSON, or .gz), for CI's whole answer")
+    lf.add_argument("--cap", type=int, help="as local-classes --cap")
+    lf.add_argument("--root", default=ROOT, help="the repository (default: this one)")
 
     mk = sub.add_parser("map-keep", help="the classes a shard keeps from a selection; FULL when it cannot be trusted (workflow step)")
     mk.add_argument("--selection", required=True, help="the JSON map-select --out wrote; missing or unreadable counts as FULL")
@@ -1511,7 +1773,8 @@ def main(argv: list[str]) -> int:
     if args.replay:
         misses = replay(args.corpus)
         if args.map:
-            map_replay(load_map(args.map), args.corpus, misses_out=args.misses_out)  # reports; does not fail the replay yet
+            map_replay(load_map(args.map), args.corpus, misses_out=args.misses_out,
+                       symbols_base=args.symbols)  # reports; does not fail the replay yet
         return 1 if misses else 0
     if args.cmd == "map-select":
         files = list(args.files)
@@ -1549,6 +1812,12 @@ def main(argv: list[str]) -> int:
     if args.cmd == "local-classes":
         code, lines = local_classes(args.root, args.base, args.map, args.wide, args.cap)
         print("\n".join(lines))
+        return code
+    if args.cmd == "local-filter":
+        code, lines, notes = local_filter(args.root, args.base, args.map, args.cap)
+        print("\n".join(notes), file=sys.stderr)
+        if lines:
+            print("\n".join(lines))
         return code
     if args.cmd == "map-keep":
         # Line 1 is `SELECTED <n>` (then one class name per line) or `FULL <reason>`; the exit code is always 0, so a
