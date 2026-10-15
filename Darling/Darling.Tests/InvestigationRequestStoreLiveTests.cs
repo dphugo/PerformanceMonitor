@@ -13,6 +13,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
+using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Storage;
 using Xunit;
 
@@ -304,8 +305,8 @@ FROM config.investigation_requests AS r WHERE r.request_id = '{id}'", ct));
         await RunAsync(async (store, connection, ct) =>
         {
             var id = (await store.OpenOrJoinAsync(Alert(T0), ct)).RequestId!.Value;
-            var tooLong = new string('a', InvestigationRequestStore.MaxAgentIdLength + 1);
-            var longest = new string('b', InvestigationRequestStore.MaxAgentIdLength);
+            var tooLong = new string('a', InvestigationRules.MaxAgentIdLength + 1);
+            var longest = new string('b', InvestigationRules.MaxAgentIdLength);
             const string AgentRows = "SELECT count(*) FROM config.investigation_journal WHERE actor LIKE 'agent:%'";
 
             var refused = await store.ClaimAsync(id, tooLong, ct);
@@ -444,7 +445,7 @@ VALUES ($1, 1, $2, $3, 'real', $4, $5::jsonb, 7)", connection, tx);
             {
                 var printed = long.Parse((await ScalarAsync(connection, $"SELECT octet_length('{json.Replace("'", "''")}'::jsonb::text)", ct))!,
                     CultureInfo.InvariantCulture);
-                Assert.Equal(printed, PerformanceMonitor.Darling.Service.Mcp.DarlingMcpInvestigationTools.PgJsonbTextBytes(
+                Assert.Equal(printed, InvestigationToolCore.PgJsonbTextBytes(
                     System.Text.Json.Nodes.JsonNode.Parse(json)));
             }
         });
