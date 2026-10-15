@@ -37,13 +37,14 @@ public sealed class InvestigationRungTests
     private static PgMigrations.Migration Rung => PgMigrations.Scripts.Single(m => m.Version == RungVersion);
 
     [Fact]
-    public void TheRungIsRegistered_OnceAtTheTopOfTheLadder()
+    public void TheRungIsRegistered_OnceJustBelowTheTopOfTheLadder()
     {
         Assert.Equal("agent-investigations", Rung.Name);
         Assert.Single(PgMigrations.Scripts, m => m.Version == RungVersion);
         Assert.Equal(InvestigationTables.RungVersion, RungVersion);
         Assert.Equal(StorageVersion.SchemaVersion, PgMigrations.Scripts[^1].Version);
-        Assert.Equal(RungVersion, PgMigrations.Scripts[^1].Version);
+        /* V185 (#5812) took the top of the ladder; this rung stays registered just below it. */
+        Assert.Equal(RungVersion, PgMigrations.Scripts[^2].Version);
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);
         Assert.Equal(InvestigationTables.CreateSql, Rung.Sql);
     }
@@ -72,24 +73,30 @@ public sealed class InvestigationRungTests
     }
 
     [Fact]
-    public void TheProbeCarriesTheSentinel_AtTheLastOrdinal_AndAFullyMigratedStoreMapsToThisTopRung()
+    public void TheProbeCarriesTheSentinel_BelowV185s_AndAStoreStoppedHereMapsToThisRung()
     {
         Assert.Contains("to_regclass('config.investigation_requests') IS NOT NULL", ViewerDataService.StoreSchemaProbeSql, StringComparison.Ordinal);
 
         var method = typeof(ViewerDataService).GetMethod("MapProbedSchemaVersion", BindingFlags.NonPublic | BindingFlags.Static)!;
         var parameters = method.GetParameters();
-        Assert.Equal("hasInvestigations", parameters[^1].Name);
-        Assert.Equal("hasReadCaller", parameters[^2].Name);
+        /* V185's sentinel (#5812) is the last parameter; this one is just below it. */
+        Assert.Equal("hasPlanRegressionPartialDays", parameters[^1].Name);
+        Assert.Equal("hasInvestigations", parameters[^2].Name);
+        Assert.Equal("hasReadCaller", parameters[^3].Name);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({parameters.Length - 1})", viewer, StringComparison.Ordinal);
-        Assert.DoesNotContain($"reader.GetBoolean({parameters.Length})", viewer, StringComparison.Ordinal);
+        Assert.Contains($"reader.GetBoolean({parameters.Length - 2})", viewer, StringComparison.Ordinal);
 
         var all = Enumerable.Repeat((object)true, parameters.Length).ToArray();
-        Assert.Equal(RungVersion, (int)method.Invoke(null, all)!);
+        Assert.Equal(StorageVersion.SchemaVersion, (int)method.Invoke(null, all)!);
 
-        var behind = (object[])all.Clone();
-        behind[^1] = false;
+        /* A store stopped here: every sentinel but V185's. */
+        var atThisRung = (object[])all.Clone();
+        atThisRung[^1] = false;
+        Assert.Equal(RungVersion, (int)method.Invoke(null, atThisRung)!);
+
+        var behind = (object[])atThisRung.Clone();
+        behind[^2] = false;
         Assert.Equal(183, (int)method.Invoke(null, behind)!);
 
         var thisArm = viewer.IndexOf("if (hasInvestigations)", StringComparison.Ordinal);
@@ -113,13 +120,15 @@ public sealed class InvestigationRungTests
         await connection.OpenAsync(ct);
         await PgMigrations.MigrateAsync(connection, ct);
 
+        await RungRewindArtifacts.DropV185SentinelAsync(connection, ct);
         await RungRewindArtifacts.DropV184SentinelAsync(connection, ct);
         await ExecAsync(connection, @"
 DELETE FROM darling_schema_version WHERE version >= 184;
 INSERT INTO config.config_notification_routes (metric_match, teams_url) VALUES ('Blocking', 'https://example.invalid/hook');", ct);
         Assert.Equal(183, await ProbedVersionAsync(connection, ct));
 
-        Assert.Equal(1, await PgMigrations.MigrateAsync(connection, ct));
+        /* V184 and the rung above it (V185, #5812) both apply. */
+        Assert.Equal(StorageVersion.SchemaVersion - 183, await PgMigrations.MigrateAsync(connection, ct));
         await AssertMigratedAsync(connection, ct);
 
         await ExecAsync(connection, Rung.Sql, ct);
@@ -138,7 +147,7 @@ INSERT INTO config.investigation_journal (event, actor, once_key) VALUES ('limit
 
     private static async Task AssertMigratedAsync(NpgsqlConnection connection, CancellationToken ct)
     {
-        Assert.Equal(RungVersion, await ProbedVersionAsync(connection, ct));
+        Assert.Equal(StorageVersion.SchemaVersion, await ProbedVersionAsync(connection, ct));
         Assert.Equal("1|1|20|100|15|240", await ScalarAsync(connection, @"
 SELECT count(*) || '|' || count(*) FILTER (WHERE agent_level IS NULL) || '|' || max(agent_max_per_hour) || '|' || max(agent_max_per_day)
        || '|' || max(agent_lease_minutes) || '|' || max(agent_expiry_minutes)

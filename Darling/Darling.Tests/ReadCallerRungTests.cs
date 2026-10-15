@@ -45,8 +45,8 @@ public sealed class ReadCallerRungTests
         Assert.Equal("read-caller", Rung.Name);
         Assert.Single(PgMigrations.Scripts, m => m.Version == RungVersion);
         Assert.Equal(StorageVersion.SchemaVersion, PgMigrations.Scripts[^1].Version);
-        /* V184 (#5632) took the top of the ladder; this rung stays registered just below it. */
-        Assert.Equal(RungVersion, PgMigrations.Scripts[^2].Version);
+        /* V184 (#5632) and V185 (#5812) took the top of the ladder; this rung stays registered below them. */
+        Assert.True(RungVersion < StorageVersion.SchemaVersion);
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);
     }
 
@@ -69,23 +69,25 @@ public sealed class ReadCallerRungTests
 
         var method = typeof(ViewerDataService).GetMethod("MapProbedSchemaVersion", BindingFlags.NonPublic | BindingFlags.Static)!;
         var parameters = method.GetParameters();
-        /* V184's sentinel (#5632) is the last parameter; this one is just below it. */
-        Assert.Equal("hasInvestigations", parameters[^1].Name);
-        Assert.Equal("hasReadCaller", parameters[^2].Name);
-        Assert.Equal("hasReadLatencyCapacityFields", parameters[^3].Name);
+        /* V185's sentinel (#5812) is the last parameter and V184's (#5632) the one before it; this one is just below them. */
+        Assert.Equal("hasPlanRegressionPartialDays", parameters[^1].Name);
+        Assert.Equal("hasInvestigations", parameters[^2].Name);
+        Assert.Equal("hasReadCaller", parameters[^3].Name);
+        Assert.Equal("hasReadLatencyCapacityFields", parameters[^4].Name);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({parameters.Length - 2})", viewer, StringComparison.Ordinal);
+        Assert.Contains($"reader.GetBoolean({parameters.Length - 3})", viewer, StringComparison.Ordinal);
 
         var all = Enumerable.Repeat((object)true, parameters.Length).ToArray();
         Assert.Equal(StorageVersion.SchemaVersion, (int)method.Invoke(null, all)!);
 
         var atThisRung = (object[])all.Clone();
         atThisRung[^1] = false;
+        atThisRung[^2] = false;
         Assert.Equal(RungVersion, (int)method.Invoke(null, atThisRung)!);
 
         var behind = (object[])atThisRung.Clone();
-        behind[^2] = false;
+        behind[^3] = false;
         Assert.Equal(182, (int)method.Invoke(null, behind)!);
 
         var thisArm = viewer.IndexOf("if (hasReadCaller)", StringComparison.Ordinal);
@@ -109,6 +111,7 @@ public sealed class ReadCallerRungTests
         await PgMigrations.MigrateAsync(connection, ct);
 
         /* Put the two tables back to their V182 shape and the ladder back to 182. */
+        await RungRewindArtifacts.DropV185SentinelAsync(connection, ct);
         await RungRewindArtifacts.DropV184SentinelAsync(connection, ct);
         await RungRewindArtifacts.DropV183SentinelAsync(connection, ct);
         await ExecAsync(connection, @"
@@ -120,8 +123,8 @@ INSERT INTO collect.slow_reads (read_time, surface, route, outcome, total_ms, ar
 VALUES ('2026-10-01 05:10', 'mcp', 'get_wait_stats', 'timeout', 60000, '{}', false, '[]', 0, false);", ct);
         Assert.Equal(182, await ProbedVersionAsync(connection, ct));
 
-        /* V183 and the V184 rung above it (#5632) both apply. */
-        Assert.Equal(2, await PgMigrations.MigrateAsync(connection, ct));
+        /* V183 and the rungs above it (V184, #5632; V185, #5812) all apply. */
+        Assert.Equal(StorageVersion.SchemaVersion - 182, await PgMigrations.MigrateAsync(connection, ct));
         await AssertMigratedAsync(connection, ct);
 
         await ExecAsync(connection, Rung.Sql, ct);

@@ -118,7 +118,7 @@ ALTER TABLE IF EXISTS collect.slow_reads
 
     /// <summary>
     /// V183 (#5793): the read caller column of <c>collect.slow_reads</c> and the distinct caller count of
-    /// <c>collect.read_latency</c> (the probe's newest sentinel). Safe on a store that never had them.
+    /// <c>collect.read_latency</c>. Safe on a store that never had them.
     /// </summary>
     internal static async Task DropV183SentinelAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
     {
@@ -131,7 +131,7 @@ ALTER TABLE IF EXISTS collect.slow_reads
     }
 
     /// <summary>
-    /// V184 (#5632): the investigation tables (the probe's newest sentinel is the request table) and the agent columns of
+    /// V184 (#5632): the investigation tables (the probe's V184 sentinel is the request table) and the agent columns of
     /// <c>config.config_notification_routes</c>. Safe on a store that never had them.
     /// </summary>
     internal static async Task DropV184SentinelAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
@@ -150,6 +150,21 @@ ALTER TABLE IF EXISTS config.config_notification_routes
     DROP COLUMN IF EXISTS agent_max_per_day,
     DROP COLUMN IF EXISTS agent_lease_minutes,
     DROP COLUMN IF EXISTS agent_expiry_minutes;", connection);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// V185 (#5812): the partial-day columns of <c>collect.plan_regression_daily_built</c>, <c>built_through</c> (the probe's
+    /// newest sentinel) and <c>partial_seq</c>. Safe on a store that never had them. A whole build made under V185 keeps
+    /// <c>built_seq = late_seq</c> and reads as a whole-day build, as every day built before V185 does. A partial build already
+    /// has <c>built_seq</c> NULL, so V184 reads it as not built, and its V184 builder rebuilds it whole.
+    /// </summary>
+    internal static async Task DropV185SentinelAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(@"
+ALTER TABLE IF EXISTS collect.plan_regression_daily_built
+    DROP COLUMN IF EXISTS built_through,
+    DROP COLUMN IF EXISTS partial_seq;", connection);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 }
