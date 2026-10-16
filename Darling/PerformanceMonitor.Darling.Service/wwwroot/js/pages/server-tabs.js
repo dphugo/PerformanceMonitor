@@ -46,6 +46,7 @@ import { multiPicker, mergeSeriesRows } from "../multi-picker.js";
 import { pgPlanColumn } from "./pg-plan-viewer.js";
 import { READ_FIELDS } from "../read-fields.js";
 import { analysisFindingsTab } from "./analysis-findings.js";
+import { collectorRunBar, runNowColumns } from "./collector-run.js";
 import { downloadText } from "../grid-tools.js";
 import { deadlockGraphCell, processRowsInDatabases } from "./deadlock-graph.js";
 import { activePlanColumns, blockingPlanColumns, deadlockPlanColumn, planColumn, procedurePlanColumn, queryStorePlanColumn } from "./plan-viewer.js";
@@ -2008,6 +2009,8 @@ export const SERVER_TABS = [
     id: "health",
     label: "Collection Health",
     build: (server, ctx) => [
+      /* #5941: "Run all collectors now" (an edit seat only) and the status and results of any run started here. */
+      collectorRunBar(server),
       /* One read, three panels. get_collection_health rolls up seven days of collector logs AND computes sweep
          pressure; these are three slices of that single payload, so three descriptors meant running the tab's
          heaviest query three times to open it. */
@@ -2029,7 +2032,7 @@ export const SERVER_TABS = [
           subtitle: "trailing 7 days",
           viz: "table",
           rowsKey: "collectors",
-          columns: COLLECTOR_COLUMNS,
+          columns: [...COLLECTOR_COLUMNS, ...runNowColumns(server)],
           /* Click-through 10: worst first, not A to Z. */
           orderRows: worstFirst,
           emptyText: "No collection log rows for this server yet.",
@@ -2173,6 +2176,7 @@ export const POSTGRES_TABS = [
          on it, and on a PostgreSQL target it is the FIRST question anyone asks — eight collectors, several of
          them gated off by major version or by Aurora-ness — so it lands on the Overview instead. One read,
          three panels, for the reason fanout exists. */
+      collectorRunBar(server),
       ...fanout("get_collection_health", { server }, [
         { title: "Sweep Pressure", subtitle: "trailing 7 days", viz: "stat", stats: SWEEP_STATS },
         /* #5735: the collection loop's skipped slots, from the same get_collection_health read (its `skipped_cycles`
@@ -2191,7 +2195,7 @@ export const POSTGRES_TABS = [
           subtitle: "trailing 7 days",
           viz: "table",
           rowsKey: "collectors",
-          columns: COLLECTOR_COLUMNS,
+          columns: [...COLLECTOR_COLUMNS, ...runNowColumns(server)],
           /* Click-through 10: worst first, not A to Z. */
           orderRows: worstFirst,
           emptyText: "No collection log rows for this server yet.",
