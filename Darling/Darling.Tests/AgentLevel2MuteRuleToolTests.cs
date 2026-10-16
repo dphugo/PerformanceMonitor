@@ -36,7 +36,7 @@ public sealed class AgentLevel2ToolPolicyTests
     private static readonly string[] ActionTools =
     {
         "create_mute_rule", "update_mute_rule", "delete_mute_rule", "set_mute_rule_enabled",
-        "create_custom_alert_rule", "update_custom_alert_rule", "delete_custom_alert_rule",
+        "create_custom_alert_rule", "update_custom_alert_rule", "delete_custom_alert_rule", "set_alert_threshold_override",
     };
 
     private static readonly DarlingMcpWritePolicy.Effective AgentArm = new(false, false, Investigations: true);
@@ -50,7 +50,7 @@ public sealed class AgentLevel2ToolPolicyTests
     }
 
     [Fact]
-    public void TheInvestigationsArm_ServesExactlyTheSevenActionTools_OfTheWrites()
+    public void TheInvestigationsArm_ServesExactlyTheEightActionTools_OfTheWrites()
     {
         var served = AgentServed().Select(t => t.ProtocolTool.Name).ToList();
         var writes = served.Where(DarlingMcpWritePolicy.IsWrite).OrderBy(n => n, StringComparer.Ordinal).ToList();
@@ -89,15 +89,15 @@ public sealed class AgentLevel2ToolPolicyTests
     }
 
     [Fact]
-    public void TheInstructionsCensus_UnderTheInvestigationsArm_CountsTheSevenAsServed_AndStillSaysTheWritesAreOff()
+    public void TheInstructionsCensus_UnderTheInvestigationsArm_CountsTheEightAsServed_AndStillSaysTheWritesAreOff()
     {
         var catalog = DarlingMcpWritePolicy.ToolNames(McpToolsListBudgetTests.BuildServedTools().Tools);
         var served = AgentServed().Select(t => t.ProtocolTool.Name).ToList();
         var writes = catalog.Count(n => DarlingMcpWritePolicy.IsWrite(n) && !DarlingMcpWritePolicy.IsServerAdmin(n));
         var admin = catalog.Count(DarlingMcpWritePolicy.IsServerAdmin);
         var text = DarlingMcpInstructions.Build(DarlingPeerDirectory.Snapshot.Empty, catalog, served);
-        Assert.Contains($"the write tools are off, so the {writes + admin - 7} that change monitoring configuration are not served", text, StringComparison.Ordinal);
-        Assert.Contains("the 7 mute and custom-rule tools are served only to an agent with an `agent_action` at Level 2", text, StringComparison.Ordinal);
+        Assert.Contains($"the write tools are off, so the {writes + admin - 8} that change monitoring configuration are not served", text, StringComparison.Ordinal);
+        Assert.Contains("the 8 mute, custom-rule and threshold override tools are served only to an agent with an `agent_action` at Level 2", text, StringComparison.Ordinal);
     }
 
     [Fact]

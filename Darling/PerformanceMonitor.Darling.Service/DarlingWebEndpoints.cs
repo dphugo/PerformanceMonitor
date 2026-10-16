@@ -137,6 +137,8 @@ public static class DarlingWebEndpoints
         "delete_custom_view",
         "run_custom_view_panel",
         "update_alert_settings",
+        /* #5916: a threshold override is set over MCP; the web grid has its own admin-login route, not a generic read. */
+        "set_alert_threshold_override",
         "set_notification_route_enabled",
         /* #5632 Phase A: claim and submit write investigation state for an agent over MCP; the web serves the two
            investigation reads only (/api/read). */
@@ -625,6 +627,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         MapCustomAlerts(app, postgres, logger, readAdmission, readLatencyRecorder);
         MapMuteRules(app, postgres, logger);
         MapInvestigationNotes(app, new InvestigationRequestStore(postgres, McpCommandDeadlines.ReadSeconds), logger);
+        MapThresholdOverrides(app, postgres, logger);
         MapServerTags(app, postgres, logger);
         MapAdminServers(app, postgres);
         MapServers(app, postgres, logger);
@@ -1193,6 +1196,70 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 DarlingWebFailureLog.Report(logger, "/api/investigation-notes/{id}/reject", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>
+    /// The threshold-overrides grid's routes (#5916 part 4): <c>GET /api/threshold-overrides</c> lists the overrides and
+    /// <c>PUT /api/threshold-overrides</c> sets or clears one (the body and the answers are <see cref="DarlingWebThresholdOverrides"/>'s).
+    /// The write answers as the note decisions do (#5903): <c>application/json</c> required, born gated by the host's write gate,
+    /// 403 with <see cref="DarlingWebThresholdOverrides.RefusedMessage"/> when the store login holds no write grant on the table
+    /// (the <c>viewer</c> role of a managed or compose store), 400 for a refused key, value or server. Every body goes through the
+    /// statement sweep (#4348): <c>set_by</c> on an agent's override is text an agent named.
+    /// </summary>
+    private static void MapThresholdOverrides(WebApplication app, NpgsqlDataSource postgres, ILogger logger)
+    {
+        app.MapGet("/api/threshold-overrides", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                return DarlingWebStatementSweep.JsonText(
+                    await DarlingWebThresholdOverrides.ListBodyAsync(postgres, context.RequestAborted),
+                    "/api/threshold-overrides", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/threshold-overrides", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/threshold-overrides", async (HttpContext context) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            JsonObject? body;
+            try
+            {
+                body = await JsonNode.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted) as JsonObject;
+            }
+            catch (JsonException)
+            {
+                body = null;
+            }
+
+            if (body is null)
+            {
+                return ErrorResult("The body must be a JSON object: {server_name, key, value, database_name?, clear?}.", StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var (status, answer) = await DarlingWebThresholdOverrides.ChangeAsync(
+                    postgres, logger, body, DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(
+                    answer, "/api/threshold-overrides", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, status);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/threshold-overrides", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
                 return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
             }
         });
@@ -6635,7 +6702,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 : int.TryParse(First(c, "server_id"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var detailsServerId)
                     ? DarlingMcpAlertTools.GetAlertDetails(pg, detailsServerId, detailsMetric, detailsTime, c.RequestAborted)
                     : DarlingMcpAlertTools.GetAlertDetails(pg, 0, "", detailsTime, c.RequestAborted),
-            ["get_alert_settings"] = (c, pg, an) => DarlingMcpAlertTools.GetAlertSettings(pg, c.RequestAborted),
+            ["get_alert_settings"] = (c, pg, an) => DarlingMcpAlertTools.GetAlertSettings(pg, Server(c), c.RequestAborted),
             ["get_mute_rules"] = (c, pg, an) => DarlingMcpAlertTools.GetMuteRules(pg, QueryBool(c, "enabled_only", true), c.RequestAborted),
             ["get_notification_routes"] = (c, pg, an) => DarlingMcpAlertTools.GetNotificationRoutes(pg, c.RequestAborted),
             ["list_investigation_requests"] = (c, pg, an) => DarlingMcpInvestigationTools.ListInvestigationRequests(pg, Str(c, "state"), Server(c), Str(c, "family"), QueryInt(c, "limit", null, 20), c.RequestAborted),

@@ -77,6 +77,7 @@ internal static class DarlingMcpWritePolicy
         "delete_mute_rule",
         "set_mute_rule_enabled",
         "update_alert_settings",
+        "set_alert_threshold_override",
         "delete_notification_route",
         "set_notification_route_enabled",
         "create_custom_alert_rule",
