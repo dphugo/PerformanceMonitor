@@ -312,6 +312,9 @@
                     </StackPanel>
                 </Grid>
             </TabItem>
+            <TabItem Header="_Agent changes">
+                <local:AgentChangesTab x:Name="AgentChangesView"/>
+            </TabItem>
         </TabControl>
 
         <TextBlock x:Name="StatusText" Grid.Row="2" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="0,10,100,0"

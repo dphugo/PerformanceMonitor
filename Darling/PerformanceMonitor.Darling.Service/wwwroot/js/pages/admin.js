@@ -26,6 +26,7 @@
 import { VIZ } from "../panels.js";
 import { el, mount, loadingStrip, errorStrip, emptyStrip, noticeStrip, readTool, apiGet, apiWrite, onSessionExpired, localizeIsoText } from "../util.js";
 import { getSession } from "../views-api.js";
+import { buildAgentChanges, resetAgentChangesStatus } from "./admin-agent-changes.js";
 
 export const SERVER_COLUMNS = [
   { key: "display_name", label: "Display Name" },
@@ -666,6 +667,7 @@ const TABS = [
   { id: "practice", label: "Practice Scores" },
   { id: "pending", label: "Pending Notes" },
   { id: "overrides", label: "Threshold Overrides" },
+  { id: "agent-changes", label: "Agent changes" },
 ];
 
 /* The tab last shown, so a repaint with a bare #/admin returns to it. */
@@ -1786,7 +1788,19 @@ async function buildOverrides(body, generation) {
   mount(body, nodes);
 }
 
-const BUILDERS = { servers: buildServers, routes: buildRoutes, settings: buildSettings, feedback: buildFeedback, practice: buildPractice, pending: buildPending, overrides: buildOverrides };
+/* Agent changes (#5917) lives in its own file; it gets this file's helpers and repaints through startBuilder. */
+const agentChangesContext = {
+  getSession,
+  failure,
+  isCurrent: (generation) => generation === renderGeneration,
+  repaint: () => {
+    if (shownTab === "agent-changes" && shownBody) return startBuilder("agent-changes", shownBody, ++renderGeneration);
+    return null;
+  },
+};
+const buildAgentChangesTab = (body, generation) => buildAgentChanges(body, generation, agentChangesContext);
+
+const BUILDERS = { servers: buildServers, routes: buildRoutes, settings: buildSettings, feedback: buildFeedback, practice: buildPractice, pending: buildPending, overrides: buildOverrides, "agent-changes": buildAgentChangesTab };
 
 /* Run a tab's builder. A builder that throws leaves an error strip: in the Servers tab's table area when its boxes are on the
    page (the form above it is never replaced), else in the body. */
@@ -1831,6 +1845,7 @@ export function renderAdmin(main, tabId) {
     layout = null;
     summary = null;
     notesStatus = null;
+    resetAgentChangesStatus();
     notice = tab.id === "servers" ? held : null;
     if (tab.id === "servers") held = null;
   }

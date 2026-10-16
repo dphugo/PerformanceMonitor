@@ -60,6 +60,8 @@ public partial class InvestigationsWindow : Window
         IsEditable = !readOnly;
         RequestsGrid.ItemsSource = _requests;
         NotesGrid.ItemsSource = _notes;
+        AgentChangesView.Initialize(_dataService, readOnly, login);
+        AgentChangesView.Status += ShowStatus;
         FeedbackReportsGrid.ItemsSource = _feedbackReports;
         PracticePanel.Initialize(_dataService, login, readOnly);
         SetScopes(null);
@@ -175,6 +177,7 @@ public partial class InvestigationsWindow : Window
         await PracticePanel.LoadAsync();
         await LoadNotesAsync();
         await LoadProfilesAsync();
+        await AgentChangesView.LoadAsync();
     }
 
     /// <summary>What the counts and the list are taken over, in words, and the settled-verdict rule the counts use (#5913).</summary>
