@@ -210,6 +210,12 @@ public sealed class ViewerGridPayloadColumnOrderPinTests
         {
             var lite = ColumnHeaders(ReadRepoFile(liteFile), liteGrid);
             var viewer = ColumnHeaders(ReadRepoFile(viewerFile), viewerGrid);
+            // Exempt exactly the column named "Tag", and nothing else, until Darling's viewer gets its tag column, #5988 (which removes this).
+            if (!viewer.Contains("Tag"))
+            {
+                lite = lite.Where(h => h != "Tag").ToList();
+            }
+
             if (lite.SequenceEqual(viewer))
             {
                 continue;
