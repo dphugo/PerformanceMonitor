@@ -55,7 +55,10 @@ public sealed partial class InvestigationRequestStore : IInvestigationRequestSto
 
     /* #5918: a practice request is never joined (a live alert must open its own request) and never counts against a route's limits. */
     internal const string FindJoinSql = @"
-SELECT r.request_id
+SELECT r.request_id,
+       r.max_severity,
+       EXISTS (SELECT 1 FROM config.investigation_request_alerts AS a
+               WHERE a.request_id = r.request_id AND a.metric_name = $5) AS has_metric
 FROM config.investigation_requests AS r
 WHERE r.server_id = $1
   AND r.family = $2
@@ -82,7 +85,8 @@ LIMIT 1";
 UPDATE config.investigation_requests
 SET alert_count = alert_count + 1,
     last_alert_at = greatest(last_alert_at, $2),
-    autonomy_level = least(autonomy_level, " + StampLevelSql(3, 4) + @")
+    autonomy_level = least(autonomy_level, " + StampLevelSql(3, 4) + @"),
+    max_severity = $5
 WHERE request_id = $1";
 
     internal const string CountRouteSql = @"
@@ -96,9 +100,9 @@ WHERE route_id = $1
     internal static readonly string OpenSql = @"
 INSERT INTO config.investigation_requests
     (request_id, route_id, server_id, server_name, family, first_metric, first_dedup_key, story_path_hash,
-     first_alert_at, last_alert_at, window_until, opened_at, expires_at, lease_minutes, autonomy_level)
+     first_alert_at, last_alert_at, window_until, opened_at, expires_at, lease_minutes, autonomy_level, max_severity)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9 + interval '30 minutes', $10, $10 + make_interval(mins => $11), $12,
-        " + StampLevelSql(6, 13) + ")";
+        " + StampLevelSql(6, 13) + ", $14)";
 
     internal const string AlertRowsSql = @"
 INSERT INTO config.investigation_request_alerts
@@ -177,17 +181,84 @@ WHERE request_id = $1 AND claim_id = $2 AND state = 'claimed'";
         $"COALESCE({registry}.display_name, {registry}.server_name, {requests}.server_name) AS registry_display_name, "
         + $"{registry}.server_name AS registry_instance_name";
 
-    /* #5822: the long-poll's catch-up read. Every request opened after $1 on the routes in $2 (all routes when NULL), oldest
-       first, whatever its state now: it answers what opened, and the claim decides what is still claimable. */
+    /* #5822, #6003: the long-poll's catch-up read. Every request event (InvestigationEvents.Kinds, $4) journaled after $1 on the
+       routes in $2 (all routes when NULL), oldest first, whatever the request's state now: it answers what happened, and the
+       claim decides what is still claimable. An open is its request's "opened" row. */
     internal static readonly string OpenedSinceSql = $@"
 SELECT r.request_id, r.route_id, r.server_name, r.family, r.opened_at,
-       {RegistryNamesSelect("r", "sv")}
-FROM config.investigation_requests AS r
+       {RegistryNamesSelect("r", "sv")},
+       j.event_id, j.event, j.event_time, j.detail::text, r.practice_of
+FROM config.investigation_journal AS j
+JOIN config.investigation_requests AS r ON r.request_id = j.request_id
 LEFT JOIN collect.servers AS sv ON sv.server_id = r.server_id
-WHERE r.opened_at > $1
+WHERE j.event_time > $1
+  AND j.event = ANY ($4)
   AND ($2::integer[] IS NULL OR r.route_id = ANY ($2))
-ORDER BY r.opened_at, r.request_id
+ORDER BY j.event_time, j.event_id
 LIMIT $3";
+
+    /* #6003: the events not yet delivered to their agent route, journaled after $1, oldest first. An event counts as delivered
+       once its delivery mark (once key delivered:<event_id>) exists, so a replay of the same event id is never sent again. */
+    internal const string PendingDeliverySql = @"
+SELECT j.journal_id, j.event_id, j.event, j.event_time, r.request_id, r.route_id, r.server_id, r.server_name, r.family,
+       j.reason, j.detail::text, r.practice_of
+FROM config.investigation_journal AS j
+JOIN config.investigation_requests AS r ON r.request_id = j.request_id
+WHERE j.event_time > $1
+  AND j.event = ANY ($2)
+  AND NOT EXISTS (SELECT 1 FROM config.investigation_journal AS d
+                  WHERE d.once_key = 'delivered:' || j.event_id::text)
+ORDER BY j.journal_id
+LIMIT $3";
+
+    /* #6003, D8: requests that expired with no agent holding them, journaled after $1, whose fallback has not been sent. */
+    internal const string UnclaimedExpiriesSql = @"
+SELECT r.request_id, r.route_id, r.server_id, r.server_name, r.family, r.first_metric, r.opened_at, j.event_time
+FROM config.investigation_journal AS j
+JOIN config.investigation_requests AS r ON r.request_id = j.request_id
+WHERE j.event = 'expired'
+  AND j.event_time > $1
+  AND r.practice_of IS NULL
+  AND COALESCE((j.detail ->> 'unclaimed')::boolean, false)
+  AND NOT EXISTS (SELECT 1 FROM config.investigation_journal AS f
+                  WHERE f.once_key = 'fallback:' || r.request_id::text)
+ORDER BY j.journal_id
+LIMIT $2";
+
+    /* #6003, D7: a live request is resolved when EVERY metric linked to it has a resolution row after that metric's last
+       alert on the same server. A resolution row is stored under its title ("CPU Resolved"); its context_json names the
+       metric it resolves (Resolves, written by DarlingSelfAlertEvaluator.BuildResolutionRecord on every clear, whatever the
+       route's SendResolutions says). The member is NOT matched as text (#6003 review round 2): every alert-log write goes
+       through DerivedStoreScrub, which re-serializes a context it changed with an encoder that escapes < > & ' + and every
+       non-ASCII character, so no one encoding of a metric name is the stored one. The candidate rows come back and C# parses
+       each context_json (System.Text.Json reads every escaping); one a text column holds but jsonb refuses (a NUL
+       escape) is no problem there. The prefilter is the member's key, which no encoder escapes. A metric with no candidate
+       comes back once with a NULL context, so a request with an uncleared metric is seen as unresolved. */
+    internal const string ResolveCandidatesSql = @"
+SELECT m.request_id, m.metric_name, h.context_json
+FROM (SELECT a.request_id, a.server_id, a.metric_name, max(a.alert_time) AS last_alert
+      FROM config.investigation_request_alerts AS a
+      WHERE a.request_id IN (SELECT r.request_id
+                             FROM config.investigation_requests AS r
+                             WHERE r.state IN ('open', 'claimed', 'reported')
+                               AND r.practice_of IS NULL
+                               AND r.opened_at > $1 - interval '2 days')
+      GROUP BY a.request_id, a.server_id, a.metric_name) AS m
+LEFT JOIN config.config_alert_log AS h
+       ON h.server_id = m.server_id
+      AND h.alert_time > m.last_alert
+      AND strpos(h.context_json, 'Resolves') > 0";
+
+    /* Journals resolved once per request (once key resolved:<request_id>). The state is checked again: the candidates were
+       read a moment ago. */
+    internal const string ResolveInsertSql = @"
+INSERT INTO config.investigation_journal (event_time, request_id, route_id, server_id, event, actor, once_key)
+SELECT $1, r.request_id, r.route_id, r.server_id, 'resolved', 'service', 'resolved:' || r.request_id::text
+FROM config.investigation_requests AS r
+WHERE r.request_id = ANY($2)
+  AND r.state IN ('open', 'claimed', 'reported')
+  AND r.practice_of IS NULL
+ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
 
     internal static readonly string ListSql = $@"
 SELECT request_id, route_id, server_id, server_name, family, first_metric, first_alert_at, last_alert_at, alert_count,
@@ -350,18 +421,28 @@ FROM config.investigation_requests AS r
 WHERE r.state = 'claimed' AND r.lease_until < $1
 ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
 
+    /* #6003: the row names the request's route, and its detail says whether an agent held the request when it expired
+       (unclaimed), which is what sends the D8 fallback. A claimed request whose lease lapsed counts as unclaimed: the lapse
+       is journaled but leaves the state claimed, and a reported request is never due, so no agent was working on it. */
     internal const string SweepExpireSql = @"
-WITH expired AS (
-    UPDATE config.investigation_requests
-    SET state = 'expired'
+WITH due AS (
+    SELECT request_id, state = 'open' OR (state = 'claimed' AND lease_until < $1) AS unclaimed
+    FROM config.investigation_requests
     WHERE (state IN ('open', 'claimed') AND expires_at <= $1)
        OR (state = 'claimed' AND lease_until < $1 AND claim_count >= 3)
        OR (state = 'open' AND claim_count >= 3)
-    RETURNING request_id, server_id, expires_at > $1 AS exhausted
+    FOR UPDATE
+),
+expired AS (
+    UPDATE config.investigation_requests AS r
+    SET state = 'expired'
+    FROM due AS d
+    WHERE r.request_id = d.request_id
+    RETURNING r.request_id, r.route_id, r.server_id, r.expires_at > $1 AS exhausted, d.unclaimed
 )
-INSERT INTO config.investigation_journal (event_time, request_id, server_id, event, actor, once_key)
-SELECT $1, e.request_id, e.server_id, CASE WHEN e.exhausted THEN 'claims_exhausted' ELSE 'expired' END, 'service',
-       'expired:' || e.request_id::text
+INSERT INTO config.investigation_journal (event_time, request_id, route_id, server_id, event, actor, detail, once_key)
+SELECT $1, e.request_id, e.route_id, e.server_id, CASE WHEN e.exhausted THEN 'claims_exhausted' ELSE 'expired' END, 'service',
+       jsonb_build_object('unclaimed', e.unclaimed), 'expired:' || e.request_id::text
 FROM expired AS e
 ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
 
@@ -409,26 +490,38 @@ ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
 
         await ExecAsync(connection, transaction, GroupLockSql, cancellationToken, P(alert.ServerId), P(alert.Family));
 
+        var severity = AlertSeverityWord(alert.Severity);
         Guid? joinId = null;
+        string? maxSeverity = null;
+        var newMetric = false;
         await using (var find = Command(connection, transaction, FindJoinSql,
-                         P(alert.ServerId), P(alert.Family), P(now), P(alertTime)))
+                         P(alert.ServerId), P(alert.Family), P(now), P(alertTime), P(alert.MetricName)))
+        await using (var found = await find.ExecuteReaderAsync(cancellationToken))
         {
-            var found = await find.ExecuteScalarAsync(cancellationToken);
-            if (found is Guid id)
+            if (await found.ReadAsync(cancellationToken))
             {
-                joinId = id;
+                joinId = found.GetGuid(0);
+                maxSeverity = found.IsDBNull(1) ? null : found.GetString(1);
+                newMetric = !found.GetBoolean(2);
             }
         }
 
         if (joinId is Guid join)
         {
+            /* #6003, D6: a join is an event only when it brings a new metric or a higher severity; any other join is
+               journaled as a quiet join, which neither reader delivers. */
+            var evented = InvestigationEvents.JoinIsEvent(newMetric, maxSeverity, severity);
+            var newMax = InvestigationEvents.SeverityRank(severity) > InvestigationEvents.SeverityRank(maxSeverity)
+                ? severity
+                : maxSeverity ?? severity;
             await ExecAsync(connection, transaction, JoinSql, cancellationToken, P(join), P(alertTime), P(alert.MetricName),
-                P((short)alert.AutonomyLevel));
+                P((short)alert.AutonomyLevel), P(newMax));
             await InsertAlertRowsAsync(connection, transaction, join, alert, alertTime, keys, cancellationToken);
-            await JournalAsync(connection, transaction, now, join, alert.RouteId, alert.ServerId, "joined", "service",
-                alert.MetricName, null, null, cancellationToken);
+            await JournalAsync(connection, transaction, now, join, alert.RouteId, alert.ServerId,
+                evented ? InvestigationEvents.Joined : InvestigationEvents.QuietJoin, "service",
+                alert.MetricName, evented ? JoinDetail(newMetric, severity) : null, null, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
-            return new InvestigationOpenResult(InvestigationOpenOutcome.Joined, join);
+            return new InvestigationOpenResult(InvestigationOpenOutcome.Joined, join) { Evented = evented };
         }
 
         await ExecAsync(connection, transaction, RouteLockSql, cancellationToken, P(RouteLockKey), P(alert.RouteId));
@@ -458,13 +551,21 @@ ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
         await ExecAsync(connection, transaction, OpenSql, cancellationToken,
             P(requestId), P(alert.RouteId), P(alert.ServerId), P(alert.ServerName), P(alert.Family), P(alert.MetricName),
             PNullable(keys.FirstOrDefault()), PNullable(alert.StoryPathHash), P(alertTime), P(now), P(alert.ExpiryMinutes),
-            P(alert.LeaseMinutes), P((short)alert.AutonomyLevel));
+            P(alert.LeaseMinutes), P((short)alert.AutonomyLevel), P(severity));
         await InsertAlertRowsAsync(connection, transaction, requestId, alert, alertTime, keys, cancellationToken);
         await JournalAsync(connection, transaction, now, requestId, alert.RouteId, alert.ServerId, "opened", "service",
             alert.MetricName, null, null, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
-        return new InvestigationOpenResult(InvestigationOpenOutcome.Opened, requestId);
+        return new InvestigationOpenResult(InvestigationOpenOutcome.Opened, requestId) { Evented = true };
     }
+
+    /// <summary>The stored severity word: critical, or warning for anything else (null included).</summary>
+    private static string AlertSeverityWord(string? severity) =>
+        string.Equals(severity, InvestigationEvents.Critical, StringComparison.Ordinal) ? InvestigationEvents.Critical : InvestigationEvents.Warning;
+
+    /// <summary>What a <c>joined</c> event says it brought: a new metric, a higher severity, or both.</summary>
+    private static string JoinDetail(bool newMetric, string severity) =>
+        "{\"new_metric\":" + (newMetric ? "true" : "false") + ",\"severity\":\"" + severity + "\"}";
 
     /// <summary>
     /// Claims <paramref name="requestId"/> for <paramref name="agentId"/> under a new claim id with one conditional UPDATE.
@@ -982,7 +1083,8 @@ ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
                 TypedValue = routeIds is { Count: > 0 } ? routeIds.ToArray() : null,
                 NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Integer,
             },
-            P(limit));
+            P(limit),
+            new NpgsqlParameter<string[]> { TypedValue = InvestigationEvents.Kinds.ToArray(), NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Text });
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         var rows = new List<InvestigationOpenedRow>();
         while (await reader.ReadAsync(cancellationToken))
@@ -994,16 +1096,112 @@ ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
                 reader.GetString(3),
                 reader.GetFieldValue<DateTime>(4),
                 reader.GetString(5),
-                reader.IsDBNull(6) ? null : reader.GetString(6)));
+                reader.IsDBNull(6) ? null : reader.GetString(6))
+            {
+                EventId = reader.GetGuid(7),
+                Event = reader.GetString(8),
+                EventTimeUtc = reader.GetFieldValue<DateTime>(9),
+                /* #6003 review: only the members the event's kind lists leave the store. */
+                DetailJson = InvestigationEvents.PublicDetail(reader.GetString(8), reader.IsDBNull(10) ? null : reader.GetString(10),
+                    reader.IsDBNull(11) ? null : reader.GetGuid(11)),
+            });
         }
 
         return rows;
     }
 
     /// <summary>
+    /// #6003: up to <paramref name="limit"/> request events journaled after <paramref name="sinceUtc"/> that have no delivery
+    /// mark yet, oldest first, for the signed POST to the agent route.
+    /// </summary>
+    public async Task<IReadOnlyList<InvestigationEventRow>> PendingDeliveriesAsync(
+        DateTime sinceUtc, int limit, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = Command(connection, null, PendingDeliverySql,
+            P(DateTime.SpecifyKind(sinceUtc, DateTimeKind.Utc)),
+            new NpgsqlParameter<string[]> { TypedValue = InvestigationEvents.Kinds.ToArray(), NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Text },
+            P(limit));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var rows = new List<InvestigationEventRow>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            /* #6003 review: the signed POST carries only the reason and the detail members the event's kind lists. */
+            var kind = reader.GetString(2);
+            rows.Add(new InvestigationEventRow(
+                reader.GetInt64(0), reader.GetGuid(1), kind, reader.GetFieldValue<DateTime>(3),
+                reader.GetGuid(4), reader.GetInt32(5), reader.GetInt32(6), reader.GetString(7), reader.GetString(8),
+                InvestigationEvents.PublicReason(kind, reader.IsDBNull(9) ? null : reader.GetString(9)),
+                InvestigationEvents.PublicDetail(kind, reader.IsDBNull(10) ? null : reader.GetString(10),
+                    reader.IsDBNull(11) ? null : reader.GetGuid(11))));
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// #6003: writes <paramref name="row"/>'s delivery mark (once key <see cref="InvestigationEvents.DeliveredOnceKey"/>) and
+    /// answers whether THIS call wrote it. The caller sends only on true, so an event id is delivered at most once however
+    /// often it is read or replayed; <paramref name="outcome"/> is null for a send about to be made, else why none is.
+    /// </summary>
+    public Task<bool> MarkDeliveredAsync(InvestigationEventRow row, string? outcome, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        return MarkOnceAsync(row.RequestId, row.RouteId, row.ServerId, InvestigationEvents.Delivered,
+            outcome is null ? row.Event : row.Event + ": " + outcome, InvestigationEvents.DeliveredOnceKey(row.EventId),
+            cancellationToken);
+    }
+
+    /// <summary>#6003, D8: up to <paramref name="limit"/> requests that expired unclaimed after <paramref name="sinceUtc"/>
+    /// and have no fallback yet, oldest first.</summary>
+    public async Task<IReadOnlyList<InvestigationUnclaimedExpiry>> UnclaimedExpiriesAsync(
+        DateTime sinceUtc, int limit, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = Command(connection, null, UnclaimedExpiriesSql,
+            P(DateTime.SpecifyKind(sinceUtc, DateTimeKind.Utc)), P(limit));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var rows = new List<InvestigationUnclaimedExpiry>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new InvestigationUnclaimedExpiry(
+                reader.GetGuid(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetString(3), reader.GetString(4),
+                reader.GetString(5), reader.GetFieldValue<DateTime>(6), reader.GetFieldValue<DateTime>(7)));
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// #6003, D8: writes the request's fallback mark naming <paramref name="target"/> and answers whether THIS call wrote it;
+    /// the caller sends only on true, so a fallback goes out at most once per request.
+    /// </summary>
+    public Task<bool> MarkFallbackAsync(InvestigationUnclaimedExpiry expiry, string target, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expiry);
+        return MarkOnceAsync(expiry.RequestId, expiry.RouteId, expiry.ServerId, InvestigationEvents.FallbackSent, target,
+            InvestigationEvents.FallbackOnceKey(expiry.RequestId), cancellationToken);
+    }
+
+    private async Task<bool> MarkOnceAsync(Guid requestId, int routeId, int serverId, string journalEvent, string reason,
+        string onceKey, CancellationToken cancellationToken)
+    {
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var written = await JournalAsync(connection, transaction, Now(), requestId, routeId, serverId, journalEvent, "service",
+            reason, null, onceKey, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return written > 0;
+    }
+
+    /// <summary>
     /// The expiry sweep: journals each lapsed lease once per claim, then moves every request past its expiry, or out of
     /// claims (its last claim's lease lapsed, or released), to <c>expired</c> and journals that once: <c>expired</c> past the
-    /// expiry, <c>claims_exhausted</c> before it. It never reopens a lease.
+    /// expiry, <c>claims_exhausted</c> before it. It never reopens a lease. Then, in a transaction of its own, it journals
+    /// each live request whose every metric has cleared (<see cref="ResolveCandidatesSql"/>), so a failure there cannot hold
+    /// back the expiry and its fallback (#6003 review).
     /// </summary>
     public async Task<InvestigationSweepResult> SweepAsync(CancellationToken cancellationToken = default)
     {
@@ -1013,7 +1211,73 @@ ON CONFLICT (once_key) WHERE once_key IS NOT NULL DO NOTHING";
         var lapsed = await ExecAsync(connection, transaction, SweepLapsedSql, cancellationToken, P(now));
         var expired = await ExecAsync(connection, transaction, SweepExpireSql, cancellationToken, P(now));
         await transaction.CommitAsync(cancellationToken);
-        return new InvestigationSweepResult(lapsed, expired);
+        await using var resolvedTransaction = await connection.BeginTransactionAsync(cancellationToken);
+        var resolved = await SweepResolvedAsync(connection, resolvedTransaction, now, cancellationToken);
+        await resolvedTransaction.CommitAsync(cancellationToken);
+        return new InvestigationSweepResult(lapsed, expired) { Resolved = resolved };
+    }
+
+    /// <summary>
+    /// The resolved sweep (#6003, D7): reads each live request's linked metrics with the resolution rows logged since each
+    /// metric's last alert, parses their <c>context_json</c> here, and journals <c>resolved</c> for every request whose
+    /// metrics all have a row whose top-level <c>Resolves</c> names them. Returns the
+    /// journal rows written.
+    /// </summary>
+    private async Task<int> SweepResolvedAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, DateTime now,
+        CancellationToken cancellationToken)
+    {
+        /* Per request: each linked metric, and whether a parsed row names it. */
+        var requests = new Dictionary<Guid, Dictionary<string, bool>>();
+        await using (var candidates = Command(connection, transaction, ResolveCandidatesSql, P(now)))
+        await using (var reader = await candidates.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var requestId = reader.GetGuid(0);
+                var metric = reader.GetString(1);
+                if (!requests.TryGetValue(requestId, out var metrics))
+                {
+                    metrics = new Dictionary<string, bool>(StringComparer.Ordinal);
+                    requests[requestId] = metrics;
+                }
+
+                metrics.TryAdd(metric, false);
+                if (!reader.IsDBNull(2) && !metrics[metric] && ResolvesMetric(reader.GetString(2), metric))
+                {
+                    metrics[metric] = true;
+                }
+            }
+        }
+
+        var cleared = requests.Where(r => r.Value.Values.All(done => done)).Select(r => r.Key).ToArray();
+        if (cleared.Length == 0)
+        {
+            return 0;
+        }
+
+        return await ExecAsync(connection, transaction, ResolveInsertSql, cancellationToken, P(now),
+            new NpgsqlParameter<Guid[]> { TypedValue = cleared, NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Uuid });
+    }
+
+    /// <summary>The member of a resolution row's context that names the metric it resolves (<c>DarlingSelfAlertEvaluator.ResolvesMember</c>).</summary>
+    private const string ResolvesMember = "Resolves";
+
+    /// <summary>True when <paramref name="contextJson"/> is a JSON object whose own <c>Resolves</c> string is <paramref name="metric"/>.</summary>
+    private static bool ResolvesMetric(string contextJson, string metric)
+    {
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(contextJson);
+            return document.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                && document.RootElement.TryGetProperty(ResolvesMember, out var member)
+                && member.ValueKind == System.Text.Json.JsonValueKind.String
+                && string.Equals(member.GetString(), metric, StringComparison.Ordinal);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            /* A context that is not JSON names nothing; the row is stored data, not a store read. */
+            return false;
+        }
     }
 
     private Task<int> InsertAlertRowsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid requestId,

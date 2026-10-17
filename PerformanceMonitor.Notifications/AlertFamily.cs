@@ -81,12 +81,17 @@ public static class AlertFamily
     /// <summary>Every family, in the order the settings surfaces list them.</summary>
     public static readonly IReadOnlyList<string> All = new[] { SelfMonitor, Reports, AgentJobs, Performance, External };
 
+    /// <summary>#6003, D8: the self-alert for an investigation request that expired with no agent on it and nowhere else to go.
+    /// A WEBHOOK AUTOMATION KEY like every metric name, so it must stay stable across releases.</summary>
+    public const string InvestigationUnansweredMetric = "Investigation Not Picked Up";
+
     /// <summary>
     /// The exact metric NAME → family census. Every entry is a string the engines deliver verbatim — the
     /// <c>AlertEngine</c>/<c>PostgresAlertEvaluator</c>/<c>AgAlertPolicy</c> constants and the self-alert
     /// evaluator's — spelled here as literals only because this assembly sits below the ones that declare
     /// them; the census test asserts each literal equals its declaring constant.
     /// </summary>
+
     public static readonly IReadOnlyDictionary<string, string> MetricFamilies = new Dictionary<string, string>(StringComparer.Ordinal)
     {
         /* ---- performance: the shared engine's SQL Server alerts ---- */
@@ -143,6 +148,9 @@ public static class AlertFamily
         /* #5654: external alerts the drain could not deliver (expired, interrupted or failed rows). Its
            "External Alerts Delivered Again" recovery is a resolution row, like "Custom Alert Rules Recovered". */
         ["External Alerts Undelivered"] = SelfMonitor,
+        /* #6003, D8: an investigation request expired with no agent on it, and its agent route has no fallback route and no
+           human channel. Never an investigation itself (InvestigationFamily.Of). */
+        [InvestigationUnansweredMetric] = SelfMonitor,
         ["Stale Mute Rules"] = SelfMonitor,
         ["Web TLS Certificate Expiring"] = SelfMonitor,
         /* #5288: the MCP endpoint's twin of the web certificate alert, its own metric so a mute or route for
