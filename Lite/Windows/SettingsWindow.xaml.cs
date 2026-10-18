@@ -1548,6 +1548,97 @@ public partial class SettingsWindow : Window
         UpdateSlackControlStates();
         UpdateGenericControlStates();
         UpdatePagerDutyControlStates();
+        ShowGenericSigning();
+    }
+
+    // ── Generic webhook signing key (#6012) ──
+
+    private static LiteSigningState GenericSigningState() => new(App.GenericSigningSet, App.GenericSigningUntilUtc);
+
+    /// <summary>Shows only that a key is saved and when a rotation ends; never the key. The new-key box is cleared and hidden.</summary>
+    private void ShowGenericSigning()
+    {
+        var state = GenericSigningState();
+        var unreadable = state.HasKey && new AppAlertSettings().GenericSigningKeyUnreadable;
+        GenericSigningStatusText.Text = LiteWebhookSigningKeys.StatusText(state, DateTime.UtcNow, unreadable);
+        GenericSigningGenerateButton.Content = LiteWebhookSigningKeys.ActionText(state);
+        GenericSigningRemoveButton.IsEnabled = state.HasKey;
+        GenericSigningNewKeyBox.Text = "";
+        GenericSigningNewKeyBox.Visibility = Visibility.Collapsed;
+        GenericSigningShownOnceText.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>Writes the two plain facts to settings.json now: a key was just saved to Credential Manager, so the flag that says so
+    /// is saved with it, not left for the Save button. True only when the file was written.</summary>
+    private static bool PersistGenericSigning(LiteSigningState state) =>
+        App.TryWriteSetting("generic signing key", root =>
+        {
+            root["generic_signing_set"] = state.HasKey;
+            root["generic_signing_until"] = state.PreviousUntilUtc?.ToString("o", System.Globalization.CultureInfo.InvariantCulture) ?? "";
+        });
+
+    /// <summary>The flag's save for a Generate or Rotate: the in-memory flag moves with the file, and goes back when the file is not
+    /// written. Null when saved, else why not (#6012).</summary>
+    private static string? SaveGenericSigningState(LiteSigningState next)
+    {
+        var before = GenericSigningState();
+        App.GenericSigningSet = next.HasKey;
+        App.GenericSigningUntilUtc = next.PreviousUntilUtc;
+        if (PersistGenericSigning(next))
+        {
+            return null;
+        }
+
+        App.GenericSigningSet = before.HasKey;
+        App.GenericSigningUntilUtc = before.PreviousUntilUtc;
+        return "settings.json could not be written";
+    }
+
+    private void GenericSigningGenerate_Click(object sender, RoutedEventArgs e)
+    {
+        var result = LiteWebhookSigningKeys.Generate(
+            RouteSecretAccess.CredentialManager(), LiteWebhookSigningKeys.SettingsName(false), LiteWebhookSigningKeys.SettingsName(true),
+            GenericSigningState(), DateTime.UtcNow, SaveGenericSigningState);
+        if (result.Error is { } error)
+        {
+            MessageBox.Show(error, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        ShowGenericSigning();
+
+        /* The key is shown once, in a read-only box to copy from. It is in no label, tooltip or log, and not on the clipboard. */
+        GenericSigningShownOnceText.Text = LiteWebhookSigningKeys.ShownOnceText;
+        GenericSigningShownOnceText.Visibility = Visibility.Visible;
+        GenericSigningNewKeyBox.Text = result.NewKey;
+        GenericSigningNewKeyBox.Visibility = Visibility.Visible;
+        GenericSigningNewKeyBox.Focus();
+        GenericSigningNewKeyBox.SelectAll();
+    }
+
+    private void GenericSigningRemove_Click(object sender, RoutedEventArgs e)
+    {
+        var state = LiteWebhookSigningKeys.Remove(
+            RouteSecretAccess.CredentialManager(), LiteWebhookSigningKeys.SettingsName(false), LiteWebhookSigningKeys.SettingsName(true),
+            GenericSigningState(), out var error);
+        if (error is not null)
+        {
+            MessageBox.Show(error, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!PersistGenericSigning(state))
+        {
+            /* The keys are gone and settings.json still says one is saved. Keep the flag as the file has it (fail closed): the
+               destination reads as unreadable and posts to it are held back until Remove is tried again. */
+            ShowGenericSigning();
+            MessageBox.Show(LiteWebhookSigningKeys.RemoveNotSavedText, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        App.GenericSigningSet = state.HasKey;
+        App.GenericSigningUntilUtc = state.PreviousUntilUtc;
+        ShowGenericSigning();
     }
 
     /// <summary>
@@ -1626,6 +1717,9 @@ public partial class SettingsWindow : Window
         root["generic_webhook_enabled"] = App.GenericWebhookEnabled;
         root["generic_proxy_address"] = App.GenericWebhookProxyAddress;
         root["generic_body_template"] = App.GenericWebhookBodyTemplate;
+        /* #6012: the signing key's two plain facts; the keys are in Credential Manager. */
+        root["generic_signing_set"] = App.GenericSigningSet;
+        root["generic_signing_until"] = App.GenericSigningUntilUtc?.ToString("o", System.Globalization.CultureInfo.InvariantCulture) ?? "";
 
         root["pagerduty_webhook_enabled"] = App.PagerDutyWebhookEnabled;
         root["pagerduty_use_eu_region"] = App.PagerDutyUseEuRegion;
@@ -1845,7 +1939,13 @@ public partial class SettingsWindow : Window
         {
             var body = GenericWebhookBodyBox.Text?.Trim();
             var proxy = GenericWebhookProxyAddressBox.Text?.Trim();
-            var error = await WebhookAlertService.SendTestGenericAsync(url, headers, body, proxy, EmailAlertService.Branding);
+            /* #6012: Lite is the sender, so its test is signed with the saved key. A saved key that will not open sends nothing. */
+            var signing = LiteWebhookSigningKeys.Open(
+                RouteSecretAccess.CredentialManager(), LiteWebhookSigningKeys.SettingsName(false), LiteWebhookSigningKeys.SettingsName(true),
+                GenericSigningState(), DateTime.UtcNow, out var signingUnreadable);
+            var error = signingUnreadable
+                ? LiteWebhookSigningKeys.UnreadableText
+                : await WebhookAlertService.SendTestGenericAsync(url, headers, body, proxy, EmailAlertService.Branding, signing);
 
             if (error == null)
             {

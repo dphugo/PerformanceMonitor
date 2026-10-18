@@ -36,6 +36,9 @@ public partial class NotificationRouteEditDialog : Window
     private const string AgentInvestigateChoice = "Investigate";
 
     private readonly Func<NotificationRoute, Task<bool>> _save;
+    private readonly Func<int, Task<(string? Key, string? Error)>>? _generateKey;
+    private readonly Func<int, Task<string?>>? _removeKey;
+    private readonly Func<int, Task<LiteRouteSigning?>>? _signingState;
     private readonly NotificationRoute? _stored;
     private readonly List<RouteScopeOption> _scopeOptions;
     private readonly ComboBoxItem _wildcardItem = new() { Content = WildcardChoice, Tag = NotificationRoute.WildcardMatch };
@@ -44,10 +47,16 @@ public partial class NotificationRouteEditDialog : Window
     internal NotificationRouteEditDialog(
         IReadOnlyList<RouteScopeOption> scopeOptions,
         Func<NotificationRoute, Task<bool>> save,
-        NotificationRoute? existing = null)
+        NotificationRoute? existing = null,
+        Func<int, Task<(string? Key, string? Error)>>? generateKey = null,
+        Func<int, Task<string?>>? removeKey = null,
+        Func<int, Task<LiteRouteSigning?>>? signingState = null)
     {
         InitializeComponent();
         _save = save;
+        _generateKey = generateKey;
+        _removeKey = removeKey;
+        _signingState = signingState;
         _stored = existing;
         _scopeOptions = scopeOptions.ToList();
         if (_scopeOptions.Count == 0)
@@ -66,6 +75,7 @@ public partial class NotificationRouteEditDialog : Window
         AgentLevelCombo.Items.Add(new ComboBoxItem { Content = AgentOffChoice, Tag = NotificationRoute.AgentLevelOff });
         AgentLevelCombo.Items.Add(new ComboBoxItem { Content = AgentInvestigateChoice, Tag = NotificationRoute.AgentLevelInvestigate });
         ShowAgent(existing);
+        InitSigning();
 
         var selectedScope = existing is null ? _scopeOptions[0] : NotificationRouteUi.OptionFor(existing, _scopeOptions);
         foreach (var option in _scopeOptions)
@@ -106,6 +116,151 @@ public partial class NotificationRouteEditDialog : Window
         InitSecretBox(PagerDutyKeyBox, existing.PagerDutyRoutingKey, existing.IsOffFor(NotificationRouter.PagerDutyChannel));
         SmtpRecipientsBox.Text = existing.SmtpRecipients;
         EnabledCheckBox.IsChecked = existing.Enabled;
+    }
+
+    // ── Signing key (#6012) ──
+
+    /* What the screen knows about the route's key: only that one is saved and when a rotation ends. Never the key. */
+    private bool _hasKey;
+    private DateTime? _previousUntilUtc;
+    private bool _signingUnreadable;
+
+    private void InitSigning()
+    {
+        /* Until the row is read the screen shows what the loaded route says. A key that will not open loads the route with no key
+           and its generic channel off, so the first read below replaces this with the row's own facts. */
+        _hasKey = _stored?.GenericSigning is { HasKey: true };
+        _previousUntilUtc = _stored?.GenericSigning?.PreviousUntilUtc;
+        _signingUnreadable = false;
+        ShowSigning();
+        if (_stored is not null && _signingState is not null)
+        {
+            Loaded += async (_, _) => await RefreshSigningAsync();
+        }
+    }
+
+    /// <summary>Reads the route's saved flag, rotation end and whether the key opens from the row (#6012, round 2), so the screen
+    /// shows what the store saved and not a guess. A read that fails leaves the screen as it was.</summary>
+    private async Task<bool> RefreshSigningAsync()
+    {
+        if (_stored is null || _signingState is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (await _signingState(_stored.RouteId) is not { } read)
+            {
+                return false;
+            }
+
+            _hasKey = read.State.HasKey;
+            _previousUntilUtc = read.State.PreviousUntilUtc;
+            _signingUnreadable = read.State.HasKey && read.Unreadable;
+            ShowSigning();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn("NotificationRoutes", $"The route's signing state could not be read: {ex.GetType().Name}");
+            return false;
+        }
+    }
+
+    private void ShowSigning()
+    {
+        var savedUrl = _stored is not null && (!string.IsNullOrWhiteSpace(_stored.GenericUrl) || _stored.IsOffFor(NotificationRouter.GenericChannel));
+        var state = new LiteSigningState(_hasKey, _previousUntilUtc);
+        SigningGenerateButton.IsEnabled = savedUrl && _generateKey is not null;
+        SigningGenerateButton.Content = LiteWebhookSigningKeys.ActionText(state);
+        SigningRemoveButton.IsEnabled = savedUrl && _removeKey is not null && _hasKey;
+        SigningStatusText.Text = _stored is null
+            ? LiteWebhookSigningKeys.SaveRouteFirstText
+            : savedUrl
+                ? LiteWebhookSigningKeys.StatusText(state, DateTime.UtcNow, _signingUnreadable)
+                : "Save a generic webhook URL on this route first. A key signs the route's own generic URL.";
+        SigningNewKeyBox.Text = "";
+        SigningNewKeyBox.Visibility = Visibility.Collapsed;
+        SigningShownOnceText.Visibility = Visibility.Collapsed;
+    }
+
+    private async void SigningGenerate_Click(object sender, RoutedEventArgs e)
+    {
+        if (_stored is null || _generateKey is null)
+        {
+            return;
+        }
+
+        string? key;
+        string? error;
+        try
+        {
+            (key, error) = await _generateKey(_stored.RouteId);
+        }
+        catch (Exception ex)
+        {
+            /* The store reports a failure as an error, not an exception; this is the last net so a click never ends the app. */
+            AppLogger.Warn("NotificationRoutes", $"The route's signing key was not made: {ex.GetType().Name}");
+            key = null;
+            error = "The key was not made (" + ex.GetType().Name + ").";
+        }
+
+        if (key is null)
+        {
+            SigningStatusText.Text = error ?? "The key was not made.";
+            return;
+        }
+
+        /* Show the state the store saved: the rotation's end is what the row holds, not now plus the overlap. */
+        _hasKey = true;
+        _signingUnreadable = false;
+        _previousUntilUtc = null;
+        if (!await RefreshSigningAsync())
+        {
+            ShowSigning();
+        }
+
+        /* Shown once, in a read-only box to copy from: in no label, tooltip or log, and not on the clipboard. */
+        SigningShownOnceText.Text = LiteWebhookSigningKeys.ShownOnceText;
+        SigningShownOnceText.Visibility = Visibility.Visible;
+        SigningNewKeyBox.Text = key;
+        SigningNewKeyBox.Visibility = Visibility.Visible;
+        SigningNewKeyBox.Focus();
+        SigningNewKeyBox.SelectAll();
+    }
+
+    private async void SigningRemove_Click(object sender, RoutedEventArgs e)
+    {
+        if (_stored is null || _removeKey is null)
+        {
+            return;
+        }
+
+        string? error;
+        try
+        {
+            error = await _removeKey(_stored.RouteId);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn("NotificationRoutes", $"The route's signing key was not removed: {ex.GetType().Name}");
+            error = "The key was not removed (" + ex.GetType().Name + ").";
+        }
+
+        if (error is not null)
+        {
+            SigningStatusText.Text = error;
+            /* A remove that took the keys but not the flag leaves the route unreadable; show the row as it is. */
+            await RefreshSigningAsync();
+            SigningStatusText.Text = error;
+            return;
+        }
+
+        _hasKey = false;
+        _previousUntilUtc = null;
+        _signingUnreadable = false;
+        ShowSigning();
     }
 
     /// <summary>Puts the route's agent channel on the screen (#5820): a new route starts at Inherit with the default limits.</summary>

@@ -397,6 +397,8 @@ CREATE TABLE IF NOT EXISTS notification_routes (
     agent_max_per_day INTEGER,
     agent_lease_minutes INTEGER,
     agent_expiry_minutes INTEGER,
+    generic_signing_set BOOLEAN,
+    generic_signing_until TIMESTAMP,
     CHECK (scope_server_id IS NULL OR scope_tag_id IS NULL),
     CHECK (metric_match <> '*' OR scope_server_id IS NOT NULL OR scope_tag_id IS NOT NULL)
 )";
@@ -455,6 +457,8 @@ CREATE TABLE IF NOT EXISTS investigation_requests (
     closed_reason VARCHAR,
     evidence_state VARCHAR,
     max_severity VARCHAR,
+    follow_up_of UUID,
+    follow_up_at TIMESTAMP,
     CHECK (family IN ('blocking', 'query_performance', 'resources', 'availability', 'jobs', 'self_monitor', 'other')),
     CHECK (state IN ('open', 'claimed', 'reported', 'closed', 'expired'))
 )";
