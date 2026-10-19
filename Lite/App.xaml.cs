@@ -254,6 +254,9 @@ public partial class App : Application
     public static List<string> AlertLongRunningQueryExcludedProgramNamePrefixes { get; set; } = LongRunningQueryExclusions.DefaultProgramNamePrefixes.ToList();
     public static List<string> AlertLongRunningQueryExcludedLogins { get; set; } = LongRunningQueryExclusions.DefaultLogins.ToList();
     public static List<string> AlertExcludedDatabases { get; set; } = new();
+    /* #6098: mount points the Volume Free Space alert ignores on every server (VolumeExclusions is the match
+       rule). Empty by default; persisted as the alert_excluded_volumes array, edited on the Alerts tab. */
+    public static List<string> AlertExcludedVolumes { get; set; } = new();
     public static bool AlertTempDbSpaceEnabled { get; set; } = true;
     public static int AlertTempDbSpaceThresholdPercent { get; set; } = 80;
     public static bool AlertLowDiskEnabled { get; set; } = true;
@@ -1403,6 +1406,10 @@ public partial class App : Application
                     var db = elem.ValueKind == JsonValueKind.String ? elem.GetString() : null;
                     if (!string.IsNullOrWhiteSpace(db)) AlertExcludedDatabases.Add(db);
                 }
+
+                /* #6098 input checks: the same name bounds the MCP write enforces (a name over 128 characters or with a
+                   control character is dropped, at most 256 kept), so a hand-edited file and the tools agree. */
+                AlertExcludedDatabases = ExcludedDatabaseNames.Normalize(AlertExcludedDatabases).ToList();
             }
             /* #3653 (A5, Q5): the two opt-out lists, read with the same element-kind filter as the database list
                above and normalised through the shared rule so a hand-edited file and the Settings window agree.
@@ -1417,6 +1424,13 @@ public partial class App : Application
             if (read.TryGetProperty("alert_long_running_query_excluded_logins", out v) && v.IsArray())
             {
                 AlertLongRunningQueryExcludedLogins = LongRunningQueryExclusions.Normalize(
+                    v.Element.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String).Select(e => e.GetString()!)).ToList();
+            }
+            /* #6098: the Volume Free Space alert's fleet-wide excluded mount points, read like the database list
+               (element-kind filtered) and normalised through the shared rule (VolumeExclusions). */
+            if (read.TryGetProperty("alert_excluded_volumes", out v) && v.IsArray())
+            {
+                AlertExcludedVolumes = VolumeExclusions.Normalize(
                     v.Element.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String).Select(e => e.GetString()!)).ToList();
             }
             if (read.TryGetProperty("alert_tempdb_space_enabled", out v)) AlertTempDbSpaceEnabled = v.Bool(AlertTempDbSpaceEnabled);

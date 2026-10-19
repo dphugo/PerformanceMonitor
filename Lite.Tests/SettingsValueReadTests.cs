@@ -94,6 +94,62 @@ public class SettingsValueReadTests
     }
 
     /// <summary>
+    /// #6098: <c>alert_excluded_volumes</c> is read element-kind filtered and normalised through the shared rule
+    /// (trimmed, blanks dropped, <c>S:\</c> and <c>s:</c> one entry); a present array replaces the stale value.
+    /// </summary>
+    [Fact]
+    public void TheExcludedVolumesList_IsReadNormalised()
+    {
+        var dir = WriteSettings("volumes",
+            """
+            {
+              "alert_excluded_volumes": [" S:\\ ", "s:", 7, "", "/mnt/scratch/"]
+            }
+            """);
+
+        try
+        {
+            App.AlertExcludedVolumes = new System.Collections.Generic.List<string> { "stale" };
+            App.LoadAlertSettings(dir, key => "stored:" + key, FailOnWrite);
+
+            Assert.Equal(new[] { "S:\\", "/mnt/scratch/" }, App.AlertExcludedVolumes);
+        }
+        finally
+        {
+            App.AlertExcludedVolumes = new System.Collections.Generic.List<string>();
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// #6098 input checks: a hand-edited file's volume entry holding a comma or a control character, a stray backslash
+    /// that would otherwise stand for the root, and an over-long database name are dropped on read; the root "/" stays
+    /// and a database name holding a comma is kept.
+    /// </summary>
+    [Fact]
+    public void TheExcludedLists_DropInputTheInputChecksRefuse()
+    {
+        var tooLongDatabase = new string('d', 129);
+        var dir = WriteSettings("inputchecks",
+            "{\"alert_excluded_volumes\": [\"/mnt/a,b\", \"\\\\\\\\\", \"/bad\\u0000nul\", \"/\", \"S:\\\\\"],"
+            + " \"alert_excluded_databases\": [\"Sales,2024\", \"" + tooLongDatabase + "\", \"bad\\u0000name\", \"tempdb\"]}");
+
+        try
+        {
+            App.LoadAlertSettings(dir, key => "stored:" + key, FailOnWrite);
+
+            Assert.Equal(new[] { "/", "S:\\" }, App.AlertExcludedVolumes);
+            Assert.Equal(new[] { "Sales,2024", "tempdb" }, App.AlertExcludedDatabases);
+        }
+        finally
+        {
+            App.AlertExcludedVolumes = new System.Collections.Generic.List<string>();
+            App.AlertExcludedDatabases = new System.Collections.Generic.List<string>();
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    /// <summary>
     /// The same shape one level down, and a second throw site the old single <c>try</c> hid: an array whose
     /// ELEMENT is the wrong kind. <c>elem.GetString()</c> throws on the number, and on dev that one element
     /// cost every setting in the rest of the file.

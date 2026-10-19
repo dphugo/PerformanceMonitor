@@ -575,6 +575,7 @@ public sealed class DarlingMcpAlertTools
         },
         cooldown_minutes = s.CooldownMinutes,
         excluded_databases = s.ExcludedDatabases,
+        excluded_volumes = s.ExcludedVolumes,
         delivery = new
         {
             mode = s.DeliveryMode,
@@ -1061,6 +1062,10 @@ public sealed class DarlingMcpAlertTools
         "shipped values are DEFAULTS from a 7-day production read — the SQL Agent job-step prefix and the two NT AUTHORITY service " +
         "logins; the application's admin login is deliberately not one, because it also runs real ad-hoc long-runners). The fired " +
         "card's Excluded Count item, split by arm, shows the knob working. " +
+        "excluded_volumes is the Volume Free Space alert's fleet-wide list of mount points to ignore (for example [\"S:\\\\\", \"/mnt/scratch\"]): " +
+        "the whole mount point, any case, a trailing \\ or / on either side ignored, never a prefix match. Excluded volumes are dropped before " +
+        "the breach test, so the worst volume, the severity and the card come from the volumes that remain, and a server whose only low volumes " +
+        "are excluded resolves. Pass the FULL list each time; an EMPTY array clears it. " +
         "Returns {status:\"updated\", updated_fields:[...], warnings:[...], settings:{...}} with the full new settings (warnings is " +
         "empty unless a stored-but-unconsulted field was sent, or a round-trip moved the route knob's source from the file to the store), or " +
         "{status:\"unavailable\"} when the settings row has not been seeded yet.")]
@@ -2212,7 +2217,7 @@ public sealed class DarlingMcpAlertTools
             }
         }
 
-        void AddStringArray(string column, JsonNode? node, string field, Func<IEnumerable<string>, IReadOnlyList<string>>? normalize = null)
+        void AddStringArray(string column, JsonNode? node, string field, Func<IEnumerable<string>, IReadOnlyList<string>>? normalize = null, Func<IEnumerable<string>, string?>? refuse = null)
         {
             if (error != null) return;
             if (node is JsonArray arr)
@@ -2231,9 +2236,18 @@ public sealed class DarlingMcpAlertTools
                     }
                 }
 
+                /* #6098 input checks: an optional per-field refusal runs before the normaliser, so input the normaliser
+                   would drop or cut off (a comma, a control character, too long, too many) is refused with the tool's
+                   ordinary invalid answer and nothing is written, instead of the caller finding out later. */
+                if (refuse?.Invoke(array) is { } refusal)
+                {
+                    error = refusal;
+                    return;
+                }
+
                 /* #3653 (A5, Q5): an optional per-field normaliser, so a list whose meaning has a stated canonical
                    form (the Long-Running Query opt-out patterns) is stored in that form; excluded_databases keeps
-                   its raw write, as it always has. */
+                   its raw spelling, as it always has, and gains only the #6098 bounds. */
                 var stored = normalize is null ? array.ToArray() : normalize(array).ToArray();
                 updates.Add(new UpdateTarget(AlertSettingsTable, column, field,
                     new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Text, Value = stored }));
@@ -2322,7 +2336,10 @@ public sealed class DarlingMcpAlertTools
                    the only one that round-trips. Sending both in one body is refused below rather than
                    letting one silently win. */
                 case DeliveryCooldownColumn: AddInt(DeliveryCooldownColumn, prop.Value, DeliveryCooldownColumn, 1, 120, NotificationTable); break;
-                case "excluded_databases": AddStringArray("excluded_databases", prop.Value, "excluded_databases"); break;
+                case "excluded_databases": AddStringArray("excluded_databases", prop.Value, "excluded_databases", ExcludedDatabaseNames.Normalize, r => ExcludedDatabaseNames.Refusal(r, "excluded_databases")); break;
+                /* #6098: the Volume Free Space alert's fleet-wide excluded mount points, stored in the shared canonical
+                   form (trimmed, blanks dropped, a trailing separator ignored when de-duplicating). */
+                case "excluded_volumes": AddStringArray("excluded_volumes", prop.Value, "excluded_volumes", VolumeExclusions.Normalize, r => VolumeExclusions.Refusal(r, "excluded_volumes")); break;
 
                 case "cpu":
                     Group(prop.Value, "cpu", (k, n) =>
