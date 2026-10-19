@@ -140,9 +140,12 @@ public sealed class McpPayloadClockFrameDisciplineTests
             + "five populated columns measure -240.2 to -242.1 against the UTC event_time on the same row, "
             + "and de-skewing them takes (event_time - blocked_last_batch_started) - wait_time_ms from an "
             + "impossible +240.0 minutes to 0.0"),
-        ("DmvBlockingSnapshotsSql", [new("blocked_last_tran_started"), new("blocking_last_tran_started")],
+        ("DmvBlockingSnapshotsSql",
+            [new("blocked_last_tran_started"), new("blocking_last_tran_started"),
+             new("blocking_login_time"), new("blocking_last_request_end_time")],
             "DmvBlockingSnapshotCollector ships sys.dm_tran_active_transactions.transaction_begin_time "
-            + "verbatim, and both columns measure -239.9 to -240.1 against collection_time on two stores"),
+            + "verbatim, and both columns measure -239.9 to -240.1 against collection_time on two stores; "
+            + "blocking_login_time and blocking_last_request_end_time (#5632) ship sys.dm_exec_sessions' own local-clock values verbatim, stored raw"),
         /* The one DERIVED column in the set: the alias is last_user_access, but the expression projected is
            the GREATEST of the four stored DMV columns, so its source has to be named explicitly. The reader
            converts that one value in C#, which equals converting the four first except inside the hour a fall
@@ -311,7 +314,8 @@ public sealed class McpPayloadClockFrameDisciplineTests
         ("Lite/Mcp/McpJobTools.cs", ["StartTime"]),
         ("Lite/Mcp/McpBlockingTools.cs",
             ["BlockedLastTranStarted", "BlockingLastTranStarted", "BlockedLastBatchStarted",
-             "BlockingLastBatchStarted", "BlockedLastBatchCompleted", "BlockingLastBatchCompleted"]),
+             "BlockingLastBatchStarted", "BlockedLastBatchCompleted", "BlockingLastBatchCompleted",
+             "BlockingLoginTime", "BlockingLastRequestEndTime"]),
         ("Lite/Mcp/McpObjectStatsTools.cs", ["LastUserAccess"]),
         ("Lite/Mcp/McpPvsTools.cs",
             ["AbortedCleanerStartTime", "AbortedCleanerEndTime", "OffrowCleanerStartTime", "OffrowCleanerEndTime"]),
@@ -456,7 +460,7 @@ public sealed class McpPayloadClockFrameDisciplineTests
             .Count();
         var liteFields = LiteToolSites.Sum(x => x.Properties.Length);
 
-        Assert.Equal(12, darlingFields);
+        Assert.Equal(14, darlingFields);
         Assert.Equal(darlingFields, liteFields);
 
         /* And the overlap is exactly the DMV fallback's two columns — named as a number so that a THIRD read
@@ -467,8 +471,8 @@ public sealed class McpPayloadClockFrameDisciplineTests
         var liteAlreadyUtcFields = LiteAlreadyUtcToolSites.Sum(x => x.Properties.Length);
 
         Assert.Equal(4, liteAlreadyUtcFields);
-        Assert.Equal(16, darlingFields + liteAlreadyUtcFields);
-        Assert.Equal(16, liteFields + liteAlreadyUtcFields);
+        Assert.Equal(18, darlingFields + liteAlreadyUtcFields);
+        Assert.Equal(18, liteFields + liteAlreadyUtcFields);
     }
 
     /* ───────────────────────── the discriminators, both directions ───────────────────────── */
