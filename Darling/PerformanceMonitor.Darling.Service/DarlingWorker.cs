@@ -15016,15 +15016,19 @@ AND   j.hypertable_name = '{relation}'", connection))
     {
         ServerLoopState? server;
         ServerRuntime? runtime;
+        MonitoredServer? config;
         string displayName;
         lock (_serversLock)
         {
             server = servers.Find(s => s.Config.ServerId == serverId);
             runtime = server?.Runtime;
-            displayName = server?.Config.DisplayName ?? serverId.ToString(CultureInfo.InvariantCulture);
+            /* #6170: the definition is read with the runtime, in one hold of the lock: the login pair below must be the one the
+               address in the runtime was made from, not a later edit's. */
+            config = server?.Config;
+            displayName = config?.DisplayName ?? serverId.ToString(CultureInfo.InvariantCulture);
         }
 
-        if (server is null)
+        if (server is null || config is null)
         {
             return new CommandOutcome(false, "server not monitored", JsonError($"no monitored server with server_id {serverId}"));
         }
@@ -15033,6 +15037,12 @@ AND   j.hypertable_name = '{relation}'", connection))
         {
             return new CommandOutcome(false, "server not connected",
                 JsonError($"server '{displayName}' is not currently connected — a hypothetical index has to be tested against the server's own statistics, so there is nothing to answer from while it is unreachable"));
+        }
+
+        if (!ServerDefinitionEquals(config, runtime.Config))
+        {
+            return new CommandOutcome(false, "server definition changed",
+                JsonError($"server '{displayName}' was edited and is reconnecting; try again once it has reconnected"));
         }
 
         if (runtime.Target.Engine != CollectorTargetEngine.PostgreSql)
@@ -15062,11 +15072,21 @@ AND   j.hypertable_name = '{relation}'", connection))
                 JsonError($"no statement text is stored for queryid {queryId} on '{displayName}'. Text is refreshed on its own cadence and a major-version upgrade re-keys every queryid, so a statement first seen minutes ago genuinely has none yet — there is nothing to re-plan until it does."));
         }
 
+        /* #6170: the check runs under its own login, never the monitoring login. Planning can evaluate a function a database role created
+           when its arguments are constants, and the monitoring login usually holds pg_monitor or pg_read_all_stats. With no login set up
+           the check is refused with what to set up, and nothing is sent to the monitored server. */
+        var (hypotheticalIndexConnectionString, loginRefusal) = Targets.HypotheticalIndexLogin.Resolve(
+            config, runtime.ConnectionString);
+        if (hypotheticalIndexConnectionString is null)
+        {
+            return new CommandOutcome(false, "hypothetical-index login not set up", JsonError(loginRefusal ?? "no login"));
+        }
+
         try
         {
             /* #6143: pinned like every other monitoring connection. The experiment sets the database's own
                search_path only around the EXPLAIN and the hypothetical index it plans against. */
-            await using var connection = PostgresTargetProvider.CreatePinnedConnection(runtime.ConnectionString);
+            await using var connection = PostgresTargetProvider.CreatePinnedConnection(hypotheticalIndexConnectionString);
             await connection.OpenAsync(cancellationToken);
 
             var result = await Targets.HypotheticalIndexExperiment.RunAsync(
@@ -15096,20 +15116,33 @@ AND   j.hypertable_name = '{relation}'", connection))
         {
             throw;
         }
+        catch (NpgsqlException ex) when (Targets.HypotheticalIndexLogin.IsSignInRuleRefusal(ex))
+        {
+            /* #6170: the server asked for a sign-in the check does not accept (clear text, MD5, none, or SCRAM without channel binding). Refused
+               before the password was sent, with what to change. */
+            return new CommandOutcome(false, "hypothetical-index sign-in refused",
+                JsonError($"the hypothetical-index connection to '{displayName}' did not sign in: "
+                    + $"{CustomAlertEvaluator.SanitizeDisplayText(ex.Message, HypotheticalIndexErrorMaxLength).TrimEnd('.')}. "
+                    + Targets.HypotheticalIndexLogin.SignInRule));
+        }
         catch (PostgresException ex)
         {
             /* Reported rather than thrown, and the SQLSTATE travels: 42P01 here means the table named in the
                candidate does not exist, which is a caller mistake, and 42501 means the login cannot plan
-               against it — two different conversations that a bare failure would merge. */
+               against it — two different conversations that a bare failure would merge. The server's text goes to the
+               Viewer, so it is cleaned and capped like the pooler text is (#6165). */
             return new CommandOutcome(false, "experiment failed",
-                JsonError($"planning on '{displayName}' failed: {ex.MessageText} (SQLSTATE {ex.SqlState})"));
+                JsonError($"planning on '{displayName}' failed: {CustomAlertEvaluator.SanitizeDisplayText(ex.MessageText, HypotheticalIndexErrorMaxLength)} (SQLSTATE {ex.SqlState})"));
         }
         catch (Exception ex)
         {
             return new CommandOutcome(false, "experiment failed",
-                JsonError($"planning on '{displayName}' failed: {ex.Message}"));
+                JsonError($"planning on '{displayName}' failed: {CustomAlertEvaluator.SanitizeDisplayText(ex.Message, HypotheticalIndexErrorMaxLength)}"));
         }
     }
+
+    /// <summary>The longest server or driver text the hypothetical-index result carries to the Viewer (#6170).</summary>
+    private const int HypotheticalIndexErrorMaxLength = 300;
 
     /// <summary>
     /// The <c>fetch_active_queries</c> command handler (headless-plan live-snapshot wave): reads the LIVE
