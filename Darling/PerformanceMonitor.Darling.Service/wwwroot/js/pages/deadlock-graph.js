@@ -21,6 +21,20 @@ import { el, disclosure } from "../util.js";
    it. charts.js keeps the same constant; it is repeated here so this file does not import the chart code. */
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+/* One line of the handles block: position, handle, the frame's own statement range, then procedure and line. */
+function frameLine(f) {
+  let t = f.position + " (" + (f.position === 1 ? "running" : "caller") + ")  " + f.sql_handle +
+    "  stmtstart " + f.stmt_start + ", stmtend " + f.stmt_end;
+  if (f.proc_name) t += "  " + f.proc_name;
+  if (f.line != null) t += " line " + f.line;
+  return t;
+}
+
+/* The process's own handle, when the graph put one on the process element that no frame repeats: not a numbered frame. */
+function processHandleLine(h) {
+  return "process (own handle)  " + h.sql_handle + "  stmtstart " + h.stmt_start + ", stmtend " + h.stmt_end;
+}
+
 function svg(tag, attrs) {
   const node = document.createElementNS(SVG_NS, tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) if (v != null) node.setAttribute(k, String(v));
@@ -286,6 +300,16 @@ export function drawDeadlockGraph(graph, row) {
     for (const [k, v] of fields) {
       if (v == null || v === "") continue;
       side.appendChild(el("div", { class: "dlg-prop" }, [el("span", { class: "fk", text: k + ": " }), el("span", { class: "fv", text: v })]));
+    }
+    /* #6205: every execution-stack frame's sql_handle in stack order, with its own statement range, as selectable
+       text for a plan-cache lookup. Frame 1 is the statement that was running; later frames are its callers. */
+    const handleLines = [];
+    if (p.sql_process_handle) handleLines.push(processHandleLine(p.sql_process_handle));
+    if (Array.isArray(p.sql_frames)) for (const f of p.sql_frames) handleLines.push(frameLine(f));
+    if (handleLines.length) {
+      side.appendChild(el("div", { class: "dlg-prop" }, [el("span", { class: "fk", text: (handleLines.length === 1 ? "SQL handle" : "SQL handles (stack order)") + ":" })]));
+      side.appendChild(el("pre", { class: "code", text: handleLines.join("\n") }));
+      side.appendChild(el("div", { class: "dlg-prop", text: "A handle covers a whole batch or procedure: find the statement in sys.dm_exec_query_stats by sql_handle plus statement_start_offset / statement_end_offset." }));
     }
     if (p.sql_text) {
       side.appendChild(el("pre", { class: "code", text: p.sql_text }));

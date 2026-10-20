@@ -660,6 +660,33 @@ public partial class DeadlockGraphControl : UserControl, IGraphViewer
         return text != null && ClipboardText.TrySetText(text);
     }
 
+    /// <summary>
+    /// Every execution-stack frame of <paramref name="node"/> that has a sql_handle, one line each in stack order, with
+    /// its own statement offsets, procedure and line (#6205): the text the Properties panel shows and its Copy button
+    /// puts on the clipboard. <c>null</c> when the process has none (the all-zero dynamic-SQL handle is already
+    /// dropped by the parser).
+    /// </summary>
+    internal static string? SqlHandlesToCopy(DeadlockProcessNode? node)
+    {
+        if (node == null) return null;
+        // The process's own handle (when the graph put one on <process> that no frame repeats) leads, as it does in the plan lookups.
+        var lines = node.StackFrames.Select(f => f.Describe());
+        if (node.ProcessHandle != null) lines = lines.Prepend(node.ProcessHandle.Describe());
+        var text = string.Join(Environment.NewLine, lines);
+        return text.Length == 0 ? null : text;
+    }
+
+    /// <summary>
+    /// Raised when the user asks the Properties panel for the cached plan of a process (#6205). The host owns plan
+    /// lookup (it holds the server connection), so the control only reports which process; the "View Cached Plan"
+    /// button is shown only while a host is listening and the process has a usable sql_handle.
+    /// </summary>
+    public event Action<DeadlockProcessNode>? ViewCachedPlanRequested;
+
+    private const string HandleHint =
+        "Frame 1 is the statement that was running; later frames are its callers. A handle covers a whole batch or " +
+        "procedure: find the statement in sys.dm_exec_query_stats by sql_handle plus statement_start_offset / statement_end_offset.";
+
     private void ShowProperties(DeadlockProcessNode node)
     {
         PropertiesContent.Children.Clear();
@@ -680,6 +707,79 @@ public partial class DeadlockGraphControl : UserControl, IGraphViewer
         if (!string.IsNullOrEmpty(node.LoginName)) AddPropRow("Login", node.LoginName);
         if (!string.IsNullOrEmpty(node.HostName)) AddPropRow("Host", node.HostName);
         if (!string.IsNullOrEmpty(node.ClientApp)) AddPropRow("Application", node.ClientApp);
+
+        var handlesText = SqlHandlesToCopy(node);
+        if (handlesText != null)
+        {
+            // #6205: the sql_handle(s) beside the other values, as selectable text with a Copy button, so the
+            // plan can be found in the cache. One heading row like SQL Text's; the optional plan action sits
+            // beside Copy when the host can fetch a cached plan.
+            var handleHeading = new DockPanel { Margin = new Thickness(0, 10, 0, 4), LastChildFill = true };
+
+            var copyHandles = new Button
+            {
+                Content = "Copy",
+                ToolTip = "Copy the sql_handle(s) to the clipboard",
+                Padding = new Thickness(8, 0, 8, 0),
+                Height = 22,
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            AutomationProperties.SetName(copyHandles, "Copy SQL handles");
+            copyHandles.Click += (_, _) => ClipboardText.TrySetText(handlesText);
+            DockPanel.SetDock(copyHandles, Dock.Right);
+            handleHeading.Children.Add(copyHandles);
+
+            if (ViewCachedPlanRequested != null)
+            {
+                var planButton = new Button
+                {
+                    Content = "View Cached Plan",
+                    ToolTip = "Look this process's plan up in the plan cache by its sql_handle",
+                    Padding = new Thickness(8, 0, 8, 0),
+                    Height = 22,
+                    FontSize = 11,
+                    Margin = new Thickness(0, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                AutomationProperties.SetName(planButton, "View cached plan");
+                planButton.Click += (_, _) => ViewCachedPlanRequested?.Invoke(node);
+                DockPanel.SetDock(planButton, Dock.Right);
+                handleHeading.Children.Add(planButton);
+            }
+
+            handleHeading.Children.Add(new TextBlock
+            {
+                Text = node.StackFrames.Count + (node.ProcessHandle != null ? 1 : 0) == 1 ? "SQL Handle" : "SQL Handles (stack order)",
+                ToolTip = HandleHint,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = MutedBrush,
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            PropertiesContent.Children.Add(handleHeading);
+            PropertiesContent.Children.Add(new TextBlock
+            {
+                Text = HandleHint,
+                Foreground = MutedBrush,
+                FontSize = 10,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 4)
+            });
+            PropertiesContent.Children.Add(new TextBox
+            {
+                Text = handlesText,
+                IsReadOnly = true,
+                FontFamily = new FontFamily("Consolas"),
+                FontSize = 11,
+                Background = NodeBackgroundBrush,
+                Foreground = ForegroundBrush,
+                BorderThickness = new Thickness(0),
+                TextWrapping = TextWrapping.Wrap,
+                MaxHeight = 160,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+            });
+        }
 
         if (!string.IsNullOrEmpty(node.SqlText))
         {

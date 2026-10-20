@@ -615,10 +615,9 @@ public partial class ServerTab : UserControl
 
     // ── Blocked Process Report plan lookup ──
 
-    /* SQL Server writes this 42-byte all-zero handle into executionStack frames
-       for dynamic SQL / system contexts where no persistent sql_handle exists.
-       Filter matches sp_HumanEventsBlockViewer's XPath exclusion. */
-    private static readonly string ZeroSqlHandle = "0x" + new string('0', 84);
+    /* SQL Server writes an all-zero handle into executionStack frames for dynamic SQL / system
+       contexts where no persistent sql_handle exists; DeadlockGraphParser.IsZeroSqlHandle skips
+       it whatever its length (the same test the deadlock pane uses). */
 
     private async void ViewBlockedSidePlan_Click(object sender, RoutedEventArgs e)
         => await ShowBlockedProcessPlanAsync(sender, blockingSide: false);
@@ -675,7 +674,7 @@ public partial class ServerTab : UserControl
         }
     }
 
-    private static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractBlockedProcessFrames(
+    internal static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractBlockedProcessFrames(
         string bprXml, bool blockingSide)
     {
         var empty = Array.Empty<(string, int, int)>();
@@ -697,7 +696,7 @@ public partial class ServerTab : UserControl
             {
                 var handle = frame.Attribute("sqlhandle")?.Value;
                 if (string.IsNullOrWhiteSpace(handle)) continue;
-                if (string.Equals(handle, ZeroSqlHandle, StringComparison.OrdinalIgnoreCase)) continue;
+                if (PerformanceMonitor.Common.DeadlockGraphParser.IsZeroSqlHandle(handle)) continue;
 
                 int stmtStart = 0;
                 int stmtEnd = -1;
@@ -726,10 +725,19 @@ public partial class ServerTab : UserControl
         var grid = FindParentDataGrid(menuItem);
         if (grid?.CurrentItem is not DeadlockProcessDetail row) return;
 
-        var sideLabel = row.IsVictim ? "Victim" : "Deadlocker";
-        var label = $"Est Plan - {sideLabel} SPID {row.Spid}";
+        await ViewDeadlockProcessPlanAsync(
+            row.DeadlockGraphXml, row.ProcessId, row.IsVictim, row.Spid, row.DatabaseName, row.SqlText);
+    }
 
-        var frames = ExtractDeadlockProcessFrames(row.DeadlockGraphXml, row.ProcessId);
+    /* The deadlock-process plan lookup behind both the grid's context item and the graph viewer's Properties
+       panel button (#6205): one lookup, keyed by the process id inside the graph XML. */
+    private async System.Threading.Tasks.Task ViewDeadlockProcessPlanAsync(
+        string graphXml, string processId, bool isVictim, int spid, string databaseName, string sqlText)
+    {
+        var sideLabel = isVictim ? "Victim" : "Deadlocker";
+        var label = $"Est Plan - {sideLabel} SPID {spid}";
+
+        var frames = ExtractDeadlockProcessFrames(graphXml, processId);
         if (frames.Count == 0)
         {
             MessageBox.Show(
@@ -747,7 +755,7 @@ public partial class ServerTab : UserControl
             foreach (var f in frames)
             {
                 planXml = await LivePlanDisplay.FilterAsync(await LocalDataService.FetchPlanBySqlHandleAsync(
-                    connStr, row.DatabaseName, f.SqlHandle, f.StmtStart, f.StmtEnd));
+                    connStr, databaseName, f.SqlHandle, f.StmtStart, f.StmtEnd));
                 if (!string.IsNullOrEmpty(planXml)) break;
             }
         }
@@ -755,7 +763,7 @@ public partial class ServerTab : UserControl
 
         if (!string.IsNullOrEmpty(planXml))
         {
-            _ = OpenPlanTab(planXml, label, row.SqlText);
+            _ = OpenPlanTab(planXml, label, sqlText);
             PlanViewerTabItem.IsSelected = true;
         }
         else
@@ -767,7 +775,7 @@ public partial class ServerTab : UserControl
         }
     }
 
-    private static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractDeadlockProcessFrames(
+    internal static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractDeadlockProcessFrames(
         string graphXml, string processId)
     {
         var empty = Array.Empty<(string, int, int)>();
@@ -784,7 +792,7 @@ public partial class ServerTab : UserControl
             /* Try process-level sqlhandle first — deadlock graphs frequently put it on <process>. */
             var procHandle = process.Attribute("sqlhandle")?.Value;
             if (!string.IsNullOrWhiteSpace(procHandle) &&
-                !string.Equals(procHandle, ZeroSqlHandle, StringComparison.OrdinalIgnoreCase))
+                !PerformanceMonitor.Common.DeadlockGraphParser.IsZeroSqlHandle(procHandle))
             {
                 int ps = 0, pe = -1;
                 int.TryParse(process.Attribute("stmtstart")?.Value, out ps);
@@ -800,7 +808,7 @@ public partial class ServerTab : UserControl
                 {
                     var handle = frame.Attribute("sqlhandle")?.Value;
                     if (string.IsNullOrWhiteSpace(handle)) continue;
-                    if (string.Equals(handle, ZeroSqlHandle, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (PerformanceMonitor.Common.DeadlockGraphParser.IsZeroSqlHandle(handle)) continue;
 
                     int fs = 0, fe = -1;
                     int.TryParse(frame.Attribute("stmtstart")?.Value, out fs);
