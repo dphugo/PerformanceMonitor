@@ -64,6 +64,12 @@ public sealed class PostgresTargetProvider : ITargetProvider
     private static NpgsqlDataSource BuildDataSource(string connectionString)
     {
         var builder = new NpgsqlDataSourceBuilder(connectionString);
+        /* #6143: Npgsql reads pg_type once per data source, on its first physical connection and before the
+           initializer below. Turning that off makes the first statement on a target connection the caller's own, so a
+           server's own search_path setting can't change how a connection reads. Npgsql then knows only built-in
+           types: a column of any other type ("char", regclass, an enum, an extension type, a record) throws on read,
+           so cast it to text in the SQL. */
+        builder.ConfigureTypeLoading(typeLoading => typeLoading.EnableTypeLoading(false));
         var settings = builder.ConnectionStringBuilder;
         if (MonitoredServerConnection.CarriesPin(settings.Options))
         {

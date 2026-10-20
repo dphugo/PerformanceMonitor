@@ -89,6 +89,20 @@ public sealed class PgCollectorSearchPathLiveTests
         SELECT pg_catalog.count(*) FROM public.pm6143_rows;
         """";
 
+    /// <summary>
+    /// The text the same-named operators raise in the type-loading test. Npgsql's type-loading joins cannot hash or
+    /// merge on these operators, so they run as nested loops and call the operator very many times. Raising on the
+    /// first call ends that query at once on any machine, where a counting copy ran for as long as the machine took.
+    /// </summary>
+    private const string OperatorRanMarker = "pm6143 same-named operator ran";
+
+    private const string RaisingOperatorsSql = $$"""
+        CREATE OR REPLACE FUNCTION lookalike.int4_eq(integer, integer) RETURNS boolean LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION '{{OperatorRanMarker}}'; END $$;
+        CREATE OR REPLACE FUNCTION lookalike.oid_eq(oid, oid) RETURNS boolean LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION '{{OperatorRanMarker}}'; END $$;
+        """;
+
     [Theory]
     [InlineData("database")]
     [InlineData("role")]
@@ -701,6 +715,80 @@ public sealed class PgCollectorSearchPathLiveTests
         await using var unpinned = PostgresTargetProvider.CreatePinnedConnection(replaced);
         var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => unpinned.OpenAsync(ct));
         Assert.StartsWith("precondition:", refused.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The first statement on a target connection is the caller's own. The database's search_path puts a schema first
+    /// that holds a same-named <c>=</c> for oid and integer, which is what Npgsql's type-loading query would run on the
+    /// first connection of a data source. A string without the pin (so the server's own setting applies) and the
+    /// service's pinned string both open and answer, and none of that schema runs.
+    /// </summary>
+    [Fact]
+    public async Task TargetConnection_FirstStatementIsTheCallers_AndNoSameNamedOperatorRuns()
+    {
+        var adminConnectionString = Environment.GetEnvironmentVariable("DARLING_TEST_PG");
+        Assert.SkipWhen(string.IsNullOrWhiteSpace(adminConnectionString),
+            "Set DARLING_TEST_PG to a Postgres connection string to run the search_path live test.");
+
+        var ct = TestContext.Current.CancellationToken;
+        var admin = new NpgsqlConnectionStringBuilder(adminConnectionString) { Pooling = false };
+        var ownedAdmin = new NpgsqlConnectionStringBuilder(admin.ConnectionString) { Database = Database };
+
+        var bodySucceeded = false;
+        try
+        {
+            await ResetAsync(admin.ConnectionString, ct);
+            await ExecAsync(admin.ConnectionString, $"CREATE ROLE {Owner} LOGIN NOSUPERUSER", ct);
+            await ExecAsync(admin.ConnectionString, $"CREATE ROLE {Monitor} LOGIN SUPERUSER", ct);
+            await ExecAsync(admin.ConnectionString, $"CREATE DATABASE {Database} OWNER {Owner}", ct);
+            await ExecAsync(ownedAdmin.ConnectionString, SetupSql, ct);
+            await ExecAsync(ownedAdmin.ConnectionString, RaisingOperatorsSql, ct);
+            await ExecAsync(
+                new NpgsqlConnectionStringBuilder(ownedAdmin.ConnectionString) { Username = Owner }.ConnectionString,
+                $"ALTER DATABASE {Database} SET search_path = lookalike, pg_catalog, public", ct);
+
+            var runtime = await RuntimeAsync(admin, Database, Monitor, ct);
+            /* Both data sources are cached by connection string for the life of the process (ClearPools empties their
+               pools, not the cache), so a fresh GUID in each string makes every run build new ones and open a first
+               physical connection. */
+            var runId = Guid.NewGuid().ToString("N");
+
+            /* Control: a plain, unpinned connection with Npgsql's type loading on. Its pg_type read runs under the
+               database's search_path and reaches the same-named operator, which raises at once. The open failing with
+               that text proves this setup catches type loading. */
+            var controlString = new NpgsqlConnectionStringBuilder(runtime.ConnectionString) { Options = null, ApplicationName = $"pm6143-control-{runId}" }.ConnectionString;
+            var control = await Assert.ThrowsAnyAsync<NpgsqlException>(async () =>
+            {
+                await using var plain = new NpgsqlConnection(controlString);
+                await plain.OpenAsync(ct);
+            });
+            Assert.Contains(OperatorRanMarker, control.Message, StringComparison.Ordinal);
+
+            var withoutPin = new NpgsqlConnectionStringBuilder(runtime.ConnectionString) { Options = null, ApplicationName = $"pm6143-first-statement-{runId}" }.ConnectionString;
+
+            await using (var unpinned = PostgresTargetProvider.CreatePinnedConnection(withoutPin))
+            {
+                await unpinned.OpenAsync(ct);
+                await using var command = new NpgsqlCommand("SHOW search_path", unpinned);
+                Assert.Contains("lookalike", (string?)await command.ExecuteScalarAsync(ct), StringComparison.Ordinal);
+            }
+
+
+            var pinnedString = new NpgsqlConnectionStringBuilder(runtime.ConnectionString) { ApplicationName = $"pm6143-first-statement-pinned-{runId}" }.ConnectionString;
+            await using (var pinned = PostgresTargetProvider.CreatePinnedConnection(pinnedString))
+            {
+                await pinned.OpenAsync(ct);
+                await using var command = new NpgsqlCommand("SHOW search_path", pinned);
+                Assert.Equal("pg_catalog,pg_temp", (string?)await command.ExecuteScalarAsync(ct));
+            }
+
+            bodySucceeded = true;
+        }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(admin.ConnectionString, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DropAsync(admin.ConnectionString, cleanup, cleanupCt));
+        }
     }
 
     /// <summary>

@@ -78,11 +78,15 @@ public static class RemediationConnection
     /// connection, and the same TLS mode (an Optional mode prefers TLS, a trusted certificate requires it, anything else verifies the
     /// certificate in full); the remediation login, a 15-second connect budget, a 30-second command budget, no pooled connection, and the
     /// application name that says so in <c>pg_stat_activity.application_name</c>.
-    /// <para>It differs from the monitoring connection in four ways, because its login can end sessions:</para>
+    /// <para>It differs from the monitoring connection in five ways, because its login can end sessions:</para>
     /// <list type="bullet">
     /// <item>It always opens the <c>postgres</c> database. pg_stat_activity and pg_terminate_backend are cluster-wide, so that is enough,
     /// and the settings of a database somebody else owns never apply to this connection.</item>
     /// <item>It sets <c>search_path</c> to <c>pg_catalog, pg_temp</c> at sign-in (<see cref="PostgresSearchPathOption"/>).</item>
+    /// <item>Npgsql's type loading is off (<c>Server Compatibility Mode=NoTypeLoading</c>), so its pg_type read does not run on the first open
+    /// and the first statement on the connection is the caller's own. The caller then reads the search_path (<see cref="PerformanceMonitor.Common.PostgresSearchPathPin.ReadSql"/>)
+    /// and refuses to go on unless it is the pinned one (<see cref="PerformanceMonitor.Common.PostgresSearchPathPin"/>). Npgsql then knows only built-in types, so every statement on this
+    /// connection reads built-in types only (or casts to text).</item>
     /// <item>It accepts SCRAM-SHA-256 sign-in only: a server that asks for a password in clear text or MD5, or asks for none, is refused
     /// before the password is sent.</item>
     /// <item>Unless the certificate is verified in full, it requires SCRAM channel binding, which ties the sign-in to the TLS session, so it
@@ -112,6 +116,9 @@ public static class RemediationConnection
         };
         if (server.Port > 0)
             builder.Port = server.Port;
+        /* The keyword, not the ServerCompatibilityMode property: that property is obsolete (CS0618), and a connection built from a string has
+           no data source to configure. Npgsql reads it as the same switch as EnableTypeLoading(false). */
+        builder["Server Compatibility Mode"] = "NoTypeLoading";
         return builder.ConnectionString;
     }
 }
