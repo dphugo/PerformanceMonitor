@@ -21,6 +21,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 using PerformanceMonitor.Darling.Service;
+using PerformanceMonitor.Darling.Service.Hosting;
 using PerformanceMonitor.Darling.Service.Mcp;
 using PerformanceMonitor.Darling.Storage;
 using Xunit;
@@ -79,6 +80,24 @@ public sealed class AgentChangesWebLiveTests
             Assert.Equal("0", await ScalarAsync(owner, "SELECT count(*) FROM config.config_service WHERE NOT agent_actions_enabled", ct));
             Assert.Equal("0", await ScalarAsync(owner, "SELECT count(*) FROM config.investigation_journal WHERE event IN ('action_undone', 'agent_actions_switched')", ct));
         });
+    }
+
+    [Fact]
+    public async Task OnAnUnsignedLoopbackDashboard_APlanUndo_Answers403WithTheSignInSentence_AndWritesAndJournalsNothing()
+    {
+        await WithWebRoutesAsync("admin", async (owner, Send, ct) =>
+        {
+            var planCall = await ScalarAsync(owner, "SELECT journal_id FROM config.investigation_journal WHERE detail->>'kind' = 'plan_force'", ct);
+            var before = await ScalarAsync(owner, "SELECT count(*) FROM config.investigation_journal", ct);
+            foreach (var payload in new[] { "{}", "{\"confirm\":true}" })
+            {
+                var refused = await Send("PUT", "/api/agent-changes/" + planCall + "/undo", "application/json", payload);
+                Assert.Equal(403, refused.Status);
+                Assert.Equal(DarlingWebEndpoints.InvestigationWriteSignInMessage, (string)refused.Body!["error"]!);
+            }
+
+            Assert.Equal(before, await ScalarAsync(owner, "SELECT count(*) FROM config.investigation_journal", ct));
+        }, signedInAs: () => null);
     }
 
     [Fact]

@@ -28,6 +28,7 @@ import { el, mount, loadingStrip, errorStrip, emptyStrip, noticeStrip, readTool,
 import { getSession } from "../views-api.js";
 import { writeNote, startPractice, writeAccess, SIGN_IN_SENTENCE, NOTE_MAX_LENGTH, NOTE_MAX_DAYS, NOTE_DEFAULT_DAYS } from "../investigation-writes.js";
 import { buildAgentChanges, resetAgentChangesStatus } from "./admin-agent-changes.js";
+import { buildServerActions, resetServerActionsStatus } from "./admin-server-actions.js";
 import { buildProfiles, readAgentSetupAccess, routeColumns, routeEditorNodes, routeListOnlyNodes, routeUseText } from "./admin-agent-setup.js";
 
 export const SERVER_COLUMNS = [
@@ -671,6 +672,7 @@ const TABS = [
   { id: "pending", label: "Pending Notes" },
   { id: "overrides", label: "Threshold Overrides" },
   { id: "agent-changes", label: "Agent changes" },
+  { id: "server-actions", label: "Server actions" },
   { id: "profiles", label: "Environment Profiles" },
 ];
 
@@ -1972,7 +1974,17 @@ const agentChangesContext = {
 };
 const buildAgentChangesTab = (body, generation) => buildAgentChanges(body, generation, agentChangesContext);
 
-const BUILDERS = { servers: buildServers, routes: buildRoutes, settings: buildSettings, feedback: buildFeedback, practice: buildPractice, pending: buildPending, overrides: buildOverrides, "agent-changes": buildAgentChangesTab, profiles: buildProfilesTab };
+/* Server actions (#6269) lives in its own file too, with the same helpers. */
+const serverActionsContext = {
+  ...agentChangesContext,
+  repaint: () => {
+    if (shownTab === "server-actions" && shownBody) return startBuilder("server-actions", shownBody, ++renderGeneration);
+    return null;
+  },
+};
+const buildServerActionsTab = (body, generation) => buildServerActions(body, generation, serverActionsContext);
+
+const BUILDERS = { servers: buildServers, routes: buildRoutes, settings: buildSettings, feedback: buildFeedback, practice: buildPractice, pending: buildPending, overrides: buildOverrides, "agent-changes": buildAgentChangesTab, profiles: buildProfilesTab, "server-actions": buildServerActionsTab };
 
 /* Run a tab's builder. A builder that throws leaves an error strip: in the Servers tab's table area when its boxes are on the
    page (the form above it is never replaced), else in the body. */
@@ -2018,6 +2030,7 @@ export function renderAdmin(main, tabId) {
     summary = null;
     notesStatus = null;
     resetAgentChangesStatus();
+    resetServerActionsStatus();
     notice = tab.id === "servers" ? held : null;
     if (tab.id === "servers") held = null;
   }

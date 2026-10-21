@@ -225,6 +225,9 @@ public static class DarlingWebEndpoints
         "set_collector_run_at",
         "set_collector_retention",
         "get_collector_schedules",
+        /* #6269: the server action switches have their own web routes (GET /api/server-actions and PUT /api/servers/{id}/actions/{action}, admin role); the MCP write is under mcp.allowServerAdmin. */
+        "set_server_action",
+        "get_server_actions",
         "get_tool_guide",
         "wait_for_investigation_requests",
         /* #6033: an agent's read of one claimed request's frozen evidence, served by claim; no page read mirrors it. */
@@ -692,6 +695,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         MapAgentSetup(app, postgres, logger, passwordKeys);
         MapAgentChanges(app, new AgentChangeUndo(postgres, McpCommandDeadlines.ReadSeconds), logger, ownerSource);
         MapServerTags(app, postgres, logger);
+        MapServerActions(app, postgres, new AgentChangeUndo(postgres, McpCommandDeadlines.ReadSeconds), logger, ownerSource);
         MapAdminServers(app, postgres);
         MapQueryTags(app, postgres, logger, readAdmission, readLatencyRecorder);
         MapCollectorRuns(app, new PostgresSnapshotNowStore(postgres), logger, async (name, ct) => { var (r, err) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, name, ct, NameClash.Refuse); return (r.ServerId, err); });
@@ -1720,6 +1724,12 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                    (no confirm) answers the statement and the state and writes nothing; {"confirm": true, "statement": "<shown>"} writes. */
                 if ((await changes.GetAsync(id, context.RequestAborted))?.IsPlanChange == true)
                 {
+                    /* A plan undo writes to the monitored server, so it needs a signed-in admin, not just the web's store login (#6269). */
+                    if (!DarlingWebSeat.IsSignedInAdmin(context))
+                    {
+                        return SignInRequiredResult();
+                    }
+
                     if (!await changes.CanDecideAsync(context.RequestAborted))
                     {
                         return AgentChangeRefusedResult();
@@ -3909,6 +3919,103 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         var noMatch = !McpHelpers.IsRefusalEnvelope(error)
             || message.StartsWith("Could not resolve server", StringComparison.Ordinal);
         return ErrorResult(message, noMatch ? StatusCodes.Status404NotFound : StatusCodes.Status400BadRequest);
+    }
+
+    /// <summary>The 403 a refused switch change answers when the web signs in to the store as the viewer role (#6269).</summary>
+    internal const string ServerActionRefusedMessage =
+        "This dashboard signs in to the store as the viewer role, so it cannot change server action switches. "
+        + "Use the Viewer app, or run the web under the admin login.";
+
+    /// <summary>
+    /// The server action switch routes (#6269). <c>GET /api/server-actions</c> lists every server with a state for each action
+    /// (<c>{can_decide, servers_returned, servers: [{server_id, server_name, engine, engine_kind, actions: [{action, valid, enabled, set_by,
+    /// updated_at_utc}]}]}</c>; <c>can_decide</c> is false under the viewer role, which lists only). <c>PUT /api/servers/{id}/actions/{action}</c>
+    /// with <c>{"enabled": true|false}</c> sets one switch: 200 <c>{status: set|unchanged, ...}</c>; 400 for a bad body, an unknown action or a
+    /// signed-in name that cannot be recorded; 403 under the viewer role (and for a read-only seat, which the host's method gate refuses first);
+    /// 404 for an unknown server; 409 when the server's engine cannot run the action; 415 without <c>application/json</c>; 503 before the service
+    /// has published its store owner connection. <b>The write runs on that owner connection</b>, because no other role can write the table; the
+    /// admin check is the web login's own privileges (<see cref="AgentChangeUndo.CanDecideAsync"/>) and the seat's method gate. The change is
+    /// journaled by <c>person:&lt;login&gt;</c>, surface <c>web</c>.
+    /// </summary>
+    internal static void MapServerActions(WebApplication app, NpgsqlDataSource postgres, AgentChangeUndo changes, ILogger logger, StoreOwnerSource? ownerSource)
+    {
+        app.MapGet("/api/server-actions", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var rows = await ServerActionSwitches.ListAsync(postgres, context.RequestAborted);
+                var body = Mcp.DarlingMcpServerActionTools.ListToJson(rows);
+                body["can_decide"] = DarlingWebSeat.IsSignedInAdmin(context) && await changes.CanDecideAsync(context.RequestAborted);
+                body["signed_in_admin"] = DarlingWebSeat.IsSignedInAdmin(context);
+                return DarlingWebStatementSweep.JsonText(body, "/api/server-actions", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/server-actions", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/servers/{id:int}/actions/{action}", async (HttpContext context, int id, string action) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (JsonNode.Parse(await ReadBodyAsync(context)) is not JsonObject body || body["enabled"] is not JsonValue flag || !flag.TryGetValue(out bool enabled))
+                {
+                    return ErrorResult("Send {\"enabled\": true} or {\"enabled\": false}.", StatusCodes.Status400BadRequest);
+                }
+
+                /* A signed-in admin comes first: the store login the web runs on says nothing about who is calling (#6269). */
+                if (!DarlingWebSeat.IsSignedInAdmin(context))
+                {
+                    return SignInRequiredResult();
+                }
+
+                /* The same actor every web person write records: ONE person: prefix on the signed-in name (NoteDecider), held to the shared 256-unit name rule. */
+                var actor = NoteDecider(DarlingWebSeat.FromContext(context));
+                if (InvestigationPersonWrites.ValidateActor(actor) is not null)
+                {
+                    return ErrorResult("The signed-in name cannot be recorded as the person who changed this switch.", StatusCodes.Status400BadRequest);
+                }
+
+                /* The admin check comes before anything is read or written. */
+                if (!await changes.CanDecideAsync(context.RequestAborted))
+                {
+                    return ErrorResult(ServerActionRefusedMessage, StatusCodes.Status403Forbidden);
+                }
+
+                var owner = ownerSource?.Read();
+                if (owner is null)
+                {
+                    return ErrorResult("The service has not published its store owner connection yet, so the switch cannot be written. Try again in a moment.",
+                        StatusCodes.Status503ServiceUnavailable);
+                }
+
+                var result = await ServerActionSwitches.SetAsync(owner, id, action, enabled, actor, ServerActionSurfaces.Web, context.RequestAborted);
+                var status = result.Succeeded ? StatusCodes.Status200OK
+                    : result.Code == "unknown_server" ? StatusCodes.Status404NotFound
+                    : result.Code is "not_for_engine" or "switch_busy" ? StatusCodes.Status409Conflict
+                    : StatusCodes.Status400BadRequest;
+                return DarlingWebStatementSweep.JsonText(result.ToJson(), "/api/servers/{id}/actions/{action}", logger, stopwatch.ElapsedMilliseconds,
+                    context.RequestAborted, status);
+            }
+            catch (Exception ex) when (ex is JsonException)
+            {
+                return ErrorResult("The request body is not valid.", StatusCodes.Status400BadRequest);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/servers/{id}/actions/{action}", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
     }
 
     internal static void MapAdminServers(WebApplication app, NpgsqlDataSource postgres)
