@@ -15,6 +15,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
 using PerformanceMonitor.Collectors;
+using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Service;
 using PerformanceMonitor.Darling.Service.Mcp;
 using PerformanceMonitor.Darling.Storage;
@@ -642,6 +643,319 @@ public sealed class ServerEditLiveTests : IDisposable
         finally
         {
             Environment.SetEnvironmentVariable("SYNTH_EDIT_LIVE_GOOD", null);
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: over MCP, where a registration connects is not changed while a route with an agent setting applies to the server. An
+    /// Off route counts, and so does one scoped to a tag above the server's own tag. The display name stays editable.</summary>
+    [Fact]
+    public async Task AsTheMcpRole_AnAgentCoveredServer_CannotBePointedElsewhere_ButItsDisplayNameChanges()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            await SeedServerAsync(rig.Owner, 7201, "alpha-71", "alpha-71.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7202, "alpha-72", "alpha-72.example.test", "integrated", null, null, ct);
+            await ExecAsync(rig.Owner,
+                "INSERT INTO config.server_tags (id, name, parent_id) OVERRIDING SYSTEM VALUE VALUES (7301, 'fleet-a', NULL), (7302, 'prod-a', 7301);" +
+                "INSERT INTO config.server_tag_map (server_id, tag_id) VALUES (7202, 7302);" +
+                "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 0, 7201);" +
+                "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_tag_id) VALUES ('Blocking', 2, 7301);", ct);
+
+            /* A server-scoped Off route covers 7201. */
+            var offMove = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-71", "{\"host\":\"alpha-79.example.test\"}", Reachable, TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("refused", offMove["status"]!.GetValue<string>());
+            var message = offMove["message"]!.GetValue<string>();
+            Assert.Contains("Viewer", message, StringComparison.Ordinal);
+            Assert.Contains("web dashboard", message, StringComparison.Ordinal);
+            Assert.Equal("alpha-71.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7201", ct));
+
+            /* An agent route on a tag ABOVE 7202's own tag covers 7202; a database change is a change of where it connects too. */
+            var tagMove = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-72", "{\"database\":\"orders\"}", Reachable, TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("refused", tagMove["status"]!.GetValue<string>());
+            Assert.Equal(0, await ScalarAsync<int>(rig.Owner, "SELECT count(*)::int FROM config_monitored_servers WHERE database IS NOT NULL", ct));
+
+            /* The display name is not where it connects. */
+            var renamed = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-71", "{\"display_name\":\"Orders\"}", Reachable, TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("updated", renamed["status"]!.GetValue<string>());
+            Assert.Equal("Orders", await ScalarAsync<string>(rig.Owner, "SELECT name FROM config_monitored_servers WHERE server_id = 7201", ct));
+            ok = true;
+        }
+        finally
+        {
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: a server no route with an agent setting is scoped to (a route with no agent setting, or an agent route on another server or
+    /// tag) is still pointed elsewhere over MCP; and a route with no scope at all, which applies to every server, does not hold it either.</summary>
+    [Fact]
+    public async Task AsTheMcpRole_AnUnscopedServer_StillMoves_EvenWithAnAgentRouteThatHasNoScope()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            await SeedServerAsync(rig.Owner, 7211, "alpha-73", "alpha-73.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7212, "alpha-74", "alpha-74.example.test", "integrated", null, null, ct);
+            await ExecAsync(rig.Owner,
+                "INSERT INTO config.server_tags (id, name, parent_id) OVERRIDING SYSTEM VALUE VALUES (7311, 'other-a', NULL);" +
+                "INSERT INTO config.config_notification_routes (metric_match, scope_server_id) VALUES ('Blocking', 7211);" +
+                "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 1, 7212);" +
+                "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_tag_id) VALUES ('Blocking', 2, 7311);", ct);
+
+            var moved = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-73", "{\"host\":\"alpha-78.example.test\"}", Reachable, TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("updated", moved["status"]!.GetValue<string>());
+            Assert.Equal("alpha-78.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7211", ct));
+
+            await ExecAsync(rig.Owner, "INSERT INTO config.config_notification_routes (metric_match, agent_level) VALUES ('Deadlocks', 0)", ct);
+            var movedAgain = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-78", "{\"host\":\"alpha-80.example.test\"}", Reachable, TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("updated", movedAgain["status"]!.GetValue<string>());
+            Assert.Equal("alpha-80.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7211", ct));
+            ok = true;
+        }
+        finally
+        {
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: over MCP another database or read-only intent on a registered machine is added as usual, unless a route with an agent
+    /// setting is scoped to the registration that holds the machine (its id, or a tag or a tag above one), a removed registration included. A route
+    /// with no scope never holds an add back. The removed registration's own name is re-used.</summary>
+    [Fact]
+    public async Task TheAddServersTool_RefusesASecondRegistrationOfAMachineOnlyWhileAScopedAgentRouteCoversTheFirst()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            await SeedServerAsync(rig.Owner, 7221, "alpha-75", "alpha-75.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7222, "alpha-78", "alpha-78.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7223, "alpha-79", "alpha-79.example.test", "integrated", null, null, ct);
+            var removedId = ServerIdHelper.GetDeterministicHashCode("alpha-76.example.test:orders");
+            var removedPlainId = ServerIdHelper.GetDeterministicHashCode("alpha-81.example.test:orders");
+            await ExecAsync(rig.Owner,
+                "INSERT INTO collect.servers (server_id, server_name, display_name, is_enabled, sql_major_version, created_date, modified_date) " +
+                $"VALUES ({removedId}, 'alpha-76.example.test:orders', 'Removed Orders', FALSE, 16, now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC')," +
+                $"({removedPlainId}, 'alpha-81.example.test:orders', 'Removed Plain', FALSE, 16, now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC');" +
+                "INSERT INTO config.server_tags (id, name, parent_id) OVERRIDING SYSTEM VALUE VALUES (7321, 'fleet-b', NULL), (7322, 'prod-b', 7321);" +
+                "INSERT INTO config.server_tag_map (server_id, tag_id) VALUES (7223, 7322);", ct);
+
+            async Task<(string Status, string Detail)> AddAsync(string json)
+            {
+                var answer = Parse(await Edit.AddServersAsync(rig.Mcp, json, Reachable, ct, ring: TestKeyRings.Healthy, policy: DarlingMcpAddServersPolicy.Default));
+                var row = answer["results"]!.AsArray().Single()!;
+                return (row["status"]!.GetValue<string>(), row["detail"]!.GetValue<string>());
+            }
+
+            /* Only a route with no scope (it applies to every server): the machine takes another database and another intent. */
+            await ExecAsync(rig.Owner, "INSERT INTO config.config_notification_routes (metric_match, agent_level) VALUES ('Deadlocks', 0)", ct);
+            Assert.Equal("added", (await AddAsync("[{\"host\":\"alpha-75.example.test\",\"database\":\"billing\"}]")).Status);
+            Assert.Equal("added", (await AddAsync("[{\"host\":\"ALPHA-75.example.test\",\"read_only_intent\":true}]")).Status);
+            Assert.Equal("added", (await AddAsync("[{\"host\":\"alpha-81.example.test\",\"database\":\"billing\"}]")).Status);
+
+            /* An Off route scoped to the registration holds the machine, whatever the database or intent. */
+            await ExecAsync(rig.Owner, "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 0, 7222)", ct);
+            var scoped = await AddAsync("[{\"host\":\"alpha-78.example.test\",\"database\":\"billing\"}]");
+            Assert.Equal("collides", scoped.Status);
+            Assert.Contains("alpha-78", scoped.Detail, StringComparison.Ordinal);
+            Assert.Equal("collides", (await AddAsync("[{\"host\":\"alpha-78.example.test\",\"read_only_intent\":true}]")).Status);
+
+            /* A route on a tag above the registration's own tag holds it too. */
+            await ExecAsync(rig.Owner, "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_tag_id) VALUES ('Blocking', 2, 7321)", ct);
+            Assert.Equal("collides", (await AddAsync("[{\"host\":\"alpha-79.example.test\",\"database\":\"billing\"}]")).Status);
+
+            /* A removed registration holds its machine only while a route is scoped to its id. */
+            await ExecAsync(rig.Owner, $"INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 1, {removedId})", ct);
+            var removed = await AddAsync("[{\"host\":\"alpha-76.example.test\",\"database\":\"billing\"}]");
+            Assert.Equal("collides", removed.Status);
+            Assert.Contains("Removed Orders", removed.Detail, StringComparison.Ordinal);
+            Assert.Equal("added", (await AddAsync("[{\"host\":\"alpha-81.example.test\",\"database\":\"audit\"}]")).Status);
+
+            Assert.Equal(3 + 4, await ScalarAsync<int>(rig.Owner, "SELECT count(*)::int FROM config_monitored_servers", ct));
+
+            /* The removed registration's own name is re-used, and a fresh machine is added. */
+            var again = await AddAsync("[{\"host\":\"alpha-76.example.test\",\"database\":\"orders\"}]");
+            Assert.Equal("added", again.Status);
+            Assert.Equal("added", (await AddAsync("[{\"host\":\"alpha-77.example.test\"}]")).Status);
+            Assert.Equal(removedId, await ScalarAsync<int>(rig.Owner, "SELECT server_id FROM config_monitored_servers WHERE host = 'alpha-76.example.test'", ct));
+            ok = true;
+        }
+        finally
+        {
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: several databases of one logical server go in one call; none of them has a route yet, so none holds another back.</summary>
+    [Fact]
+    public async Task TheAddServersTool_TakesSeveralDatabasesOfOneMachineInOneCall()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            var answer = Parse(await Edit.AddServersAsync(rig.Mcp,
+                "[{\"host\":\"alpha-90.example.test\",\"database\":\"one\"},{\"host\":\"alpha-90.example.test\",\"database\":\"two\"}]",
+                Reachable, ct, ring: TestKeyRings.Healthy, policy: DarlingMcpAddServersPolicy.Default));
+            Assert.All(answer["results"]!.AsArray(), row => Assert.Equal("added", row!["status"]!.GetValue<string>()));
+            Assert.Equal(2, await ScalarAsync<int>(rig.Owner, "SELECT count(*)::int FROM config_monitored_servers WHERE host = 'alpha-90.example.test'", ct));
+            ok = true;
+        }
+        finally
+        {
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: over MCP, a registration no route is scoped to is not pointed at a machine whose registration a route with an agent setting is
+    /// scoped to, in any database or intent and in any spelling of the host: the same rule add_servers applies. A machine nothing holds, and the
+    /// registration's other settings, still change.</summary>
+    [Fact]
+    public async Task AsTheMcpRole_AnUnscopedServer_CannotBePointedAtAMachineAScopedRegistrationHolds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            await SeedServerAsync(rig.Owner, 7401, "alpha-p1", "alpha-p1.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7402, "alpha-b1", "alpha-b1.example.test", "integrated", null, null, ct);
+            await ExecAsync(rig.Owner, "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 0, 7401)", ct);
+
+            async Task<JsonNode> EditAsync(string changes) =>
+                Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-b1", changes, Reachable, TestKeyRings.Healthy, null, ct, policy: DarlingMcpAddServersPolicy.Default));
+
+            foreach (var changes in new[]
+            {
+                "{\"host\":\"alpha-p1.example.test\",\"database\":\"master\"}",
+                "{\"host\":\"alpha-p1.example.test\",\"read_only_intent\":true}",
+                "{\"host\":\"ALPHA-P1.example.test.\",\"database\":\"orders\"}",
+                "{\"host\":\"tcp:alpha-p1.example.test,1433\",\"database\":\"orders\"}",
+                "{\"host\":\"alpha-p1.example.test\\\\MSSQLSERVER\",\"database\":\"orders\"}",
+            })
+            {
+                var refused = await EditAsync(changes);
+                Assert.Equal("refused", refused["status"]!.GetValue<string>());
+                Assert.Contains("alpha-p1", refused["message"]!.GetValue<string>(), StringComparison.Ordinal);
+                Assert.Equal("alpha-b1.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7402", ct));
+            }
+
+            /* A machine no route holds, and the display name, still change. */
+            Assert.Equal("updated", (await EditAsync("{\"host\":\"alpha-q1.example.test\"}"))["status"]!.GetValue<string>());
+            Assert.Equal("updated", (await EditAsync("{\"display_name\":\"Billing\"}"))["status"]!.GetValue<string>());
+            Assert.Equal("alpha-q1.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7402", ct));
+
+            /* Without a policy (the web dashboard, the operator) the same move is allowed. */
+            var web = Parse(await Edit.EditServerCoreAsync(new Edit.PostgresServerEditStore(rig.Owner), 7402, "{\"host\":\"alpha-p1.example.test\",\"database\":\"master\"}", Reachable, TestKeyRings.Healthy, null, ct));
+            Assert.Equal("updated", web["status"]!.GetValue<string>());
+            ok = true;
+        }
+        finally
+        {
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: a route set up while the connection test runs is seen by the write itself, which checks inside its own transaction: the edit
+    /// is refused and nothing is saved, whether the route holds the machine the registration moves to or the registration itself; and an add whose
+    /// machine gets a route during its test is refused the same way.</summary>
+    [Fact]
+    public async Task ARouteSetUpDuringTheConnectionTest_RefusesTheEditAndTheAdd_AndWritesNothing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            await SeedServerAsync(rig.Owner, 7411, "alpha-r1", "alpha-r1.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7412, "alpha-r2", "alpha-r2.example.test", "integrated", null, null, ct);
+            await SeedServerAsync(rig.Owner, 7413, "alpha-r3", "alpha-r3.example.test", "integrated", null, null, ct);
+
+            Edit.ServerProbe RoutedDuringProbe(int scopedServerId) => async (_, c) =>
+            {
+                await ExecAsync(rig.Owner, $"INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 1, {scopedServerId})", c);
+                return new ConnectionProbeResult(true, 15, 3, "Enterprise", false, false, false, true, null);
+            };
+
+            /* The machine the edit moves to gets a route during the test. */
+            var moved = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-r2", "{\"host\":\"alpha-r1.example.test\",\"database\":\"orders\"}", RoutedDuringProbe(7411), TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("refused", moved["status"]!.GetValue<string>());
+            Assert.Equal("alpha-r2.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7412", ct));
+
+            /* The registration being edited gets a route during the test. */
+            var own = Parse(await Edit.EditServerByNameAsync(rig.Mcp, "alpha-r3", "{\"host\":\"alpha-r9.example.test\"}", RoutedDuringProbe(7413), TestKeyRings.Healthy, null, ct,
+                policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("refused", own["status"]!.GetValue<string>());
+            Assert.Equal("alpha-r3.example.test", await ScalarAsync<string>(rig.Owner, "SELECT host FROM config_monitored_servers WHERE server_id = 7413", ct));
+
+            /* An add of another database of a machine that gets a route during the test. */
+            await SeedServerAsync(rig.Owner, 7414, "alpha-r4", "alpha-r4.example.test", "integrated", null, null, ct);
+            var added = Parse(await Edit.AddServersAsync(rig.Mcp, "[{\"host\":\"alpha-r4.example.test\",\"database\":\"billing\"}]", RoutedDuringProbe(7414), ct,
+                ring: TestKeyRings.Healthy, policy: DarlingMcpAddServersPolicy.Default));
+            Assert.Equal("collides", added["results"]!.AsArray().Single()!["status"]!.GetValue<string>());
+            Assert.Equal(1, await ScalarAsync<int>(rig.Owner, "SELECT count(*)::int FROM config_monitored_servers WHERE host = 'alpha-r4.example.test'", ct));
+            ok = true;
+        }
+        finally
+        {
+            await DropRoleAsync(rig, ok);
+        }
+    }
+
+    /// <summary>#6281: the machine a registration holds is told by its host with the spelling folded away: case, a trailing dot, a tcp: prefix,
+    /// host,port, host\MSSQLSERVER and an explicit default port are the same machine, so an add in any of them is refused; a named instance and another
+    /// port are other machines.</summary>
+    [Fact]
+    public async Task TheAddServersTool_RefusesEverySpellingOfAHeldMachine_AndAddsAnotherInstanceOrPort()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await using var rig = await OpenAsync(ct);
+        var ok = false;
+        try
+        {
+            await SeedServerAsync(rig.Owner, 7431, "alpha-s1", "alpha-s1.example.test", "integrated", null, null, ct);
+            await ExecAsync(rig.Owner, "INSERT INTO config.config_notification_routes (metric_match, agent_level, scope_server_id) VALUES ('Blocking', 0, 7431)", ct);
+
+            async Task<string> AddAsync(string json) =>
+                Parse(await Edit.AddServersAsync(rig.Mcp, json, Reachable, ct, ring: TestKeyRings.Healthy, policy: DarlingMcpAddServersPolicy.Default))["results"]!.AsArray().Single()!["status"]!.GetValue<string>();
+
+            foreach (var json in new[]
+            {
+                "[{\"host\":\"ALPHA-S1.EXAMPLE.TEST\",\"database\":\"d1\"}]",
+                "[{\"host\":\"alpha-s1.example.test.\",\"database\":\"d2\"}]",
+                "[{\"host\":\"tcp:alpha-s1.example.test\",\"database\":\"d3\"}]",
+                "[{\"host\":\"alpha-s1.example.test,1433\",\"database\":\"d4\"}]",
+                "[{\"host\":\"tcp:alpha-s1.example.test,1433\",\"database\":\"d5\"}]",
+                "[{\"host\":\"alpha-s1.example.test\\\\MSSQLSERVER\",\"database\":\"d6\"}]",
+                "[{\"host\":\"alpha-s1.example.test\",\"port\":1433,\"database\":\"d7\"}]",
+            })
+            {
+                Assert.Equal("collides", await AddAsync(json));
+            }
+
+            Assert.Equal(1, await ScalarAsync<int>(rig.Owner, "SELECT count(*)::int FROM config_monitored_servers", ct));
+
+            /* Another port, and a named instance, are other engine instances. */
+            Assert.Equal("added", await AddAsync("[{\"host\":\"alpha-s1.example.test\",\"port\":1444,\"database\":\"d8\"}]"));
+            Assert.Equal("added", await AddAsync("[{\"host\":\"alpha-s1.example.test\\\\REPORTS\",\"database\":\"d9\"}]"));
+            ok = true;
+        }
+        finally
+        {
             await DropRoleAsync(rig, ok);
         }
     }

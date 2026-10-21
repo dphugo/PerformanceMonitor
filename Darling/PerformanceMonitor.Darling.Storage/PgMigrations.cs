@@ -2092,6 +2092,106 @@ ALTER TABLE config.config_mute_rules ADD COLUMN IF NOT EXISTS starts_at_utc time
 ALTER TABLE config.config_service ADD COLUMN IF NOT EXISTS query_store_fetch_top_n integer NOT NULL DEFAULT 100;";
 
     /// <summary>
+    /// V210 (#6281, part of #5632): the MCP tag writes may not change which servers an agent route covers. A tag-scoped route covers
+    /// every registered server mapped to its tag or to any descendant of it (<c>NotificationRouteScopeExpander</c>), and
+    /// <c>update_notification_route</c> refuses over MCP to change an agent route's scope, so the tag tools, which write
+    /// <c>config.server_tags</c> and <c>config.server_tag_map</c>, could not be left to change the same set.
+    ///
+    /// <para><b>Which sessions.</b> A session whose login is <c>mcp</c>, or whose session setting <c>darling.surface</c> is
+    /// <c>mcp</c>: the MCP host sets that setting inside each write's own transaction (transaction-local, so it ends with the commit or the rollback and a pooled connection never keeps it), so an MCP that connects as the store's owner (no
+    /// <c>postgres.mcpConnectionString</c>), or as another login, is held to the rule too. The Viewer, the web dashboard and the
+    /// service carry neither and are not held to it. The login test is on <c>session_user</c>, which a non-superuser cannot change,
+    /// because the function is SECURITY DEFINER (it reads the route table, which <c>mcp</c> may not).</para>
+    ///
+    /// <para><b>The rule.</b> A row trigger on each table refuses with SQLSTATE <c>DL403</c>, naming the route, when any tag the
+    /// write could reach is the scope tag of a route whose <c>agent_level</c> is set (0, Off, included: an Off route is how a person
+    /// keeps servers away from a broader agent route, the same test the route rule uses). It does not work out which route wins. For
+    /// an assignment or removal of a server, the tag and every tag above it. For a delete of a tag, or a move of it to another
+    /// parent, the tag, every tag under it, and every tag above its old parent and above its new parent. A server that is not
+    /// registered, or has been removed, counts like any other: its tag rows come back with it when it is added again (the id is a
+    /// hash), so <c>remove_server</c> over MCP is refused for a server mapped under an agent route's tag. A rename, a colour or a
+    /// sort-order change does not touch coverage and is not looked at. No new column, no backfill, no grant.</para>
+    /// </summary>
+    private const string V210Sql = @"
+CREATE OR REPLACE FUNCTION config.agent_route_tag_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $guard$
+DECLARE
+    v_route integer;
+    v_up integer[];
+    v_down integer[];
+BEGIN
+    IF session_user::text IS DISTINCT FROM 'mcp'
+       AND COALESCE(pg_catalog.current_setting('darling.surface', true), '') <> 'mcp' THEN
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END IF;
+
+    v_up := ARRAY[]::integer[];
+    v_down := ARRAY[]::integer[];
+    IF TG_TABLE_NAME = 'server_tag_map' THEN
+        IF TG_OP IN ('INSERT', 'UPDATE') THEN
+            v_up := v_up || NEW.tag_id;
+        END IF;
+        IF TG_OP IN ('DELETE', 'UPDATE') THEN
+            v_up := v_up || OLD.tag_id;
+        END IF;
+    ELSIF TG_OP = 'DELETE' THEN
+        v_down := ARRAY[OLD.id];
+        IF OLD.parent_id IS NOT NULL THEN
+            v_up := ARRAY[OLD.parent_id];
+        END IF;
+    ELSIF NEW.parent_id IS DISTINCT FROM OLD.parent_id THEN
+        v_down := ARRAY[OLD.id];
+        IF OLD.parent_id IS NOT NULL THEN
+            v_up := v_up || OLD.parent_id;
+        END IF;
+        IF NEW.parent_id IS NOT NULL THEN
+            v_up := v_up || NEW.parent_id;
+        END IF;
+    END IF;
+
+    IF cardinality(v_up) + cardinality(v_down) > 0 THEN
+        WITH RECURSIVE above(id, parent_id) AS (
+            SELECT t.id, t.parent_id FROM config.server_tags AS t WHERE t.id = ANY(v_up)
+            UNION
+            SELECT p.id, p.parent_id FROM config.server_tags AS p JOIN above AS a ON p.id = a.parent_id),
+        below(id) AS (
+            SELECT t.id FROM config.server_tags AS t WHERE t.id = ANY(v_down)
+            UNION
+            SELECT c.id FROM config.server_tags AS c JOIN below AS b ON c.parent_id = b.id)
+        SELECT r.route_id INTO v_route
+        FROM config.config_notification_routes AS r
+        WHERE r.agent_level IS NOT NULL
+          AND (r.scope_tag_id IN (SELECT a.id FROM above AS a) OR r.scope_tag_id IN (SELECT b.id FROM below AS b))
+        ORDER BY r.route_id
+        LIMIT 1;
+        IF v_route IS NOT NULL THEN
+            RAISE EXCEPTION 'Route % has an agent setting (Off included) and its tag is this tag, or is above or below it, so changes to which servers it covers are made in the Viewer or on the web dashboard, not over MCP.', v_route
+                USING ERRCODE = 'DL403';
+        END IF;
+    END IF;
+
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$guard$;
+REVOKE ALL ON FUNCTION config.agent_route_tag_guard() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS trg_agent_route_tag_guard ON config.server_tag_map;
+CREATE TRIGGER trg_agent_route_tag_guard
+    BEFORE INSERT OR UPDATE OR DELETE ON config.server_tag_map
+    FOR EACH ROW EXECUTE FUNCTION config.agent_route_tag_guard();
+ALTER TABLE config.server_tag_map ENABLE ALWAYS TRIGGER trg_agent_route_tag_guard;
+
+DROP TRIGGER IF EXISTS trg_agent_route_tag_guard ON config.server_tags;
+CREATE TRIGGER trg_agent_route_tag_guard
+    BEFORE UPDATE OR DELETE ON config.server_tags
+    FOR EACH ROW EXECUTE FUNCTION config.agent_route_tag_guard();
+ALTER TABLE config.server_tags ENABLE ALWAYS TRIGGER trg_agent_route_tag_guard;";
+
+    /// <summary>
     /// V196 (#5632, step 5): Level 3 and the per-server action switches. <b>Nothing here turns an action on.</b>
     ///
     /// <para><b>Levels.</b> <c>ck_config_notification_routes_agent</c> now allows <c>agent_level</c> NULL and 0 to 3, and
@@ -2475,6 +2575,7 @@ $rung$;";
         new Migration(207, "change-watches", ChangeWatchStore.V207Sql),
         new Migration(208, "mute-rule-starts-at", V208Sql),
         new Migration(209, "query-store-fetch-top-n", V209Sql),
+        new Migration(210, "mcp-agent-route-tag-guard", V210Sql),
     };
 
     /// <summary>

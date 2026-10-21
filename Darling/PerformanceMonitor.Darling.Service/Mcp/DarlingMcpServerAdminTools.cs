@@ -156,6 +156,9 @@ public sealed partial class DarlingMcpServerAdminTools
         "covers (it names one database but connects to a different one, e.g. a wrong Initial Catalog) is refused as " +
         "status \"collides\" — adding it would store one database's history under two identities and alert twice. " +
         "So is a server whose id is already held by a different server (two identities that hash to one id). " +
+        "A new database or read_only_intent on a machine (engine, host and port) another registration already holds is added as usual, " +
+        "unless a route with an agent setting is scoped to that registration (its id, one of its tags or a tag above one; a route with no scope does not count) " +
+        "- a removed registration included. Then the entry is refused as status \"collides\" and names that registration, because the route is tied to it. Register the other database in the Viewer or on the web dashboard. " +
         "A SQL password or service-principal client secret is sealed with the service's password key before it is " +
         "stored, and is never returned. password is the password itself: a value that starts with env: or file: is " +
         "rejected as \"invalid\", because references are set in the configuration file. " +
@@ -239,6 +242,28 @@ public sealed partial class DarlingMcpServerAdminTools
             var (ready, duplicates) = PartitionDuplicates(entries, existingKeys);
             results.AddRange(duplicates);
 
+            /* #6281: over MCP a machine another registration holds is not registered again while a route with an agent
+               setting is scoped to that registration (its id, a tag of it or a tag above): the new id would sit outside
+               that route. Entries of this batch have no routes yet, so they never hold each other back. The operator's
+               own command and the web route pass no policy and are not held to this. */
+            if (policy is not null && ready.Count > 0)
+            {
+                var held = await definitions.LoadTargetsAsync(cancellationToken);
+                var kept = new List<ParsedServerEntry>();
+                foreach (var entry in ready)
+                {
+                    if (await TargetHeldRefusalAsync(held, entry, definitions.ScopedAgentRouteAsync, cancellationToken) is { } heldRefusal)
+                    {
+                        results.Add(new ServerResult(entry.Order, entry.DisplayName, AddStatus.Collides, heldRefusal));
+                        continue;
+                    }
+
+                    kept.Add(entry);
+                }
+
+                ready = kept;
+            }
+
             /* #2280: the identities claimed so far — the store's, plus every entry this batch is about to add.
                The gate above compares DECLARED identities; the check inside the loop compares each entry's ACTUAL
                database (what the server just told the probe) against this set, which is what catches two
@@ -303,7 +328,10 @@ public sealed partial class DarlingMcpServerAdminTools
                        it is compared again under the identity lock: a definition at that key may have been committed
                        during the probe, after the claimed set was read. Null when the probe named nothing new. */
                     var actualStorageKey = ActualStorageKeyOf(entry, probeResult.ConnectedDatabase);
-                    var rowsWritten = await definitions.InsertAsync(entry, encryptedPassword, actualStorageKey, cancellationToken);
+                    string? heldInWrite = null;
+                    HeldCheck? heldCheck = policy is null ? null : async (connection, transaction, token) =>
+                        heldInWrite = await TargetHeldRefusalInTransactionAsync(connection, transaction, entry, null, token);
+                    var rowsWritten = await definitions.InsertAsync(entry, encryptedPassword, actualStorageKey, heldCheck, cancellationToken);
                     if (rowsWritten > 0)
                     {
                         results.Add(new ServerResult(entry.Order, entry.DisplayName, AddStatus.Added, DescribeProbe(probeResult)));
@@ -316,6 +344,10 @@ public sealed partial class DarlingMcpServerAdminTools
                            have been had the other write landed a moment sooner. */
                         results.Add(new ServerResult(entry.Order, entry.DisplayName, AddStatus.Duplicate,
                             "Already monitored: another change to the server list claimed this address while this call ran; skipped."));
+                    }
+                    else if (rowsWritten == InsertTargetHeld)
+                    {
+                        results.Add(new ServerResult(entry.Order, entry.DisplayName, AddStatus.Collides, heldInWrite!));
                     }
                     else if (rowsWritten == InsertActualKeyClaimed)
                     {
@@ -470,9 +502,13 @@ public sealed partial class DarlingMcpServerAdminTools
                of the connection, so a re-added server would otherwise get its old tags back and rejoin
                tag-scoped alert rules. */
             int affected;
+            string? tagGuardRefusal = null;
             await using (var connection = await postgres.OpenConnectionAsync())
             await using (var transaction = await connection.BeginTransactionAsync())
             {
+                /* #6281: the marker the store's tag guard reads, set first so it covers the tag-row clearing below in this transaction. */
+                await DarlingStoreConnection.MarkMcpSurfaceAsync(connection, transaction, McpCommandDeadlines.ReadSeconds);
+
                 /* Two-arg on the store connection with the transaction ASSIGNED, and the SQL hoisted to a local:
                    the shape McpReadCommandTimeoutTests recognises as a store command (see the same note in
                    DarlingMcpAlertTools); the three-arg form is the monitored-target shape. */
@@ -488,21 +524,39 @@ public sealed partial class DarlingMcpServerAdminTools
                 {
                     clear.CommandTimeout = McpCommandDeadlines.ReadSeconds;
                     clear.Parameters.Add(new NpgsqlParameter<int> { TypedValue = resolved.ServerId });
-                    await clear.ExecuteNonQueryAsync();
+                    try
+                    {
+                        await clear.ExecuteNonQueryAsync();
+                    }
+                    catch (PostgresException ex) when (ex.SqlState == "DL403")
+                    {
+                        /* #6281: the store's guard on the tag writes refused the clearing of this server's tag rows, because one of its
+                           tags is the tag of a route with an agent setting, or is under or over it. The delete above shares this
+                           transaction and is rolled back with it (nothing is committed on this path), so the server is still defined. */
+                        tagGuardRefusal = ex.MessageText;
+                    }
                 }
 
-                /* #5977: the server's query-tag assignments, rules and map rows go in the same transaction, for the
-                   same reason (server_id is a hash, so orphaned rows would come back when the server is re-added). Only this
-                   server's rows: an all-server assignment or rule (server_id NULL) and the tags themselves stay. */
-                foreach (var queryTagSql in QueryTagSchema.ClearForServerSqls)
+                if (tagGuardRefusal is null)
                 {
-                    await using var queryTagClear = new NpgsqlCommand(queryTagSql, connection) { Transaction = transaction };
-                    queryTagClear.CommandTimeout = McpCommandDeadlines.ReadSeconds;
-                    queryTagClear.Parameters.Add(new NpgsqlParameter<int> { TypedValue = resolved.ServerId });
-                    await queryTagClear.ExecuteNonQueryAsync();
-                }
+                    /* #5977: the server's query-tag assignments, rules and map rows go in the same transaction, for the
+                       same reason (server_id is a hash, so orphaned rows would come back when the server is re-added). Only this
+                       server's rows: an all-server assignment or rule (server_id NULL) and the tags themselves stay. */
+                    foreach (var queryTagSql in QueryTagSchema.ClearForServerSqls)
+                    {
+                        await using var queryTagClear = new NpgsqlCommand(queryTagSql, connection) { Transaction = transaction };
+                        queryTagClear.CommandTimeout = McpCommandDeadlines.ReadSeconds;
+                        queryTagClear.Parameters.Add(new NpgsqlParameter<int> { TypedValue = resolved.ServerId });
+                        await queryTagClear.ExecuteNonQueryAsync();
+                    }
 
-                await transaction.CommitAsync();
+                    await transaction.CommitAsync();
+                }
+            }
+
+            if (tagGuardRefusal is not null)
+            {
+                return Outcome("refused", tagGuardRefusal + " The server was not removed: its tag assignments are changed in the Viewer or on the web dashboard first.");
             }
 
             return affected > 0
@@ -1234,6 +1288,10 @@ ON CONFLICT (server_id) DO NOTHING";
     /// <see cref="ActualIdentityCollision"/> gives before the write.</summary>
     internal const int InsertActualKeyClaimed = -2;
 
+    /// <summary>What <see cref="IServerDefinitions.InsertAsync"/> returns when the held check, run under the identity lock, found a
+    /// route with an agent setting scoped to another registration of the entry's machine (#6281): nothing was written.</summary>
+    internal const int InsertTargetHeld = -3;
+
     private static async Task<List<string>> LoadExistingStorageKeysAsync(NpgsqlDataSource postgres, CancellationToken cancellationToken)
     {
         var keys = new List<string>();
@@ -1287,7 +1345,7 @@ ON CONFLICT (server_id) DO NOTHING";
     /// of a batch takes and releases the lock in its own transaction, so a long batch never holds it across a probe.
     /// </summary>
     private static async Task<int> InsertServerAsync(
-        NpgsqlDataSource postgres, ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, CancellationToken cancellationToken)
+        NpgsqlDataSource postgres, ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, HeldCheck? heldCheck, CancellationToken cancellationToken)
     {
         var config = entry.ProbeConfig;
         var now = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
@@ -1326,6 +1384,13 @@ ON CONFLICT (server_id) DO NOTHING";
             /* The entry's own key is free but the database its probe reached is held: the same refusal, and the
                rollback on this return releases the lock. */
             return InsertActualKeyClaimed;
+        }
+
+        /* #6281: the held-machine rule again, in this transaction and under the lock, so a route set up while the probe ran
+           is seen before the row exists. */
+        if (heldCheck is not null && await heldCheck(connection, transaction, cancellationToken) is not null)
+        {
+            return InsertTargetHeld;
         }
 
         await using var command = new NpgsqlCommand(InsertServerSql, connection) { Transaction = transaction };
@@ -1372,11 +1437,21 @@ ON CONFLICT (server_id) DO NOTHING";
         /// <see cref="InsertKeyClaimed"/> when another definition already holds the entry's storage key (read under the
         /// identity lock, #5240) and nothing was written. <paramref name="actualStorageKey"/> is the key the probe's
         /// connected database gives when it differs from the entry's own, else null; a definition holding it, read under
-        /// the same lock, answers <see cref="InsertActualKeyClaimed"/> with nothing written.</summary>
-        Task<int> InsertAsync(ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, CancellationToken cancellationToken);
+        /// the same lock, answers <see cref="InsertActualKeyClaimed"/> with nothing written. <paramref name="heldCheck"/>, when given,
+        /// runs inside the write's transaction after those checks; a non-null answer means a route now scopes another registration of the
+        /// machine, so nothing is written and the result is <see cref="InsertTargetHeld"/> (#6281).</summary>
+        Task<int> InsertAsync(ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, HeldCheck? heldCheck, CancellationToken cancellationToken);
 
         /// <summary>The storage key of the row that holds <paramref name="serverId"/>, or null when none does.</summary>
         Task<string?> ReadStorageKeyAsync(int serverId, CancellationToken cancellationToken);
+
+        /// <summary>Every registration an MCP add is compared with (#6281): the live definitions and the removed ones.
+        /// Required of every implementation: a store that answers nothing would silently drop the check.</summary>
+        Task<List<RegisteredTarget>> LoadTargetsAsync(CancellationToken cancellationToken);
+
+        /// <summary>The lowest route_id of a route with an agent setting scoped to the registration (#6281), or null.
+        /// Required of every implementation, for the same reason.</summary>
+        Task<int?> ScopedAgentRouteAsync(int serverId, CancellationToken cancellationToken);
     }
 
     /// <summary>The definitions table itself: <c>config_monitored_servers</c>.</summary>
@@ -1389,11 +1464,17 @@ ON CONFLICT (server_id) DO NOTHING";
         public Task<List<string>> LoadStorageKeysAsync(CancellationToken cancellationToken) =>
             LoadExistingStorageKeysAsync(_postgres, cancellationToken);
 
-        public Task<int> InsertAsync(ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, CancellationToken cancellationToken) =>
-            InsertServerAsync(_postgres, entry, encryptedPassword, actualStorageKey, cancellationToken);
+        public Task<int> InsertAsync(ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, HeldCheck? heldCheck, CancellationToken cancellationToken) =>
+            InsertServerAsync(_postgres, entry, encryptedPassword, actualStorageKey, heldCheck, cancellationToken);
 
         public Task<string?> ReadStorageKeyAsync(int serverId, CancellationToken cancellationToken) =>
             ReadStorageKeyByIdAsync(_postgres, serverId, cancellationToken);
+
+        public Task<List<RegisteredTarget>> LoadTargetsAsync(CancellationToken cancellationToken) =>
+            LoadRegisteredTargetsAsync(_postgres, cancellationToken);
+
+        public Task<int?> ScopedAgentRouteAsync(int serverId, CancellationToken cancellationToken) =>
+            DarlingMcpServerAdminTools.ScopedAgentRouteAsync(_postgres, serverId, cancellationToken);
     }
 
     /* ─────────────────────────────── helpers ─────────────────────────────── */
