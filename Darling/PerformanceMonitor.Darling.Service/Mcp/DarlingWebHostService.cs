@@ -1414,6 +1414,16 @@ public sealed class DarlingWebHostService : BackgroundService
                             return;
                         }
 
+                        /* #6286: a page link followed from another site (Teams, mail, a work item) is a cross-site top-level
+                           navigation, so the browser withholds the SameSite=Strict session cookie and a live session looks
+                           signed out. Answer it once with a page that re-navigates to the same address from this site; that
+                           request is same-origin and carries the cookie. With no session still, it gets the sign-in page below. */
+                        if (IsCrossSitePageNavigation(context.Request))
+                        {
+                            await WriteReNavigationPageAsync(context);
+                            return;
+                        }
+
                         await WriteLoginPageAsync(context, oidcClient is not null);
                         return;
                 }
@@ -1560,7 +1570,8 @@ public sealed class DarlingWebHostService : BackgroundService
     /// same answer as the SPA's.
     /// </summary>
     internal static bool IsApiPath(string path)
-        => path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase);
+        => path.Equals("/api", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// PURE per-request decision, composing the sign-in flow around <see cref="DecideWebAuth"/>: the CIDR
@@ -2402,6 +2413,75 @@ public sealed class DarlingWebHostService : BackgroundService
         context.Response.Headers[DarlingWebSecurityHeaders.ContentSecurityPolicyHeader] = LandingPagePolicy;
         return context.Response.WriteAsync(html);
     }
+
+    /// <summary>
+    /// PURE (reads headers only): is this a GET page request that the browser says came from another site, so the
+    /// SameSite=Strict session cookie was not sent (#6286)? True only when <c>Sec-Fetch-Site</c> says
+    /// <c>cross-site</c>. A request without the header (an older browser, a command-line client), with
+    /// <c>none</c> (typed address, bookmark) or with <c>same-origin</c> / <c>same-site</c> is false, so it gets the
+    /// sign-in page as before: the same-origin answer to the re-navigation below is what ends the loop. When the
+    /// browser also says what the request is for, only a top-level navigation counts (<c>Sec-Fetch-Mode</c>
+    /// <c>navigate</c>, <c>Sec-Fetch-Dest</c> <c>document</c>), so a cross-site image or script request is not
+    /// answered with a page. It must also be a navigation the person started (<c>Sec-Fetch-User</c> is <c>?1</c>, which a
+    /// browser sends for a click or a typed address and not for a script redirect, a meta refresh or a popup nobody
+    /// clicked), so such a navigation gets the sign-in form as it did before. Never true for a non-GET request or an
+    /// /api (or /api/*) call.
+    /// </summary>
+    internal static bool IsCrossSitePageNavigation(HttpRequest request)
+    {
+        if (!HttpMethods.IsGet(request.Method) || IsApiPath(request.Path.Value ?? "/"))
+        {
+            return false;
+        }
+
+        if (!string.Equals(request.Headers["Sec-Fetch-Site"].ToString(), "cross-site", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!string.Equals(request.Headers["Sec-Fetch-User"].ToString(), "?1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var mode = request.Headers["Sec-Fetch-Mode"].ToString();
+        var dest = request.Headers["Sec-Fetch-Dest"].ToString();
+        return (mode.Length == 0 || string.Equals(mode, "navigate", StringComparison.OrdinalIgnoreCase))
+            && (dest.Length == 0 || string.Equals(dest, "document", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// The page a cross-site page request with no session cookie is answered with (#6286): it reloads itself, which
+    /// asks for the SAME address again, path, query and <c>#/...</c> fragment included. A navigation started by a
+    /// script on this site is same-site, so the Strict session cookie travels with it, as on the signed-in landing
+    /// page. The script reloads rather than calling <c>location.replace(location.href)</c> because an address that
+    /// carries a fragment is a same-document navigation to a script: the browser does nothing and the page stays.
+    /// The script names no address at all, so the page cannot send anyone elsewhere. It reloads only when the page
+    /// came from an ordinary navigation; in every other case (it is itself the result of a reload, the browser gives no
+    /// navigation entry, or the script fails) it shows a message instead, so a browser that still marked the request
+    /// cross-site cannot loop. A static link to the sign-in page is always in the markup.
+    /// </summary>
+    internal static Task WriteReNavigationPageAsync(HttpContext context)
+    {
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        context.Response.ContentType = "text/html; charset=utf-8";
+        context.Response.Headers.CacheControl = "no-store";
+        var html =
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Darling Web</title>" + IconLinkHtml + "</head>"
+            + "<body style='background:#181b1f;color:#E4E6EB;font-family:system-ui'>"
+            + "<p id='m'>Opening the dashboard…</p>"
+            + "<p><a href='/' style='color:#2eaef1'>Go to the sign-in page</a></p>"
+            + ReNavigationScriptBlock
+            + "</body></html>";
+        context.Response.Headers[DarlingWebSecurityHeaders.ContentSecurityPolicyHeader] = ReNavigationPagePolicy;
+        return context.Response.WriteAsync(html);
+    }
+
+    /// <summary>The re-navigation page's only inline script: constant text, so its hash does not depend on the request.</summary>
+    internal const string ReNavigationScriptBlock = "<script>try{var n=performance.getEntriesByType('navigation')[0];if(n&&n.type==='navigate'){location.reload();}else{document.getElementById('m').textContent='Open the address again to continue.';}}catch(e){document.getElementById('m').textContent='Open the address again to continue.';}</script>";
+
+    /// <summary>The re-navigation page's policy: the default plus the hash of <see cref="ReNavigationScriptBlock"/>.</summary>
+    internal static readonly string ReNavigationPagePolicy = DarlingWebSecurityHeaders.PolicyForInlinePage(ReNavigationScriptBlock);
 
     /// <summary>
     /// The tab-icon link every page this host writes by hand carries in its own head (#5701), the same <c>data:</c>
