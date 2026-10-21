@@ -110,8 +110,7 @@ public sealed class McpToolLatencyFilter
             /* #5793: who made the call, worked out once here so the recorder only ever sees the finished string. The
                composed-panel tool records itself through the shared runner, which reads it from the ambient value. */
             var caller = CallerOf(request);
-
-            /* Set for every tool, not just the composed panel: a write tool names its caller in its own log line. */
+            /* #6230/#6227: set for every tool, not just the composed panel: a write tool names its caller in its own log line (it takes no request of its own). */
             ReadCaller.SetAmbientMcpCaller(caller);
             if (string.Equals(toolName, SkippedToolName, StringComparison.Ordinal))
             {

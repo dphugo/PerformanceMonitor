@@ -151,6 +151,14 @@ public static class DarlingWebEndpoints
         "kill_session",
         /* #5632 step 10: an agent's read of what compiled after its eviction, served over MCP by journal id; no page read mirrors it. */
         "get_compiles_after_evict",
+        /* #6230 part B: the incident actions queue a command to the service over MCP; the web has its own routes for them, none a generic read.
+           get_command_result reads a queue row by id and get_agent_changes is the MCP twin of GET /api/agent-changes. */
+        "test_connection",
+        "analyze_now",
+        "purge_now",
+        "undo_plan_change",
+        "get_command_result",
+        "get_agent_changes",
         "set_notification_route_enabled",
         "set_notification_route_fallback",
         /* #5632 Phase A: claim and submit write investigation state for an agent over MCP; the web serves the two
@@ -193,6 +201,16 @@ public static class DarlingWebEndpoints
         "list_query_tag_rules",
         "test_query_tag_rule",
         "run_collectors_now",
+        /* #6230: the collection-state writes (pause, resume, disable and enable a server, a server's excluded databases, reload) are MCP-only:
+           the Viewer and the command plane already carry them, and the web host's viewer role holds no write on config_service or
+           config_monitored_servers. Their read, get_collection_state, is MCP-only too: the Viewer's Manage Servers and Settings windows show the same state. */
+        "get_collection_state",
+        "pause_collection",
+        "resume_collection",
+        "disable_server",
+        "enable_server",
+        "set_server_excluded_databases",
+        "reload_config",
         /* #6227: the five collector schedule writes are MCP-only (the Viewer's schedule editor is the page for a person), and the
            get_collector_schedules read is for an agent checking its own change before and after; no page read mirrors it. */
         "disable_collector",
@@ -669,7 +687,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         MapServerTags(app, postgres, logger);
         MapAdminServers(app, postgres);
         MapQueryTags(app, postgres, logger, readAdmission, readLatencyRecorder);
-        MapCollectorRuns(app, new PostgresSnapshotNowStore(postgres), logger, async (name, ct) => { var (r, err) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, name, ct); return (r.ServerId, err); });
+        MapCollectorRuns(app, new PostgresSnapshotNowStore(postgres), logger, async (name, ct) => { var (r, err) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, name, ct, NameClash.Refuse); return (r.ServerId, err); });
         MapServers(app, postgres, logger);
         MapAlertHistoryDismiss(app, postgres, logger);
         MapInvestigationFeedback(app, postgres, logger);
