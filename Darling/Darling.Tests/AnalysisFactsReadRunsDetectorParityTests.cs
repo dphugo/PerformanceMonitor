@@ -35,7 +35,6 @@ namespace Darling.Tests;
 /// service over the batch-request spike fixture; Darling's gated <c>PgTargetAnomalyTests</c> e2e asserts
 /// the planted TPS spike through the real <c>get_analysis_facts</c>. This file is the shape both rest on.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class AnalysisFactsReadRunsDetectorParityTests
 {
     private const string ReadEntry = "public async Task<(List<Fact> Facts, WindowCoverage? Coverage, CollectionCaveatState Caveats)> CollectAndScoreFactsAsync(";
@@ -141,7 +140,7 @@ public sealed class AnalysisFactsReadRunsDetectorParityTests
         }
 
         /* #3898 Phase 2 (D5): the instructions' per-tool row that used to restate this is gone on both SKUs —
-           the "Asking about a PAST window" section's as_of guardrail still says the anchor reaches the
+           the "Asking about a past window" section's as_of guardrail still says the anchor reaches the
            detector, which is the fact this half of the pin protects; the stale collect+score phrasing it
            guarded against cannot come back once there is no per-tool row left to carry it. */
         foreach (var (sku, instructions) in new[]

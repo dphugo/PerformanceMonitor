@@ -29,20 +29,14 @@ namespace PerformanceMonitorLite.Tests;
 /// cell and a server box item. The names came out as "System.Windows.Controls.StackPanel", a bare glyph, "Item: ...Row,
 /// Column Display Index: 7" and "ServerConnection". The Viewer twin is in Darling.Tests (ViewerScreenReaderNamesTests).
 /// </summary>
-[Trait("Reads", "Darling")]
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public class ScreenReaderNamesTests
 {
     private static string RepoRoot([CallerFilePath] string thisFile = "") =>
         Path.GetFullPath(Path.Combine(Path.GetDirectoryName(thisFile)!, ".."));
 
     /// <summary>Shows the window and lets its layout and input-priority work run, so the first SizeChanged of every element has fired.</summary>
-    private static void Settle(Window window)
-    {
-        window.Show();
-        var frame = new DispatcherFrame();
-        window.Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() => frame.Continue = false));
-        Dispatcher.PushFrame(frame);
-    }
+    private static void Settle(Window window) => StaTestThread.Settle(window);
 
     private static void Walk(AutomationPeer peer, List<AutomationPeer> into)
     {

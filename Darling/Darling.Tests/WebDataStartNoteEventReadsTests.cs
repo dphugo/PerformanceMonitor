@@ -11,8 +11,10 @@ using System.Linq;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using PerformanceMonitor.Darling.Service;
+using PerformanceMonitor.Darling.Service.Mcp;
 using Xunit;
 using static Darling.Tests.RepoFile;
 
@@ -32,6 +34,39 @@ public sealed class WebDataStartNoteEventReadsTests
         NpgsqlDataSource.Create("Host=127.0.0.1;Port=9;Username=x;Database=x;Timeout=1;Pooling=false");
 
     private static readonly CancellationToken Cancelled = new(canceled: true);
+
+    /* #5678: the connect timeout that beats Npgsql's look at the request token, as the exception itself: an NpgsqlException that
+       wraps a TimeoutException, not an OperationCanceledException. The rule under test takes the exception and the token, so a
+       hand-built exception stands in for the race with no connection attempt to time. */
+    private static NpgsqlException ConnectTimeout() => new("Exception while connecting", new TimeoutException());
+
+    /// <summary>#5678: a cancelled caller gets the cancellation from a failed registry read, never the registry-fault sentence,
+    /// whatever type the failure had; a live caller still gets the sentence.</summary>
+    [Fact]
+    public void AFailedRegistryRead_SurfacesCancellation_ForACancelledCaller_AndTheFaultSentenceForALiveOne()
+    {
+        Assert.Throws<OperationCanceledException>(() => DarlingServerResolver.FaultOrCancel(ConnectTimeout(), Cancelled));
+
+        var (servers, fault) = DarlingServerResolver.FaultOrCancel(ConnectTimeout(), CancellationToken.None);
+        Assert.Empty(servers);
+        Assert.StartsWith(DarlingServerResolver.RegistryReadFaultPrefix, fault, StringComparison.Ordinal);
+    }
+
+    /// <summary>#5678: a cancelled caller gets the cancellation from a failed data-start probe, not an unannotated grid, whatever
+    /// type the failure had; a live caller still gets the grid untouched and one Debug line.</summary>
+    [Fact]
+    public void AFailedDataStartProbe_SurfacesCancellation_ForACancelledCaller_AndTheGridForALiveOne()
+    {
+        const string grid = "{\"rows\":[]}";
+        var logger = new CapturingTestLogger();
+
+        Assert.Throws<OperationCanceledException>(
+            () => WebDataStartNote.ProbeFailed(grid, ConnectTimeout(), "get_health_parser_system_health", logger, Cancelled));
+        Assert.Equal("(no log lines captured)", logger.Joined);
+
+        Assert.Same(grid, WebDataStartNote.ProbeFailed(grid, ConnectTimeout(), "get_health_parser_system_health", logger, CancellationToken.None));
+        Assert.Equal(1, logger.CountAtLevel(LogLevel.Debug));
+    }
 
     private const string DefaultTraceCapped =
         "{\"server\":\"sql01\",\"hours_back\":48,\"total_events\":250,\"shown\":2,\"events\":["
@@ -178,7 +213,7 @@ public sealed class WebDataStartNoteEventReadsTests
         Assert.Equal(unavailable, await WebDataStartNote.AddAsync(store, read, "sql01", 48, WindowEnd, unavailable, null, Cancelled));
     }
 
-    /// <summary>The system_health CPU line shares its read with the Entries table, and a chart draws no note: the page's note helper
+    /// <summary>The system_health CPU line shares its read with the Entries table, and a chart draws no data-start note: the page note helper
     /// returns null for any viz other than a table or a stat, so the listed read adds no strip above the line (#4966).</summary>
     [Fact]
     public void TheSystemHealthCpuLine_IsAChart_AndTheNoteHelperDrawsNothingForACharts()
@@ -189,7 +224,9 @@ public sealed class WebDataStartNoteEventReadsTests
         Assert.Contains("viz: \"line\"", tabs.AsSpan(line, 200).ToString(), StringComparison.Ordinal);
 
         var util = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "util.js");
-        Assert.Contains("(desc.viz !== \"table\" && desc.viz !== \"stat\")) return null;", util, StringComparison.Ordinal);
+        Assert.Contains("if (desc.viz !== \"table\" && desc.viz !== \"stat\" && !chart) return null;", util, StringComparison.Ordinal);
+        // ...and a chart draws only the row-capped note that names the oldest row shown (#5644 W12), which the data-start note does not.
+        Assert.Contains("if (typeof source.oldest_shown_utc !== \"string\") return null;", util, StringComparison.Ordinal);
     }
 
     /// <summary>The four reads' premises, in the tools' source: the payload fields the rules read.</summary>
@@ -207,7 +244,8 @@ public sealed class WebDataStartNoteEventReadsTests
 
         var blocking = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpBlockingTools.cs");
         Assert.Contains("order = \"event_time_desc\"", blocking, StringComparison.Ordinal);
-        Assert.Contains("oldest_returned_event_time = McpHelpers.FormatEffectiveStart(withXml.Min(r => r.EventTime))", blocking, StringComparison.Ordinal);
+        /* get_blocked_process_xml's oldest_returned_event_time is checked by calling the tool, not by its source text:
+           McpResponseBudget6180LiveTests.BlockedProcessXml_Default_KeepsWholeReportsThatFit_AndListsTheRest (#6180). */
         var longQueries = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpLongQueryTools.cs");
         Assert.Contains("order = \"duration_ms_desc\"", longQueries, StringComparison.Ordinal);
         var trace = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpDefaultTraceTools.cs");

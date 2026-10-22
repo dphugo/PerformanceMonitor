@@ -108,7 +108,9 @@ public sealed class CollectionHealthKeyedLookupParityTests
             /* The viewer's statement has no window left at all; the MCP statement keeps ONE, the trailing
                zero-row count, over the rows from the newest streak break on (a lookup, never the window). */
             Assert.Equal(0, await CountWindowAggsAsync(connection, ViewerDataService.CollectionHealthSql, windowStart, ct));
-            Assert.Equal(1, await CountWindowAggsAsync(connection, DarlingDataReader.CollectionHealthSql, windowStart, ct));
+            /* #5810 moved this pin from 1 to 3: the p95 CTE's running sum and total are two more WindowAggs, but
+               over the per-(collector, duration) HISTOGRAM (an Aggregate's output), never over the window's runs. */
+            Assert.Equal(3, await CountWindowAggsAsync(connection, DarlingDataReader.CollectionHealthSql, windowStart, ct));
 
             bodySucceeded = true;
         }
@@ -455,7 +457,11 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
 
     private static void AssertSameRows(string label, Result oracle, Result current)
     {
-        Assert.Equal(oracle.Columns, current.Columns);
+        /* #5646: the current statements carry ONE more column than the pre-change oracles, appended last
+           (trailing_success_runs, the recovery rule's input). Every column the oracle has is compared. */
+        Assert.Equal(oracle.Columns.Count + 1, current.Columns.Count);
+        Assert.Equal("trailing_success_runs", current.Columns[^1].Name);
+        Assert.Equal(oracle.Columns, current.Columns.Take(oracle.Columns.Count).ToList());
         Assert.Equal(oracle.Rows.Count, current.Rows.Count);
         Assert.True(oracle.Rows.Count >= 10, label + ": the seed should give the oracle many collectors");
         for (var r = 0; r < oracle.Rows.Count; r++)

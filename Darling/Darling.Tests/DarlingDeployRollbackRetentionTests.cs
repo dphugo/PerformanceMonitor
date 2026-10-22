@@ -273,6 +273,75 @@ public sealed class DarlingDeployRollbackRetentionTests
     }
 
     /// <summary>
+    /// #5700 follow-up: the kept-backup step passes each backup folder to the permission step on its own.
+    ///
+    /// <para><b>The trap is the same unary-comma return as #2671.</b> <c>Get-DarlingRollbackBackups</c> returns
+    /// <c>,@(...)</c>, so wrapping the call in <c>@( )</c> again gave a one-element array holding the whole list.
+    /// With two or more backups the loop ran once, <c>$retained.FullName</c> was every path, and the
+    /// <c>[string]$path</c> parameter joined them with spaces. With exactly one backup it happened to work, so
+    /// this builds three.</para>
+    ///
+    /// <para>It runs <c>Protect-DarlingKeptRollbackBackups</c> - the function the main body calls - against an
+    /// install root holding three backup folders named by <c>New-DarlingRollbackBackupName</c> plus a folder that
+    /// is not a backup. <c>Protect-DarlingRollbackBackupFolder</c> and <c>Warn</c> are recording stubs, so the
+    /// assertion is on the exact calls the loop makes.</para>
+    /// </summary>
+    [Fact]
+    public void TheKeptBackupStep_PassesEachBackupFolderToThePermissionStepOnItsOwn()
+    {
+        var root = Directory.CreateTempSubdirectory("darling-5700-kept-");
+        try
+        {
+            var probe = new StringBuilder();
+            probe.AppendLine(ExtractFunction(DeployScript, "Test-DarlingRollbackBackupName"));
+            probe.AppendLine(ExtractFunction(DeployScript, "New-DarlingRollbackBackupName"));
+            probe.AppendLine(ExtractFunction(DeployScript, "Get-DarlingRollbackBackups"));
+            probe.AppendLine(ExtractFunction(DeployScript, "Protect-DarlingKeptRollbackBackups"));
+
+            /* Recording stubs for the two collaborators. The second folder reports a problem, so the warning path is
+               walked once and must name that folder alone. */
+            probe.AppendLine("$script:calls = New-Object System.Collections.Generic.List[string]");
+            probe.AppendLine("function Protect-DarlingRollbackBackupFolder([string]$path, [switch]$ResetChildren) {");
+            probe.AppendLine("    $script:calls.Add(('PROTECT|{0}|{1}' -f $path, $ResetChildren.IsPresent))");
+            probe.AppendLine("    if ($path -like '*20260802-*') { return ('problem with ' + $path) }");
+            probe.AppendLine("    return $null");
+            probe.AppendLine("}");
+            probe.AppendLine("function Warn([string]$message) { $script:calls.Add('WARN|' + $message) }");
+
+            /* Three backups taken on different days, stamped with different times so the newest-first order is set by
+               LastWriteTimeUtc, plus a folder that is not a backup and a stray file. */
+            probe.AppendLine($"$root = '{root.FullName}'");
+            probe.AppendLine("$days = @(1, 2, 3)");
+            probe.AppendLine("foreach ($d in $days) {");
+            probe.AppendLine("    $name = New-DarlingRollbackBackupName ([datetime]::new(2026, 8, $d, 10, 0, 0, [DateTimeKind]::Utc))");
+            probe.AppendLine("    $dir = New-Item -ItemType Directory -Path (Join-Path $root $name)");
+            probe.AppendLine("    $dir.LastWriteTimeUtc = [datetime]::new(2026, 8, $d, 10, 0, 0, [DateTimeKind]::Utc)");
+            probe.AppendLine("}");
+            probe.AppendLine("New-Item -ItemType Directory -Path (Join-Path $root 'viewer') | Out-Null");
+            probe.AppendLine("Set-Content -LiteralPath (Join-Path $root '_rollback_manual_20260809-000000') -Value 'a file, not a folder'");
+
+            probe.AppendLine("Protect-DarlingKeptRollbackBackups $root");
+            probe.AppendLine("foreach ($c in $script:calls) { $c }");
+
+            var answers = RunWindowsPowerShell(probe.ToString());
+
+            var dir = root.FullName;
+            string[] expected =
+            [
+                $"PROTECT|{dir}\\_rollback_manual_20260803-100000|True",
+                $"PROTECT|{dir}\\_rollback_manual_20260802-100000|True",
+                $"WARN|problem with {dir}\\_rollback_manual_20260802-100000",
+                $"PROTECT|{dir}\\_rollback_manual_20260801-100000|True",
+            ];
+            Assert.Equal(expected, answers);
+        }
+        finally
+        {
+            TryDeleteTree(root.FullName);
+        }
+    }
+
+    /// <summary>
     /// The script must never kill a process under the install tree, and this is the pin that says so out
     /// loud rather than trusting that nobody adds one.
     ///
@@ -408,8 +477,13 @@ public sealed class DarlingDeployRollbackRetentionTests
 
         Assert.Contains("[switch]$PruneOnly", DeployScript, StringComparison.Ordinal);
 
+        // #5796: the script ships in the Windows publish only (the only place a rollback backup is taken, so the
+        // only place the advice is given); the Linux publish leaves all three scripts out.
         var csproj = ReadRepoFile(Path.Combine("Darling", "PerformanceMonitor.Darling.Service", "PerformanceMonitor.Darling.Service.csproj"));
-        Assert.Contains("upgrade-darling.ps1", csproj, StringComparison.Ordinal);
+        Assert.Contains(
+            """<None Include="..\tools\upgrade-darling.ps1" Link="upgrade-darling.ps1" CopyToOutputDirectory="PreserveNewest" Condition="$(DarlingShipsWindowsScripts)" />""",
+            csproj,
+            StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -575,7 +649,7 @@ public sealed class DarlingDeployRollbackRetentionTests
 
         var crossCheck = script.IndexOf("$registeredRoot = Get-DarlingInstallRootFromService $serviceName", StringComparison.Ordinal);
         Assert.True(crossCheck >= 0, "upgrade-darling.ps1 no longer cross-checks -InstallRoot against the registered ImagePath (#2525)");
-        Assert.Contains("elseif (-not (Test-DarlingSamePath $registeredRoot $InstallRoot)) {", script, StringComparison.Ordinal);
+        Assert.Contains("elseif (-not (Test-DarlingSamePath $registeredRoot $InstallRoot) -and -not (Test-DarlingSameFolderIdentity $registeredRoot $InstallRoot)) {", script, StringComparison.Ordinal);
 
         /* Unconditional. A `if ($PSBoundParameters.ContainsKey('InstallRoot'))` around this would make it
            absent for the caller it exists to protect. */
@@ -604,6 +678,7 @@ public sealed class DarlingDeployRollbackRetentionTests
     public void TheDeployScript_ComparesPathsOneWay_AndToleratesTheWaysPeopleTypeThem()
     {
         var probe = new StringBuilder();
+        probe.AppendLine(ExtractFunction(DeployScript, "Get-DarlingCanonicalPath"));
         probe.AppendLine(ExtractFunction(DeployScript, "Test-DarlingSamePath"));
         probe.AppendLine("$sep = [IO.Path]::DirectorySeparatorChar");
         probe.AppendLine("$root = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'PerformanceMonitorDarling')).TrimEnd($sep)");
@@ -712,13 +787,7 @@ public sealed class DarlingDeployRollbackRetentionTests
         File.WriteAllText(path, script);
         try
         {
-            using var process = Process.Start(new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -File \"{path}\"")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            });
+            using var process = Process.Start(WindowsPowerShellStartInfo.ForScript(path));
             Assert.NotNull(process);
 
             /* BOTH streams drained CONCURRENTLY. Reading stdout to the end and then stderr is the classic

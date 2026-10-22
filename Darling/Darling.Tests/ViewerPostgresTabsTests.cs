@@ -340,7 +340,9 @@ public sealed class ViewerPostgresTabsTests
         Assert.False(waits.IsFault);
         Assert.Contains("aurora_stat_system_waits()", waits.Explanation, StringComparison.Ordinal);
         Assert.Contains("never will", waits.Explanation, StringComparison.Ordinal);
-        Assert.Contains(stock.ServerName, waits.Explanation, StringComparison.Ordinal);
+        /* #6135: the sentence names the server the way every other screen does, not by its connection key. */
+        Assert.Contains(stock.DisplayName, waits.Explanation, StringComparison.Ordinal);
+        Assert.DoesNotContain(stock.ServerName, waits.Explanation, StringComparison.Ordinal);
 
         /* A collector that CAN run here and has no rows is a fault to chase, not a fact to read. The two
            states are deliberately distinct because they need different responses. */
@@ -407,8 +409,8 @@ public sealed class ViewerPostgresTabsTests
         /* The ONE stated exemption: pg_database_size_stats (V136, #3691) is written by its collector and read by
            nothing yet — the analysis consumer (lane 32) and its Viewer panel are follow-on lanes on #3691. It is
            PLACED on the Storage tab (the placement census above has no exemption path, deliberately) and the
-           tab's note tells the operator it is collected and not yet drawn; PgRegistryPanelPlacementTests and
-           ViewerCollectorCoverageTests carry the matching entries. All three come off in the panel's PR. */
+           tab's note tells the operator it is collected and not yet drawn; PgRegistryPanelPlacementTests carries
+           the matching entry. Both come off in the panel's PR. */
         var placedNotDrawn = new HashSet<string>(StringComparer.Ordinal) { "pg_database_size_stats" };
 
         var unasked = ViewerPostgresTabs.All

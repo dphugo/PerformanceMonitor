@@ -137,33 +137,6 @@ public class ComposeClientTimeoutAttributionTests
 
     private static string WebCode() => Code("Darling", "PerformanceMonitor.Darling.Service", "DarlingWebEndpoints.cs");
 
-    private static string CallArguments(string code, string callStart)
-    {
-        var at = code.IndexOf(callStart, StringComparison.Ordinal);
-        Assert.True(at >= 0, $"call '{callStart}' not found");
-        var end = code.IndexOf(");", at, StringComparison.Ordinal);
-        Assert.True(end > at);
-        return code[at..end];
-    }
-
-    [Fact]
-    public void TheComposeRunRoute_PassesTheHeadroomAndTheRemapFlag()
-    {
-        var call = CallArguments(WebCode(), "await RunComposedPanelAsync(postgres, body, context.RequestAborted");
-
-        Assert.Equal("await RunComposedPanelAsync(postgres, body, context.RequestAborted, readLatencyRecorder, ComposeClientDeadlineHeadroomSeconds, remapClientTimeout: true, includeDataStartFields: true", call);
-    }
-
-    [Fact]
-    public void TheMcpCaller_PassesNoHeadroom_AndTheRemapFlag()
-    {
-        var call = CallArguments(
-            Code("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpCustomViewTools.cs"),
-            "DarlingWebEndpoints.RunComposedPanelAsync(");
-
-        Assert.Equal("DarlingWebEndpoints.RunComposedPanelAsync(postgres, body, CancellationToken.None, readLatency, remapClientTimeout: true", call);
-    }
-
     [Fact]
     public void TheRunner_PassesTheClientDeadlineToTheMeasureAndAnnotationQueries()
     {

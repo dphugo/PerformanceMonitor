@@ -421,7 +421,7 @@ LIMIT 1";
     /// it. The wait value's index follows the database values, so it is <c>5 + dbValues.Count</c>.</para>
     /// </summary>
     public async Task<(List<QuerySnapshotRow> Rows, long PopulationCount)> GetActiveQueriesPageAsync(
-        int serverId, int hoursBack, int cap, string? databaseName = null, bool blockingOnly = false, string? waitType = null, DateTime? asOfUtc = null)
+        int serverId, int hoursBack, int cap, string? databaseName = null, bool blockingOnly = false, string? waitType = null, DateTime? asOfUtc = null, QueryTagReadScope? tags = null)
     {
         using var _q = TimeQuery("GetActiveQueriesPageAsync", "v_query_snapshots filtered page (MCP)");
         using var connection = await OpenConnectionAsync();
@@ -433,6 +433,7 @@ LIMIT 1";
         var blockingClause = blockingOnly ? " AND (w.blocking_session_id > 0 OR h.session_id IS NOT NULL)" : "";
         var waitFilter = string.IsNullOrWhiteSpace(waitType) ? null : waitType.Trim();
         var waitClause = waitFilter == null ? "" : $" AND upper(w.wait_type) IN (upper(${5 + dbValues.Count}), upper(${5 + dbValues.Count}) || ' ')";
+        var tagValues = new List<object>();
 
         command.CommandText = @"
 WITH window_rows AS (
@@ -487,7 +488,7 @@ population AS (
     LEFT JOIN heads h
       ON  h.collection_time = w.collection_time
       AND h.session_id = w.session_id
-    WHERE (w.query_text NOT LIKE 'WAITFOR%' OR h.session_id IS NOT NULL)" + dbClause + blockingClause + waitClause + @"
+    WHERE (w.query_text NOT LIKE 'WAITFOR%' OR h.session_id IS NOT NULL)" + dbClause + blockingClause + waitClause + (tags is null ? "" : QueryTagReadScope.HashToken("w.query_hash")) + @"
 )
 SELECT
     p.session_id,
@@ -527,6 +528,11 @@ SELECT
 FROM population p
 ORDER BY p.collection_time DESC, p.cpu_time_ms DESC
 LIMIT $4";
+        if (tags is not null)
+        {
+            command.CommandText = tags.Apply(command.CommandText, 5 + dbValues.Count + (waitFilter == null ? 0 : 1));
+            tagValues.AddRange(tags.ParameterValues);
+        }
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = startTime });
@@ -536,6 +542,8 @@ LIMIT $4";
             command.Parameters.Add(new DuckDBParameter { Value = db });
         if (waitFilter != null)
             command.Parameters.Add(new DuckDBParameter { Value = waitFilter });
+        foreach (var tagValue in tagValues)
+            command.Parameters.Add(new DuckDBParameter { Value = tagValue });
 
         var items = new List<QuerySnapshotRow>();
         long populationCount = 0;
@@ -581,7 +589,7 @@ LIMIT $4";
 
     /// <summary>
     /// Gets lightweight blocking + deadlock counts and latest event time for alert badge updates.
-    /// Much cheaper than fetching full rows with XML — just COUNT(*) and MAX(time).
+    /// Much cheaper than fetching full rows with XML — a count of waits and MAX(time).
     /// </summary>
     /// <remarks>
     /// <paramref name="fromDate"/>/<paramref name="toDate"/> are the tab's custom range as naive-UTC instants
@@ -601,11 +609,20 @@ LIMIT $4";
 
         /* blocking_count prefers the blocked-process-report; falls back to the always-on DMV snapshot when
            BPR captured nothing (AWS RDS). latest_event_time includes DMV blocking recency too. */
+        /* #5644: the count is WAITS, not report rows (BlockingWaits.WaitsCteSql, the definition the Overview tile, the
+           alert and the analysis fact share): SQL Server writes a report for a still-blocked session every threshold
+           seconds, so one one-minute wait put about eleven on this badge beside a tile that said 1. */
         command.CommandText = @"
+WITH " + BlockingWaits.WaitsCteSql(
+            BlockingWaits.SqlDialect.DuckDb, "xe_waits",
+            @"SELECT blocked_spid, blocking_spid, event_time, wait_time_ms
+    FROM " + StoredEventCopies.BlockedProcessReports("server_id = $1 AND event_time >= $2 AND event_time <= $3") + @" AS ev") + "," + BlockingWaits.WaitsCteSql(
+            BlockingWaits.SqlDialect.DuckDb, "dmv_waits",
+            @"SELECT blocked_spid, blocking_spid, event_time, wait_time_ms
+    FROM v_dmv_blocking_snapshots
+    WHERE server_id = $1 AND collection_time >= $2 AND collection_time <= $3") + @"
 SELECT
-    COALESCE(NULLIF((SELECT COUNT(*) FROM " + StoredEventCopies.BlockedProcessReports("server_id = $1 AND event_time >= $2 AND event_time <= $3") + @" AS ev), 0),
-     (SELECT COUNT(*) FROM v_dmv_blocking_snapshots
-     WHERE server_id = $1 AND collection_time >= $2 AND collection_time <= $3)) AS blocking_count,
+    COALESCE(NULLIF((SELECT COUNT(*) FROM xe_waits), 0), (SELECT COUNT(*) FROM dmv_waits)) AS blocking_count,
     (SELECT " + StoredEventCopies.DeadlockDistinctCount + @" FROM v_deadlocks AS dl WHERE server_id = $1 AND deadlock_time >= $2 AND deadlock_time <= $3) AS deadlock_count,
     (SELECT MAX(t) FROM (
         SELECT MAX(event_time) AS t FROM " + StoredEventCopies.BlockedProcessReports("server_id = $1 AND event_time >= $2 AND event_time <= $3") + @" AS ev
@@ -852,7 +869,8 @@ SELECT
     blocked_sql_text, blocking_sql_text,
     blocked_login_name, blocked_host_name, blocked_client_app,
     blocked_last_tran_started, blocking_last_tran_started, monitor_loop,
-    blocking_login_name, blocking_host_name, blocking_client_app
+    blocking_login_name, blocking_host_name, blocking_client_app,
+    blocking_login_time, blocking_last_request_end_time, blocking_open_transaction_count, blocking_tran_log_bytes_used
 FROM v_dmv_blocking_snapshots
 WHERE server_id = $1 AND collection_time >= $2 AND collection_time <= $3" + dbClause + @"
 ORDER BY event_time DESC
@@ -893,6 +911,11 @@ LIMIT $4";
                     BlockingLoginName = reader.IsDBNull(19) ? "" : reader.GetString(19),
                     BlockingHostName = reader.IsDBNull(20) ? "" : reader.GetString(20),
                     BlockingClientApp = reader.IsDBNull(21) ? "" : reader.GetString(21),
+                    /* #5632: the head blocker's evidence (the two stamps are the monitored server's local clock, stored raw). */
+                    BlockingLoginTime = reader.IsDBNull(22) ? null : reader.GetDateTime(22),
+                    BlockingLastRequestEndTime = reader.IsDBNull(23) ? null : reader.GetDateTime(23),
+                    BlockingOpenTransactionCount = reader.IsDBNull(24) ? null : reader.GetInt32(24),
+                    BlockingTranLogBytesUsed = reader.IsDBNull(25) ? null : reader.GetInt64(25),
                     Source = BlockedProcessAlertRow.DmvSnapshotSource
                 });
             }
@@ -1604,6 +1627,19 @@ public class BlockedProcessReportRow : BlockedProcessAlertRow
     public DateTime? BlockingLastBatchCompleted { get; set; }
     public int BlockedPriority { get; set; }
     public int BlockingPriority { get; set; }
+
+    /* #5632, DMV-snapshot rows only: the head blocker's evidence. The two stamps are the monitored server's local clock, stored raw. */
+    public DateTime? BlockingLoginTime { get; set; }
+    public DateTime? BlockingLastRequestEndTime { get; set; }
+    public int? BlockingOpenTransactionCount { get; set; }
+    public long? BlockingTranLogBytesUsed { get; set; }
+
+    /* #5632 part 4: the grid's text for the four. The two stamps are the monitored server's own clock, so they take the server-clock
+       renderer (not the UTC one EventTime uses); a NULL is an empty cell, and the columns sort on the numbers above, not on this text. */
+    public string BlockingLoginTimeLocal => ServerTimeHelper.FormatServerClock(BlockingLoginTime);
+    public string BlockingLastRequestEndTimeLocal => ServerTimeHelper.FormatServerClock(BlockingLastRequestEndTime);
+    public string BlockingOpenTransactionCountText => BlockingHeadEvidenceText.FormatCount(BlockingOpenTransactionCount);
+    public string BlockingTranLogBytesUsedText => BlockingHeadEvidenceText.FormatLogBytes(BlockingTranLogBytesUsed);
 
     public string EventTimeLocal => ServerTimeHelper.FormatServerTime(EventTime);
     public string WaitTimeFormatted => WaitTimeMs < 1000 ? $"{WaitTimeMs} ms" : $"{WaitTimeMs / 1000.0:F1} sec";

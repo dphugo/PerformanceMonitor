@@ -8,9 +8,13 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
+using NpgsqlTypes;
+using PerformanceMonitor.Common;
+using PerformanceMonitor.Notifications;
 
 namespace PerformanceMonitor.Darling.Service.Mcp;
 
@@ -48,7 +52,17 @@ internal static class DarlingAlertReader
     public sealed record AlertHistoryReadRow(
         DateTime AlertTime, int ServerId, string ServerName, string MetricName,
         double CurrentValue, double ThresholdValue, bool AlertSent, string NotificationType,
-        string? SendError, bool Muted, string? DetailText, bool Dismissed, string? ContextJson = null, string? StoredServerName = null);
+        string? SendError, bool Muted, string? DetailText, bool Dismissed, string? ContextJson = null, string? StoredServerName = null)
+    {
+        /// <summary>#5825 (V187): when a resolution's send delivered (UTC); null on every other row.</summary>
+        public DateTime? ResolutionSentAt { get; init; }
+
+        /// <summary>#5825: the channels a resolution went to, or would have gone to when muted, comma-separated.</summary>
+        public string? ResolutionChannels { get; init; }
+
+        /// <summary>#5825: <c>sent</c>, <c>failed: ...</c>, <c>muted</c> or <c>route deleted or disabled: ...</c>.</summary>
+        public string? ResolutionOutcome { get; init; }
+    }
 
     private const string AlertHistorySelectColumns = @"
     a.alert_time,
@@ -64,6 +78,9 @@ internal static class DarlingAlertReader
     a.detail_text,
     a.context_json,
     a.server_name AS stored_server_name,
+    a.resolution_sent_at,
+    a.resolution_channels,
+    a.resolution_outcome,
     a.dismissed";
 
     /// <summary>Per-server alert history — the viewer's <c>AlertHistorySql</c>. $1 window start, $2 window
@@ -90,6 +107,8 @@ WHERE a.alert_time >= $1
 AND   a.alert_time <= $2
 AND   a.server_id = $3
 AND   (a.dismissed = FALSE OR $5)
+AND   ($6::text IS NULL OR lower(a.metric_name) = lower($6))
+AND   TRUE /* family */
 ORDER BY a.alert_time DESC
 LIMIT $4";
 
@@ -102,6 +121,8 @@ LEFT JOIN servers s ON s.server_id = a.server_id
 WHERE a.alert_time >= $1
 AND   a.alert_time <= $2
 AND   (a.dismissed = FALSE OR $4)
+AND   ($5::text IS NULL OR lower(a.metric_name) = lower($5))
+AND   TRUE /* family */
 ORDER BY a.alert_time DESC
 LIMIT $3";
 
@@ -115,7 +136,9 @@ FROM config_alert_log
 WHERE alert_time >= $1
 AND   alert_time <= $2
 AND   server_id = $3
-AND   dismissed = TRUE";
+AND   dismissed = TRUE
+AND   ($4::text IS NULL OR lower(metric_name) = lower($4))
+AND   TRUE /* family */";
 
     /// <summary>The fleet-wide twin of <see cref="DismissedAlertCountSql"/>. $1 window start, $2 window end.</summary>
     public const string DismissedAlertCountAllServersSql = @"
@@ -123,7 +146,9 @@ SELECT COUNT(*)
 FROM config_alert_log
 WHERE alert_time >= $1
 AND   alert_time <= $2
-AND   dismissed = TRUE";
+AND   dismissed = TRUE
+AND   ($3::text IS NULL OR lower(metric_name) = lower($3))
+AND   TRUE /* family */";
 
     /// <summary>
     /// Recent alerts newest first, excluding dismissed rows — the Alert History read. With no
@@ -134,18 +159,37 @@ AND   dismissed = TRUE";
     /// </summary>
     public static Task<List<AlertHistoryReadRow>> GetAlertHistoryAsync(
         NpgsqlDataSource postgres, DateTime sinceUtc, DateTime untilUtc, int? serverId, int limit, CancellationToken cancellationToken = default) =>
-        GetAlertHistoryPageAsync(postgres, sinceUtc, untilUtc, serverId, limit, includeDismissed: false, cancellationToken);
+        GetAlertHistoryPageAsync(postgres, sinceUtc, untilUtc, serverId, limit, includeDismissed: false, cancellationToken: cancellationToken);
+
+    /// <summary>The optional metric and family filters of <c>get_alert_history</c> (#6074). Both apply in the SQL, ahead of
+    /// the row cap, so a filtered page is the newest <c>limit</c> rows OF THAT METRIC and not a trim of an unfiltered page.
+    /// <see cref="MetricName"/> matches the stored name exactly, case-insensitively; <see cref="Family"/> is a canonical family
+    /// (<see cref="AlertFamily.NormalizeFamily"/>), matched through <see cref="AlertFamily.Of"/>'s census.</summary>
+    public sealed record AlertHistoryFilter(string? MetricName, string? Family)
+    {
+        public static readonly AlertHistoryFilter None = new(null, null);
+
+        public bool IsSet => MetricName is not null || Family is not null;
+
+        /// <summary>The statement with the family placeholder replaced by the family predicate over <paramref name="column"/>.</summary>
+        internal string Apply(string sql, string column) =>
+            Family is null
+                ? sql
+                : sql.Replace("TRUE /* family */", AlertFamily.SqlFamilyPredicate(column, Family), StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// <see cref="GetAlertHistoryAsync"/> with the dismissed filter as a parameter. Callers detecting
     /// truncation pass <c>limit + 1</c> and read the extra row as the signal.
     /// </summary>
     public static async Task<List<AlertHistoryReadRow>> GetAlertHistoryPageAsync(
-        NpgsqlDataSource postgres, DateTime sinceUtc, DateTime untilUtc, int? serverId, int limit, bool includeDismissed, CancellationToken cancellationToken = default)
+        NpgsqlDataSource postgres, DateTime sinceUtc, DateTime untilUtc, int? serverId, int limit, bool includeDismissed,
+        AlertHistoryFilter? filter = null, CancellationToken cancellationToken = default)
     {
         var rows = new List<AlertHistoryReadRow>();
+        filter ??= AlertHistoryFilter.None;
 
-        await using var command = postgres.CreateCommand(serverId.HasValue ? AlertHistorySql : AlertHistoryAllServersSql);
+        await using var command = postgres.CreateCommand(filter.Apply(serverId.HasValue ? AlertHistorySql : AlertHistoryAllServersSql, "a.metric_name"));
         command.CommandTimeout = McpCommandDeadlines.ReadSeconds;
         DarlingMcpReadParameters.AddTimestamp(command, sinceUtc);
         DarlingMcpReadParameters.AddTimestamp(command, untilUtc);
@@ -157,6 +201,7 @@ AND   dismissed = TRUE";
         /* Typed bool so Npgsql binds a boolean rather than inferring from an object — the predicate is
            `(dismissed = FALSE OR $N)` and an untyped parameter there is a runtime type error, not a compile one. */
         command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = includeDismissed });
+        DarlingMcpReadParameters.AddNullableText(command, filter.MetricName);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
@@ -165,6 +210,59 @@ AND   dismissed = TRUE";
         }
 
         return rows;
+    }
+
+    /// <summary>#6261: every fire of the page's (server, metric) pairs in the span the page's streaks look at: $1 server ids, $2
+    /// metric names (parallel arrays, one entry per distinct pair), $3 window start (the oldest row's time minus
+    /// <see cref="InvestigationAlertRecurrence.Days"/> days), $4 window end (the newest row's time), naive UTC. Muted and dismissed
+    /// rows are in: they fired. Exact metric name, like the brief's recurrence read, so a resolution row ("X Resolved") never
+    /// matches a firing metric. The <c>(server_id, metric_name, alert_time)</c> index serves it, one seek per pair.</summary>
+    public const string AlertStreakFiresSql = @"
+SELECT a.server_id, a.metric_name, a.alert_time
+FROM unnest($1::int[], $2::text[]) AS p(server_id, metric_name)
+JOIN config_alert_log AS a ON a.server_id = p.server_id AND a.metric_name = p.metric_name
+WHERE a.alert_time >= $3
+AND   a.alert_time <= $4";
+
+    /// <summary>#6261: the streak of each row of <paramref name="page"/>, aligned with it, in one read for the whole page. Null on
+    /// a resolution row (a recovery is not a fire). See <see cref="InvestigationAlertStreak"/>.</summary>
+    public static async Task<int?[]> GetAlertStreaksAsync(
+        NpgsqlDataSource postgres, IReadOnlyList<AlertHistoryReadRow> page, CancellationToken cancellationToken = default)
+    {
+        var streaks = new int?[page.Count];
+        var firing = page.Where(r => !AlertMetricClassifier.IsResolution(r.MetricName)).ToList();
+        if (firing.Count == 0) return streaks;
+
+        var pairs = firing.Select(r => (r.ServerId, r.MetricName)).Distinct().ToList();
+        var since = firing.Min(r => r.AlertTime).AddDays(-InvestigationAlertRecurrence.Days);
+        var until = firing.Max(r => r.AlertTime);
+
+        var fires = new Dictionary<(int, string), List<DateTime>>();
+        await using var command = postgres.CreateCommand(AlertStreakFiresSql);
+        command.CommandTimeout = McpCommandDeadlines.ReadSeconds;
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Integer, Value = pairs.Select(p => p.ServerId).ToArray() });
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Text, Value = pairs.Select(p => p.MetricName).ToArray() });
+        DarlingMcpReadParameters.AddTimestamp(command, since);
+        DarlingMcpReadParameters.AddTimestamp(command, until);
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var key = (reader.GetInt32(0), reader.GetString(1));
+                if (!fires.TryGetValue(key, out var list)) fires[key] = list = new List<DateTime>();
+                list.Add(reader.GetDateTime(2));
+            }
+        }
+
+        for (var i = 0; i < page.Count; i++)
+        {
+            if (AlertMetricClassifier.IsResolution(page[i].MetricName)) continue;
+            streaks[i] = fires.TryGetValue((page[i].ServerId, page[i].MetricName), out var list)
+                ? InvestigationAlertStreak.ForAlert(page[i].AlertTime, list)
+                : 0;
+        }
+
+        return streaks;
     }
 
     /// <summary>The stored context of ONE alert, by the page's own row identity (#5241): $1 server_id, $2 metric_name
@@ -213,11 +311,16 @@ LIMIT 1";
             !reader.IsDBNull(9) && reader.GetBoolean(9),
             reader.IsDBNull(10) ? null : reader.GetString(10),
             /* context_json sits at ordinal 11, the stored server_name (the spelling the producer's mute context
-               carries, as opposed to the display name at ordinal 2) at 12, and dismissed stays the LAST column
-               at 13 — the "dismissed is selected" pin anchors on it closing the list. */
-            !reader.IsDBNull(13) && reader.GetBoolean(13),
+               carries, as opposed to the display name at ordinal 2) at 12, the three #5825 resolution columns at 13-15,
+               and dismissed stays the LAST column at 16. */
+            !reader.IsDBNull(16) && reader.GetBoolean(16),
             reader.IsDBNull(11) ? null : reader.GetString(11),
-            reader.IsDBNull(12) ? null : reader.GetString(12));
+            reader.IsDBNull(12) ? null : reader.GetString(12))
+        {
+            ResolutionSentAt = reader.IsDBNull(13) ? null : DateTime.SpecifyKind(reader.GetDateTime(13), DateTimeKind.Utc),
+            ResolutionChannels = reader.IsDBNull(14) ? null : reader.GetString(14),
+            ResolutionOutcome = reader.IsDBNull(15) ? null : reader.GetString(15),
+        };
 
     /* ─────────── the first row after an alert (#4755) ─────────── */
 
@@ -327,9 +430,10 @@ LIMIT 1";
     /// <summary>How many dismissed rows the window (and server scope) holds — the rows the default read hides.
     /// See <see cref="DismissedAlertCountSql"/>.</summary>
     public static async Task<long> CountDismissedAlertsAsync(
-        NpgsqlDataSource postgres, DateTime sinceUtc, DateTime untilUtc, int? serverId, CancellationToken cancellationToken = default)
+        NpgsqlDataSource postgres, DateTime sinceUtc, DateTime untilUtc, int? serverId, AlertHistoryFilter? filter = null, CancellationToken cancellationToken = default)
     {
-        await using var command = postgres.CreateCommand(serverId.HasValue ? DismissedAlertCountSql : DismissedAlertCountAllServersSql);
+        filter ??= AlertHistoryFilter.None;
+        await using var command = postgres.CreateCommand(filter.Apply(serverId.HasValue ? DismissedAlertCountSql : DismissedAlertCountAllServersSql, "metric_name"));
         command.CommandTimeout = McpCommandDeadlines.ReadSeconds;
         DarlingMcpReadParameters.AddTimestamp(command, sinceUtc);
         DarlingMcpReadParameters.AddTimestamp(command, untilUtc);
@@ -337,6 +441,7 @@ LIMIT 1";
         {
             DarlingMcpReadParameters.AddInt(command, serverId.Value);
         }
+        DarlingMcpReadParameters.AddNullableText(command, filter.MetricName);
 
         var count = await command.ExecuteScalarAsync(cancellationToken);
         return count is long l ? l : Convert.ToInt64(count, System.Globalization.CultureInfo.InvariantCulture);
@@ -409,7 +514,25 @@ LIMIT 1";
            same reason. Carried RAW rather than resolved so the payload builder can say which of the knob's two
            homes decided (DarlingAlertSettings.ResolveUncorroboratedRoute takes this beside the published file
            value) and so a store whose CHECK was dropped reports the same fall-through the service applied. */
-        string? AnalysisUncorroboratedRoute);
+        string? AnalysisUncorroboratedRoute,
+        /* #5641 (V177): the Runnable Queue alert's switch and its two bars (runnable tasks per scheduler, averaged over the
+           last 5 minutes' collections, or the newest 3 inside 10 minutes), NOT NULL in the store. APPENDED, same reason. Carried as stored: the payload reports them
+           through RunnableQueueEvaluator.ClampBars, the way the engine reads them. */
+        bool RunnableQueueEnabled,
+        int RunnableQueueWarningPerScheduler,
+        int RunnableQueueCriticalPerScheduler,
+        /* #5640 (V179): the Client Timeouts alert's switch (OFF by default) and its two bars (client attentions per minute over the
+           attention collector's last runs), NOT NULL in the store. APPENDED, same reason. Carried as stored: the payload reports the
+           bars through AttentionEvaluator.ClampBars, the way the engine reads them. */
+        bool ClientTimeoutsEnabled,
+        int ClientTimeoutsWarningPerMinute,
+        int ClientTimeoutsCriticalPerMinute,
+        /* #6098 (V200): the Volume Free Space alert's fleet-wide excluded mount points (text[] NOT NULL, the excluded_databases
+           shape). APPENDED, same reason. */
+        IReadOnlyList<string> ExcludedVolumes,
+        /* #5736 (V211): the relative Client Timeouts bars' two multiples (integer NOT NULL, defaults 3 and 10). APPENDED, same reason. */
+        int ClientTimeoutsWarningMultiple,
+        int ClientTimeoutsCriticalMultiple);
 
     /// <summary>The single global alert-settings row (id=1) — the viewer's <c>AlertSettingsSelectSql</c>. The
     /// columns are read in the SAME order the service reads them (<c>StoreConfigProvider</c>), and
@@ -443,7 +566,11 @@ SELECT enabled, cpu_enabled, cpu_threshold_percent, cpu_mode, blocking_enabled, 
        fleet_sweep_enabled, fleet_sweep_interval_minutes,
        self_disk_free_warn_gb,
        long_running_query_excluded_program_name_prefixes, long_running_query_excluded_logins,
-       analysis_uncorroborated_route
+       analysis_uncorroborated_route,
+       runnable_queue_enabled, runnable_queue_warning_per_scheduler, runnable_queue_critical_per_scheduler,
+       client_timeouts_enabled, client_timeouts_warning_per_minute, client_timeouts_critical_per_minute,
+       excluded_volumes,
+       client_timeouts_warning_multiple, client_timeouts_critical_multiple
 FROM config_alert_settings
 WHERE id = 1";
 
@@ -502,7 +629,15 @@ WHERE id = 1";
             reader.IsDBNull(68) ? Array.Empty<string>() : reader.GetFieldValue<string[]>(68),
             /* #3712 (V137): the route knob's store half at 69 — NULL is the expected reading on every store that
                has not had a route written, not a mid-migration guard. */
-            reader.IsDBNull(69) ? null : reader.GetString(69));
+            reader.IsDBNull(69) ? null : reader.GetString(69),
+            /* #5641 (V177): the Runnable Queue switch and bars at 70-72. */
+            reader.GetBoolean(70), reader.GetInt32(71), reader.GetInt32(72),
+            /* #5640 (V179): the Client Timeouts switch and bars at 73-75. */
+            reader.GetBoolean(73), reader.GetInt32(74), reader.GetInt32(75),
+            /* #6098 (V200): the excluded mount points at 76. */
+            reader.IsDBNull(76) ? Array.Empty<string>() : reader.GetFieldValue<string[]>(76),
+            /* #5736 (V211): the multiples at 77-78. */
+            reader.GetInt32(77), reader.GetInt32(78));
     }
 
     /* ─────────────────────── delivery cooldown (a SECOND config table) ─────────────────────── */
@@ -525,15 +660,23 @@ WHERE id = 1";
     /// columns the carve GRANTS is the shape that survives. <c>McpConfigReadAvoidsSecretColumnsTests</c>
     /// pins that this SELECT names no carved column.</para></summary>
     public const string DeliveryCooldownSelectSql = @"
-SELECT email_cooldown_minutes
+SELECT email_cooldown_minutes,
+       slack_send_resolutions, teams_send_resolutions, generic_send_resolutions, email_send_resolutions
 FROM config_notification
 WHERE id = 1";
+
+    /// <summary>The four per-channel "send resolutions" flags (V187, #5825), as get_alert_settings reports them under
+    /// <c>delivery.send_resolutions</c>. Non-secret columns of the same row, granted to the read roles.</summary>
+    public sealed record SendResolutionsRead(bool Slack, bool Teams, bool Webhook, bool Email);
+
+    /// <summary>The delivery half of the alert configuration: the delivery cooldown and the resolution flags.</summary>
+    public sealed record DeliveryRead(int CooldownMinutes, SendResolutionsRead SendResolutions);
 
     /// <summary>Reads the delivery cooldown, or null when the store has no notification row. Null is a
     /// distinct answer rather than the shipped 15: the service seeds this row and
     /// <c>config_alert_settings</c> in ONE pass, so "settings present, notification absent" is not a state
     /// the product produces, and reporting a number nobody wrote would claim a reading never taken.</summary>
-    private static async Task<int?> ReadDeliveryCooldownAsync(
+    private static async Task<DeliveryRead?> ReadDeliveryAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken = default)
     {
         await using var command = new NpgsqlCommand(DeliveryCooldownSelectSql, connection) { Transaction = transaction };
@@ -544,13 +687,15 @@ WHERE id = 1";
             return null;
         }
 
-        return reader.GetInt32(0);
+        return new DeliveryRead(
+            reader.GetInt32(0),
+            new SendResolutionsRead(reader.GetBoolean(1), reader.GetBoolean(2), reader.GetBoolean(3), reader.GetBoolean(4)));
     }
 
     /// <summary>Both halves of the alert configuration, read in ONE snapshot: the settings row and the
     /// delivery cooldown that lives on the other table. Either may be null when the store has not seeded
     /// that singleton yet.</summary>
-    public sealed record AlertConfigurationRead(AlertSettingsReadRow? Settings, int? DeliveryCooldownMinutes);
+    public sealed record AlertConfigurationRead(AlertSettingsReadRow? Settings, DeliveryRead? Delivery);
 
     /// <summary>
     /// The alert configuration across BOTH config tables, under one snapshot.
@@ -578,8 +723,8 @@ WHERE id = 1";
             System.Data.IsolationLevel.RepeatableRead, cancellationToken);
 
         var settings = await ReadAlertSettingsAsync(connection, transaction, cancellationToken);
-        var deliveryCooldownMinutes = await ReadDeliveryCooldownAsync(connection, transaction, cancellationToken);
+        var delivery = await ReadDeliveryAsync(connection, transaction, cancellationToken);
 
-        return new AlertConfigurationRead(settings, deliveryCooldownMinutes);
+        return new AlertConfigurationRead(settings, delivery);
     }
 }

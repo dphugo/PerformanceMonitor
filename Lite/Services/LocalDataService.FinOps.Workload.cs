@@ -293,7 +293,9 @@ ORDER BY c.database_name";
                 avgCandidates.Add(new TopResourceConsumerRow
                 {
                     DatabaseName = dbName,
-                    CpuTimeMs = ToInt64(reader.GetValue(6)),
+                    /* #5644 W4: the average stays unrounded for the ranking; CpuTimeMs is only its whole-ms rounding. */
+                    CpuTimeMs = (long)Math.Round(Convert.ToDecimal(reader.GetValue(6))),
+                    AvgCpuMs = Convert.ToDecimal(reader.GetValue(6)),
                     ExecutionCount = executionCount,
                     IoTotalMb = ioTotalMb,
                     TotalCpuTimeMs = cpuTimeMs,
@@ -307,7 +309,7 @@ ORDER BY c.database_name";
            statement's ORDER BY c.database_name — deterministic, where the old per-grid statements left a tie's
            order to whichever plan DuckDB picked (never a documented contract). */
         var byTotal = totalCandidates.OrderByDescending(r => r.CpuTimeMs).Take(topN).ToList();
-        var byAvg = avgCandidates.OrderByDescending(r => r.CpuTimeMs).Take(topN).ToList();
+        var byAvg = avgCandidates.OrderByDescending(r => r.AvgCpuMs).Take(topN).ToList();
 
         return (byTotal, byAvg);
     }
@@ -326,7 +328,8 @@ ORDER BY c.database_name";
 WITH categorized AS (
     SELECT
         CASE
-            WHEN wait_type IN ('SOS_SCHEDULER_YIELD', 'CXPACKET', 'CXCONSUMER', 'CXSYNC_PORT', 'CXSYNC_CONSUMER') THEN 'CPU'
+            WHEN wait_type = 'SOS_SCHEDULER_YIELD' THEN 'CPU'
+            WHEN wait_type IN ('CXPACKET', 'CXCONSUMER', 'CXSYNC_PORT', 'CXSYNC_CONSUMER', 'HTDELETE', 'HTBUILD', 'HTREPARTITION') THEN 'Parallelism'
             WHEN wait_type ILIKE 'PAGEIOLATCH%'
             OR   wait_type IN ('WRITELOG', 'IO_COMPLETION', 'ASYNC_IO_COMPLETION') THEN 'Storage'
             WHEN wait_type IN ('RESOURCE_SEMAPHORE', 'RESOURCE_SEMAPHORE_QUERY_COMPILE', 'CMEMTHREAD') THEN 'Memory'
@@ -344,7 +347,8 @@ WITH categorized AS (
     AND   delta_wait_time_ms > 0
     GROUP BY
         CASE
-            WHEN wait_type IN ('SOS_SCHEDULER_YIELD', 'CXPACKET', 'CXCONSUMER', 'CXSYNC_PORT', 'CXSYNC_CONSUMER') THEN 'CPU'
+            WHEN wait_type = 'SOS_SCHEDULER_YIELD' THEN 'CPU'
+            WHEN wait_type IN ('CXPACKET', 'CXCONSUMER', 'CXSYNC_PORT', 'CXSYNC_CONSUMER', 'HTDELETE', 'HTBUILD', 'HTREPARTITION') THEN 'Parallelism'
             WHEN wait_type ILIKE 'PAGEIOLATCH%'
             OR   wait_type IN ('WRITELOG', 'IO_COMPLETION', 'ASYNC_IO_COMPLETION') THEN 'Storage'
             WHEN wait_type IN ('RESOURCE_SEMAPHORE', 'RESOURCE_SEMAPHORE_QUERY_COMPILE', 'CMEMTHREAD') THEN 'Memory'

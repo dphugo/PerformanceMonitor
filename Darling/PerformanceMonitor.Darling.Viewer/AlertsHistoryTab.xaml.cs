@@ -59,9 +59,18 @@ public partial class AlertsHistoryTab : UserControl
     /// <summary>Raised with a short status message on load/dismiss/mute outcomes so the shell can show it.</summary>
     public event Action<string>? StatusChanged;
 
+    /// <summary>#5847: builds the Alert Details window's "open the full chain" action for a row, or null when the row has
+    /// no Blocking or Deadlocks view to open (set by the shell, which owns the server tabs).</summary>
+    public Func<ViewerAlertRow, Action?>? FullChainOpener { get; set; }
+
+    /// <summary>#5847: where the Alert Details window keeps its last size (set by the shell).</summary>
+    public AlertDetailWindow.ISizeStore? DetailWindowSizeStore { get; set; }
+
     public AlertsHistoryTab()
     {
         InitializeComponent();
+        /* #6136: each column is at least as wide as its own header ("Channel" was cut to "Channe"). */
+        Loaded += (_, _) => DataGridHeaderFit.Apply(this);
         /* #5562: the shared picker; the old combo defaulted to the last 24 hours. */
         TimeRangePickerControl.ZoneProvider = ViewerTimeHelper.CurrentDisplayZone;
         TimeRangePickerControl.Value = TimeRangePresets.Find("1d")!;
@@ -92,6 +101,25 @@ public partial class AlertsHistoryTab : UserControl
         }
 
         _staleDataTimer.Start();
+        _ = GateKnownPatternsButtonAsync(dataService);
+    }
+
+    /// <summary>#6334: a store older than the known-pattern table (V214) has nothing for the editor to read or write, so the button is
+    /// disabled with the same "needs a newer store" wording the editor window shows. An unanswered probe leaves it enabled.</summary>
+    private async Task GateKnownPatternsButtonAsync(ViewerDataService dataService)
+    {
+        try
+        {
+            if (!await dataService.KnownPatternsSupportedAsync())
+            {
+                KnownPatternsButton.IsEnabled = false;
+                KnownPatternsButton.ToolTip = ViewerDataService.KnownPatternsNeedNewerStoreMessage;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ViewerLogger.Error("AlertsHistoryTab", "Known patterns store probe failed", ex);
+        }
     }
 
     /// <summary>Reloads the alert history (the shell calls this when the Alerts tab becomes visible / on the timer).</summary>
@@ -122,7 +150,8 @@ public partial class AlertsHistoryTab : UserControl
 
             var displayCount = AlertsDataGrid.Items.Count;
             NoAlertsMessage.Visibility = displayCount == 0 ? Visibility.Visible : Visibility.Collapsed;
-            AlertTimeHeaderText.Text = TimeColumnTitle.For("Time", ViewerTimeHelper.CurrentDisplayMode); // D5: the column names its clock
+            AlertTimeHeaderText.Text = TimeColumnTitle.For("Time", ViewerTimeHelper.CurrentDisplayMode, alerts.Any(a => a.MixedServers)); // D5: the column names its clock
+            DataGridHeaderFit.Apply(AlertsDataGrid); // #6136: a longer title widens its column
             /* D7: the cap applies to the READ (alerts.Count), not to what a column filter leaves on screen. */
             _lastReadRowCount = alerts.Count;
             AlertCountIndicator.Text = JobHistoryCap.CountText(displayCount, _lastReadRowCount, RowCap, "alert(s)");
@@ -455,7 +484,7 @@ public partial class AlertsHistoryTab : UserControl
 
     private void ShowDetail(ViewerAlertRow item)
     {
-        var detailWindow = new AlertDetailWindow(item);
+        var detailWindow = new AlertDetailWindow(item, FullChainOpener?.Invoke(item), DetailWindowSizeStore);
         var owner = Window.GetWindow(this);
         if (owner != null)
         {
@@ -554,6 +583,17 @@ public partial class AlertsHistoryTab : UserControl
         }
 
         var window = new MuteRulesWindow(_dataService) { Owner = Window.GetWindow(this) };
+        window.ShowDialog();
+    }
+
+    private void KnownPatterns_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService == null)
+        {
+            return;
+        }
+
+        var window = new KnownPatternsWindow(_dataService) { Owner = Window.GetWindow(this) };
         window.ShowDialog();
     }
 

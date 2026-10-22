@@ -131,10 +131,106 @@ public sealed class DarlingCliUnusableStoreConnectionTests
         {
             var path = WriteByoConfig(root, MalformedConnectionString);
 
-            var (exit, _, error) = await RunVerbAsync(verb, path);
+            var (exit, output, error) = await RunVerbAsync(verb, path);
 
             Assert.Equal(1, exit);
             Assert.Contains("postgres.connectionString could not be used:", error, StringComparison.Ordinal);
+
+            /* The keyword Npgsql could not set is named, and the value it was given is not printed. */
+            Assert.Contains("value for the 'SSL Mode' keyword", error, StringComparison.Ordinal);
+            Assert.DoesNotContain("NotARealSslMode", error, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("NotARealSslMode", output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Every verb that can open a bring-your-own store: a password with an unquoted ';' makes Npgsql report a
+    /// keyword built out of the password itself (the text from the ';' to the next '=', lowercased), and a password
+    /// that starts with '=' puts the whole password there. The verb exits with one and prints no piece of either
+    /// password on either stream. The four endpoint toggles are not here for the reason
+    /// <see cref="ConnectionStringThatDoesNotParse_ExitsWithOne_AndNamesTheSetting"/> gives.
+    /// </summary>
+    [Theory]
+    [InlineData("--validate-config", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--check-settings", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--collapse-legacy-slices", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--recompress-plan-dim", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--add-server", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--backfill-rollups", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--enable-collector", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--disable-collector", StoreParseFailureFixtures.SemicolonInPassword)]
+    [InlineData("--validate-config", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--check-settings", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--collapse-legacy-slices", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--recompress-plan-dim", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--add-server", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--backfill-rollups", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--enable-collector", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--disable-collector", StoreParseFailureFixtures.LeadingEqualsInPassword)]
+    [InlineData("--validate-config", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--check-settings", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--collapse-legacy-slices", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--recompress-plan-dim", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--add-server", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--backfill-rollups", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--enable-collector", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--disable-collector", StoreParseFailureFixtures.PortTailInHost)]
+    [InlineData("--validate-config", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--check-settings", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--collapse-legacy-slices", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--recompress-plan-dim", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--add-server", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--backfill-rollups", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--enable-collector", StoreParseFailureFixtures.NegativePortInHost)]
+    [InlineData("--disable-collector", StoreParseFailureFixtures.NegativePortInHost)]
+    public async Task ConnectionStringWithAPasswordThatBreaksTheParse_ExitsWithOne_AndNeverEchoesIt(string verb, string connectionString)
+    {
+        var root = Directory.CreateTempSubdirectory("darling-cli-parse-fragment-");
+        try
+        {
+            var path = WriteByoConfig(root, connectionString);
+
+            var (exit, output, error) = await RunVerbAsync(verb, path);
+
+            Assert.Equal(1, exit);
+            Assert.Contains("postgres.connectionString could not be used:", error, StringComparison.Ordinal);
+            StoreParseFailureFixtures.AssertNoFragment(error, $"{verb} stderr");
+            StoreParseFailureFixtures.AssertNoFragment(output, $"{verb} stdout");
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// A setting conflict that Npgsql rejects when it builds a connection (Multiplexing without Pooling) is named by a
+    /// sentence of our own, not by the hint that a value with ';' or '=' must be quoted, and Npgsql's own message is not
+    /// passed through.
+    /// </summary>
+    [Theory]
+    [InlineData("--validate-config")]
+    [InlineData("--check-settings")]
+    public async Task ASettingConflict_ExitsWithOne_AndIsNamedByOurOwnSentence(string verb)
+    {
+        var root = Directory.CreateTempSubdirectory("darling-cli-p1-conflict-");
+        try
+        {
+            var path = WriteByoConfig(
+                root, "Host=127.0.0.1;Port=5432;Username=darling;Password=pw;Database=darlingtest;Multiplexing=true;Pooling=false");
+
+            var (exit, output, error) = await RunVerbAsync(verb, path);
+
+            Assert.Equal(1, exit);
+            Assert.Contains(
+                "postgres.connectionString could not be used: Npgsql rejected the settings: Multiplexing needs Pooling to be on.",
+                error, StringComparison.Ordinal);
+            Assert.DoesNotContain("must be quoted", error, StringComparison.Ordinal);
+            Assert.DoesNotContain("Pooling must be on to use multiplexing", error + output, StringComparison.Ordinal);
         }
         finally
         {
@@ -252,10 +348,11 @@ public sealed class DarlingCliUnusableStoreConnectionTests
            shared body), --collapse-legacy-slices, --recompress-plan-dim, --add-server, --backfill-rollups, and the
            two collector toggles (one shared body). That is eight call sites. The ninth is --drop-xe-sessions reading
            this install's id, the long-query schedule rows and the instance names (#4961), after it has resolved the
-           server through the first one's shared body. The tenth is --diagnostics-bundle (#5097). An eleventh verb that
-           opens the store adds an eleventh here, and growing this count is the point. */
+           server through the first one's shared body. The tenth is --diagnostics-bundle (#5097). The eleventh is
+           --validate-config's agent dispatch read of the MCP switch and the agent route count (#6263). A twelfth call
+           site adds a twelfth here, and growing this count is the point. */
         var calls = Regex.Matches(code, @"(?<!bool\s)TryBuildStoreConnectionString\(").Count;
-        Assert.Equal(10, calls);
+        Assert.Equal(11, calls);
 
         /* The stored credential is read bare in exactly two places: inside that method, and in the firewall verb's
            best-effort read (TryReadEndpointTogglesAsync), which turns a failure into a reason it prints rather than

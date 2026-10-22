@@ -130,10 +130,12 @@ public sealed class TimescaleAggregateCompressionTests
                 StringComparer.Ordinal);
 
             Assert.Equal(
-                hourly ? TimescaleSupport.HourlyAggregateCompressAfterSpan : TimescaleSupport.DailyAggregateCompressAfterSpan,
+                hourly ? TimescaleSupport.HourlyAggregateCompressAfterSpan
+                    : TimescaleSupport.DailyRefreshStartSpanFor(view) + TimescaleSupport.AggregateCompressMarginSpan,   // #6070: a daily-parented daily's window is a bucket wider
                 TimescaleSupport.AggregateCompressAfterSpanFor(view));
             Assert.Equal(
-                hourly ? TimescaleSupport.HourlyAggregateCompressAfter : TimescaleSupport.DailyAggregateCompressAfter,
+                hourly ? TimescaleSupport.HourlyAggregateCompressAfter
+                    : TimescaleSupport.WholeDaysInterval(TimescaleSupport.DailyRefreshStartSpanFor(view) + TimescaleSupport.AggregateCompressMarginSpan),
                 TimescaleSupport.AggregateCompressAfterFor(view));
         }
 
@@ -319,7 +321,7 @@ public sealed class TimescaleAggregateCompressionTests
             var sql = TimescaleSupport.AddAggregateCompressionPolicySql(view, night);
 
             Assert.StartsWith($"SELECT add_compression_policy('collect.{view}', ", sql, StringComparison.Ordinal);
-            Assert.Contains($"compress_after => INTERVAL '{(hourly ? "2 days" : "4 days")}'", sql, StringComparison.Ordinal);
+            Assert.Contains($"compress_after => INTERVAL '{(hourly ? "2 days" : view == TimescaleSupport.QueryStoreStatsDayGrainDailyView ? "5 days" : "4 days")}'", sql, StringComparison.Ordinal);
             Assert.Contains("schedule_interval => INTERVAL '1 day'", sql, StringComparison.Ordinal);
             Assert.Contains("if_not_exists => true", sql, StringComparison.Ordinal);
             Assert.Contains(
@@ -649,7 +651,7 @@ public sealed class TimescaleAggregateCompressionTests
 
                 Assert.True(reader.GetBoolean(0), $"{view} is not compression-enabled");
                 Assert.Equal(1L, reader.GetInt64(1));
-                Assert.Equal((long)(hourly ? TimescaleSupport.HourlyAggregateCompressAfterSpan : TimescaleSupport.DailyAggregateCompressAfterSpan).TotalSeconds, reader.GetInt64(2));
+                Assert.Equal((long)TimescaleSupport.AggregateCompressAfterSpanFor(view).TotalSeconds, reader.GetInt64(2));
                 Assert.Equal((long)TimescaleSupport.AggregateCompressionScheduleSpan.TotalSeconds, reader.GetInt64(3));
                 Assert.True(reader.GetBoolean(4), $"{view}'s compression job is not on a fixed schedule");
                 Assert.Equal(TimescaleSupport.AggregateCompressionBandHourFor(view), reader.GetInt32(5));

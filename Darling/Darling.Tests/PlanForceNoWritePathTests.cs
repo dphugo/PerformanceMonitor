@@ -11,8 +11,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using PerformanceMonitor.Darling.Service;
+using PerformanceMonitor.Darling.Service.Mcp;
 using Xunit;
 
 namespace Darling.Tests;
@@ -50,6 +52,7 @@ namespace Darling.Tests;
 /// feature, and executes with their own hands. Rendering advice and executing it are different acts,
 /// and only the second one is what "cannot write" is about.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class PlanForceNoWritePathTests
 {
     /// <summary>The statements that change a monitored server's behaviour. Nothing else in the
@@ -93,6 +96,172 @@ public sealed class PlanForceNoWritePathTests
                     "Phase 1 of #2138 ships no write path; the write path is #2731.");
             }
         }
+    }
+
+    /// <summary>
+    /// #5632 Phase A (review round 2, L6): the agent hand-off docs teach no write. <c>Darling/AGENTS.example.md</c> is meant
+    /// to be pasted into an operator's own agent's instructions, and the README section "Hand an alert to your own agent"
+    /// describes that hand-off, so a write statement named in either one teaches an agent to run it. Both are read as
+    /// text and held to the same <see cref="WriteStatements"/> the service assembly is.
+    /// </summary>
+    [Fact]
+    public void TheAgentHandOffDocs_NameNoForceUnforceOrEvictStatement()
+    {
+        string darling = Path.Combine(RepoRoot(), "Darling");
+        string agents = File.ReadAllText(Path.Combine(darling, "AGENTS.example.md"));
+        string section = MarkdownSection(File.ReadAllText(Path.Combine(darling, "README.md")), "Hand an alert to your own agent");
+
+        foreach (var (name, text) in new[] { ("Darling/AGENTS.example.md", agents), ("Darling/README.md \"Hand an alert to your own agent\"", section) })
+        {
+            foreach (var statement in WriteStatements)
+            {
+                Assert.False(
+                    text.Contains(statement, StringComparison.OrdinalIgnoreCase),
+                    $"{name} names '{statement}'. The agent hand-off docs must not teach an agent a write (#5632, #2731).");
+            }
+        }
+    }
+
+    /// <summary>The body of the markdown section whose heading contains <paramref name="heading"/>: from that heading to
+    /// the next heading of the same or a higher level. Fails when the heading is gone, so a rename cannot empty the
+    /// scan.</summary>
+    private static string MarkdownSection(string markdown, string heading)
+    {
+        var lines = markdown.Split('\n');
+        int start = Array.FindIndex(lines, l => l.TrimStart().StartsWith('#') && l.Contains(heading, StringComparison.Ordinal));
+        Assert.True(start >= 0, $"The README heading \"{heading}\" moved or was renamed; point the guard at it again.");
+
+        int level = lines[start].TrimStart().TakeWhile(ch => ch == '#').Count();
+        var body = new StringBuilder();
+        for (int i = start + 1; i < lines.Length; i++)
+        {
+            string trimmed = lines[i].TrimStart();
+            int next = trimmed.TakeWhile(ch => ch == '#').Count();
+            if (next > 0 && next <= level && trimmed.Length > next && trimmed[next] == ' ') break;
+            body.Append(lines[i]).Append('\n');
+        }
+
+        Assert.True(body.Length > 0, $"The README section \"{heading}\" is empty.");
+        return body.ToString();
+    }
+
+    private static string RepoRoot([CallerFilePath] string thisFile = "")
+    {
+        var dir = Path.GetDirectoryName(thisFile);
+        while (dir is not null && !File.Exists(Path.Combine(dir, "PerformanceMonitor.sln")))
+        {
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        return dir ?? throw new InvalidOperationException("PerformanceMonitor.sln not found above " + thisFile);
+    }
+
+    /// <summary>
+    /// #5632 step 7: <see cref="StoreOwnerSource"/> hands the store owner's data source to MCP tool code, so the force tools can read one
+    /// server's remediation slot, which the <c>mcp</c> role cannot read. It is registered in the MCP host's services, so any tool method could
+    /// ask for it by type and then read or write the store as the owner. This pin keeps it to the one class: no other MCP tool method takes it,
+    /// and the force tools take it as a service parameter, never as a client argument.
+    /// </summary>
+    [Fact]
+    public void OnlyTheForceToolClass_TakesTheStoreOwnerSource()
+    {
+        var takers = typeof(PlanForceBot).Assembly.GetTypes()
+            .SelectMany(type => type.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            .Where(method => method.GetCustomAttributes(typeof(ModelContextProtocol.Server.McpServerToolAttribute), false).Length > 0)
+            .Where(method => method.GetParameters().Any(parameter => parameter.ParameterType == typeof(StoreOwnerSource)))
+            .Select(method => method.DeclaringType!.Name + "." + method.Name)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Equal(new[]
+        {
+            nameof(DarlingMcpPlanForceTools) + "." + nameof(DarlingMcpPlanForceTools.EvictCachedPlan),
+            nameof(DarlingMcpPlanForceTools) + "." + nameof(DarlingMcpPlanForceTools.ForceQueryStorePlan),
+            nameof(DarlingMcpPlanForceTools) + "." + nameof(DarlingMcpPlanForceTools.KillSession),
+            nameof(DarlingMcpPlanForceTools) + "." + nameof(DarlingMcpPlanForceTools.UnforceQueryStorePlan),
+            /* #6230: the undo is the way back from a force, run by the same code the web route runs; its gate is the force tools (that server force_plan switch and remediation login). */
+            nameof(DarlingMcpPlanUndoTools) + "." + nameof(DarlingMcpPlanUndoTools.UndoPlanChange),
+        /* #6269: the server action switch tool writes config.config_server_actions, which only the store owner can write. */
+        nameof(DarlingMcpServerActionTools) + "." + nameof(DarlingMcpServerActionTools.SetServerAction),
+        }, takers);
+    }
+
+    /// <summary>
+    /// #5632 step 7: the service now references the Remediation assembly, for ONE class. Two proofs that the door has one hinge. By
+    /// reflection: no field, property, method signature or local of any other service type names a Remediation type, and the executor
+    /// itself is named only by <c>DarlingMcpPlanForceTools</c> (and the compiler's nested types for its async bodies). By source: the
+    /// Remediation namespace and the executor's name appear in no other service file, and never in <see cref="PlanForceBot"/>'s.
+    /// </summary>
+    [Fact]
+    public void OnlyTheForceToolClass_TouchesTheRemediationAssembly()
+    {
+        var service = typeof(PlanForceBot).Assembly;
+        var remediation = typeof(PerformanceMonitor.Darling.Remediation.SqlServerRemediationExecutor).Assembly;
+        const BindingFlags all = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+
+        static IEnumerable<Type> Flatten(Type type)
+        {
+            yield return type;
+            if (type.HasElementType && type.GetElementType() is Type element)
+                foreach (var nested in Flatten(element))
+                    yield return nested;
+            foreach (var argument in type.IsGenericType ? type.GetGenericArguments() : Array.Empty<Type>())
+                foreach (var nested in Flatten(argument))
+                    yield return nested;
+        }
+
+        static Type Owner(Type type) => type.DeclaringType is { } outer ? Owner(outer) : type;
+
+        var offenders = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var type in service.GetTypes())
+        {
+            var used = new List<Type>();
+            if (type.BaseType is not null)
+                used.Add(type.BaseType);
+            used.AddRange(type.GetInterfaces());
+            used.AddRange(type.GetFields(all).Select(f => f.FieldType));
+            used.AddRange(type.GetProperties(all).Select(p => p.PropertyType));
+            foreach (var method in type.GetMethods(all).Cast<MethodBase>().Concat(type.GetConstructors(all)))
+            {
+                if (method is MethodInfo info)
+                    used.Add(info.ReturnType);
+                used.AddRange(method.GetParameters().Select(p => p.ParameterType));
+                if (method.GetMethodBody() is { } body)
+                    used.AddRange(body.LocalVariables.Select(l => l.LocalType));
+            }
+
+            if (used.SelectMany(Flatten).Any(t => t.Assembly == remediation))
+                offenders.Add(Owner(type).Name);
+        }
+
+        Assert.Equal(new[] { nameof(DarlingMcpPlanForceTools) }, offenders);
+
+        var botTypes = service.GetTypes().Where(t => Owner(t) == typeof(PlanForceBot)).ToList();
+        Assert.NotEmpty(botTypes);
+        Assert.DoesNotContain(offenders, name => name == nameof(PlanForceBot));
+    }
+
+    [Fact]
+    public void TheExecutorsName_AppearsInOneServiceSourceFile_AndNeverInThePlanForceBot()
+    {
+        var serviceDir = Path.Combine(RepoRoot(), "Darling", "PerformanceMonitor.Darling.Service");
+        var files = Directory.GetFiles(serviceDir, "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                && !f.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            .ToArray();
+        Assert.NotEmpty(files);
+
+        var naming = files
+            .Where(f =>
+            {
+                var code = CSharpSourceWalker.StripCommentsAndStrings(File.ReadAllText(f));
+                return code.Contains("SqlServerRemediationExecutor", StringComparison.Ordinal)
+                    || code.Contains("Darling.Remediation", StringComparison.Ordinal);
+            })
+            .Select(Path.GetFileName)
+            .ToArray();
+        Assert.Equal(new[] { "DarlingMcpPlanForceTools.cs" }, naming);
+        Assert.DoesNotContain("PlanForceBot.cs", naming);
     }
 
     [Fact]

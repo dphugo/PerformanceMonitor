@@ -125,10 +125,19 @@ public partial class LiteAlertForwardingTests : IDisposable
         public Task<List<PoisonWaitAccumulation>> GetPoisonWaitAccumulationAsync(string serverKey, int windowMinutes, CancellationToken cancellationToken = default) =>
             Task.FromResult(new List<PoisonWaitAccumulation>(PoisonWaits));
 
+        public Task<AttentionWindow> GetAttentionWindowAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default) =>
+            Task.FromResult(AttentionWindow.Empty);
+
+        public Task<AttentionBaseline?> GetAttentionBaselineAsync(string serverKey, DateTime nowUtc, CancellationToken cancellationToken = default) =>
+            Task.FromResult<AttentionBaseline?>(null);
+
+        public Task<IReadOnlyList<RunnableQueueSample>> GetRunnableQueueSamplesAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<RunnableQueueSample>>(new List<RunnableQueueSample>());
+
         public Task<LongRunningQueryReadResult> GetLongRunningQueriesAsync(
             string serverKey, int thresholdMinutes, int maxResults,
             bool excludeSpServerDiagnostics, bool excludeWaitFor, bool excludeBackups, bool excludeMiscWaits, bool excludeCdc,
-            IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, CancellationToken cancellationToken = default) =>
+            IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, bool orderByCpu = false, CancellationToken cancellationToken = default) =>
             Task.FromResult(new LongRunningQueryReadResult(new List<LongRunningQueryInfo>(LongRunning), 0, 0, 0));
 
         public Task<List<VolumeFreeSpaceInfo>> GetVolumeFreeSpaceAsync(string serverKey, CancellationToken cancellationToken = default) =>
@@ -272,6 +281,8 @@ public partial class LiteAlertForwardingTests : IDisposable
         public InMemoryStateStore StateStore { get; } = new();
         public RecordingDeliverer Deliverer { get; } = new();
         public List<AlertResolution> Resolutions { get; } = new();
+        /// <summary>#6010 part 2: runs after a resolution is noted, so a test can wire Lite's real history-row callback.</summary>
+        public Func<AlertResolution, CancellationToken, Task>? ResolutionHook { get; set; }
         public List<FailedJobInfo> FailedJobs { get; } = new();
         public bool Muted { get; set; }
         public DateTime Now { get; set; } = new(2026, 7, 1, 12, 0, 0, DateTimeKind.Utc);
@@ -285,7 +296,7 @@ public partial class LiteAlertForwardingTests : IDisposable
             Adapter, StateStore, deliverer,
             isAlertMuted: _ => Muted,
             failedJobsFetcher: (_, _, _) => Task.FromResult(new List<FailedJobInfo>(FailedJobs)),
-            resolutionCallback: (r, _) => { Resolutions.Add(r); return Task.CompletedTask; },
+            resolutionCallback: (r, ct) => { Resolutions.Add(r); return ResolutionHook?.Invoke(r, ct) ?? Task.CompletedTask; },
             logger: null,
             utcNow: () => Now);
 
@@ -566,6 +577,54 @@ public partial class LiteAlertForwardingTests : IDisposable
     /* =====================================================================================
        2. Blocking rolling-count fire + watermark persist (old :118-196 + #1091/#1145)
        ===================================================================================== */
+
+    /* #5644 review (W1/W2): the XE-or-DMV choice is made on the rows BEFORE the excluded-database filter, so XE
+       reports that sit only in an excluded database do not fall back to DMV waits elsewhere (Lite's overview
+       makes the same choice on the unfiltered set). Lite runs the shared engine, so this is the Lite twin. */
+    [Fact]
+    public async Task Blocking_XeOnlyInExcludedDatabase_DoesNotFallBackToDmvWaits()
+    {
+        DisableAllChecks();
+        App.AlertBlockingEnabled = true;
+        App.AlertExcludedDatabases = new List<string> { "ExcludedDb" };
+        var h = new Harness();
+        var engine = h.Build();
+        var xe = BlockingRow(51);
+        xe.DatabaseName = "ExcludedDb";
+        var dmv = BlockingRow(61);
+        dmv.Source = BlockedProcessAlertRow.DmvSnapshotSource;
+        h.Adapter.Blocking.Add(xe);
+        h.Adapter.Blocking.Add(dmv);
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Empty(h.Deliverer.Outcomes);
+
+        /* The XE report now sits in a database that is not excluded: it fires on the XE wait alone. */
+        xe.DatabaseName = "StackOverflow";
+        h.Now = h.Now.AddMinutes(10);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        var fired = Assert.Single(h.Deliverer.Outcomes);
+        Assert.Equal("1", fired.CurrentValue);
+    }
+
+    [Fact]
+    public async Task Blocking_NoXeReports_FiresOnDmvWaits()
+    {
+        DisableAllChecks();
+        App.AlertBlockingEnabled = true;
+        var h = new Harness();
+        var engine = h.Build();
+        var dmv = BlockingRow(61);
+        dmv.Source = BlockedProcessAlertRow.DmvSnapshotSource;
+        h.Adapter.Blocking.Add(dmv);
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        var fired = Assert.Single(h.Deliverer.Outcomes);
+        Assert.Equal("1", fired.CurrentValue);
+    }
 
     [Fact]
     public async Task Blocking_FiresOnce_PersistsWatermark_AndEdgeTriggerHoldsWithinTheHour()
@@ -1217,6 +1276,10 @@ public partial class LiteAlertForwardingTests : IDisposable
 
         App.AlertExcludedDatabases = new List<string> { "tempdb", "model" };
         Assert.Equal(new[] { "tempdb", "model" }, settings.ExcludedDatabases);
+
+        /* #6098: the Volume Free Space alert's fleet-wide excluded mount points. */
+        App.AlertExcludedVolumes = new List<string> { "S:\\", "/mnt/scratch" };
+        Assert.Equal(new[] { "S:\\", "/mnt/scratch" }, settings.ExcludedVolumes);
 
         /* #3653 (A5, Q5): the Long-Running Query opt-out knob's two lists, forwarded raw (the engine normalises). */
         App.AlertLongRunningQueryExcludedProgramNamePrefixes = new List<string> { "SQLAgent - TSQL JobStep", "HammerDB" };

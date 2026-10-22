@@ -44,10 +44,14 @@ public sealed partial class ViewerDataService
     /// running loop to finish before the UI reports "still running / try again".</summary>
     public static readonly TimeSpan ImperativeCommandTimeout = TimeSpan.FromMinutes(3);
 
+    /// <summary>A pause writes the service row, which an agent change in progress holds until its remote work ends (at most 30 s). The
+    /// service waits up to 60 s for it, so the viewer waits 60 s plus the claim's poll and the report (#5632).</summary>
+    public static readonly TimeSpan PauseCommandTimeout = TimeSpan.FromSeconds(75);
+
     /// <summary>Enqueues a <c>pause</c> (service stops collecting on its next reconcile) and waits for the
     /// terminal result. Returns null on timeout. Read-only seats throw <see cref="ViewerReadOnlyException"/>.</summary>
     public Task<CommandResult?> PauseServiceAsync(CancellationToken cancellationToken = default) =>
-        RunCommandAsync(CommandPause, targetServerId: null, argsJson: null, RequestedBy(), timeout: null, cancellationToken);
+        RunCommandAsync(CommandPause, targetServerId: null, argsJson: null, RequestedBy(), PauseCommandTimeout, cancellationToken);
 
     /// <summary>Enqueues a <c>resume</c> (service resumes collecting) and waits for the terminal result.</summary>
     public Task<CommandResult?> ResumeServiceAsync(CancellationToken cancellationToken = default) =>
@@ -57,6 +61,12 @@ public sealed partial class ViewerDataService
     /// waits for the terminal result. Returns null on timeout.</summary>
     public Task<CommandResult?> RequestSnapshotNowAsync(int serverId, CancellationToken cancellationToken = default) =>
         RunCommandAsync(CommandSnapshotNow, serverId, argsJson: null, RequestedBy(), ImperativeCommandTimeout, cancellationToken);
+
+    /// <summary>Enqueues a <c>snapshot_now</c> for one server and waits for the terminal result (#6382: the Collection Health tab's "Run all
+    /// collectors now" and per-collector "Run now"). <paramref name="collectors"/> null or empty is the run-all form (every enabled
+    /// collector); a list runs only those, each even when disabled, the same argument the web's route sends (#5941). Returns null on timeout.</summary>
+    public Task<CommandResult?> RequestCollectorRunAsync(int serverId, System.Collections.Generic.IReadOnlyList<string>? collectors, CancellationToken cancellationToken = default) =>
+        RunCommandAsync(CommandSnapshotNow, serverId, ViewerCollectorRun.BuildArgs(collectors), RequestedBy(), ImperativeCommandTimeout, cancellationToken);
 
     /// <summary>Enqueues an <c>analyze_now</c> for one server (force an analysis pass now) and waits for the
     /// terminal result. Returns null on timeout.</summary>

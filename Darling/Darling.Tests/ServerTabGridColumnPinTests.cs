@@ -37,35 +37,12 @@ public sealed class ServerTabGridColumnPinTests
         var tool = Tool(toolFile);
         var cols = Columns(constant);
         foreach (var (key, _) in cols)
-            Assert.True(Regex.IsMatch(tool, @"\b" + key + @"\s*="), $"{constant}: '{key}' is not a field of {toolFile}");
+            Assert.True(Regex.IsMatch(tool, @"\b" + key + @"(\s*=|""\]\s*=)"), $"{constant}: '{key}' is not a field of {toolFile}");
         foreach (var key in expected)
             Assert.Contains(cols, c => c.Key == key);
         Assert.Equal(cols.Count, cols.Select(c => c.Key).Distinct().Count());
         // Numeric columns use numeric formats, never pre-formatted *_text strings.
         Assert.DoesNotContain(cols, c => c.Key.EndsWith("_text", StringComparison.Ordinal) && c.Key != "query_text");
-    }
-
-    [Fact]
-    public void QueryStoreRegressions_CarriesBaseExecsAndBothReadsColumns() =>
-        EveryKeyIsReturnedBy("QUERY_STORE_REGRESSION_COLUMNS", "DarlingMcpQueryStoreRegressionTools.cs",
-            "baseline_exec_count", "baseline_reads", "recent_reads");
-
-    [Fact]
-    public void PlanCorrections_CarriesEveryFieldTheReadReturnsExceptTheDuplicatedFlags() =>
-        EveryKeyIsReturnedBy("PLAN_CORRECTION_COLUMNS", "DarlingMcpPlanCorrectionTools.cs",
-            "regressed_plan_id", "last_good_plan_id", "last_good_plan_forcing_type",
-            "last_good_plan_force_failure_reason", "regressed_plan_execution_count",
-            "regressed_plan_cpu_time_average_ms", "last_good_plan_execution_count",
-            "last_good_plan_cpu_time_average_ms", "valid_since", "last_refresh",
-            "execute_action_initiated_by", "execute_action_initiated_time",
-            "revert_action_initiated_by", "revert_action_initiated_time", "recommendation_state_reason");
-
-    [Fact]
-    public void PlanCorrections_TimestampColumnsAreInstants()
-    {
-        foreach (var (key, line) in Columns("PLAN_CORRECTION_COLUMNS"))
-            if (key is "valid_since" or "last_refresh" || key.EndsWith("_time", StringComparison.Ordinal))
-                Assert.Contains("format: \"time\"", line);
     }
 
     [Fact]

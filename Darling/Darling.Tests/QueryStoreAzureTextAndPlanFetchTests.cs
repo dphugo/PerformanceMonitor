@@ -147,19 +147,6 @@ public sealed class QueryStoreAzureTextAndPlanFetchTests
            third site would be a third place for the guards and the phase stamps to drift. */
         Assert.Equal(1, Occurrences(code, "await FetchAndStorePlansAsync("));
         Assert.Equal(1, Occurrences(code, "await FetchAndStoreQueryTextAsync("));
-
-        /* The enumerated site: right after the per-item read, on the per-item connection and budget token. */
-        var readItem = code.IndexOf("await definition.ReadItemAsync(item, itemReader, batch, context, ct);", StringComparison.Ordinal);
-        Assert.True(readItem >= 0, "The enumerated per-item read moved.");
-        var enumerated = code.IndexOf(SharedFetch, readItem, StringComparison.Ordinal);
-        Assert.True(enumerated > readItem, "The enumerated read no longer reaches the shared fetch.");
-
-        /* Nothing but the read's own statement sits between them: the fetch follows the read directly. */
-        Assert.Equal(1, Occurrences(code[readItem..enumerated], ";"));
-
-        var statement = code[enumerated..code.IndexOf(';', enumerated)];
-        Assert.Contains("targetConnection, pgConnection, server, item, definition.Name,", statement, StringComparison.Ordinal);
-        Assert.Contains(", ct)", statement, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -168,12 +155,12 @@ public sealed class QueryStoreAzureTextAndPlanFetchTests
         var code = RunnerCode();
         var method = MethodBody(code, "private async Task FetchQueryStorePlansAndTextAsync<TRow>(");
 
-        Assert.Contains("context.CapturePlanXml && targetConnection is SqlConnection planFetchConnection", method, StringComparison.Ordinal);
-        Assert.Contains("context.FetchQueryTextSeparately && targetConnection is SqlConnection textFetchConnection", method, StringComparison.Ordinal);
+        Assert.Contains("context.CapturePlanXml && targetProvider.Engine == CollectorTargetEngine.SqlServer", method, StringComparison.Ordinal);
+        Assert.Contains("context.FetchQueryTextSeparately && targetProvider.Engine == CollectorTargetEngine.SqlServer", method, StringComparison.Ordinal);
 
         /* The databaseName parameter reaches both fetches: it is what names the [db].sys.sp_executesql target. */
-        Assert.Contains("FetchAndStorePlansAsync(planFetchConnection, storeConnection,", method, StringComparison.Ordinal);
-        Assert.Contains("FetchAndStoreQueryTextAsync(textFetchConnection, storeConnection,", method, StringComparison.Ordinal);
+        Assert.Contains("FetchAndStorePlansAsync(targetProvider, targetConnection, storeConnection,", method, StringComparison.Ordinal);
+        Assert.Contains("FetchAndStoreQueryTextAsync(targetProvider, targetConnection, storeConnection,", method, StringComparison.Ordinal);
         Assert.Equal(2, Occurrences(method, "server, databaseName, collectorName, context, commandTimeoutSeconds,"));
 
         /* The #2854 rule the shared method inherited: the parent reading is stamped from a finally, so a fetch

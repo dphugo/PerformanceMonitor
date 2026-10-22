@@ -15,6 +15,7 @@
  *   #/server/{name}     — one server's detail (Overview)
  *   #/server/{name}/{tab} — one server's detail, opened on a named sub-tab (pages/server-tabs.js)
  *   #/alerts            — fleet-wide Alert History
+ *   #/investigations    — agent investigation requests, their reports and journal (#5904)
  *   #/alert-rules       — Custom Alert Rules list (#3285)
  *   #/alert-rule/new    — the alert-rule editor creating a new rule (optionally /new/{template})
  *   #/alert-rule/{id}   — the alert-rule editor editing a saved rule (#3285)
@@ -37,6 +38,7 @@
  */
 
 import { el, mount, apiGet, apiGetFleet, readTool, localTime, hasInFlightReads, readErrorCount, isSessionExpired, onSessionExpired } from "./util.js";
+import { makeScrollReset } from "./scroll-reset.js";
 import { renderFleet } from "./pages/fleet.js";
 import { renderAg } from "./pages/ag.js";
 import { renderSweeps } from "./pages/sweeps.js";
@@ -44,6 +46,7 @@ import { renderAdmin } from "./pages/admin.js";
 import { renderServer } from "./pages/server.js";
 import { renderFinops } from "./pages/finops.js";
 import { renderAlerts } from "./pages/alerts.js";
+import { renderInvestigations } from "./pages/investigations.js";
 import { renderAlertRuleList } from "./pages/alert-rules.js";
 import { renderViewList, renderView, currentViewRefresh, onViewRefreshChange, clearViewRefresh } from "./pages/views.js";
 import { REFRESH_CHOICES, PAGE_REFRESH_CHOICES, nextRefreshDelayMs, isBackedOff, defaultRefreshChoice, refreshLabel, loadPageRefreshChoice, savePageRefreshChoice, PAGE_REFRESH_KEY } from "./refresh-policy.js";
@@ -52,13 +55,18 @@ import { renderTriage } from "./pages/triage.js";
 import { renderEditor } from "./editor.js";
 import { renderNotebookEditor } from "./notebook.js";
 import { renderAlertEditor } from "./alert-editor.js";
-import { getSession, listViews } from "./views-api.js";
+import { getSession, listViews, onViewsChanged } from "./views-api.js";
+import { paintViewList } from "./view-sidebar.js";
 import { renderMuteRules } from "./pages/mute-rules.js";
+import { renderKnownPatterns } from "./pages/known-patterns.js";
 import { renderManageTags } from "./pages/manage-tags.js";
+import { renderManageQueryTags } from "./pages/manage-query-tags.js";
+import { renderQueryTagUsage } from "./pages/query-tag-usage.js";
 import { renderJobHistory } from "./pages/job-history.js";
-import { refreshAttention, onChange as onLocalChange } from "./viewer-local.js";
+import { refreshAttention, clearViewGroups, onChange as onLocalChange } from "./viewer-local.js";
 import { initSidebarCollapse, initSeverityColorSettings } from "./viewer-local-ui.js";
 import { initSidebarSearch, paintServerList } from "./sidebar.js";
+import { initNarrowNav } from "./narrow-nav.js";
 
 /* The shell (sidebar, view list, AG nav) refreshes every POLL_MS; the page re-renders on its own interval. */
 const POLL_MS = 60000;
@@ -72,6 +80,9 @@ const statusbar = document.getElementById("statusbar");
 
 /* ─────────────────────────── routing ─────────────────────────── */
 
+/* RULE for every route this switch returns: a route must never write, export or confirm anything on load. A link
+   from another site can open the dashboard with a live session behind it (#6286), so a page reached by an address
+   may only read and draw; a change happens after a click on a button inside the page, never from the address. */
 function currentRoute() {
   const h = location.hash || "#/fleet";
   if (h.startsWith("#/server/")) return serverRoute(h.slice("#/server/".length));
@@ -86,6 +97,7 @@ function currentRoute() {
     return { name: "triage", query: q >= 0 ? h.slice(q + 1) : "" };
   }
   if (h.startsWith("#/alerts")) return { name: "alerts" };
+  if (h === "#/investigations" || h === "#/investigations/") return { name: "investigations" };
   /* Alert-rule routes (#3285): the list, the new form (optionally /new/{template}), then the bare /{id} edit form,
      tested most-specific first. Distinct from #/alerts above (which cannot collide: #/alert- never starts #/alerts). */
   if (h === "#/alert-rules" || h === "#/alert-rules/") return { name: "alertRules" };
@@ -117,7 +129,10 @@ function currentRoute() {
     const q = h.indexOf("?");
     return { name: "muteRules", query: q >= 0 ? h.slice(q + 1) : "" };
   }
+  if (h === "#/known-patterns") return { name: "knownPatterns" };
   if (h === "#/manage-tags") return { name: "manageTags" };
+  if (h === "#/manage-query-tags") return { name: "manageQueryTags" };
+  if (h === "#/query-tag-usage") return { name: "queryTagUsage" };
   if (h === "#/job-history" || h === "#/job-history/") return { name: "jobHistory" };
   return { name: "fleet" };
 }
@@ -158,6 +173,9 @@ function finopsRoute(rest) {
   };
 }
 
+/* #6159: another page, server or tab opens at the top; the poll re-render of the same route keeps the scroll position. */
+const resetScrollOnRouteChange = makeScrollReset(() => window.scrollTo(0, 0));
+
 /**
  * @param {object} [opts] — forwarded to renderServer; `{ poll: true }` marks this call as the 60s poll's own
  * refresh rather than a hashchange (sub-tab click, deep link) or the first paint (#4190/#4191). Also forwarded
@@ -173,6 +191,7 @@ function route(opts) {
   if (isSessionExpired()) return;
 
   const r = currentRoute();
+  resetScrollOnRouteChange(r, !!(opts && opts.poll === true));
   markPageRenderStart(r.name, !!(opts && opts.poll === true));
   setActiveNav(r);
   if (r.name === "server") renderServer(main, r.param, r.tab, opts);
@@ -180,6 +199,7 @@ function route(opts) {
   else if (r.name === "ag") renderAg(main);
   else if (r.name === "sweeps") renderSweeps(main, opts);
   else if (r.name === "alerts") renderAlerts(main);
+  else if (r.name === "investigations") renderInvestigations(main);
   else if (r.name === "alertRules") renderAlertRuleList(main);
   else if (r.name === "alertEditor") renderAlertEditor(main, r.id, r.template);
   else if (r.name === "admin") renderAdmin(main, r.tab);
@@ -190,7 +210,10 @@ function route(opts) {
   else if (r.name === "notebook") renderView(main, r.id); // renderView kind-detects -> notebook document
   else if (r.name === "notebookEditor") renderNotebookEditor(main, r.id, r.template);
   else if (r.name === "muteRules") renderMuteRules(main, r.query);
+  else if (r.name === "knownPatterns") renderKnownPatterns(main);
   else if (r.name === "manageTags") renderManageTags(main);
+  else if (r.name === "manageQueryTags") renderManageQueryTags(main);
+  else if (r.name === "queryTagUsage") renderQueryTagUsage(main);
   else if (r.name === "jobHistory") renderJobHistory(main);
   else renderFleet(main);
 }
@@ -207,7 +230,10 @@ function navKeyFor(r) {
   if (r.name === "views" || isViewItemRoute(r.name)) return "views";
   if (r.name === "alertRules" || r.name === "alertEditor") return "alert-rules";
   if (r.name === "muteRules") return "mute-rules";
+  if (r.name === "knownPatterns") return "known-patterns";
   if (r.name === "manageTags") return "manage-tags";
+  if (r.name === "manageQueryTags") return "manage-query-tags";
+  if (r.name === "queryTagUsage") return "query-tag-usage";
   if (r.name === "jobHistory") return "job-history";
   return r.name;
 }
@@ -254,6 +280,8 @@ async function refreshSidebar() {
 let lastSidebarFleet = null;
 
 function paintSidebar() {
+  /* #6214: a signed-out page paints nothing: a late poll or a local change must not bring the old session's lists back. */
+  if (isSessionExpired()) return;
   const res = lastSidebarFleet;
   if (!res) return;
   const r = currentRoute();
@@ -292,37 +320,19 @@ async function refreshAgNav() {
 async function refreshViewList() {
   if (!viewList) return;
   const [session, res] = await Promise.all([getSession(), listViews()]);
+  if (isSessionExpired()) return; // the session ended while the list was in flight: keep nothing of it
+  lastViewList = { session, views: res.kind === "data" && Array.isArray(res.data) ? res.data : [] };
+  paintViewListNow();
+}
+
+/* #6214: the last good list, kept so collapsing a folder (a viewer-local change) repaints without a refetch. The grouping,
+   the order and the collapse state live in view-sidebar.js and view-folders.js. */
+let lastViewList = null;
+
+function paintViewListNow() {
+  if (isSessionExpired() || !viewList || !lastViewList) return;
   const r = currentRoute();
-  const items = [];
-
-  if (res.kind === "data" && Array.isArray(res.data)) {
-    for (const v of res.data) {
-      const active = isViewItemRoute(r.name) && String(r.id) === String(v.id);
-      /* The summary carries the view kind (definition->>'kind'), so the sidebar links + badges a notebook without
-         fetching its definition; a notebook links to its own route and gets a document glyph (CSS). */
-      const isNotebook = v.kind === "notebook";
-      items.push(
-        el("a", {
-          class: "view-item" + (active ? " active" : "") + (isNotebook ? " is-notebook" : ""),
-          href: (isNotebook ? "#/notebook/" : "#/view/") + encodeURIComponent(v.id),
-          dataset: { view: String(v.id) },
-          title: v.description || v.name,
-          text: v.name,
-        })
-      );
-    }
-  }
-
-  if (session.can_edit) {
-    items.push(el("a", { class: "view-item new-view", href: "#/view/new", text: "＋ New view" }));
-    items.push(el("a", { class: "view-item new-view", href: "#/notebook/new", text: "＋ New notebook" }));
-  }
-
-  if (!items.length) {
-    items.push(el("div", { class: "muted", style: "padding:0.35rem 1.25rem", text: "No views yet" }));
-  }
-
-  mount(viewList, items);
+  paintViewList(viewList, lastViewList.views, lastViewList.session, isViewItemRoute(r.name) ? r.id : null);
 }
 
 /* ─────────────────────────── status bar ─────────────────────────── */
@@ -334,8 +344,10 @@ async function refreshViewList() {
    be read is simply absent (the store size keeps its last good value, marked stale).
 
    Module scope on purpose: the 60s poll rebuilds the bar, so the cached size and the last ping state live here
-   rather than inside updateStatusBar. The operator's own "collection paused" flag is not shown: /api/ping does
-   not carry it (it is the unauthenticated health route) and no read the web seat can call exposes it. */
+   rather than inside updateStatusBar. The operator's "collection paused" flag is not on /api/ping (the
+   unauthenticated health route, which also never names a person); it rides on the /api/fleet response the bar is
+   already drawn from (d.collection: paused, and paused_by / paused_utc when the store still holds who and when),
+   so showing it costs no extra read. */
 const STORE_SIZE_TTL_MS = 5 * 60 * 1000;
 const NON_OK_COLLECTION_STATES = new Set(["starting", "degraded", "stopped"]);
 let statusFleet = null;
@@ -429,6 +441,14 @@ function renderStatusBar() {
   if (statusSeat) items.push(el("span", { class: "sb-item sb-seat", text: statusSeat }));
   if (statusCollection && NON_OK_COLLECTION_STATES.has(statusCollection)) {
     items.push(el("span", { class: "sb-item sb-collection sb-warn", text: "Collection: " + statusCollection[0].toUpperCase() + statusCollection.slice(1) }));
+  }
+  /* A paused service collects and alerts on nothing, and the runtime state above still says "ok", so the bar says so
+     in its own words, with who paused it and when when the store has that. */
+  if (d.collection && d.collection.paused) {
+    let text = "Collection: PAUSED";
+    if (d.collection.paused_by) text += " by " + d.collection.paused_by;
+    if (d.collection.paused_utc) text += " since " + localTime(d.collection.paused_utc);
+    items.push(el("span", { class: "sb-item sb-collection sb-paused sb-warn", text }));
   }
   /* The stamp is the page's own last load (notePageUpdated), not the sidebar's fleet read: the fleet read is the
      shell's, so a server, FinOps or Job History page reloaded by hand or by auto-refresh left the time at the first
@@ -658,18 +678,33 @@ function updateRefreshHint() {
 /* The session-expired takeover (#4187): the FIRST read anywhere on the page to report the session is gone (an
    expired/rotated session cookie, no token — see util.js's classifyResponse) replaces the whole shell with a
    sign-in prompt, once, instead of leaving every open panel to separately render its own "signed out" guess
-   that looks like an unrelated failure. The sign-in link navigates to THIS BROWSER's own current location
-   (pathname + search + hash) — never the server's 401 body value — so a future proxy or misconfiguration
-   cannot inject an off-site or javascript: URL. Reloading the current URL rather than "/" (#4221) means an
-   alert link's #/triage route survives a stale-session sign-in the same way the login page's own return
-   value does: the hash never left the address bar, so there is nothing to lose. */
-function showSignedOutState(message, _login) {
+   that looks like an unrelated failure.
+
+   The sign-in link must RELOAD the document (#6278). A link to the page's own address, fragment included, is a
+   same-document navigation: nothing reloads and no hashchange fires, so the click did nothing. The click always
+   reloads THIS BROWSER's own current location, and the link's href is that same address. The 401 body's `login`
+   value is deliberately never used (the #4187 design: the server's answer is "/", which would drop the page being
+   read, and an address taken from a response could point anywhere). Reloading the current URL rather than "/" (#4221)
+   keeps an alert link's #/triage route through a stale-session sign-in: the hash never left the address bar. */
+function signInAgain() {
+  location.reload();
+}
+
+function showSignedOutState(message, login) {
+  /* #6214: drop the cached lists too, so nothing later repaints the old session's personal views. */
+  lastViewList = null;
+  lastSidebarFleet = null;
+  clearViewGroups();
   mount(serverList, []);
   mount(viewList, []);
   mount(statusbar, el("span", { class: "sb-item muted", text: "Signed out" }));
   mount(main, el("div", { class: "strip error", role: "alert" }, [
     (message || "Your session is no longer valid.") + " ",
-    el("a", { href: location.pathname + location.search + location.hash, text: "Sign in again" }),
+    el("a", {
+      href: location.pathname + location.search + location.hash,
+      text: "Sign in again",
+      onClick: (e) => { e.preventDefault(); signInAgain(); },
+    }),
   ]));
 }
 
@@ -727,9 +762,14 @@ function start() {
   initAutoRefreshToggle();
   initPageRefreshControl();
   initSidebarCollapse(document.getElementById("app"), document.getElementById("sidebar-collapse"));
+  initNarrowNav(document.getElementById("app"), document.getElementById("nav-toggle"), document.getElementById("sidebar"));
   initSidebarSearch(document.getElementById("server-search"), paintSidebar);
   initSeverityColorSettings(document.getElementById("viewer-settings"));
   onLocalChange(paintSidebar);
+  onLocalChange(paintViewListNow);
+
+  /* #6243: a saved, created or deleted view reaches the sidebar at once, not on the next 60 s poll. */
+  onViewsChanged(refreshViewList);
 
   refreshSidebar();
   refreshViewList();

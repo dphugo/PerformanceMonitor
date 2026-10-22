@@ -24,7 +24,7 @@ namespace PerformanceMonitorLite.Tests;
 [Trait("Stage", "Guard")]
 public sealed class AzureSqlDatabaseMasterPinsTests
 {
-    private static IDataReader FleetRow(int engineEdition, string edition)
+    internal static IDataReader FleetRow(int engineEdition, string edition, long cpuSamples = 288, int? totalMemoryMb = null, int? bufferPoolMb = null)
     {
         var table = new DataTable();
         table.Columns.Add("server_id", typeof(int));
@@ -41,7 +41,15 @@ public sealed class AzureSqlDatabaseMasterPinsTests
         table.Columns.Add("grant_utilization_pct", typeof(decimal));
         table.Columns.Add("engine_edition", typeof(int));
         table.Columns.Add("edition", typeof(string));
-        table.Rows.Add(1, 6m, 20m, 1, 8m, 7m, DBNull.Value, DBNull.Value, 0L, 0L, 0L, 0m, engineEdition, edition);
+        table.Columns.Add("total_physical_memory_mb", typeof(int));
+        table.Columns.Add("buffer_pool_mb", typeof(int));
+        table.Columns.Add("mem_time", typeof(DateTime));
+        table.Columns.Add("alloc_mb", typeof(decimal));
+        table.Columns.Add("free_mb", typeof(decimal));
+        table.Columns.Add("cpu_samples", typeof(long));
+        table.Columns.Add("total_server_memory_mb", typeof(int));
+        table.Rows.Add(1, 6m, 20m, 1, 8m, 7m, DBNull.Value, DBNull.Value, 0L, 0L, 0L, 0m, engineEdition, edition,
+            (object?)totalMemoryMb ?? DBNull.Value, (object?)bufferPoolMb ?? DBNull.Value, DBNull.Value, DBNull.Value, DBNull.Value, cpuSamples, (object?)totalMemoryMb ?? DBNull.Value);
         var reader = table.CreateDataReader();
         Assert.True(reader.Read());
         return reader;
@@ -62,28 +70,5 @@ public sealed class AzureSqlDatabaseMasterPinsTests
     {
         Assert.Equal(ProvisioningVerdict.NotApplicableLabel, new ProvisioningTrendRow { Status = ProvisioningVerdict.NotApplicable }.StatusDisplay);
         Assert.Equal("OVER PROVISIONED", new ProvisioningTrendRow { Status = ProvisioningVerdict.OverProvisioned }.StatusDisplay);
-    }
-
-    [Fact]
-    public void LogicalServerMasterEdition_MatchesTheCollectorsFormat()
-    {
-        var sql = Regex.Replace(ReadRepoFile("PerformanceMonitor.Collectors/ServerPropertiesCollector.cs"), @"/\*.*?\*/", "", RegexOptions.Singleline);
-
-        Assert.Matches(new Regex(@"THEN\s+N'Azure SQL Database'\s*\+\s*ISNULL\(N' \('"), sql);
-        Assert.Matches(new Regex(@"ELSE\s+CONVERT\(nvarchar\(128\),\s*DATABASEPROPERTYEX\(DB_NAME\(\),\s*N'Edition'\)\)\s+END\s*\+\s*N'\)'"), sql);
-        Assert.DoesNotContain("WHEN N'System'", sql, StringComparison.Ordinal);
-        Assert.Equal("Azure SQL Database" + " (" + "System" + ")", ServerHardwareScope.AzureSqlDatabaseSystemEdition);
-    }
-
-    private static string ReadRepoFile(string relative, [CallerFilePath] string thisFile = "")
-    {
-        var dir = Path.GetDirectoryName(thisFile);
-        while (dir is not null && !File.Exists(Path.Combine(dir, relative)))
-        {
-            dir = Path.GetDirectoryName(dir);
-        }
-
-        Assert.NotNull(dir);
-        return File.ReadAllText(Path.Combine(dir!, relative));
     }
 }

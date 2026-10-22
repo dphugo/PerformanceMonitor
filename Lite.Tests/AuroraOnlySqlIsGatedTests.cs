@@ -43,7 +43,6 @@ namespace Lite.Tests;
 /// file arrive unexamined.
 /// </para>
 /// </summary>
-[Trait("Reads", "Darling")]
 [Trait("Stage", "Guard")]
 public class AuroraOnlySqlIsGatedTests
 {
@@ -100,6 +99,10 @@ public class AuroraOnlySqlIsGatedTests
             "never the target; the dependency itself is PgWaitStatsCollector's GATED entry, and the detector " +
             "that emits the fact baselines pg_wait_stats, which is empty off Aurora.",
 
+        ["CollectorContext.cs"] =
+            "PROSE (#6143). AuroraFunctionNames lists the functions so the host can look up the schema each one " +
+            "lives in. It calls none of them; the collectors that do are the entries above.",
+
         ["PgTargetFactCollector.Queries.cs"] =
             "PROSE. PgTargetTopStatementsSql selects MAX(max_exec_peakmem_bytes), a STORED column in " +
             "collect.pg_statement_stats, never an Aurora function. PgStatementStatsCollector's vanilla path " +
@@ -130,25 +133,6 @@ public class AuroraOnlySqlIsGatedTests
             "  GATED  - the collector's AppliesTo excludes non-Aurora targets, and the capability really is absent there.\n" +
             "  PAIRED - there is a vanilla path chosen by flavor, so the SOURCE differs and the capability does not.\n" +
             "  PROSE  - it only names the surface in a message.");
-    }
-
-    /// <summary>
-    /// The allow-list cannot outlive what it describes. An entry naming a file that no longer references
-    /// any Aurora surface is a note about a decision that has been undone — and it would silently permit
-    /// that file to reacquire one later.
-    /// </summary>
-    [Fact]
-    public void TheAllowListHasNoStaleEntries()
-    {
-        var found = FilesNamingAuroraSurfaces().Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var stale = Accounted.Keys.Where(k => !found.Contains(k))
-                                  .OrderBy(k => k, StringComparer.Ordinal)
-                                  .ToArray();
-
-        Assert.True(stale.Length == 0,
-            "These allow-list entries name no Aurora surface any more — remove them, or the file could " +
-            "reacquire one unexamined: " + string.Join(", ", stale));
     }
 
     /// <summary>

@@ -445,9 +445,13 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
         Assert.Equal(
             new[]
             {
-                "alert_time", "server_id", "server_name", "metric_name", "current_value", "threshold_value", "alert_sent",
+                "alert_time", "server_id", "server_name", "metric_name",
+                /* #5654: Darling's external-alert source for the row; always null in Lite. */
+                "external_source", "current_value", "threshold_value", "alert_sent",
                 "notification_type", "send_error", "muted", "dismissed", "severity", "severity_source", "route", "routing",
                 "routing_reason", "detail_text",
+                /* #5642: the newest sample the alert judged and its age at fire time, read from the persisted context. */
+                "newest_sample",
             },
             alert.EnumerateObject().Select(p => p.Name).ToArray());
         Assert.Equal(Stamp(now), alert.GetProperty("alert_time").GetString());
@@ -481,6 +485,27 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
         AssertPage(whole, "completions", "completions_returned", returned: 5, truncated: false);
         var durations = whole.GetProperty("completions").EnumerateArray().Select(c => c.GetProperty("duration_ms").GetDouble()).ToArray();
         Assert.Equal(durations.OrderByDescending(d => d).ToArray(), durations);
+    }
+
+    /// <summary>
+    /// #5711 review: an <c>attention</c> row stores NO statement text and the trace's hash is 0, so the row has no
+    /// identity at all. Lite's grid shows that as a blank cell (<c>QueryIdentity</c> is ""), but the MCP wire must say
+    /// null, as Darling's does (<c>DarlingMcpLongQueryTools</c>): "" would be a group key a client could pool every
+    /// cancel and timeout under, the collapse the field exists to prevent.
+    /// </summary>
+    [Fact]
+    public async Task GetLongQueryCompletions_ANoTextZeroHashRow_EmitsNullQueryHashAndNullQueryIdentity()
+    {
+        var now = WholeSecondsNow();
+        await ExecAsync(@"
+INSERT INTO long_query_completions (long_query_completion_id, collection_time, server_id, server_name, event_time, event_type, database_name, query_hash, statement_text)
+VALUES ($1, $2, $3, $4, $5, 'attention', 'Db', '0', NULL)",
+            _nextId--, Naive(now), _serverId, ServerName, Naive(now));
+
+        var root = Parse(await McpLongQueryTools.GetLongQueryCompletions(_dataService, _serverManager, ServerName, 24, 5));
+        var row = root.GetProperty("completions")[0];
+        Assert.Equal(System.Text.Json.JsonValueKind.Null, row.GetProperty("query_hash").ValueKind);
+        Assert.Equal(System.Text.Json.JsonValueKind.Null, row.GetProperty("query_identity").ValueKind);
     }
 
     [Fact]
@@ -1118,6 +1143,20 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$
             var limit = method.GetParameters().Single(p => p.Name == "limit");
             Assert.Contains("truncated", limit.GetCustomAttribute<DescriptionAttribute>()!.Description, StringComparison.Ordinal);
         }
+    }
+
+    /// <summary>
+    /// #5640: <c>get_client_timeouts</c>' <c>limit</c> pages only the SAMPLED events, never the count or the top lists, and the
+    /// description says samples are a subset. The boundary pair (limit equal to the sample count is not truncated, one below is)
+    /// runs against DuckDB in <c>ClientTimeoutsReadTests</c>; Darling's twin pins the shared payload source.
+    /// </summary>
+    [Fact]
+    public void GetClientTimeouts_LimitPagesOnlyTheSamples_AndTheDescriptionSaysSamplesAreASubset()
+    {
+        var method = ToolMethod(typeof(McpClientTimeoutTools), "get_client_timeouts");
+        Assert.Contains("subset", method.GetCustomAttribute<DescriptionAttribute>()!.Description, StringComparison.Ordinal);
+        var limit = method.GetParameters().Single(p => p.Name == "limit");
+        Assert.Contains("Never cuts the count or top lists", limit.GetCustomAttribute<DescriptionAttribute>()!.Description, StringComparison.Ordinal);
     }
 
     /// <summary>

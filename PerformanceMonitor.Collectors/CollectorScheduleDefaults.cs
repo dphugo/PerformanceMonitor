@@ -71,6 +71,9 @@ public static class CollectorScheduleDefaults
         ["waiting_tasks"] = new(1, 7),
         ["dmv_blocking_snapshot"] = new(1, 30),
         ["blocked_process_report"] = new(1, 30),
+        /* #5640 client attentions (timeouts and cancels): one cheap counter read per minute, because the Client Timeouts alert
+           is the point. The ring buffer is shredded only when the session's counters moved. 30 days, like deadlocks. */
+        ["attention"] = new(1, 30),
         /* #1496 long-running query completion trace: seeded DISABLED (DefaultEnabled: false). A
            completion trace (rpc_completed/sql_batch_completed) fires per statement/batch even though
            the duration predicate discards most of them, so it is opt-in per fleet; enabling it creates
@@ -111,6 +114,11 @@ public static class CollectorScheduleDefaults
            per-database reader already sits (query_store); the read itself is a handful of rows per
            database against in-memory recommendation state, not a Query Store scan. */
         ["plan_correction"] = new(5, 30),
+        /* #5632 forced-plan state. The query_store collector reads only plans that RAN since its last pass, so a force the
+           engine ignores, or that never runs, never reaches the store. This reads sys.query_store_plan for the forced
+           plans themselves, a few rows per database, so the store can say whether each force works. Five minutes is the
+           query_store cadence the rows are compared against; 30 days is the retention of the rows it is compared with. */
+        ["query_store_forced_plans"] = new(5, 30),
         /* #1951 ADR persistent version store. Cadence and retention deliberately MATCH
            database_size_stats (60/90) rather than the per-minute health tier: PVS size is the same
            kind of slow-moving disk-pressure telemetry, it is read beside database sizes, and pairing
@@ -413,7 +421,7 @@ public static class CollectorScheduleDefaults
         minutes is int v
             && v >= 0
             && !(CollectorDeltaCalculator.IsDeltaFamily(collectorName) && v > CollectorDeltaCalculator.MaxDeltaFrequencyMinutes)
-        ? v
+        ? Math.Min(v, MaxFrequencyMinutes)
         : null;
 
     /// <summary>
@@ -501,5 +509,15 @@ public static class CollectorScheduleDefaults
     /// TRACE_FLAGS read the same way (see <c>PgLatestValueBounds</c> / Lite's <c>LatestValueBounds</c>).
     /// </summary>
     public static int EffectiveRecurringIntervalMinutes(int frequencyMinutes) =>
-        frequencyMinutes == 0 ? OnLoadRecaptureMinutes : frequencyMinutes;
+        frequencyMinutes == 0 ? OnLoadRecaptureMinutes : Math.Min(frequencyMinutes, MaxFrequencyMinutes);
+
+    /// <summary>The longest frequency a collector's schedule accepts, in minutes: one year (#6227). A stored value above it (a row
+    /// written another way, or before the cap) is read as this, because a longer one overflows the time arithmetic the analysis
+    /// look-backs and the retention floors do with it. No shipped default comes near it (the longest is a day).</summary>
+    public const int MaxFrequencyMinutes = 525_600;
+
+    /// <summary>The longest retention a collector's schedule accepts, in days: ten years (#6227). A stored value above it is read as
+    /// this, because a longer one makes the purge cutoff (now minus the days) fall before the earliest date a timestamp can hold.
+    /// The longest shipped default is a year.</summary>
+    public const int MaxRetentionDays = 3650;
 }

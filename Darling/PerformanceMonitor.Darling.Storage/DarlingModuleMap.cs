@@ -121,23 +121,53 @@ public static class DarlingModuleMap
     /// <para>The <c>ORDER BY</c> its DISTINCT ON requires also happens to be a deterministic ascending order
     /// on the conflict key, so concurrent refreshes take these row locks in the same relative order and the
     /// unordered-batch-upsert deadlock (#1801) cannot form here. Checked, not assumed -- do not drop or
-    /// reorder it on the belief that it is only about picking the latest row.</para>
+    /// reorder it on the belief that it is only about picking the latest row. The outer <c>ORDER BY</c> on the
+    /// same key keeps that order once the <c>NOT EXISTS</c> filter wraps the DISTINCT ON.</para>
     ///
-    /// <para>The statement returns one row: the number of map rows upserted and the watermark after the
-    /// statement (null when <c>src</c> was empty).</para>
+    /// <para>A row whose values are unchanged is not written (#5824). Each refresh re-reads a slack behind the
+    /// watermark (10 minutes hourly, <see cref="DailyRepairSlack"/> daily), so most handles it reads are already
+    /// in the map with the same names and the same <c>last_seen</c>. The update arm used to rewrite them anyway
+    /// (<c>&gt;=</c> lets an equal <c>last_seen</c> through): a new row version and WAL for every handle in the
+    /// window, about 9 MB per 20,000 unchanged handles on a test store. Two guards stop it. The <c>NOT EXISTS</c>
+    /// drops a handle whose newest row matches the map before the insert tries it, so it takes no row lock either
+    /// (an <c>ON CONFLICT ... WHERE</c> that rejects a row still locks it, and after a checkpoint each locked page
+    /// is a full-page image: 2.6 MB for the same 20,000 handles with only the second guard). The
+    /// <c>IS DISTINCT FROM</c> on the update arm is the second guard, for a row a concurrent refresh wrote between
+    /// the filter's read and the insert. With both, a refresh over unchanged rows wrote about 300 bytes (the
+    /// watermark row). The comparison stays <c>&gt;=</c>, not <c>&gt;</c>: with both guards an equal
+    /// <c>last_seen</c> writes only when a name differs, which keeps the map's contents exactly what the old
+    /// statement left, where a strict <c>&gt;</c> would stop a name change stamped at the same time.</para>
+    ///
+    /// <para>The statement returns one row: the number of map rows written (inserted, or updated because a value
+    /// changed; an unchanged row is not counted) and the watermark after the statement (null when <c>src</c> was
+    /// empty).</para>
     /// </summary>
     private const string UpsertAndAdvanceTail = @"up AS (
     INSERT INTO collect.module_map (server_name, sql_handle, database_name, schema_name, object_name, last_seen)
-    SELECT DISTINCT ON (server_name, sql_handle)
-        server_name, sql_handle, database_name, schema_name, object_name, collection_time
-    FROM src
-    ORDER BY server_name, sql_handle, collection_time DESC
+    SELECT n.server_name, n.sql_handle, n.database_name, n.schema_name, n.object_name, n.collection_time
+    FROM (
+        SELECT DISTINCT ON (server_name, sql_handle)
+            server_name, sql_handle, database_name, schema_name, object_name, collection_time
+        FROM src
+        ORDER BY server_name, sql_handle, collection_time DESC
+    ) AS n
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM collect.module_map AS m
+        WHERE m.server_name = n.server_name
+          AND m.sql_handle = n.sql_handle
+          AND (m.database_name, m.schema_name, m.object_name, m.last_seen)
+              IS NOT DISTINCT FROM (n.database_name, n.schema_name, n.object_name, n.collection_time)
+    )
+    ORDER BY n.server_name, n.sql_handle
     ON CONFLICT (server_name, sql_handle) DO UPDATE SET
         database_name = EXCLUDED.database_name,
         schema_name = EXCLUDED.schema_name,
         object_name = EXCLUDED.object_name,
         last_seen = EXCLUDED.last_seen
-    WHERE module_map.last_seen IS NULL OR EXCLUDED.last_seen >= module_map.last_seen
+    WHERE (module_map.last_seen IS NULL OR EXCLUDED.last_seen >= module_map.last_seen)
+      AND (module_map.database_name, module_map.schema_name, module_map.object_name, module_map.last_seen)
+          IS DISTINCT FROM (EXCLUDED.database_name, EXCLUDED.schema_name, EXCLUDED.object_name, EXCLUDED.last_seen)
     RETURNING 1
 ),
 st AS (
@@ -254,12 +284,20 @@ SELECT (SELECT count(*) FROM up)::integer, (SELECT refreshed_through FROM st)";
     /// <summary>The daily refresh (#5519). Once the map has a watermark and rows it re-reads only the span from
     /// <see cref="DailyRepairSlack"/> behind the watermark (capped at <see cref="MaxLookback"/>), which is the
     /// repair for rows the hourly path missed by committing late; with no watermark, or an empty map, it reads the
-    /// last two days (<see cref="RefreshSql"/>). Returns the number of rows upserted; a failure warns and the
+    /// last two days (<see cref="RefreshSql"/>). Returns the number of map rows written (new or changed); a failure warns and the
     /// existing map keeps serving (never throws). Called from the daily purge, which fires fire-and-track from the
     /// sweep loop (its first pass is right after the collectors start, #5578), never from the start path: this
     /// statement can run for a minute on a large store and must not hold a collector back.</summary>
     public static Task<int> RefreshAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken cancellationToken = default) =>
-        RefreshFromWatermarkOrFullAsync(connection, logger, DateTime.UtcNow, DailyRepairSlack, "module_map daily refresh", cancellationToken);
+        RefreshFromWatermarkOrFullAsync(connection, logger, DateTime.UtcNow, DailyRepairSlack, "module_map daily refresh", cancellationToken: cancellationToken);
+
+    /// <summary>#6044: the daily refresh, reporting whether its read failed. A failure is swallowed (the map keeps
+    /// serving) and returns 0, which is also what a read that found nothing returns, so the caller that must
+    /// not count a failed run as a run reads <paramref name="outcome"/> instead.</summary>
+    public static Task<int> RefreshAsync(NpgsqlConnection connection, ILogger? logger, ModuleMapRefreshOutcome outcome, CancellationToken cancellationToken = default) =>
+        RefreshFromWatermarkOrFullAsync(connection, logger, DateTime.UtcNow, DailyRepairSlack, "module_map daily refresh", outcome, cancellationToken);
+
+
 
     /// <summary>The map has at least one row. A watermark over an empty map means the map was rebuilt without its
     /// state row; the refresh then reads the full two days instead of trusting the watermark.</summary>
@@ -268,7 +306,7 @@ SELECT (SELECT count(*) FROM up)::integer, (SELECT refreshed_through FROM st)";
     /// <summary>The daily refresh against an explicit clock and slack; the tests pass a fixed clock.
     /// <paramref name="label"/> names the caller in the log lines.</summary>
     public static async Task<int> RefreshFromWatermarkOrFullAsync(
-        NpgsqlConnection connection, ILogger? logger, DateTime utcNow, TimeSpan slack, string label, CancellationToken cancellationToken = default)
+        NpgsqlConnection connection, ILogger? logger, DateTime utcNow, TimeSpan slack, string label, ModuleMapRefreshOutcome? outcome = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(connection);
         DateTime? watermark = null;
@@ -291,31 +329,33 @@ SELECT (SELECT count(*) FROM up)::integer, (SELECT refreshed_through FROM st)";
 
         if (watermark is null || !mapHasRows)
         {
-            return await RefreshFullAsync(connection, logger, cancellationToken);
+            return await RefreshFullAsync(connection, logger, cancellationToken, outcome);
         }
 
-        return await RefreshSinceWatermarkAsync(connection, logger, watermark, utcNow, slack, label, cancellationToken);
+        return await RefreshSinceWatermarkAsync(connection, logger, watermark, utcNow, slack, label, cancellationToken, outcome);
     }
 
-    private static async Task<int> RefreshFullAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken cancellationToken)
+    private static async Task<int> RefreshFullAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken cancellationToken, ModuleMapRefreshOutcome? outcome = null)
     {
         try
         {
             using var command = new NpgsqlCommand(RefreshSql, connection) { CommandTimeout = SetupTimeoutSeconds };
             var (rows, _) = await ReadRefreshResultAsync(command, cancellationToken);
-            logger?.LogInformation("module_map: upserted {Rows} sql_handle→module attribution(s) from recent procedure_stats.", rows);
+            logger?.LogInformation("module_map: wrote {Rows} new or changed sql_handle→module attribution(s) from recent procedure_stats (an unchanged one is not rewritten).", rows);
             return rows;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger?.LogWarning("module_map refresh failed — the existing map keeps serving: {Message}", ex.Message);
+            if (outcome is not null) { outcome.Failed = true; }
             return 0;
         }
     }
 
     /// <summary>
     /// The hourly incremental refresh: upserts the map from procedure_stats at or after <see cref="SinceFor"/>
-    /// and advances the watermark, in one statement. Returns the number of rows upserted; a failure warns and the
+    /// and advances the watermark, in one statement. Returns the number of map rows written (new or changed; see
+    /// <see cref="UpsertAndAdvanceTail"/>); a failure warns and the
     /// existing map keeps serving (never throws), and the next hour reads from the same watermark, so nothing is
     /// skipped.
     /// </summary>
@@ -335,33 +375,95 @@ SELECT (SELECT count(*) FROM up)::integer, (SELECT refreshed_through FROM st)";
     /// <see cref="SinceFor(DateTime?, DateTime, TimeSpan)"/> over <see cref="RefreshSinceSql"/>.
     /// <paramref name="label"/> names the caller in the log lines.</summary>
     private static async Task<int> RefreshSinceWatermarkAsync(
-        NpgsqlConnection connection, ILogger? logger, DateTime? watermarkBefore, DateTime utcNow, TimeSpan slack, string label, CancellationToken cancellationToken)
+        NpgsqlConnection connection, ILogger? logger, DateTime? watermarkBefore, DateTime utcNow, TimeSpan slack, string label, CancellationToken cancellationToken, ModuleMapRefreshOutcome? outcome = null)
     {
         try
         {
             var since = SinceFor(watermarkBefore, utcNow, slack);
-            if (IsCappedByLookback(watermarkBefore, utcNow, slack))
+            if (IsCappedByLookback(watermarkBefore, utcNow, slack) && watermarkBefore is { } cappedWatermark)
             {
                 /* The map shares this property with the rollup route and the daily refresh: a stall longer than the
                    lookback leaves the span between the old watermark and the floor unread, and the map keeps the
-                   names it already had for it. Say so once per run instead of hiding it. */
-                logger?.LogWarning(
-                    "{Label}: the watermark {Watermark:yyyy-MM-dd HH:mm:ss} is older than the {Days}-day lookback, so procedure_stats rows between it and {Since:yyyy-MM-dd HH:mm:ss} were not re-read; module names for that span come from the map as it was.",
-                    label, watermarkBefore, MaxLookback.TotalDays, since);
+                   names it already had for it. Say so once per run instead of hiding it -- but only when that span
+                   holds procedure_stats rows (#5729). On a quiet fleet it holds none, nothing was missed, and the
+                   watermark (which only a read of rows advances) would otherwise repeat the warning every run. */
+                if (await SkippedSpanHasRowsAsync(connection, logger, cappedWatermark, since, cancellationToken))
+                {
+                    logger?.LogWarning(
+                        "{Label}: the watermark {Watermark:yyyy-MM-dd HH:mm:ss} is older than the {Days}-day lookback, so procedure_stats rows between it and {Since:yyyy-MM-dd HH:mm:ss} were not re-read; module names for that span come from the map as it was.",
+                        label, cappedWatermark, MaxLookback.TotalDays, since);
+                }
+                else
+                {
+                    logger?.LogDebug(
+                        "{Label}: the watermark {Watermark:yyyy-MM-dd HH:mm:ss} is older than the {Days}-day lookback, but procedure_stats holds no rows between it and {Since:yyyy-MM-dd HH:mm:ss}, so nothing was missed; moving the watermark to that floor.",
+                        label, cappedWatermark, MaxLookback.TotalDays, since);
+                    await AdvanceWatermarkToFloorAsync(connection, logger, since, label, cancellationToken);
+                }
             }
 
             using var command = new NpgsqlCommand(RefreshSinceSql, connection) { CommandTimeout = SetupTimeoutSeconds };
             command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = since });
             var (rows, watermark) = await ReadRefreshResultAsync(command, cancellationToken);
             logger?.LogInformation(
-                "{Label}: upserted {Rows} sql_handle→module attribution(s) from procedure_stats since {Since:yyyy-MM-dd HH:mm:ss}; watermark now {Watermark}.",
+                "{Label}: wrote {Rows} new or changed sql_handle→module attribution(s) from procedure_stats since {Since:yyyy-MM-dd HH:mm:ss} (an unchanged one is not rewritten); watermark now {Watermark}.",
                 label, rows, since, watermark?.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) ?? "unchanged (nothing read)");
             return rows;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger?.LogWarning("{Label} failed — the existing map keeps serving and the next run reads from the same watermark: {Message}", label, ex.Message);
+            if (outcome is not null) { outcome.Failed = true; }
             return 0;
+        }
+    }
+
+    /// <summary>Any procedure_stats row with <c>collection_time</c> in <c>[$1, $2)</c>: the span a capped refresh
+    /// skips (#5729). Bounded on the time column, so the hypertable excludes every chunk outside the span.</summary>
+    public const string SkippedSpanHasRowsSql =
+        "SELECT EXISTS (SELECT 1 FROM collect.procedure_stats WHERE collection_time >= $1 AND collection_time < $2)";
+
+    /// <summary>Moves the watermark up to <c>$1</c>, never back (GREATEST, as <see cref="UpsertAndAdvanceTail"/>
+    /// does). <c>refreshed_at</c> stays: it stamps the last refresh that read rows. No clock inside the statement.</summary>
+    public const string AdvanceWatermarkToFloorSql =
+        "UPDATE collect.module_map_state SET refreshed_through = GREATEST(refreshed_through, $1) WHERE id = 1";
+
+    /// <summary>True when procedure_stats has a row in <c>[watermark, floor)</c>, the span a capped refresh does not
+    /// re-read. A failed check answers true: the caller then warns, as it did before this check existed (#5729).</summary>
+    private static async Task<bool> SkippedSpanHasRowsAsync(
+        NpgsqlConnection connection, ILogger? logger, DateTime watermark, DateTime floor, CancellationToken cancellationToken)
+    {
+        if (watermark >= floor)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var command = new NpgsqlCommand(SkippedSpanHasRowsSql, connection) { CommandTimeout = WatermarkReadTimeoutSeconds };
+            command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(watermark, DateTimeKind.Unspecified) });
+            command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(floor, DateTimeKind.Unspecified) });
+            return await command.ExecuteScalarAsync(cancellationToken) is not false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogDebug("module_map: could not check the skipped span for procedure_stats rows, so the lookback warning stands: {Message}", ex.Message);
+            return true;
+        }
+    }
+
+    private static async Task AdvanceWatermarkToFloorAsync(
+        NpgsqlConnection connection, ILogger? logger, DateTime floor, string label, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var command = new NpgsqlCommand(AdvanceWatermarkToFloorSql, connection) { CommandTimeout = WatermarkReadTimeoutSeconds };
+            command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(floor, DateTimeKind.Unspecified) });
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogWarning("{Label}: could not move the watermark to the lookback floor; the next run checks the span again: {Message}", label, ex.Message);
         }
     }
 
@@ -393,4 +495,11 @@ SELECT (SELECT count(*) FROM up)::integer, (SELECT refreshed_through FROM st)";
 
         return (reader.GetInt32(0), reader.IsDBNull(1) ? null : reader.GetDateTime(1));
     }
+}
+
+/// <summary>#6044: set when a module map refresh's read failed and was swallowed (the map keeps serving), so a
+/// caller that must not count a failed run as a run can tell it from a read that found nothing.</summary>
+public sealed class ModuleMapRefreshOutcome
+{
+    public bool Failed { get; internal set; }
 }

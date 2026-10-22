@@ -14,6 +14,8 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using PerformanceMonitor.Common.Tags;
+using PerformanceMonitorLite.Database;
 using PerformanceMonitorLite.Models;
 using PerformanceMonitorLite.Services;
 
@@ -32,12 +34,20 @@ public sealed class TagNode
 
     public int Depth { get; }
 
+    /// <summary>Whether a child tag may be added under this node: the nesting limit is the shared
+    /// <see cref="TagTreeRules"/> one (#5978), the same as Darling's server tags.</summary>
+    public bool CanAddChild => TagTreeRules.CanHaveChildren(Depth);
+
     public string Name => Tag.Name;
 
     /// <summary>The tag's colour as a brush for the tree swatch (neutral when the tag has no colour).</summary>
     public System.Windows.Media.Brush SwatchBrush => TagColorBrushes.Fill(Tag.Colour);
 
     public ObservableCollection<TagNode> Children { get; } = new();
+
+    /// <summary>Bound two-way to the tree item, so a rebuilt tree can re-select the tag the operator was on
+    /// (a Move Up or Move Down rebuilds every node).</summary>
+    public bool IsSelected { get; set; }
 }
 
 /// <summary>A server row in the assignment checklist — its membership in the selected tag is
@@ -83,9 +93,6 @@ public sealed class ServerCheckItem : INotifyPropertyChanged
 /// </summary>
 public partial class ManageTagsWindow : Window
 {
-    /// <summary>Four levels of nesting: a node at depth 0..2 may have children; depth 3 (the 4th) may not.</summary>
-    private const int MaxDepth = 4;
-
     private readonly LocalDataService _dataService;
     private readonly IReadOnlyList<ServerConnection> _servers;
 
@@ -198,9 +205,15 @@ public partial class ManageTagsWindow : Window
             }
         }
 
+        var reselect = selectedId is int id ? FindNode(nodes, id) : null;
+        if (reselect is not null)
+        {
+            reselect.IsSelected = true;
+        }
+
         TagTree.ItemsSource = nodes;
 
-        _selectedNode = selectedId is int id ? FindNode(nodes, id) : null;
+        _selectedNode = reselect;
         UpdateButtons();
     }
 
@@ -233,12 +246,71 @@ public partial class ManageTagsWindow : Window
     private void UpdateButtons()
     {
         var hasSelection = _selectedNode is not null;
-        NewChildButton.IsEnabled = hasSelection && _selectedNode!.Depth < MaxDepth - 1;
+        NewChildButton.IsEnabled = hasSelection && _selectedNode!.CanAddChild;
         RenameButton.IsEnabled = hasSelection;
         ColourButton.IsEnabled = hasSelection;
         DeleteButton.IsEnabled = hasSelection;
+        MoveUpButton.IsEnabled = CanMoveSelected(TagMoveDirection.Up);
+        MoveDownButton.IsEnabled = CanMoveSelected(TagMoveDirection.Down);
         CheckAllButton.IsEnabled = hasSelection;
         UncheckAllButton.IsEnabled = hasSelection;
+    }
+
+    /// <summary>Whether the selected tag has a sibling to swap with in <paramref name="direction"/>, from the
+    /// siblings (same parent) in the order the tree shows them.</summary>
+    private bool CanMoveSelected(TagMoveDirection direction)
+    {
+        if (_selectedNode is null)
+        {
+            return false;
+        }
+
+        var parentId = _selectedNode.Tag.ParentId;
+        var siblings = _tags
+            .Where(t => t.ParentId == parentId)
+            .Select(t => new TagSibling(t.Id, t.Name, t.SortOrder))
+            .ToList();
+        return TagSiblingOrder.CanMove(siblings, _selectedNode.Tag.Id, direction);
+    }
+
+    private async void MoveUp_Click(object sender, RoutedEventArgs e) => await MoveSelectedAsync(TagMoveDirection.Up);
+
+    private async void MoveDown_Click(object sender, RoutedEventArgs e) => await MoveSelectedAsync(TagMoveDirection.Down);
+
+    /// <summary>Moves the selected tag one place among its siblings (#6094). The data service renumbers the
+    /// siblings in one statement from a fresh read; the tree is rebuilt and the same tag stays selected.</summary>
+    private async Task MoveSelectedAsync(TagMoveDirection direction)
+    {
+        if (_selectedNode is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var movedId = _selectedNode.Tag.Id;
+            var wrote = false;
+            if (!await WriteWhileWaitingAsync(
+                    "moving the tag", "Move tag",
+                    async () => wrote = await Task.Run(() => _dataService.MoveServerTagAsync(movedId, direction))))
+            {
+                return;
+            }
+
+            if (wrote)
+            {
+                ChangedAny = true;
+            }
+
+            // Reload either way: a move that wrote nothing means the tree this window shows was already stale.
+            await ReloadTagsAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("ManageTags", "Move tag failed", ex);
+            MessageBox.Show(this, $"Could not move the tag: {ex.Message}", "Manage Tags",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void RefreshMembers()
@@ -291,13 +363,15 @@ public partial class ManageTagsWindow : Window
         var tagId = _selectedNode.Tag.Id;
         try
         {
-            if (assign)
+            if (!await WriteWhileWaitingAsync(
+                    assign ? "assigning the tag" : "removing the tag from the server",
+                    assign ? "Assign tag" : "Unassign tag",
+                    () => assign
+                        ? Task.Run(() => _dataService.AssignServerTagAsync(new[] { serverId }, tagId))
+                        : Task.Run(() => _dataService.UnassignServerTagAsync(new[] { serverId }, tagId)),
+                    reloadAfterBusy: true))
             {
-                await Task.Run(() => _dataService.AssignServerTagAsync(new[] { serverId }, tagId));
-            }
-            else
-            {
-                await Task.Run(() => _dataService.UnassignServerTagAsync(new[] { serverId }, tagId));
+                return;
             }
 
             if (!_assignedServersByTag.TryGetValue(tagId, out var set))
@@ -346,13 +420,15 @@ public partial class ManageTagsWindow : Window
 
         try
         {
-            if (assign)
+            if (!await WriteWhileWaitingAsync(
+                    assign ? "adding the servers to the tag" : "removing the servers from the tag",
+                    assign ? "Assign tag to servers" : "Unassign tag from servers",
+                    () => assign
+                        ? Task.Run(() => _dataService.AssignServerTagAsync(ids, tagId))
+                        : Task.Run(() => _dataService.UnassignServerTagAsync(ids, tagId)),
+                    reloadAfterBusy: true))
             {
-                await Task.Run(() => _dataService.AssignServerTagAsync(ids, tagId));
-            }
-            else
-            {
-                await Task.Run(() => _dataService.UnassignServerTagAsync(ids, tagId));
+                return;
             }
 
             if (!_assignedServersByTag.TryGetValue(tagId, out var set))
@@ -389,6 +465,47 @@ public partial class ManageTagsWindow : Window
         }
     }
 
+    /* #5650: a tag write can wait up to 30 s for the local database (LocalDataService.OpenUserWriteConnectionAsync) while
+       archival or a collector write holds it. While it waits, the whole work area (tree, buttons and server list) is
+       greyed out, so a second click cannot start another write, and the line at the bottom says what is happening.
+       Close stays enabled. A busy store is reported with StoreBusyReport's wording ("nothing was changed", the holder
+       when known) and one Warning line; the caller gets false and stops. Any other failure is rethrown to the caller's
+       existing catch, which keeps the old Error line and message. The write is passed already wrapped in Task.Run
+       (TabLoadsOffUiThreadTests reads that at the call), so the window stays responsive for the whole wait. */
+    private async Task<bool> WriteWhileWaitingAsync(string doing, string logAction, Func<Task> write, bool reloadAfterBusy = false)
+    {
+        TagWorkArea.IsEnabled = false;
+        WriteWaitText.Text = StoreBusyReport.WaitingText(doing);
+        WriteWaitText.Visibility = Visibility.Visible;
+        try
+        {
+            await write();
+            return true;
+        }
+        catch (StoreLockTimeoutException ex)
+        {
+            var text = StoreBusyReport.Report("ManageTags", logAction, ex, doing);
+            if (!IsLoaded)
+            {
+                return false;   // closed while it waited: nothing left to show or reload
+            }
+
+            MessageBox.Show(this, text, "Manage Tags", MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (reloadAfterBusy)
+            {
+                /* The check box was ticked before the write started; put it back to what the store holds. */
+                await ReloadTagsAsync();
+            }
+
+            return false;
+        }
+        finally
+        {
+            WriteWaitText.Visibility = Visibility.Collapsed;
+            TagWorkArea.IsEnabled = true;
+        }
+    }
+
     private void ServerFilterBox_TextChanged(object sender, TextChangedEventArgs e) => RefreshMembers();
 
     private async void NewRoot_Click(object sender, RoutedEventArgs e)
@@ -407,7 +524,7 @@ public partial class ManageTagsWindow : Window
             return;
         }
 
-        if (_selectedNode.Depth >= MaxDepth - 1)
+        if (!_selectedNode.CanAddChild)
         {
             MessageBox.Show(this, "Tags can nest at most four levels deep.", "Manage Tags",
                 MessageBoxButton.OK, MessageBoxImage.Information);
@@ -425,7 +542,13 @@ public partial class ManageTagsWindow : Window
     {
         try
         {
-            await Task.Run(() => _dataService.CreateServerTagAsync(name, parentId));
+            if (!await WriteWhileWaitingAsync(
+                    "creating the tag", "Create tag",
+                    () => Task.Run(() => _dataService.CreateServerTagAsync(name, parentId))))
+            {
+                return;
+            }
+
             ChangedAny = true;
             await ReloadTagsAsync();
         }
@@ -453,7 +576,13 @@ public partial class ManageTagsWindow : Window
         try
         {
             var renamedId = _selectedNode.Tag.Id;
-            await Task.Run(() => _dataService.RenameServerTagAsync(renamedId, name));
+            if (!await WriteWhileWaitingAsync(
+                    "renaming the tag", "Rename tag",
+                    () => Task.Run(() => _dataService.RenameServerTagAsync(renamedId, name))))
+            {
+                return;
+            }
+
             ChangedAny = true;
             await ReloadTagsAsync();
         }
@@ -482,7 +611,13 @@ public partial class ManageTagsWindow : Window
         {
             var recolouredId = _selectedNode.Tag.Id;
             var colour = dialog.SelectedColour;
-            await Task.Run(() => _dataService.SetServerTagColorAsync(recolouredId, colour));
+            if (!await WriteWhileWaitingAsync(
+                    "setting the tag colour", "Set tag colour",
+                    () => Task.Run(() => _dataService.SetServerTagColorAsync(recolouredId, colour))))
+            {
+                return;
+            }
+
             ChangedAny = true;
             await ReloadTagsAsync();
         }
@@ -517,7 +652,13 @@ public partial class ManageTagsWindow : Window
         try
         {
             var deletedId = _selectedNode.Tag.Id;
-            await Task.Run(() => _dataService.DeleteServerTagAsync(deletedId));
+            if (!await WriteWhileWaitingAsync(
+                    "deleting the tag", "Delete tag",
+                    () => Task.Run(() => _dataService.DeleteServerTagAsync(deletedId))))
+            {
+                return;
+            }
+
             _selectedNode = null;
             ChangedAny = true;
             await ReloadTagsAsync();

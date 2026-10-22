@@ -223,7 +223,7 @@ if (args.Length > 0 && DarlingCliCommands.IsConfigureFirewallVerb(args[0]))
    taking ownership needs a privilege a virtual service account is not granted — so it logs the remedy and carries
    on. This is the actor with the authority. Verifies every target after the attempt and exits non-zero if
    anything is still readable, so it is usable in a provisioning script. Windows-only: ACLs.
-   Optional second arg = an explicit config path. */
+   Optional: --config <path> (or the path as the one bare argument) = an explicit config path. */
 if (args.Length > 0 && DarlingCliCommands.IsHardenFilesVerb(args[0]))
 {
     if (!OperatingSystem.IsWindows())
@@ -232,8 +232,17 @@ if (args.Length > 0 && DarlingCliCommands.IsHardenFilesVerb(args[0]))
         return 1;
     }
 
-    var configPath = args.Length > 1 ? args[1] : null;
-    return DarlingCliCommands.HardenFiles(configPath, Console.Out, Console.Error);
+    /* #5700: --tls-key-files-only runs just the TLS key-file step, for the install and upgrade scripts (not in the
+       help text). The other argument, if any, is the config path. */
+    if (!DarlingCliCommands.TryParseHardenFilesArgs(args.Skip(1).ToArray(), out var configPath, out var tlsKeyFilesOnly, out var hardenFilesUsage))
+    {
+        Console.Error.WriteLine(hardenFilesUsage);
+        return 1;
+    }
+
+    return tlsKeyFilesOnly
+        ? DarlingCliCommands.HardenTlsKeyFilesOnly(configPath, Console.Out, Console.Error)
+        : DarlingCliCommands.HardenFiles(configPath, Console.Out, Console.Error);
 }
 
 /* CLI verbs: enable/disable the embedded MCP + web-dashboard endpoints on a HEADLESS managed deployment. Each
@@ -310,6 +319,37 @@ if (args.Length > 0 && DarlingCliCommands.IsAddServerVerb(args[0]))
         addServerConfigPath, Console.In, Console.Out, Console.Error, CancellationToken.None);
 }
 
+/* CLI verbs: --add-alert-source / --rotate-alert-source / --remove-alert-source <name> and --list-alert-sources, each with an
+   optional --config <path> (#5654) - the logins external systems use to send alerts. Each runs as the store owner, like
+   --add-server, and owns no grant SQL of its own: the grants are the ones the service re-asserts on every start. Same
+   platform posture as --add-server: NO Windows guard here, because Windows is needed only for a MANAGED store credential
+   (DPAPI), which the verb checks itself. The password is never an argument or a statement: it is generated, its SCRAM-SHA-256
+   verifier is what the server receives, and the connection string that holds it is printed once. */
+if (args.Length > 0 && DarlingCliCommands.IsAddAlertSourceVerb(args[0]))
+{
+    return await DarlingCliCommands.AddAlertSourceAsync(args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
+if (args.Length > 0 && DarlingCliCommands.IsRotateAlertSourceVerb(args[0]))
+{
+    return await DarlingCliCommands.RotateAlertSourceAsync(args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
+if (args.Length > 0 && DarlingCliCommands.IsRemoveAlertSourceVerb(args[0]))
+{
+    return await DarlingCliCommands.RemoveAlertSourceAsync(args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
+if (args.Length > 0 && DarlingCliCommands.IsListAlertSourcesVerb(args[0]))
+{
+    return await DarlingCliCommands.ListAlertSourcesAsync(args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
+if (args.Length > 0 && DarlingCliCommands.IsExportInvestigationsVerb(args[0]))
+{
+    return await DarlingCliCommands.ExportInvestigationsAsync(args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
 /* CLI verbs: --enable-collector / --disable-collector <name> [--server <name>] [--config <path>] (#3752) — flip one
    collector's enabled flag in config.config_collector_schedules, fleet-wide or for one server, and print the rows
    read back from the store. The one collector that ships OFF (long_query_completions, whose enabling is what
@@ -354,6 +394,20 @@ if (args.Length > 0 && DarlingCliCommands.IsSetCollectorRunAtVerb(args[0]))
     return await DarlingCliCommands.SetCollectorRunAtAsync(args[1..], Console.Out, Console.Error, CancellationToken.None);
 }
 
+/* CLI verbs: --set-collector-frequency <collector> <minutes|default> and --set-collector-retention <collector> <days|default>, each with
+   [--server <name>] [--config <path>] (#6227) — set or clear one value of a collector's schedule row, fleet-wide or for one server, and
+   print the rows read back. Same shape and posture as --set-collector-run-at directly above: no SQL of their own (they execute the
+   command plane's plan), trailing arguments parsed STRICTLY inside the verb. */
+if (args.Length > 0 && DarlingCliCommands.IsSetCollectorFrequencyVerb(args[0]))
+{
+    return await DarlingCliCommands.SetCollectorColumnAsync(PerformanceMonitor.Darling.Storage.CollectorScheduleColumn.FrequencyMinutes, args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
+if (args.Length > 0 && DarlingCliCommands.IsSetCollectorRetentionVerb(args[0]))
+{
+    return await DarlingCliCommands.SetCollectorColumnAsync(PerformanceMonitor.Darling.Storage.CollectorScheduleColumn.RetentionDays, args[1..], Console.Out, Console.Error, CancellationToken.None);
+}
+
 /* CLI verb: --drop-xe-sessions <server-name> [--dry-run] [--config <path>] | --print-sql (#4732) — drop the Extended
    Events sessions (the deadlock and blocked-process ring buffers, and the opt-in long-query completions one)
    Darling created on a server this service still monitors (run just before the server is removed; after removal,
@@ -376,15 +430,11 @@ if (args.Length > 0 && DarlingCliCommands.IsDropXeSessionsVerb(args[0]))
    must materialize the whole history before the first purge reclaims anything, which puts peak disk BEFORE
    any relief. It preflights free space and refuses with numbers rather than filling the volume. Runs while the
    service is up, is resumable, and arms nothing itself. --dry-run prints the plan + estimate and stops.
-   Windows-only in managed mode (the DPAPI owner credential), same guard shape as the verbs above. */
+   NO Windows guard here (#6071): Windows is needed only for a MANAGED store's DPAPI owner credential, and the verb
+   decides that itself (DarlingCliCommands.ManagedStoreCredentialRefusal), so a bring-your-own store runs it on
+   Linux too, --dry-run included. Same posture as --drop-xe-sessions above. */
 if (args.Length > 0 && DarlingCliCommands.IsBackfillRollupsVerb(args[0]))
 {
-    if (!OperatingSystem.IsWindows())
-    {
-        Console.Error.WriteLine("--backfill-rollups requires Windows (DPAPI store credential).");
-        return 1;
-    }
-
     var rest = args.AsSpan(1);
     var dryRun = false;
     string? backfillConfigPath = null;
@@ -405,15 +455,9 @@ if (args.Length > 0 && DarlingCliCommands.IsBackfillRollupsVerb(args[0]))
 }
 
 /* #1912 — repair the pre-#1907 Query Store split slices still in stored rows, then re-materialize what they
-   fed. Same Windows-only managed-credential guard and same --dry-run shape as --backfill-rollups above. */
+   fed. Same managed-credential-only platform check (inside the verb) and same --dry-run shape as --backfill-rollups above. */
 if (args.Length > 0 && DarlingCliCommands.IsCollapseLegacySlicesVerb(args[0]))
 {
-    if (!OperatingSystem.IsWindows())
-    {
-        Console.Error.WriteLine("--collapse-legacy-slices requires Windows (DPAPI store credential).");
-        return 1;
-    }
-
     var rest = args.AsSpan(1);
     var dryRun = false;
     string? collapseConfigPath = null;
@@ -434,15 +478,9 @@ if (args.Length > 0 && DarlingCliCommands.IsCollapseLegacySlicesVerb(args[0]))
 }
 
 /* #2076 — convert the plan dimension's pre-V54 text rows to gzip (#2069's write form), in batches, while
-   the service runs. Same Windows-only managed-credential guard and same --dry-run shape as the verbs above. */
+   the service runs. Same managed-credential-only platform check (inside the verb) and same --dry-run shape as the verbs above. */
 if (args.Length > 0 && DarlingCliCommands.IsRecompressPlanDimVerb(args[0]))
 {
-    if (!OperatingSystem.IsWindows())
-    {
-        Console.Error.WriteLine("--recompress-plan-dim requires Windows (DPAPI store credential).");
-        return 1;
-    }
-
     var (recompressConfigPath, dryRun, vacuumMode, parseError) = DarlingCliCommands.ParseRecompressArgs(args.AsSpan(1));
     if (parseError is not null)
     {
@@ -466,7 +504,8 @@ builder.Services.AddWindowsService(options =>
 /* The rolling file log under %ProgramData%\PerformanceMonitorDarling\logs — the service's PRIMARY
    diagnostic surface (see DarlingFileLoggerProvider remarks). Registered unconditionally: console
    runs get the same file, which is exactly what an operator collecting a bug report wants. */
-builder.Logging.AddProvider(new DarlingFileLoggerProvider());
+var fileLoggerProvider = new DarlingFileLoggerProvider();
+builder.Logging.AddProvider(fileLoggerProvider);
 
 if (OperatingSystem.IsWindows())
 {
@@ -492,67 +531,26 @@ if (OperatingSystem.IsWindows())
     }
 }
 
-/* #1560/#1562: the live MCP + web enable/port seams — the worker publishes the control-plane values on
-   every reload; each host's supervisor observes and starts/stops/rebinds without a service restart. */
-builder.Services.AddSingleton<McpRuntimeState>();
-builder.Services.AddSingleton<WebRuntimeState>();
-
-/* #3514: the host->worker seam carrying the served web-dashboard TLS certificate's expiry, so the worker's
-   alert sweep can raise a self-alert as it approaches (the web host loads the certificate once and only a
-   log line ever reported its expiry). */
-builder.Services.AddSingleton<WebTlsCertificateState>();
-
-/* #5288: the MCP listener's twin of the seam above, a SEPARATE singleton so each listener publishes and
-   clears only its own certificate: a web restart can never clear or resolve an MCP alert, and a certificate
-   both listeners serve is published to both and alerts (and resolves) twice, independently. */
-builder.Services.AddSingleton<McpTlsCertificateState>();
-
-/* #2298: the worker-published monitored-server registry the MCP host's plan-fetch resolver reads,
-   replacing its own mcp-role re-read of rows whose encrypted_password column that role is
-   deliberately denied. */
-builder.Services.AddSingleton<MonitoredServerRegistryState>();
-
-/* #2953: the collector's startup verdict — the worker publishes it, the web host's /api/ping reads it, and
-   neither touches the store to do so. A singleton for the same reason the three above are: the publisher and
-   the reader are separate hosted services in one process, and the answer has to survive being asked at any
-   moment rather than being computed on demand from something that might be down.
-
-   #4733: DARLING_STOPPED_MARKER, read once here, is the path of a file the state keeps present while collection
-   is stopped for good. Only the compose file sets it (its `darling` service's healthcheck tests for the file);
-   the Windows service and every other deployment leave it unset and nothing is written. */
 var stoppedMarkerPath = Environment.GetEnvironmentVariable("DARLING_STOPPED_MARKER");
-builder.Services.AddSingleton(services => new CollectorRuntimeState(
-    stoppedMarkerPath,
-    services.GetRequiredService<ILogger<CollectorRuntimeState>>()));
-
-/* #3941: the process's shared baseline tier. The worker's per-pass analysis services, the MCP host's and the web
-   host's each read the store as a different role (#3914), so they cannot share providers; they share the computed
-   30-day buckets instead, and a series is read from the store once per analysis hour between them. */
-builder.Services.AddSingleton<BaselineCache>();
-
-/* #4442 scope 2: the read-latency histogram accumulator, shared between the web host's /api/read/* dispatch
-   loop and RunComposedPanelAsync -- a singleton for the same reason CollectorCostAccumulator is: the worker's
-   flush and the web host's recording are separate hosted services in the one process. */
-builder.Services.AddSingleton<ReadLatencyAccumulator>();
-
-/* #5097: the slow-read record's queue. The three recorders offer to it; the worker runs its one writer once the store
-   is migrated. */
-builder.Services.AddSingleton<SlowReadLog>();
+/* The process-wide singletons and the three hosted services live in DarlingProcessServices.Add (#5950), so a test builds
+   the same container; their comments are there. */
+DarlingProcessServices.Add(builder.Services, stoppedMarkerPath);
 
 /* #5097: the per-statement timing listener for reads; samples only inside a ReadScope that asked for capture. */
 ReadStatementCapture.Register();
 
-builder.Services.AddHostedService<DarlingWorker>();
-
-/* AN4: the analysis MCP tools over Streamable HTTP — registered always, self-gating on
-   darling.json's mcp.enabled (default OFF), so Program.cs stays config-free like the worker. */
-builder.Services.AddHostedService<DarlingMcpHostService>();
-
-/* #1562: the read-only web dashboard on its own port — registered always, self-gating on
-   darling.json's web.enabled (default OFF), same config-free posture as the worker and MCP host. */
-builder.Services.AddHostedService<DarlingWebHostService>();
+/* #5506: the connection-wait listener for reads; records only inside a ReadScope. */
+ReadConnectionWait.Register();
 
 var host = builder.Build();
+
+/* The file log is the primary surface, and it is off when its folder could not be created, trusted or locked. The
+   warning that went to the Event Log reaches nobody on a hand install with no registered event source, and the
+   file provider drops everything while it is off, so the console logger is where this one lands. */
+if (fileLoggerProvider.StartupFailure is { } fileLogFailure)
+{
+    host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("DarlingFileLog").LogWarning("{Warning}", fileLogFailure);
+}
 
 /* #1581 single-instance guard: acquire a system-wide named mutex BEFORE running the host (Build() only
    constructs the DI graph; Run() is what starts the worker and touches Postgres). If another instance

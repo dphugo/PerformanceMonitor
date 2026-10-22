@@ -164,6 +164,7 @@ public sealed partial class ViewerDataService
             FROM v_collection_log
             WHERE server_id = $1
             AND   collection_time >= $2
+            AND   {CollectionCycleRow.NotCycleRowSql}
             GROUP BY collector_name
         )
         SELECT
@@ -209,7 +210,11 @@ public sealed partial class ViewerDataService
             -- newest run that CARRIED a note, so a clean run after a partial-failure cycle still shows the
             -- older cycle's note there). The band reads only this one, because the loss an older note names
             -- is not the collector's current state. APPENDED, read positionally by the one shared mapper.
-            CASE WHEN newest.status = 'SUCCESS' THEN newest.error_message END AS latest_run_note
+            CASE WHEN newest.status = 'SUCCESS' THEN newest.error_message END AS latest_run_note,
+            -- #5646: how many of the NEWEST runs in a row succeeded, counted to 3 and no further. Newest first on
+            -- the full timestamp, then log_id DESC (unique), the Darling service read's own statement.
+            -- APPENDED, read positionally by the one shared mapper.
+            COALESCE(recent.trailing_success_runs, 0) AS trailing_success_runs
         FROM health h
         -- #4955: the keyed lookups. Each reads ONE collector's rows through
         -- idx_collection_log_watermark (server_id, collector_name, collection_time DESC), at an instant the
@@ -259,6 +264,29 @@ public sealed partial class ViewerDataService
             ORDER BY t.error_message DESC
             LIMIT 1
         ) noted ON TRUE
+        -- #5646: the newest three runs, newest first, then the highest log_id.
+        LEFT JOIN LATERAL
+        (
+            SELECT {CollectorTrailingRuns.StreakFromFlagsSql} AS trailing_success_runs
+            FROM
+            (
+                -- An ordered aggregate over the three rows, not a window function: the keyed lookups
+                -- above rank nothing over the window.
+                SELECT array_agg(x.ok ORDER BY x.collection_time DESC, x.log_id DESC) AS flags
+                FROM
+                (
+                    SELECT {CollectorTrailingRuns.RunOkSql} AS ok,
+                           v.collection_time,
+                           v.log_id
+                    FROM v_collection_log v
+                    WHERE v.server_id = $1
+                    AND   v.collector_name = h.collector_name
+                    AND   v.collection_time >= $2
+                    ORDER BY v.collection_time DESC, v.log_id DESC
+                    LIMIT 3
+                ) x
+            ) r
+        ) recent ON TRUE
         ORDER BY h.collector_name
         """;
 
@@ -377,7 +405,8 @@ public sealed partial class ViewerDataService
             rows_collected,
             status,
             error_message,
-            server_name
+            server_name,
+            read_source
         FROM v_collection_log
         WHERE server_id = $1
         AND   collection_time >= $2
@@ -431,7 +460,8 @@ public sealed partial class ViewerDataService
             rows_collected,
             status,
             error_message,
-            server_name
+            server_name,
+            read_source
         FROM v_collection_log
         WHERE server_id = $1
         AND   collector_name = $2
@@ -465,7 +495,64 @@ public sealed partial class ViewerDataService
         }
 
         ApplyScheduledFrequencies(items, serverId, scheduleOverrides);
+        await ApplyReadSourceAsync(items, serverId, cancellationToken);
         return items;
+    }
+
+    /// <summary>
+    /// #6254: the newest Query Store run's <c>read_source</c> on this server in the trailing 7 days. The newest run, not the newest run
+    /// that had one, so a server whose Query Store replica setting was turned off stops showing a source as soon as its runs stop writing
+    /// one. One keyed index walk that stops at the first row.
+    /// </summary>
+    internal const string CollectionHealthReadSourceSql = @"
+SELECT read_source
+FROM v_collection_log
+WHERE server_id = $1
+AND   collector_name = 'query_store'
+AND   collection_time >= $2
+ORDER BY collection_time DESC, log_id DESC
+LIMIT 1";
+
+    /// <summary>
+    /// #6254: stamps the Query Store row with <see cref="CollectionHealthReadSourceSql"/>'s value. Null everywhere with the setting off
+    /// (every server until an operator sets it), and then no row changes and the grid is what it was. A failed read leaves the rows
+    /// unstamped: the health view answers without the extra note. A cancellation is not swallowed.
+    /// </summary>
+    private async Task ApplyReadSourceAsync(List<CollectorHealthRow> rows, int serverId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var command = _dataSource.CreateCommand(CollectionHealthReadSourceSql);
+            command.CommandTimeout = ViewerCommandDeadlines.CurrentInteractiveReadSeconds;
+            command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = serverId });
+            command.Parameters.Add(new NpgsqlParameter<DateTime>
+            {
+                TypedValue = DateTime.SpecifyKind(DateTime.UtcNow.AddDays(-7), DateTimeKind.Unspecified),
+            });
+            var value = await command.ExecuteScalarAsync(cancellationToken);
+            ApplyReadSource(rows, value as string);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"#6254 collection health could not read the Query Store read source for server {serverId}; it is shown without one: {ex.GetType().Name}");
+        }
+    }
+
+    /// <summary>#6254: puts <paramref name="readSource"/> on the <c>query_store</c> row. Blank or null changes nothing. Pure, so a test needs no store.</summary>
+    internal static void ApplyReadSource(IEnumerable<CollectorHealthRow> rows, string? readSource)
+    {
+        if (string.IsNullOrWhiteSpace(readSource))
+        {
+            return;
+        }
+
+        foreach (var row in rows)
+        {
+            if (string.Equals(row.CollectorName, "query_store", StringComparison.Ordinal))
+            {
+                row.ReadSource = readSource;
+            }
+        }
     }
 
     /// <summary>
@@ -565,6 +652,7 @@ public sealed partial class ViewerDataService
         FROM v_collection_log
         WHERE collection_time >= $1
         AND   server_id <> 0
+        AND   {CollectionCycleRow.NotCycleRowSql}
         GROUP BY server_id, collector_name
         """;
 
@@ -632,17 +720,19 @@ public sealed partial class ViewerDataService
         }
 
         var byServer = new Dictionary<int, List<CollectorHealthRow>>();
-        await using var reader = await command.ExecuteReaderAsync(CancellationToken.None);
-        while (await reader.ReadAsync(CancellationToken.None))
+        await using (var reader = await command.ExecuteReaderAsync(CancellationToken.None))
         {
-            var serverId = reader.GetInt32(0);
-            if (!byServer.TryGetValue(serverId, out var rows))
+            while (await reader.ReadAsync(CancellationToken.None))
             {
-                rows = new List<CollectorHealthRow>();
-                byServer[serverId] = rows;
-            }
+                var serverId = reader.GetInt32(0);
+                if (!byServer.TryGetValue(serverId, out var rows))
+                {
+                    rows = new List<CollectorHealthRow>();
+                    byServer[serverId] = rows;
+                }
 
-            rows.Add(MapFleetByServerRow(reader));
+                rows.Add(MapFleetByServerRow(reader));
+            }
         }
 
         foreach (var (serverId, rows) in byServer)
@@ -650,7 +740,55 @@ public sealed partial class ViewerDataService
             ApplyScheduledFrequencies(rows, serverId, scheduleOverrides.Where(o => o.ServerId is null || o.ServerId == serverId).ToList());
         }
 
+        /* #5666: after the cadence is stamped (the ladder reads it) and after the aggregate's reader has closed. */
+        await ApplyTrailingSuccessRunsAsync(_dataSource, byServer, windowStart, CancellationToken.None);
+
         return byServer;
+    }
+
+    /// <summary>
+    /// #5666: sets <see cref="CollectorHealthRow.TrailingSuccessRuns"/> on the fleet rows whose band the newest runs could change
+    /// (<see cref="CollectorHealthClassifier.RecoveryCouldChangeBand"/>), so a collector that recovered bands HEALTHY on the
+    /// Overview card as it does on its own Collection Health tab. The aggregate stays plain (#3735): the streak
+    /// comes from ONE follow-up statement through <see cref="CollectorTrailingRuns"/>, the definition the per-server read
+    /// shares, asked for just those rows and not run at all when none needs it. A row left unset keeps 0, the right
+    /// value for a row whose band does not turn on the streak.
+    /// </summary>
+    internal static async Task ApplyTrailingSuccessRunsAsync(
+        NpgsqlDataSource dataSource,
+        Dictionary<int, List<CollectorHealthRow>> byServer,
+        DateTime windowStart,
+        CancellationToken cancellationToken)
+    {
+        var pairs = new List<(int ServerId, string CollectorName)>();
+        foreach (var (serverId, serverRows) in byServer)
+        {
+            foreach (var r in serverRows)
+            {
+                if (r.RecoveryCouldChangeBand)
+                {
+                    pairs.Add((serverId, r.CollectorName));
+                }
+            }
+        }
+
+        if (pairs.Count == 0)
+        {
+            return;
+        }
+
+        var streaks = await CollectorTrailingRuns.ReadAsync(
+            dataSource, pairs, windowStart, ViewerCommandDeadlines.CurrentInteractiveReadSeconds, cancellationToken);
+        foreach (var (serverId, serverRows) in byServer)
+        {
+            foreach (var r in serverRows)
+            {
+                if (streaks.TryGetValue((serverId, r.CollectorName), out var streak))
+                {
+                    r.TrailingSuccessRuns = streak;
+                }
+            }
+        }
     }
 
     /// <summary>Maps one row of <see cref="FleetCollectionHealthByServerSql"/> / its composed twin (ordinals
@@ -678,10 +816,10 @@ public sealed partial class ViewerDataService
         LatestRunNote = reader.IsDBNull(13) ? null : reader.GetString(13),
     };
 
-    /// <summary>Maps one row of the 19-column per-server health projection (<see cref="CollectionHealthSql"/>, ordinals 0-18)
+    /// <summary>Maps one row of the 20-column per-server health projection (<see cref="CollectionHealthSql"/>, ordinals 0-19)
     /// to a <see cref="CollectorHealthRow"/>. The count is load-bearing: the projection is read POSITIONALLY
-    /// through this one mapper, so it must match it exactly (19 since #4748 appended latest_run_note at
-    /// ordinal 18; #3819's last_non_skip_time and last_productive_time sit at ordinals 16-17,
+    /// through this one mapper, so it must match it exactly (20 since #5646 appended trailing_success_runs at
+    /// ordinal 19; #4748's latest_run_note sits at ordinal 18; #3819's last_non_skip_time and last_productive_time sit at ordinals 16-17,
     /// #3240's extension_missing_count at 15 and #2804's abandoned_count at 14).</summary>
     private static CollectorHealthRow MapHealthRow(NpgsqlDataReader reader) => new()
     {
@@ -712,6 +850,8 @@ public sealed partial class ViewerDataService
         LastProductiveTime = reader.IsDBNull(17) ? null : reader.GetDateTime(17),
         /* Appended (#4748). So the band agrees between the grid and the fleet total. */
         LatestRunNote = reader.IsDBNull(18) ? null : reader.GetString(18),
+        /* Appended (#5646): the newest runs' success streak, the band's recovery input. */
+        TrailingSuccessRuns = reader.IsDBNull(19) ? 0 : Convert.ToInt64(reader.GetValue(19)),
     };
 
     /// <summary>
@@ -928,6 +1068,7 @@ public sealed partial class ViewerDataService
                 Status = reader.GetString(6),
                 ErrorMessage = reader.IsDBNull(7) ? null : reader.GetString(7),
                 ServerName = reader.IsDBNull(8) ? null : reader.GetString(8),
+                ReadSource = reader.IsDBNull(9) ? null : reader.GetString(9),
             });
         }
 
@@ -978,6 +1119,14 @@ public class CollectionLogRow
     public int? RowsCollected { get; set; }
     public string Status { get; set; } = "";
     public string? ErrorMessage { get; set; }
+
+    /// <summary>#6254: where this run's Query Store rows were read from (for example <c>replica 12, primary 2</c>), or null: every run of a server with the
+    /// replica setting off, every collector but Query Store, and every run stored before the column existed.</summary>
+    public string? ReadSource { get; set; }
+
+    /// <summary>#6254: the grids' message cell, <see cref="ErrorMessage"/> with the run's read source after it when it has one. Identical to
+    /// <see cref="ErrorMessage"/> (blank for none) when it has none. Shared wording with the health views' Note column.</summary>
+    public string MessageFormatted => CollectorHealthClassifier.FormatRunMessage(ErrorMessage, ReadSource);
 
     public string CollectionTimeFormatted => ViewerTimeHelper.FormatForDisplay(CollectionTime, "yyyy-MM-dd HH:mm:ss");
 
@@ -1079,6 +1228,21 @@ public class CollectorHealthRow
     public string? LatestRunNote { get; set; }
 
     /// <summary>
+    /// #5646: how many of the collector's newest runs in a row succeeded, counted to
+    /// <see cref="CollectorHealthClassifier.RecoveryTrailingSuccessRuns"/> and no further. The per-server read
+    /// sets it from the newest runs (full timestamp precision, then the unique log id, newest first). A row
+    /// built from plain aggregates (the fleet roll-up) starts at 0 and the roll-up sets it (#5666) for the rows whose band it could change, so the fleet card and the server's tab band alike.
+    /// </summary>
+    public long TrailingSuccessRuns { get; set; }
+
+    /// <summary>#5646: the "recovered" sentence for a collector the recovery rule kept off WARNING, or null. Only
+    /// a row whose displayed <see cref="HealthStatus"/> is HEALTHY carries it, so a row another rung bands
+    /// (abandon rate, lost databases, stopped, regression) never does. Display text only; it carries the last
+    /// failure time.</summary>
+    public string? RecoveredNote => CollectorHealthClassifier.FormatRecoveredNote(
+        HealthStatus, TotalRuns, ErrorCount, TrailingSuccessRuns, LastErrorTime, FrequencyMinutes);
+
+    /// <summary>
     /// #1852: whether the store saw user databases on this target inside the health window
     /// (<c>has_user_databases</c>) — what tells a legitimately empty server apart from one that is
     /// enumerating nothing despite having databases. False also covers "no inventory to go on" (the fleet
@@ -1126,6 +1290,12 @@ public class CollectorHealthRow
             ? CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes(schedule.FrequencyMinutes)
             : 0);
 
+    /// <summary>#5666: whether the newest-runs streak could move this row's band
+    /// (<see cref="CollectorHealthClassifier.RecoveryCouldChangeBand"/>), over the same inputs <see cref="HealthStatus"/> reads.</summary>
+    internal bool RecoveryCouldChangeBand => CollectorHealthClassifier.RecoveryCouldChangeBand(
+        TotalRuns, SuccessCount, ErrorCount, PermissionDeniedCount, ExtensionMissingCount, AbandonedCount,
+        HoursSinceLastSuccess, HoursSinceLastRun, FrequencyMinutes, LatestRunNote);
+
     /// <summary>
     /// #4999: the interval, in minutes, this collector is scheduled at on the server the row was read for, as
     /// <see cref="ViewerDataService.ApplyScheduledFrequencies"/> resolves it, or null when nothing resolved one (an
@@ -1144,7 +1314,7 @@ public class CollectorHealthRow
     public string HealthStatus => CollectorHealthClassifier.BandWithRegression(
         CollectorHealthClassifier.Classify(
             TotalRuns, SuccessCount, ErrorCount, PermissionDeniedCount, ExtensionMissingCount, AbandonedCount,
-            HoursSinceLastSuccess, HoursSinceLastRun, FrequencyMinutes, LatestRunNote),
+            HoursSinceLastSuccess, HoursSinceLastRun, FrequencyMinutes, LatestRunNote, TrailingSuccessRuns),
         RegressedFromProductive);
 
     public string AvgDurationFormatted => AvgDurationMs < 1000
@@ -1171,7 +1341,11 @@ public class CollectorHealthRow
     /// identically. Never feeds <see cref="HealthStatus"/>.
     /// </summary>
     public string NoteFormatted =>
-        CollectorHealthClassifier.FormatCollectionNote(LastNote, NoteCount, TotalRuns, CollectorName, TargetHasUserDatabases);
+        CollectorHealthClassifier.FormatCollectionNote(LastNote, NoteCount, TotalRuns, CollectorName, TargetHasUserDatabases, RecoveredNote, ReadSource);
+
+    /// <summary>#6254: where the newest Query Store run read its rows from (for example <c>replica 12, primary 2</c>), shown in the Note column.
+    /// Null for every collector but Query Store and for every server with the replica setting off. Informational only: it never feeds <see cref="HealthStatus"/>.</summary>
+    public string? ReadSource { get; set; }
 }
 
 /// <summary>

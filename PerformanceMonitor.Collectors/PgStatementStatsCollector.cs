@@ -150,10 +150,15 @@ public sealed class PgStatementStatsCollector : PostgresCollectorDefinitionBase<
        Explicit casts pin the reader's types: wal_bytes is numeric in PostgreSQL (bigint cannot hold
        its declared 10^20 range, though no real statement approaches it), and Npgsql's type checking
        is strict enough that reading numeric with GetInt64 throws. */
-    private static string BuildQueryText(int postgresMajorVersion, bool isAurora)
+    internal static string BuildQueryText(int postgresMajorVersion, bool isAurora, string? statementsExtensionVersion = null)
     {
-        var readTime = postgresMajorVersion >= 17 ? "shared_blk_read_time" : "blk_read_time";
-        var writeTime = postgresMajorVersion >= 17 ? "shared_blk_write_time" : "blk_write_time";
+        /* #6206: the stock view's columns follow the EXTENSION's catalog version (pg_extension.extversion, read with
+           the schema lookup), and the server major stands in only while that is unknown. Aurora's function is not
+           the stock view, so its flavor below keeps reading by server major. */
+        var layout = PgVersionSql.StatementsLayout.For(postgresMajorVersion, statementsExtensionVersion);
+        var sharedBlkTimes = isAurora ? postgresMajorVersion >= 17 : layout.HasSharedBlkTimeNames;
+        var readTime = sharedBlkTimes ? "shared_blk_read_time" : "blk_read_time";
+        var writeTime = sharedBlkTimes ? "shared_blk_write_time" : "blk_write_time";
 
         /* #2625, the vanilla path. The ORDINALS are identical to Aurora's on purpose: the six columns
            only Aurora reports are selected as typed NULL literals rather than omitted, so ReadAsync,
@@ -176,7 +181,19 @@ public sealed class PgStatementStatsCollector : PostgresCollectorDefinitionBase<
            Unclassified -> ERROR), not silently wrong. Aurora's aurora_stat_statements() carries the
            column regardless of the extension's catalog version, which is why the Aurora flavor below
            reads it unguarded. */
-        var topLevel = postgresMajorVersion >= 14 ? "toplevel" : "true";
+        var topLevel = layout.HasToplevel ? "toplevel" : "true";
+
+        /* #6206: before pg_stat_statements 1.8 (PostgreSQL 12 and older, or an older extension kept through an upgrade)
+           the same figures are total_time, min_time, max_time and mean_time, and the WAL counters do not exist yet.
+           They are read under the new names, in the same units (milliseconds), so the stored columns are the same;
+           the WAL columns are typed NULL. Plan-time counters are not stored by this collector at all. */
+        var totalTime = layout.HasExecTimeNames ? "total_exec_time" : "total_time";
+        var minTime = layout.HasExecTimeNames ? "min_exec_time" : "min_time";
+        var maxTime = layout.HasExecTimeNames ? "max_exec_time" : "max_time";
+        var meanTime = layout.HasExecTimeNames ? "mean_exec_time" : "mean_time";
+        var walRecords = layout.HasWal ? "wal_records::bigint" : "NULL::bigint";
+        var walFpi = layout.HasWal ? "wal_fpi::bigint" : "NULL::bigint";
+        var walBytes = layout.HasWal ? "wal_bytes::bigint" : "NULL::bigint";
 
         /* The statements epoch (#3653 A5), ordinal 27 on both flavors: StatementsEpochSql, declared at class level
            with the measurement behind its shape (#3818). */
@@ -193,7 +210,7 @@ public sealed class PgStatementStatsCollector : PostgresCollectorDefinitionBase<
            in-place major upgrade. aurora_stat_statements() is documented to carry every pg_stat_statements
            column, stats_since included, wherever the function itself exists, so the Aurora flavor reads
            it unguarded the same way it already reads toplevel unguarded. */
-        var statsSince = postgresMajorVersion >= 17 ? "stats_since" : "NULL::timestamp with time zone";
+        var statsSince = (isAurora ? postgresMajorVersion >= 17 : layout.HasStatsSince) ? "stats_since" : "NULL::timestamp with time zone";
 
         /* #4428: the TARGET's own clock, captured in the SAME read as stats_since, once per row (cheap —
            PostgreSQL evaluates now() once per statement, not per row, so this is one clock read per pass
@@ -211,10 +228,10 @@ SELECT
     userid::bigint                     AS userid,
     {topLevel}                         AS toplevel,
     calls::bigint                      AS calls,
-    total_exec_time                    AS total_exec_time,
-    min_exec_time                      AS min_exec_time,
-    max_exec_time                      AS max_exec_time,
-    mean_exec_time                     AS mean_exec_time,
+    {totalTime}                        AS total_exec_time,
+    {minTime}                          AS min_exec_time,
+    {maxTime}                          AS max_exec_time,
+    {meanTime}                         AS mean_exec_time,
     rows::bigint                       AS rows_returned,
     shared_blks_hit::bigint            AS shared_blks_hit,
     shared_blks_read::bigint           AS shared_blks_read,
@@ -228,9 +245,9 @@ SELECT
     NULL::bigint                       AS orcache_blks_hit,
     NULL::double precision             AS storage_blk_read_time,
     NULL::double precision             AS orcache_blk_read_time,
-    wal_records::bigint                AS wal_records,
-    wal_fpi::bigint                    AS wal_fpi,
-    wal_bytes::bigint                  AS wal_bytes,
+    {walRecords}                       AS wal_records,
+    {walFpi}                           AS wal_fpi,
+    {walBytes}                         AS wal_bytes,
     NULL::bigint                       AS total_exec_peakmem,
     NULL::bigint                       AS max_exec_peakmem,
     {statsReset}                       AS statements_stats_reset,
@@ -335,32 +352,49 @@ WHERE calls > 0";
        The same form on both flavors: Aurora's aurora_stat_statements() is the extension's data plus
        columns, and the extension's own info view sits beside it wherever the extension was created. */
     public const string StatementsEpochSql = @"(SELECT CASE
-            WHEN to_regclass(format('%I.pg_stat_statements_info', n.nspname)) IS NULL THEN NULL::timestamp with time zone
-            ELSE substring(
-                     query_to_xml(format('SELECT stats_reset FROM %I.pg_stat_statements_info', n.nspname), true, false, '')::text
-                     FROM '<stats_reset>([^<]+)</stats_reset>')::timestamp with time zone
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_depend AS d
+                WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND d.objid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(pg_catalog.format('%I.pg_stat_statements_info', n.nspname))::pg_catalog.oid
+                AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_extension'::pg_catalog.regclass
+                AND d.refobjid OPERATOR(pg_catalog.=) e.oid
+                AND d.deptype OPERATOR(pg_catalog.=) 'e') THEN NULL::timestamp with time zone
+            ELSE pg_catalog.substring(
+                     pg_catalog.query_to_xml(pg_catalog.format('SELECT stats_reset FROM %I.pg_stat_statements_info', n.nspname), true, false, '')::text,
+                     '<stats_reset>([^<]+)</stats_reset>')::timestamp with time zone
         END
      FROM pg_catalog.pg_extension AS e
      JOIN pg_catalog.pg_namespace AS n
-       ON n.oid = e.extnamespace
-    WHERE e.extname = 'pg_stat_statements')";
+       ON n.oid OPERATOR(pg_catalog.=) e.extnamespace
+    WHERE e.extname OPERATOR(pg_catalog.=) 'pg_stat_statements')";
 
     /* #4677: the statements EVICTION counter, appended at ordinal 30 on both flavors (27 epoch, 28 stats_since,
        29 target_now, 30 stats_dealloc). pg_stat_statements_info.dealloc counts the times the module had to drop its
        least-used entries because pg_stat_statements.max was reached (each pass drops about 5% of max); it restarts
        from zero with stats_reset. Same existence-gated query_to_xml form as StatementsEpochSql and for the same
        measured reasons (#3818/#3830): NULL, never an error, where the info view is absent (extension below 1.9, or
-       no pg_extension row), so ServerEpoch reads it as "unknown". */
+       no pg_extension row), so ServerEpoch reads it as "unknown". Both gate on MEMBERSHIP, not on the name (#6143): below 1.9 the
+       extension has no such view, so a role with CREATE on the extension's schema could create a view of that name
+       there over a function of its own, and query_to_xml would run it under the monitoring login. pg_depend's 'e' row
+       ties the relation to this extension; anything else reads NULL, as an absent view does. */
     public const string StatementsDeallocSql = @"(SELECT CASE
-            WHEN to_regclass(format('%I.pg_stat_statements_info', n.nspname)) IS NULL THEN NULL::bigint
-            ELSE substring(
-                     query_to_xml(format('SELECT dealloc FROM %I.pg_stat_statements_info', n.nspname), true, false, '')::text
-                     FROM '<dealloc>([^<]+)</dealloc>')::bigint
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_depend AS d
+                WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND d.objid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(pg_catalog.format('%I.pg_stat_statements_info', n.nspname))::pg_catalog.oid
+                AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_extension'::pg_catalog.regclass
+                AND d.refobjid OPERATOR(pg_catalog.=) e.oid
+                AND d.deptype OPERATOR(pg_catalog.=) 'e') THEN NULL::bigint
+            ELSE pg_catalog.substring(
+                     pg_catalog.query_to_xml(pg_catalog.format('SELECT dealloc FROM %I.pg_stat_statements_info', n.nspname), true, false, '')::text,
+                     '<dealloc>([^<]+)</dealloc>')::bigint
         END
      FROM pg_catalog.pg_extension AS e
      JOIN pg_catalog.pg_namespace AS n
-       ON n.oid = e.extnamespace
-    WHERE e.extname = 'pg_stat_statements')";
+       ON n.oid OPERATOR(pg_catalog.=) e.extnamespace
+    WHERE e.extname OPERATOR(pg_catalog.=) 'pg_stat_statements')";
 
     public override string Name => "pg_statement_stats";
 
@@ -409,8 +443,22 @@ WHERE calls > 0";
         },
     };
 
+    /* #6143: the stock view named by the schema pg_stat_statements was created in, which need not be public; the
+       monitoring connection's search_path is pg_catalog. Aurora's aurora_stat_statements() is named by the schema
+       the host found it in, pg_catalog or the extension's own. */
     public override CollectorQuery BuildQuery(CollectorContext context)
-        => new(BuildQueryText(context.Target.PostgresMajorVersion, context.Target.IsAurora));
+        => new(BuildQueryText(context.Target.PostgresMajorVersion, context.Target.IsAurora, context.PgExtensionVersion("pg_stat_statements"))
+            .Replace(
+                "FROM public.pg_stat_statements",
+                "FROM " + context.PgExtensionSchema("pg_stat_statements") + ".pg_stat_statements",
+                StringComparison.Ordinal)
+            .Replace(
+                "FROM aurora_stat_statements(false)",
+                "FROM " + context.PgFunctionSchema("aurora_stat_statements") + ".aurora_stat_statements(false)",
+                StringComparison.Ordinal));
+
+    /// <summary>#6143: on Aurora the host reads where <c>aurora_stat_statements</c> lives before it builds the query.</summary>
+    public override bool ReadsAuroraFunctions => true;
 
     /// <summary>
     /// The statements epoch this collector persists per server (#3653 A5): <c>pg_stat_statements_info.stats_reset</c>

@@ -59,13 +59,25 @@ public interface IAlertSettings
     string GenericWebhookHeadersJson { get; }
 
     /// <summary>
+    /// The signing keys of the generic URL on the settings row (#5998), opened. A send to that URL is signed while a key
+    /// is set; a route with its own generic URL signs with its own keys (<see cref="NotificationRoute.GenericSigning"/>).
+    /// Defaults to none, so an app that has no signing (Lite) sends exactly what it sent before.
+    /// </summary>
+    WebhookSigningKeys GenericWebhookSigning => WebhookSigningKeys.None;
+
+    /// <summary>Whether a generic webhook signing key could not be opened (#5998). The destination it signs is already off;
+    /// a send that names a generic URL by itself (a resolution) checks this so it never reaches that destination unsigned.</summary>
+    bool GenericSigningKeyUnreadable => false;
+
+    /// <summary>
     /// The JSON request body, with <c>{{metric}}</c>, <c>{{server}}</c>, <c>{{value}}</c>,
     /// <c>{{threshold}}</c>, <c>{{severity}}</c>, <c>{{context}}</c> and <c>{{timestamp}}</c>
     /// placeholders substituted per alert, plus the #2302 automation tokens:
     /// <c>{{context_json}}</c> / <c>{{incidents_json}}</c> (raw JSON values, substituted unquoted)
     /// and <c>{{dedup_key}}</c> (the PagerDuty-shape correlation key), the #2710 tag tokens
     /// <c>{{resource_name}}</c> / <c>{{database}}</c>, and <c>{{triage_url}}</c> (the computed triage-page
-    /// link, empty when <see cref="TriageBaseUrl"/> is unset). Empty falls back to
+    /// link, empty when <see cref="TriageBaseUrl"/> is unset), and the #5821 <c>{{investigation_json}}</c> (Darling and, since #5820, Lite: the
+    /// investigation request the alert opened or joined, empty when it opened none). Empty falls back to
     /// <see cref="WebhookAlertService.DefaultGenericBodyTemplate"/>.
     /// </summary>
     string GenericWebhookBodyTemplate { get; }
@@ -155,8 +167,9 @@ public interface IAlertSettings
     ///
     /// <para>Defaulted to EMPTY on the interface rather than declared abstract, deliberately: an empty list
     /// resolves every channel to the parent default and the fan-out is byte-identical to the pre-routes
-    /// one, so an adapter that does not implement this member has opted out of nothing — Lite has no
-    /// routes table and its adapter takes this default. Only Darling's store-backed adapter overrides it.</para>
+    /// one, so an adapter that does not implement this member has opted out of nothing. Both products' store-backed
+    /// adapters override it (Darling's from its routes table, Lite's, since #5750, from the expanded-routes cache); an
+    /// adapter that takes this default serves no routes.</para>
     /// </summary>
     System.Collections.Generic.IReadOnlyList<NotificationRoute> NotificationRoutes => System.Array.Empty<NotificationRoute>();
 

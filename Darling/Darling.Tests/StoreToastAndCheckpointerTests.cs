@@ -118,7 +118,7 @@ public sealed class StoreToastAndCheckpointerTests
         var gate = source.IndexOf("if (freespacemapInstalled)", StringComparison.Ordinal);
         var update = source.IndexOf("new NpgsqlCommand(ToastLiveBytesUpdateSql", StringComparison.Ordinal);
         var checkpointer = source.IndexOf("new NpgsqlCommand(checkpointerSql", StringComparison.Ordinal);
-        var store = source.IndexOf("new NpgsqlCommand(StoreInsertSql", StringComparison.Ordinal);
+        var store = source.IndexOf("new NpgsqlCommand(exact ? StoreInsertSql", StringComparison.Ordinal);
         Assert.True(insert >= 0 && probe > insert && gate > probe && update > gate && checkpointer > update && store > checkpointer,
             $"the sweep's statement order moved: insert {insert}, probe {probe}, gate {gate}, update {update}, checkpointer {checkpointer}, store {store}");
         Assert.Contains("probe.Parameters.AddWithValue(FreespacemapExtensionName)", source, StringComparison.Ordinal);
@@ -162,7 +162,7 @@ public sealed class StoreToastAndCheckpointerTests
     [Fact]
     public void TheSweepDoc_StatesThePerKindMeaningOfTheCheckpointerColumns()
     {
-        /* Single-line anchors only (the RepoFileAdoptionTests rule), each the load-bearing clause of one
+        /* Single-line anchors only (so the plain reader is enough), each the load-bearing clause of one
            paragraph: the per-kind mapping, the raw-vs-delta decision, the reset idiom, the extension fence. */
         var source = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Storage", "StoreSelfMetrics.cs");
         foreach (var phrase in new[]
@@ -191,12 +191,12 @@ public sealed class StoreToastAndCheckpointerTests
            flat top level StoreMetricsDailySql still has; the trailing-pair-before-FROM shape is checked
            against each read's own indentation instead of one shared literal. #4734: the daily read appends the
            kept row's own metric_time after the pair (the latest read already returns it as its third column),
-           so a growth point can say when its snapshot was taken. No other column moves. */
+           so a growth point can say when its snapshot was taken. #5857: both reads append size_estimated last. No other column moves. */
         var dailyNormalised = DarlingStoreMetricsReader.StoreMetricsDailySql.Replace("\r\n", "\n", StringComparison.Ordinal);
-        Assert.Contains("    total_failures,\n    toast_bytes,\n    toast_live_bytes,\n    metric_time\nFROM collect.store_metrics", dailyNormalised, StringComparison.Ordinal);
+        Assert.Contains("    total_failures,\n    toast_bytes,\n    toast_live_bytes,\n    metric_time,\n    size_estimated\nFROM collect.store_metrics", dailyNormalised, StringComparison.Ordinal);
 
         var latestNormalised = DarlingStoreMetricsReader.StoreMetricsLatestSql.Replace("\r\n", "\n", StringComparison.Ordinal);
-        Assert.Contains("        total_failures,\n        toast_bytes,\n        toast_live_bytes\n    FROM collect.store_metrics", latestNormalised, StringComparison.Ordinal);
+        Assert.Contains("        total_failures,\n        toast_bytes,\n        toast_live_bytes,\n        size_estimated\n    FROM collect.store_metrics", latestNormalised, StringComparison.Ordinal);
 
         foreach (var sql in new[] { DarlingStoreMetricsReader.StoreMetricsLatestSql, DarlingStoreMetricsReader.StoreMetricsDailySql })
         {
@@ -212,9 +212,12 @@ public sealed class StoreToastAndCheckpointerTests
             RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingStoreMetricsReader.cs"));
         Assert.Equal(2, Regex.Matches(source, @"reader\.IsDBNull\(13\) \? null : reader\.GetInt64\(13\)").Count);
         Assert.Equal(2, Regex.Matches(source, @"reader\.IsDBNull\(14\) \? null : reader\.GetInt64\(14\)").Count);
-        /* No nullable column is read past 14: the checkpointer counters stay out of the rows. Ordinal 15 is the
-           daily read's NOT NULL metric_time (#4734), taken with GetDateTime, never IsDBNull. */
-        Assert.DoesNotContain("reader.IsDBNull(15)", source, StringComparison.Ordinal);
+        /* No nullable column is read past the size_estimated marker (#5857: ordinal 15 on the latest read, 16 on the daily
+           read): the checkpointer counters stay out of the rows. Ordinal 15 on the daily read is its NOT NULL metric_time
+           (#4734), taken with GetDateTime, never IsDBNull. */
+        Assert.Single(Regex.Matches(source, @"reader\.IsDBNull\(15\) \? null : reader\.GetBoolean\(15\)"));
+        Assert.Single(Regex.Matches(source, @"reader\.IsDBNull\(16\) \? null : reader\.GetBoolean\(16\)"));
+        Assert.DoesNotContain("reader.IsDBNull(17)", source, StringComparison.Ordinal);
         Assert.Single(Regex.Matches(source, @"reader\.GetDateTime\(15\)"));
 
         var pair = DarlingStoreMetricsReader.CheckpointerPairSql.Replace("\r\n", "\n", StringComparison.Ordinal);
@@ -1447,6 +1450,14 @@ public sealed class StoreToastAndCheckpointerTests
         public bool BlockingEnabled { get; set; } = true;
         public bool DeadlockEnabled { get; set; } = true;
         public bool PoisonWaitEnabled { get; set; }
+        public bool RunnableQueueEnabled { get; set; }
+        public int RunnableQueueWarningPerScheduler { get; set; } = 8;
+        public int RunnableQueueCriticalPerScheduler { get; set; } = 16;
+        public bool ClientTimeoutsEnabled { get; set; }
+        public int ClientTimeoutsWarningPerMinute { get; set; } = 10;
+        public int ClientTimeoutsCriticalPerMinute { get; set; } = 60;
+        public int ClientTimeoutsWarningMultiple { get; set; } = 3;
+        public int ClientTimeoutsCriticalMultiple { get; set; } = 10;
         public bool LongRunningQueryEnabled { get; set; }
         public bool TempDbSpaceEnabled { get; set; }
         public bool LowDiskEnabled { get; set; }
@@ -1490,6 +1501,7 @@ public sealed class StoreToastAndCheckpointerTests
         public int CooldownMinutes { get; set; } = 5;
         public List<string> ExcludedDatabasesList { get; } = new();
         public IReadOnlyList<string> ExcludedDatabases => ExcludedDatabasesList;
+        public IReadOnlyList<string> ExcludedVolumes { get; } = new List<string>();
         public CpuAlertMode CpuAlertMode { get; set; } = CpuAlertMode.TotalServer;
     }
 

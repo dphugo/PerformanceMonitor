@@ -89,10 +89,10 @@ public sealed class DarlingMcpPgAutovacuumTools
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -115,21 +115,21 @@ public sealed class DarlingMcpPgAutovacuumTools
                    and a fabricated one for a SQL Server target — the collector has never run there. Ask the
                    engine before making the claim (#2532). */
                 var gated = await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_autovacuum_stats", cancellationToken);
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_autovacuum_stats", cancellationToken);
                 if (gated != null)
                 {
                     return gated;
                 }
 
-                return JsonSerializer.Serialize(new
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, JsonSerializer.Serialize(new
                 {
-                    server = resolved.ServerName,
+                    server = resolved.DisplayName,
                     hours_back,
-                    status = "no_pending_maintenance",
+                    status = "empty",
                     finding = "No table on this server has dead tuples, pending analyze work, inserts since "
                             + "its last vacuum, or autovacuum disabled. The collector records only tables with "
                             + "pending work, so an empty result is the healthy case rather than missing data.",
-                }, McpHelpers.JsonOptions);
+                }, McpHelpers.JsonOptions), cancellationToken);
             }
 
             /* #3603: the cost half, read once for every table on the page and attached per table below. The
@@ -232,7 +232,7 @@ public sealed class DarlingMcpPgAutovacuumTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 status = "tables_with_pending_maintenance",
                 /* The page's count under the page's name (#3594: a page count is never a total, and it is

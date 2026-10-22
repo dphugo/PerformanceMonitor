@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
+using PerformanceMonitor.Common.QueryTags;
 
 namespace PerformanceMonitor.Collectors;
 
@@ -60,6 +61,16 @@ public abstract class CollectorDefinitionBase<TRow> : ICollectorDefinition<TRow>
     public virtual IReadOnlyList<PgExtensionDependency> RequiredPgExtensions =>
         System.Array.Empty<PgExtensionDependency>();
 
+    /* Declared here as well as on the interface, the RequiredPgExtensions pair and for the same reason: a derived
+       definition cannot override the interface's default through the class type. See ICollectorSchemaInfo.StaysPlainTable. */
+    public virtual bool StaysPlainTable => false;
+
+    /* Declared here as well as on the interface, the StaysPlainTable pair and for the same reason. See ICollectorSchemaInfo.IsDarlingOnly. */
+    public virtual bool IsDarlingOnly => false;
+
+    /* Declared here as well as on the interface, the IsDarlingOnly pair and for the same reason. See ICollectorSchemaInfo.ReadsAuroraFunctions. */
+    public virtual bool ReadsAuroraFunctions => false;
+
     public virtual int? PerItemRowCountWarnThreshold => null;
 
     public virtual int? PerItemTextByteBudget => null;
@@ -82,6 +93,8 @@ public abstract class CollectorDefinitionBase<TRow> : ICollectorDefinition<TRow>
     public virtual bool RunsPerDatabase(CollectorTargetInfo target) => false;
 
     public virtual bool SkipsSeparatelyMonitoredDatabases => false;
+
+    public virtual bool SkipsMasterDatabase => false;
 
     public abstract CollectorQuery BuildQuery(CollectorContext context);
 
@@ -111,4 +124,7 @@ public abstract class CollectorDefinitionBase<TRow> : ICollectorDefinition<TRow>
        definition could not `override` it and the interface map would keep resolving to null no matter what
        the definition said. */
     public virtual OversizedPlanObservation? DescribeOversizedPlan(TRow row) => null;
+
+    /* Declared here as well as on the interface for the same reason as DescribeOversizedPlan above (#5980). */
+    public virtual IReadOnlyList<QueryTagSighting>? DescribeQueryTagSightings(TRow row) => null;
 }

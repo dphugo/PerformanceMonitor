@@ -27,16 +27,9 @@ namespace PerformanceMonitorLite.Tests;
 /// order, hidden elements inside a templated cell, heat-map and bar cells, and a long query text in a row name. The Viewer twin is
 /// in Darling.Tests (ViewerScreenReaderNamesFollowUpTests).
 /// </summary>
-[Trait("Reads", "Darling")]
 public class ScreenReaderNamesFollowUpTests
 {
-    private static void Settle(Window window)
-    {
-        window.Show();
-        var frame = new DispatcherFrame();
-        window.Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() => frame.Continue = false));
-        Dispatcher.PushFrame(frame);
-    }
+    private static void Settle(Window window) => StaTestThread.Settle(window);
 
     private static IEnumerable<DependencyObject> Descendants(DependencyObject root)
     {

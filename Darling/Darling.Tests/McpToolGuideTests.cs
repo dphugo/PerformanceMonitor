@@ -35,7 +35,6 @@ namespace Darling.Tests;
 /// <see cref="McpToolGuideHeadsHealthParserTests"/> for the pattern) — lanes converting a new family add a file
 /// there and never edit this one, so two families converting in parallel never conflict here.
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class McpToolGuideTests
 {
     internal static McpToolsListBudgetTests.MeasuredTool Served(string tool) =>
@@ -308,11 +307,13 @@ public sealed class McpToolGuideTests
     }
 
     private static readonly Type[] KnownConstantClasses =
-        [typeof(McpToolGuideTopics), typeof(McpToolGuide), typeof(AlertReadFailureCounter), typeof(McpHelpers), typeof(BaselineDiscontinuities)];
+        [typeof(McpToolGuideTopics), typeof(McpToolGuide), typeof(AlertReadFailureCounter), typeof(McpHelpers), typeof(BaselineDiscontinuities),
+         typeof(InvestigationReportFields), typeof(InvestigationReportLinks)];
 
     /// <summary>Resolves a <c>ClassName.MemberName</c> piece of a concatenated Description to its compile-time
     /// value, for the handful of shared constants (topic texts, the marker, the fleet-scoped-reads sentence,
-    /// and the window-floor / baseline-discontinuity sentences the trend family's tails carry) tool descriptions
+    /// and the window-floor / baseline-discontinuity sentences the trend family's tails carry, and the report-field constants the
+    /// investigation submit tail names since #6011) tool descriptions
     /// embed instead of repeating. Returns null for anything else, so the caller fails naming the tool rather
     /// than silently dropping an unrecognized piece.</summary>
     private static string? ResolveKnownConstant(string className, string memberName)

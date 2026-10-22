@@ -1390,6 +1390,50 @@ namespace PerformanceMonitor.Common
         public const double WarningFailureRatePercent = 20.0;
 
         /// <summary>
+        /// #5646. The most runs the failure rate waits for before it bands WARNING. Two errors in the first
+        /// eight runs of a new target is 25%, which read WARNING until the tenth run landed even though the
+        /// collector had long since recovered. This is the ceiling of the floor, not the floor itself: a
+        /// collector that runs less often than this window can hold has a lower one
+        /// (<see cref="FailureRateRunFloor"/>).
+        /// </summary>
+        public const int MinimumRunsForFailureRate = 10;
+
+        /// <summary>
+        /// #5646. The length of the trailing window every collection-health read counts runs over: 7 days, in
+        /// minutes. Lite's per-server read, the Darling service's per-server read and fleet roll-up, and the
+        /// Viewer's reads all cut <c>now - 7 days</c>. <see cref="FailureRateRunFloor"/> divides it by a
+        /// collector's frequency to find how many runs a full window holds.
+        /// </summary>
+        public const int HealthWindowMinutes = 7 * 24 * 60;
+
+        /// <summary>
+        /// #5646. How many runs the window must hold before the failure rate alone bands a collector
+        /// WARNING: <see cref="MinimumRunsForFailureRate"/>, or fewer when a full health window
+        /// (<see cref="HealthWindowMinutes"/>) holds fewer at <paramref name="frequencyMinutes"/>, so the
+        /// floor is never one the collector cannot reach. A daily collector (1440 minutes) fills the window
+        /// with 7 runs, and a floor of 10 would exempt it from the rate for good. A frequency of 0 or less
+        /// (not on a schedule) keeps the full floor. The band (<see cref="Classify"/>) and the "recovered"
+        /// sentence (<see cref="FormatRecoveredNote"/>) both read it, so they cannot disagree.
+        /// </summary>
+        public static long FailureRateRunFloor(int frequencyMinutes)
+        {
+            if (frequencyMinutes <= 0)
+            {
+                return MinimumRunsForFailureRate;
+            }
+
+            var fullWindowRuns = (HealthWindowMinutes + (long)frequencyMinutes - 1) / frequencyMinutes;
+            return Math.Min(MinimumRunsForFailureRate, fullWindowRuns);
+        }
+
+        /// <summary>
+        /// #5646. How many of a collector's newest runs in a row must have succeeded before the failure rate
+        /// alone stops banding WARNING. A collector that alternates between failing and succeeding never has
+        /// this many in a row.
+        /// </summary>
+        public const int RecoveryTrailingSuccessRuns = 3;
+
+        /// <summary>
         /// A collector whose ABANDONED rate exceeds this percent bands WARNING (#2804). An abandoned cycle is
         /// the #2673 whole-server wall-clock budget giving up: it stores nothing and advances no watermark, so
         /// it is guaranteed data loss rather than a retryable fault.
@@ -1606,6 +1650,7 @@ namespace PerformanceMonitor.Common
             "index_object_stats",
             "plan_correction",
             "query_store_health",
+            "query_store_forced_plans",
         };
 
         /// <summary>
@@ -1674,6 +1719,35 @@ namespace PerformanceMonitor.Common
         /// </summary>
         public static bool IsEventCollector(string? collectorName) =>
             collectorName is not null && EventCollectorNames.Contains(collectorName);
+
+        /// <summary>
+        /// The collectors whose source holds nothing UNLESS something is enabled, running or configured (#5644 W13): a
+        /// trace-flag list with no flag turned on, a SQL Agent running-job snapshot with no job in flight, a plan-correction
+        /// list with no tuning recommendation, a replication-slot or standby list on a primary with none. A zero is the
+        /// normal answer for them, so <see cref="FormatOutputFinding"/> must not call a persistent zero "a look" (the
+        /// generic snapshot sentence the web audit flagged). Not event captures: nothing "occurred" - there is simply
+        /// nothing set up to report - which is why they are not in <see cref="EventCollectorNames"/> and why the
+        /// event sentence's "stores a row only when an event occurs" is not said of them. Same polarity rule as the event
+        /// list: a name is added only for a source that is genuinely empty by default, so an omission fails loud (the
+        /// "needs a look" sentence) rather than reassuring over a broken zero. Pinned against the catalog's real names by
+        /// both suites. The AG state collectors are handled separately (a not-applicable row where Always On is off).
+        /// </summary>
+        private static readonly HashSet<string> ZeroIsNormalCollectorNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "trace_flags",
+            "running_jobs",
+            "plan_correction",
+            "pg_replication_slots",
+            "pg_replication_stats",
+        };
+
+        /// <summary>True when a zero-row window is the normal answer for this collector's source (<see cref="ZeroIsNormalCollectorNames"/>, #5644).
+        /// False for every other collector and for a null name.</summary>
+        public static bool IsZeroNormalCollector(string? collectorName) =>
+            collectorName is not null && ZeroIsNormalCollectorNames.Contains(collectorName);
+
+        /// <summary>The names in <see cref="ZeroIsNormalCollectorNames"/>, so both suites can pin them against the catalog.</summary>
+        public static IReadOnlyCollection<string> ZeroIsNormalCollectorNamesForPinning => ZeroIsNormalCollectorNames;
 
         /// <summary>
         /// The names in <see cref="EventCollectorNames"/>, exposed read-only so both suites can pin the set
@@ -2231,7 +2305,8 @@ namespace PerformanceMonitor.Common
             double hoursSinceLastSuccess,
             double hoursSinceLastRun,
             int frequencyMinutes,
-            string? latestRunNote = null)
+            string? latestRunNote,
+            long trailingSuccessRuns)
         {
             if (totalRuns == 0)
             {
@@ -2297,7 +2372,9 @@ namespace PerformanceMonitor.Common
             /* Below STALE/FAILING deliberately. A collector that has not succeeded in far too long is the
                louder fact and keeps its band; abandonment is the one that would otherwise have NO band at all,
                because a partially-abandoning collector still lands successes and so never ages into either. */
-            if (failureRatePercent > WarningFailureRatePercent || abandonRatePercent > WarningAbandonRatePercent)
+            if (FailureRateBandsWarning(
+                    totalRuns, errorCount, failureRatePercent, trailingSuccessRuns, frequencyMinutes)
+                || abandonRatePercent > WarningAbandonRatePercent)
             {
                 return Warning;
             }
@@ -2311,7 +2388,106 @@ namespace PerformanceMonitor.Common
                 return Warning;
             }
 
+            /* #6441. A ring-buffer read whose XML SQL Server truncated still records SUCCESS (often with 0 rows,
+               because the cut drops the NEWEST events and the watermark filters the rest), so the run's counts are
+               the only record that the read is blind. Same rule as the partial-database note: the NEWEST run's
+               note, read only where the ladder would otherwise say HEALTHY. */
+            if (RingBufferTruncationNote.TryParse(latestRunNote, out _, out _))
+            {
+                return Warning;
+            }
+
             return Healthy;
+        }
+
+        /// <summary>
+        /// #5646. Whether the 7-day failure rate alone bands WARNING. Three rules, each only ever quieter than
+        /// the plain rate: a MINIMUM-RUNS floor (<see cref="FailureRateRunFloor"/>: 10 runs, or fewer for a
+        /// collector that runs so rarely a full window holds fewer, such as 7 for a daily one), a RECOVERY rule
+        /// (<see cref="RecoveryTrailingSuccessRuns"/> successes in a row), and the exception to the floor: a
+        /// collector whose newest run did not succeed (<paramref name="trailingSuccessRuns"/> is 0) keeps the
+        /// plain rate, so a few-run collector whose runs all failed is never read as healthy by the floor.
+        /// <paramref name="trailingSuccessRuns"/> 0 is also what a row passes where no streak can exist (a
+        /// collector with no runs). The fleet roll-ups' plain aggregates cannot see the newest runs, so they
+        /// ask <see cref="RecoveryCouldChangeBand"/> which rows need the streak and read it for those alone
+        /// (#5666).
+        /// </summary>
+        private static bool FailureRateBandsWarning(
+            long totalRuns, long errorCount, double failureRatePercent, long trailingSuccessRuns, int frequencyMinutes)
+        {
+            if (failureRatePercent <= WarningFailureRatePercent)
+            {
+                return false;
+            }
+
+            if (trailingSuccessRuns >= RecoveryTrailingSuccessRuns)
+            {
+                return false;
+            }
+
+            return totalRuns >= FailureRateRunFloor(frequencyMinutes) || (trailingSuccessRuns <= 0 && errorCount > 0);
+        }
+
+        /// <summary>
+        /// #5666. Whether the newest-runs streak could move this row's band: the ladder says WARNING with no
+        /// streak and does not say WARNING with a full one. The fleet roll-ups band from aggregates alone, so they
+        /// read the streak only for the rows this returns true for, and none at all when no row does. Decided by
+        /// running <see cref="Classify"/> both ways rather than by restating its rules, so a later rule cannot
+        /// make this disagree with it. A row it returns true for may still band WARNING once the streak is
+        /// known (an alternating collector); it is never wrong in the other direction.
+        /// </summary>
+        public static bool RecoveryCouldChangeBand(
+            long totalRuns,
+            long successCount,
+            long errorCount,
+            long permissionDeniedCount,
+            long extensionMissingCount,
+            long abandonedCount,
+            double hoursSinceLastSuccess,
+            double hoursSinceLastRun,
+            int frequencyMinutes,
+            string? latestRunNote) =>
+            Classify(
+                totalRuns, successCount, errorCount, permissionDeniedCount, extensionMissingCount, abandonedCount,
+                hoursSinceLastSuccess, hoursSinceLastRun, frequencyMinutes, latestRunNote,
+                trailingSuccessRuns: 0) == Warning
+            && Classify(
+                totalRuns, successCount, errorCount, permissionDeniedCount, extensionMissingCount, abandonedCount,
+                hoursSinceLastSuccess, hoursSinceLastRun, frequencyMinutes, latestRunNote,
+                trailingSuccessRuns: RecoveryTrailingSuccessRuns) != Warning;
+
+        /// <summary>
+        /// #5646. The sentence a collector that RECOVERED carries beside its HEALTHY band, or null. Present
+        /// only where the recovery rule is what kept the band off WARNING: the row's band
+        /// (<paramref name="healthStatus"/>, the one it displays) is HEALTHY, the window holds enough runs for
+        /// the rate to count (<see cref="FailureRateRunFloor"/> at <paramref name="frequencyMinutes"/>, the same
+        /// floor the band uses), the rate is over the threshold, and the newest
+        /// <see cref="RecoveryTrailingSuccessRuns"/> runs all succeeded. A row any other rung bands (the abandon
+        /// rate, the lost-databases note, a stale or stopped collector, a regression) carries no such sentence,
+        /// because its band is not one the streak decided. <paramref name="lastFailureTime"/> is the newest
+        /// failure of the window (naive UTC).
+        /// </summary>
+        public static string? FormatRecoveredNote(
+            string healthStatus, long totalRuns, long errorCount, long trailingSuccessRuns, DateTime? lastFailureTime,
+            int frequencyMinutes)
+        {
+            if (!string.Equals(healthStatus, Healthy, StringComparison.Ordinal)
+                || totalRuns < FailureRateRunFloor(frequencyMinutes)
+                || errorCount <= 0
+                || trailingSuccessRuns < RecoveryTrailingSuccessRuns
+                || (double)errorCount / totalRuns * 100 <= WarningFailureRatePercent)
+            {
+                return null;
+            }
+
+            return lastFailureTime.HasValue
+                ? string.Format(
+                    CultureInfo.InvariantCulture,
+                    "recovered: the last {0} runs succeeded; last failure {1:yyyy-MM-dd HH:mm:ss} UTC",
+                    RecoveryTrailingSuccessRuns, lastFailureTime.Value)
+                : string.Format(
+                    CultureInfo.InvariantCulture,
+                    "recovered: the last {0} runs succeeded", RecoveryTrailingSuccessRuns);
         }
 
         /// <summary>
@@ -2371,12 +2547,54 @@ namespace PerformanceMonitor.Common
         /// whether the emptiness is surprising, and a false alarm on a legitimately empty install is
         /// worse than a missing hint. The fleet rollup passes nothing at all, by design.
         /// </param>
+        /// <param name="readSource">
+        /// #6254: where the collector's newest run read its rows from, for a Query Store run that read a replica
+        /// (<c>replica 12, primary 2</c>). Null or blank, the default and every server with the setting off, adds
+        /// nothing, so the note is the one it was before.
+        /// </param>
         public static string FormatCollectionNote(
             string? lastNote,
             long noteCount,
             long totalRuns,
             string? collectorName = null,
-            bool targetHasUserDatabases = false)
+            bool targetHasUserDatabases = false,
+            string? recoveredNote = null,
+            string? readSource = null)
+        {
+            /* #5646: the recovery sentence rides beside the run note, in the same column on every surface. */
+            var runNote = FormatRunNote(lastNote, noteCount, totalRuns, collectorName, targetHasUserDatabases);
+            var note = string.IsNullOrEmpty(recoveredNote)
+                ? runNote
+                : runNote.Length == 0 ? recoveredNote : recoveredNote + "; " + runNote;
+            return AppendReadSource(note, readSource);
+        }
+
+        /// <summary>
+        /// #6254: the per-run Collection Log grids' message cell. A run's own message (its error, or the note it left) with the run's
+        /// <c>read_source</c> after it, worded as the health views word it (<c>read source: replica 12, primary 2</c>). A run with no
+        /// read source (every run of a server with the replica setting off, every collector but Query Store, every run stored before the
+        /// column existed) returns the message exactly as it was, blank for none.
+        /// </summary>
+        public static string FormatRunMessage(string? message, string? readSource) =>
+            AppendReadSource(message ?? string.Empty, readSource);
+
+        private static string AppendReadSource(string note, string? readSource)
+        {
+            if (string.IsNullOrWhiteSpace(readSource))
+            {
+                return note;
+            }
+
+            var source = "read source: " + readSource.Trim();
+            return note.Length == 0 ? source : note + "; " + source;
+        }
+
+        private static string FormatRunNote(
+            string? lastNote,
+            long noteCount,
+            long totalRuns,
+            string? collectorName,
+            bool targetHasUserDatabases)
         {
             if (string.IsNullOrWhiteSpace(lastNote) || noteCount <= 0)
             {
@@ -2388,6 +2606,14 @@ namespace PerformanceMonitor.Common
                labelled as the latest run's and carry no run-count qualifier at all. */
             if (HasMeasurements(lastNote))
             {
+                /* #6441: a truncated ring buffer bands WARNING, and the counts alone do not say why. */
+                if (RingBufferTruncationNote.Describe(lastNote) is { } truncation)
+                {
+                    return noteCount >= totalRuns && totalRuns > 0
+                        ? "latest run: " + truncation + " (" + lastNote + ")"
+                        : string.Format(CultureInfo.InvariantCulture, "latest noted run: {0} ({1}; {2} of {3} runs)", truncation, lastNote, noteCount, totalRuns);
+                }
+
                 /* The note is the newest run that CARRIED one, and some measurers write counts only when
                    something happened. Only when every run carried it is it the newest run's. */
                 return noteCount >= totalRuns && totalRuns > 0
@@ -2612,11 +2838,27 @@ namespace PerformanceMonitor.Common
             bool deniedSinceLastSuccess,
             long noteCount,
             long faultedRuns,
-            bool isEventCollector)
+            bool isEventCollector,
+            bool isZeroNormal = false,
+            bool bandedNoPermissions = false)
         {
             if (rowsStored > 0 || totalRuns <= 0)
             {
                 return string.Empty;
+            }
+
+            /* #6177: a row banded NO_PERMISSIONS had every attempt in the window refused (no success, no error),
+               so it could not read, whatever the denial-currency flag below says. Without this arm a window
+               whose newest instants tied or whose notes counted fell through to "read rather than being unable
+               to read", the opposite of the band beside it. */
+            if (bandedNoPermissions)
+            {
+                return string.Format(
+                    CultureInfo.InvariantCulture,
+                    "Stored 0 rows across {0:N0} runs because every attempt in the window was refused for lack of "
+                    + "permission (status NO_PERMISSIONS), so this collector was unable to read. last_error carries "
+                    + "what the monitored server said and the grant or setup step that answers it.",
+                    totalRuns);
             }
 
             if (deniedSinceLastSuccess)
@@ -2704,6 +2946,24 @@ namespace PerformanceMonitor.Common
                     + "long completion, a blocking chain, a held xmin - so zero is the correct resting state "
                     + "on a well-behaved target and needs no action. No run recorded a note or a fault, "
                     + "which is what that reading rests on. "
+                    + ZeroOutputCaveat,
+                    totalRuns);
+            }
+
+            /* #5644 W13: a source that is empty unless something is enabled or running (ZeroIsNormalCollectorNames). Same
+               preconditions as the event sentence above (no denial, no fault, no note), so the reading rests on the same
+               facts; what differs is the reason a zero is fine - there is nothing set up to report - and it does not
+               claim the collector waits for an event. */
+            if (isZeroNormal)
+            {
+                return string.Format(
+                    CultureInfo.InvariantCulture,
+                    "Stored 0 rows across {0:N0} runs with no current denial (denied_since_last_success is "
+                    + "false), so this collector read and found nothing rather than being unable to read. "
+                    + "Its source is empty unless something is enabled or running - a trace flag turned on, a "
+                    + "job in progress, a tuning recommendation, a replication slot - so zero is a normal answer "
+                    + "and needs no action. No run recorded a note or a fault, which is what that reading rests "
+                    + "on. "
                     + ZeroOutputCaveat,
                     totalRuns);
             }

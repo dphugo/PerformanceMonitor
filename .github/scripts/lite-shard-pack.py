@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Duration-aware shard assignment for the Lite test matrix, with a proof that it loses no class (#5208).
 
-  lite-shard-pack.py pack      --classes FILE --shards N --out DIR [--timings DIR ...] [--tests-dir DIR]
-  lite-shard-pack.py reconcile --classes FILE --shards N --out DIR
+  lite-shard-pack.py pack      --classes FILE --shards N --out DIR [--timings DIR ...] [--tests-dir DIR] [--classes-source TEXT]
+  lite-shard-pack.py reconcile --classes FILE --shards N --out DIR [--classes-source TEXT]
   lite-shard-pack.py backtest  --runs DIR [DIR ...] [--tests-dir DIR]
   lite-shard-pack.py --self-test
 
@@ -18,7 +18,8 @@ the repo root), so there is no hand-kept list to rot. Every class weighs at leas
 shard's load and no shard is left empty. A class with no timing history gets the MEAN weight of the known
 classes. When the timings are missing, unreadable, empty, all zero, or cover less than MIN_COVERAGE of the
 discovered classes, the assignment falls back to the class-name hash (SHA-256 first byte modulo N), the cut
-the workflow used before this script existed.
+the workflow used before this script existed. A timed class the test sources no longer declare is left out, with
+one warning line each (#5833).
 
 `backtest` replays the model: the DIRs are runs in time order, each holding one xUnit XML per shard. For every run after
 the first it weighs that run's shards by the PREVIOUS run's timings and prints modelled against ran, the way the real
@@ -29,11 +30,14 @@ total seconds so the unit drops out. `pack` ignores cpu-ms: wall weights still c
 
 `reconcile` is the guard: it fails (exit 1) unless the shard files hold every discovered class exactly once
 and nothing else, and prints both differences. `pack` runs it before it exits, so a bad packer cannot
-produce a green run, and the workflow runs it again on the files each shard actually reads.
+produce a green run, and the workflow runs it again on the files each shard actually reads. Its error lines name where
+each side came from (--classes-source says which class listing the file holds, #6117).
 """
 import collections
+import contextlib
 import glob
 import hashlib
+import io
 import math
 import os
 import re
@@ -146,6 +150,45 @@ def serial_collection_names(tests_dir):
             else:
                 names.add(found)
     return names, unresolved
+
+
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+TEST_SOURCE_DIRS = (os.path.join(REPO_ROOT, "Lite.Tests"), os.path.join(REPO_ROOT, "Darling", "Darling.Tests"))
+_DECLARATION = re.compile(r"\b(?:class|record|struct)\s+([A-Za-z_]\w*)")
+
+
+def declared_class_names(dirs=TEST_SOURCE_DIRS):
+    """Every class, record and struct name the C# files under DIRS declare (bin and obj left out). Both test projects
+    are read, because each compiles some of the other's files in. Empty when no DIR exists."""
+    names = set()
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, "**", "*.cs"), recursive=True) if os.path.isdir(d) else []:
+            parts = set(os.path.relpath(p, d).replace("\\", "/").split("/"))
+            if "bin" in parts or "obj" in parts:
+                continue
+            try:
+                with open(p, encoding="utf-8-sig", errors="replace") as f:
+                    names.update(_DECLARATION.findall(f.read()))
+            except OSError:
+                continue
+    return names
+
+
+def drop_missing_classes(weights, declared, source):
+    """#5833: a weight whose class the test sources no longer declare (a deleted or renamed class) is left out, with
+    one warning line each, instead of being carried. Returns (kept weights, warning lines); the caller prints the
+    lines where its output carries them. A class is matched by its own name (`Ns.Outer+Inner` is `Inner`, and a
+    generic arity suffix is ignored). With no declarations to compare against, nothing is dropped."""
+    if not declared:
+        return dict(weights), []
+    kept, warnings = {}, []
+    for name in sorted(weights):
+        if re.split(r"[.+/]", name)[-1].split("`")[0] in declared:
+            kept[name] = weights[name]
+        else:
+            warnings.append(f"::warning title=Shard weights::{source} has a weight for {name}, a class the test sources "
+                            "no longer declare; it is left out")
+    return kept, warnings
 
 
 def hash_shard(name, shards):
@@ -309,10 +352,16 @@ def read_shards(out, shards):
     return result
 
 
-def run_reconcile(classes, assignment):
+def run_reconcile(classes, assignment, classes_src=None, shards_src=None, annotate=True):
+    """Prints and returns 1 on any problem. classes_src and shards_src say where each side came from (#6117), so a
+    disagreement names both. annotate=False prints plain lines: the self-test's deliberate failure must not raise
+    a `##[error]` annotation that a reader of the job summary takes for the real failure (#6117)."""
     problems = reconcile(classes, assignment)
+    seen = {c for shard in assignment for c in shard}
+    where = (f" [class list: {classes_src or 'unnamed'}, {len(set(classes))} classes; "
+             f"shard files: {shards_src or 'unnamed'}, {len(seen)} classes in {len(assignment)} shards]")
     for p in problems:
-        print("::error title=Lite shard reconciliation failed::" + p)
+        print(("::error title=Lite shard reconciliation failed::" if annotate else "expected problem: ") + p + where)
     if problems:
         print("RECONCILIATION FAILED: the shard lists are not exactly the discovered class set.")
         return 1
@@ -371,10 +420,14 @@ def main(argv):
     classes = read_classes(arg(rest, "--classes"))
     shards = int(arg(rest, "--shards"))
     out = arg(rest, "--out")
+    classes_src = arg(rest, "--classes-source") or arg(rest, "--classes")
+    shards_src = os.path.join(out, "shard-*.txt")
     if cmd == "reconcile":
-        return run_reconcile(classes, read_shards(out, shards))
+        return run_reconcile(classes, read_shards(out, shards), classes_src, shards_src)
     timings = arg(rest, "--timings", many=True)
-    weights = load_weights(timings)
+    weights, stale = drop_missing_classes(load_weights(timings), declared_class_names(), "the timing run")
+    for line in stale:
+        print(line)
     tests_dir = arg(rest, "--tests-dir", DEFAULT_TESTS_DIR)
     serial_names, unresolved = serial_collection_names(tests_dir)
     for u in unresolved:
@@ -393,7 +446,7 @@ def main(argv):
           f"timed seconds per shard {[round(x) for x in load]}; "
           f"{len(serial)} serial classes, per shard {[sum(1 for c in s if c in serial) for s in assignment]}; "
           f"predicted wall seconds per shard {[round(x) for x in walls]}")
-    return run_reconcile(classes, read_shards(out, shards))
+    return run_reconcile(classes, read_shards(out, shards), classes_src, shards_src)
 
 
 def self_test():
@@ -565,9 +618,20 @@ def self_test():
         f.write("\n".join(names) + "\n")
         f.flush()
         write_shards(d, withheld)
-        print("--- expected failure below (a class was deliberately withheld) ---")
-        ok(run_reconcile(read_classes(f.name), read_shards(d, 4)) == 1, "reconcile exits 1 when a class is withheld")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_reconcile(read_classes(f.name), read_shards(d, 4), "listing 2 (re-listed)", "the cut's shard files", annotate=False)
+        shown = buf.getvalue()
+        ok(rc == 1, "reconcile exits 1 when a class is withheld")
+        ok("##[error]" not in shown and "::error" not in shown, "the self-test's deliberate failure raises no error annotation")
+        ok("listing 2 (re-listed)" in shown and "the cut's shard files" in shown and gone in shown, "a disagreement names both sides and the class")
+        print("--- the expected failure, printed plain (a class was deliberately withheld) ---")
+        print(shown.rstrip())
         print("--- end expected failure ---")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_reconcile(read_classes(f.name), read_shards(d, 4))
+        ok("::error title=Lite shard reconciliation failed::" in buf.getvalue(), "the real run still raises the error annotation")
         write_shards(d, a)
         ok(run_reconcile(read_classes(f.name), read_shards(d, 4)) == 0, "reconcile passes on the real pack")
     dup = [list(s) for s in a]
@@ -577,6 +641,24 @@ def self_test():
     inv[0].append("Invented.Class")
     ok(any("not in the discovered" in x for x in reconcile(names, inv)), "invented class detected")
     ok(reconcile([], [[], []]) != [], "empty discovered set fails")
+
+    # A weight for a class the sources no longer declare is left out with one warning line; a nested or generic
+    # class is matched by its own name, and with nothing declared to compare against nothing is dropped.
+    kept, warned = drop_missing_classes({"Lite.Tests.Kept": 1.0, "Lite.Tests.Outer+Inner": 2.0, "Lite.Tests.Box`1": 3.0,
+                                         "Lite.Tests.Gone": 4.0}, {"Kept", "Inner", "Box"}, "the table")
+    ok(sorted(kept) == ["Lite.Tests.Box`1", "Lite.Tests.Kept", "Lite.Tests.Outer+Inner"], "only the missing class is dropped")
+    ok(len(warned) == 1 and "Lite.Tests.Gone" in warned[0] and warned[0].startswith("::warning "), "one warning line names it")
+    ok(drop_missing_classes({"Lite.Tests.Gone": 4.0}, set(), "the table") == ({"Lite.Tests.Gone": 4.0}, []),
+       "no declarations: nothing dropped")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "Sub"))
+        os.makedirs(os.path.join(d, "obj"))
+        with open(os.path.join(d, "Sub", "A.cs"), "w", encoding="utf-8") as f:
+            f.write("public sealed class ATests { private sealed record Row(int X); }\ninternal struct Pair { }\n")
+        with open(os.path.join(d, "obj", "G.cs"), "w", encoding="utf-8") as f:
+            f.write("public class GeneratedTests { }\n")
+        ok(declared_class_names([d, os.path.join(d, "missing")]) == {"ATests", "Row", "Pair"},
+           "the source scan reads class, record and struct declarations and skips obj")
 
     print(f"self-test: {checks} assertions passed")
     return 0

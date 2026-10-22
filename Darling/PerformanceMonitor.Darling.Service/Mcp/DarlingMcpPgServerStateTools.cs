@@ -52,10 +52,10 @@ public sealed class DarlingMcpPgServerStateTools
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -67,15 +67,15 @@ public sealed class DarlingMcpPgServerStateTools
 
             if (rows.Count == 0)
             {
-                return await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_buffer_usage", cancellationToken)
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, await DarlingEngineCapability.NotCollectedStatusAsync(
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_buffer_usage", cancellationToken)
                     ?? await DarlingRuntimePrecondition.StatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "pg_buffer_usage", cancellationToken)
+                        postgres, resolved.ServerId, resolved.DisplayName, "pg_buffer_usage", cancellationToken)
                     ?? McpHelpers.Status(
                         "empty",
-                        $"No buffer pool contents recorded for {resolved.ServerName} in the last "
+                        $"No buffer pool contents recorded for {resolved.DisplayName} in the last "
                         + $"{hours_back} hour(s). This needs the pg_buffercache extension in the database "
-                        + "the collector connects to.");
+                        + "the collector connects to."), cancellationToken);
             }
 
             var newest = rows[0];
@@ -97,7 +97,7 @@ public sealed class DarlingMcpPgServerStateTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 relation_count = rows.Count,
                 /* 8 kB is PostgreSQL's near-universal block size but it IS a compile-time setting, so the
@@ -116,7 +116,7 @@ public sealed class DarlingMcpPgServerStateTools
         }
     }
 
-    [McpServerTool(Name = "get_pg_extensions"), Description("Gets which PostgreSQL extensions are installed, outdated, available or absent, per database, as of as_of (daily collector). Explains why another extension-backed tool is empty. Per-DATABASE, not per-cluster. Rows are databases x extension names, so a multi-database host overflows limit; truncated withholds state totals, and installed rows like plpgsql are cut first. Read install_census for the complete picture, or pass database_name for one database's full slice. <<GUIDE>> Gets which PostgreSQL extensions are installed, outdated, merely available, or absent, per database. Use this to answer why another read is empty: pg_stat_statements, pg_wait_sampling, pg_stat_kcache, pg_qualstats, pgstattuple, pg_buffercache and hypopg each back a specific tool, and 'absent' here is the reason that tool has nothing to show. State is one of installed, outdated, available or absent - 'available' means the files are on the server and CREATE EXTENSION would work, which is a different situation from absent and usually a one-line fix. IMPORTANT: extensions are per-DATABASE, so installed_version reflects the database the row names and not the cluster; an extension can be installed in the application database and absent from postgres. Rows are therefore the PRODUCT of databases and extension names - 102 extension names per database on the measured fleet - so a ten-database host needs 1,020 rows against a 1000-row maximum and cannot be completed in one call. Do NOT read a truncated row list as an install census: the ordering puts non-relevant 'installed' rows behind every non-relevant 'available' one, so plpgsql, which is installed in every database of every server, has no row at all once a host reaches ten databases. Read install_census instead - one row per extension created anywhere on the server with databases_installed against databases_total, aggregated so no row limit touches it - and pass database_name to complete one database's 102 rows at a time. The census and reach fields report the population and whether a larger limit would help; sampling this tool at a small limit returns exactly the 8 monitoring-relevant extensions per database and looks like a complete per-database answer. A sixteen-database host's product is 1,632 rows against the 1,000-row maximum; database_name completes one database at a time instead, sixteen calls that each finish.")]
+    [McpServerTool(Name = "get_pg_extensions"), Description("Gets which PostgreSQL extensions are installed, outdated, available or absent, per database, as of as_of (daily collector). Explains why another extension-backed tool is empty. Per-DATABASE, not per-cluster. Rows are databases x extension names, so a multi-database host overflows limit; truncated withholds state totals, and installed rows like plpgsql are cut first. Read install_census for the complete picture, or pass database_name for one database's full slice. <<GUIDE>> Gets which PostgreSQL extensions are installed, outdated, merely available, or absent, per database. Use this to answer why another read is empty: pg_stat_statements, pg_wait_sampling, pg_stat_kcache, pg_qualstats, pgstattuple, pg_buffercache and hypopg each back a specific tool, and 'absent' here is the reason that tool has nothing to show. State is one of installed, outdated, available or absent - 'available' means the files are on the server and CREATE EXTENSION would work, which is a different situation from absent and usually a one-line fix. Extensions are per-DATABASE, so installed_version reflects the database the row names and not the cluster; an extension can be installed in the application database and absent from postgres. Rows are therefore the PRODUCT of databases and extension names - 102 extension names per database on the measured fleet - so a ten-database host needs 1,020 rows against a 1000-row maximum and cannot be completed in one call. Do NOT read a truncated row list as an install census: the ordering puts non-relevant 'installed' rows behind every non-relevant 'available' one, so plpgsql, which is installed in every database of every server, has no row at all once a host reaches ten databases. Read install_census instead - one row per extension created anywhere on the server with databases_installed against databases_total, aggregated so no row limit touches it - and pass database_name to complete one database's 102 rows at a time. The census and reach fields report the population and whether a larger limit would help; sampling this tool at a small limit returns exactly the 8 monitoring-relevant extensions per database and looks like a complete per-database answer. A sixteen-database host's product is 1,632 rows against the 1,000-row maximum; database_name completes one database at a time instead, sixteen calls that each finish.")]
     public static async Task<string> GetPgExtensions(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -127,10 +127,10 @@ public sealed class DarlingMcpPgServerStateTools
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -152,11 +152,11 @@ public sealed class DarlingMcpPgServerStateTools
 
             if (fetched.Count == 0)
             {
-                return await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_extension_availability", cancellationToken)
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, await DarlingEngineCapability.NotCollectedStatusAsync(
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_extension_availability", cancellationToken)
                     ?? McpHelpers.Status(
                         "empty",
-                        $"No extension inventory for {resolved.ServerName} in the last {hours_back} "
+                        $"No extension inventory for {resolved.DisplayName} in the last {hours_back} "
                         + "hour(s). This collector runs DAILY, so a short window can be empty on a healthy "
                         + "server — widen it before concluding anything."
                         + (scope is null
@@ -164,7 +164,7 @@ public sealed class DarlingMcpPgServerStateTools
                             : $" You filtered to database_name '{scope}': check the spelling and "
                               + "that the collector enumerates it, because a name that matches nothing is "
                               + "indistinguishable here from a server with no inventory. Re-run without the "
-                              + "filter to see which databases are reported."));
+                              + "filter to see which databases are reported.")), cancellationToken);
             }
 
             /* The result is capped at `limit`, so a summary count taken over the returned rows describes
@@ -287,7 +287,7 @@ public sealed class DarlingMcpPgServerStateTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 extension_count = rows.Count,
                 truncated,
@@ -402,10 +402,10 @@ public sealed class DarlingMcpPgServerStateTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -421,7 +421,7 @@ public sealed class DarlingMcpPgServerStateTools
             if (fetched.Count == 0)
             {
                 var bare = await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_lock_stats", cancellationToken);
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_lock_stats", cancellationToken);
                 if (bare is not null)
                 {
                     return bare;
@@ -434,16 +434,16 @@ public sealed class DarlingMcpPgServerStateTools
                 var emptyNotice = await DarlingMcpWindowNotice.ReadForToolAsync(
                     postgres, "get_pg_lock_stats", resolved.ServerName, emptyStart, windowEnd, emptyAnswer: true, logger, cancellationToken);
 
-                return McpHelpers.Status(
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, McpHelpers.Status(
                         "empty",
                         McpHelpers.QuietUnlessCut(
                             emptyNotice.WindowTruncated, emptyNotice.EffectiveStart,
-                            factual: $"No lock activity sampled on {resolved.ServerName} in the last {hours_back} "
+                            factual: $"No lock activity sampled on {resolved.DisplayName} in the last {hours_back} "
                                 + "hour(s). This is a SAMPLE of pg_locks rather than an event log",
                             coveredClaim: ", so this is the "
                                 + "healthy state on a server without sustained contention — and it is not proof "
                                 + "that nothing was ever locked."),
-                        emptyNotice.AsHints());
+                        emptyNotice.AsHints()), cancellationToken);
             }
 
             /* #4966: where the store's coverage of the window starts, probed on the web's own source for this read (WebDataStartNote).
@@ -475,7 +475,7 @@ public sealed class DarlingMcpPgServerStateTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,
@@ -511,10 +511,10 @@ public sealed class DarlingMcpPgServerStateTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -525,18 +525,18 @@ public sealed class DarlingMcpPgServerStateTools
 
             if (row is null)
             {
-                return await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_write_stats", cancellationToken)
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, await DarlingEngineCapability.NotCollectedStatusAsync(
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_write_stats", cancellationToken)
                     ?? McpHelpers.Status(
                         "empty",
-                        $"No checkpoint or WAL activity recorded for {resolved.ServerName} in the last "
+                        $"No checkpoint or WAL activity recorded for {resolved.DisplayName} in the last "
                         + $"{hours_back} hour(s). These are differenced across snapshots, so a single "
                         + "collection has nothing to difference against and the window fills on the "
                         + "second one.",
                         /* #4966: the window keys ride on an empty answer under hints, from the coverage probe; not_collected (above) stays bare. */
                         (await DarlingMcpWindowNotice.ReadAsync(
                             () => DarlingMcpWindowNotice.Probe(postgres, WriteStatsTable, resolved.ServerName, requestedStart, windowEnd, cancellationToken),
-                            requestedStart, windowEnd, WriteStatsTable, emptyAnswer: true, logger: logger, cancellationToken: cancellationToken)).AsHints());
+                            requestedStart, windowEnd, WriteStatsTable, emptyAnswer: true, logger: logger, cancellationToken: cancellationToken)).AsHints()), cancellationToken);
             }
 
             /* #4966: ONE row whose every figure is a first-to-last difference, so the span it covers IS the row's own first sample
@@ -569,7 +569,7 @@ public sealed class DarlingMcpPgServerStateTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,
@@ -669,6 +669,7 @@ public sealed class DarlingMcpPgServerStateTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_pg_server_config"), Description("Gets the PostgreSQL server's configuration from pg_settings: value, default, source, restart-or-reload need. LATEST IS A TIME: the newest stored snapshot, not a window or the live server; captured_at is when it was taken (collector runs hourly). Non-default settings list FIRST; pass include_defaults for the rest. pending_restart=true means the file and server disagree, with no other symptom. Bounded by limit (truncated says if more existed); non_default_count is the snapshot's, not the page's. database_overrides (present only if any exist) is what sessions actually run with. <<GUIDE>> Gets the PostgreSQL server's configuration from pg_settings - what each parameter is set to, whether it differs from the compiled-in default, where the value came from (configuration file, command line, ALTER SYSTEM, per-database or per-role), and whether changing it needs a restart or only a reload. Non-default settings are listed FIRST, because a server has several hundred parameters and only the ones somebody chose are an answer. Reports pending_restart loudly: that means postgresql.conf was edited and reloaded but the running server is still using the old value, so the file and the server disagree with no symptom until the next restart. Where pg_file_settings is read, true can also mean the file holds a value PostgreSQL rejected, which would stop the next start; the server log names the rejected setting. Session-scoped rows are excluded - pg_settings is a per-connection view and its client-source rows describe the monitoring connection, not the server. LATEST IS A TIME: this is the newest stored snapshot, not a window and not the live server - captured_at is the instant it was taken. The collector runs hourly, so a value here is 'as of' that stamp: a setting changed since (ALTER SYSTEM, a reload, a parameter-group edit) is not reflected until the next collection, and on a server whose collector has stalled the stamp is the only thing that says how stale the answer is. Compare captured_at against get_collection_log before trusting a value in an incident. THE PAGE IS BOUNDED BY limit: settings_returned is how many rows you got, truncated says the population you asked for (the non-default settings, or every setting when include_defaults is true) held more, and the rows are the chosen ones first. COUNTS ARE OF THE SNAPSHOT, NOT OF THE PAGE: non_default_count is how many settings in the whole snapshot differ from their default, computed in the same statement as the rows before the cap, so it is the same number at any limit; non_default_returned is how many of those are on this page, and the gap between the two is what the cap left out. PER-DATABASE AND PER-ROLE OVERRIDES ARE A SEPARATE SECTION: the settings list is the SERVER's configuration, and database_overrides - present only when the cluster has any - carries the values one database or one role was given with ALTER DATABASE/ROLE SET, which are what sessions there actually run with rather than the server-wide value beside them. A setting marked pending_restart is kept in the non-default view whatever its source, because it is the row that says the file and the server disagree.")]
     public static async Task<string> GetPgServerConfig(
         NpgsqlDataSource postgres,
@@ -677,7 +678,7 @@ public sealed class DarlingMcpPgServerStateTools
         [Description("When true, include settings still at their default. Default false: non-default settings, plus any pending_restart row, are the answer. See the tool's reading guide.")] bool include_defaults = false,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
         var limitError = McpHelpers.ValidateTop(limit);
@@ -699,13 +700,13 @@ public sealed class DarlingMcpPgServerStateTools
                 /* Empty on the default view can mean two things: no snapshot, or a snapshot in which nothing
                    is set and nothing is pending. SnapshotNonDefaultCount cannot tell them apart (it rides on
                    rows that did not come back), so the capability read decides as it always has. */
-                return await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_server_config", cancellationToken)
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, DateTime.UtcNow, await DarlingEngineCapability.NotCollectedStatusAsync(
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_server_config", cancellationToken)
                     ?? McpHelpers.Status(
                         "empty",
-                        $"No configuration snapshot has been collected for {resolved.ServerName} yet. "
+                        $"No configuration snapshot has been collected for {resolved.DisplayName} yet. "
                         + "This collector runs hourly, so a server registered in the last hour has not "
-                        + "reached its first collection.");
+                        + "reached its first collection."), cancellationToken);
             }
 
             var truncated = page.Rows.Count > limit;
@@ -733,18 +734,18 @@ public sealed class DarlingMcpPgServerStateTools
                correct off pg_settings alone, so an unreadable verdict there is not worth a caveat. */
             var fileSettingsUnreadable =
                 PgFileSettingsCapability.TryGetCachedVerdict(
-                    resolved.ServerName, out var fileSettingsReadable, out var fileSettingsIsWindows)
+                    resolved.DisplayName, out var fileSettingsReadable, out var fileSettingsIsWindows)
                 && fileSettingsIsWindows
                 && !fileSettingsReadable;
 
             var configPage = new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 status = "server_config",
                 /* #3653 (from #3541 A10): the snapshot's own clock, read off the row statement — every row of
                    this call carries the same collection_time because the reader pins the newest one — so the
                    answer says when it was true. No age_seconds and no as_of: this read takes no window to
-                   anchor against (the Stamped dialect, McpLatestSnapshotStampTests.DarlingOnlyStamped). */
+                   anchor against (the Stamped dialect, declared by [ReadsLatestSnapshot] on this tool). */
                 captured_at = rows[0].CollectionTimeUtc.ToString("o"),
                 /* Three counts, each with its denominator in its name (#3653). settings_returned is the page.
                    non_default_count is the SNAPSHOT's: computed on the reader's statement above the LIMIT, so
@@ -855,10 +856,10 @@ public sealed class DarlingMcpPgServerStateTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         var limitError = McpHelpers.ValidateTop(limit);
@@ -874,7 +875,7 @@ public sealed class DarlingMcpPgServerStateTools
             if (fetched.Count == 0)
             {
                 var bare = await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_server_config", cancellationToken);
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_server_config", cancellationToken);
                 if (bare is not null)
                 {
                     return bare;
@@ -887,15 +888,15 @@ public sealed class DarlingMcpPgServerStateTools
                 var emptyNotice = await DarlingMcpWindowNotice.ReadForToolAsync(
                     postgres, "get_pg_server_config_changes", resolved.ServerName, emptyStart, windowEnd, emptyAnswer: true, logger, cancellationToken);
 
-                return McpHelpers.Status(
-                        "no_changes",
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, McpHelpers.Status(
+                        "empty",
                         McpHelpers.QuietUnlessCut(
                             emptyNotice.WindowTruncated, emptyNotice.EffectiveStart,
-                            factual: $"No configuration parameter changed value on {resolved.ServerName} in the last "
+                            factual: $"No configuration parameter changed value on {resolved.DisplayName} in the last "
                                 + $"{hours_back} hour(s)",
                             coveredClaim: ". That is a real finding rather than missing data - this "
                                 + "read compares consecutive snapshots, so an unchanged server produces no rows."),
-                        emptyNotice.AsHints());
+                        emptyNotice.AsHints()), cancellationToken);
             }
 
             var truncated = fetched.Count > limit;
@@ -921,7 +922,7 @@ public sealed class DarlingMcpPgServerStateTools
                when NULL, because there NULL is the answer: set had nothing before, reset has nothing after. */
             var page = new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,

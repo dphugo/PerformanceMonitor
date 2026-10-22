@@ -10,6 +10,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace PerformanceMonitor.Darling.Service;
@@ -67,11 +68,123 @@ internal sealed class ReadScope
     private string? _sourceReason;
     private long _rows = -1;
     private int _serverId = -1;
+    private long _waitTicks;
+    private DateTime? _windowStart;
+    private DateTime? _windowEnd;
+    private bool _noWindow;
 
-    private ReadScope(ILogger? logger)
+    /* #5506: the reads in progress on the service right now. Only an outermost scope counts, so a composed panel the MCP
+       run_custom_view_panel tool runs (a scope inside the tool's scope) is one read, not two. */
+    private static int s_inFlight;
+
+    private ReadScope(ILogger? logger, ReadScope? parent, int inFlightAtStart)
     {
         Logger = logger;
         StartedUtc = DateTime.UtcNow;
+        _parent = parent;
+        InFlightAtStart = inFlightAtStart;
+        _counting = parent is null ? 1 : 0;
+    }
+
+    private readonly ReadScope? _parent;
+
+    /* 1 while this outermost scope is counted in s_inFlight; 0 for a nested scope, and while the read waits for an
+       admission slot (#5506 part 3). Exchanged, so a scope is uncounted exactly once. */
+    private int _counting;
+
+    /// <summary>The reads in progress on the service right now (#5506).</summary>
+    internal static int InFlight => Volatile.Read(ref s_inFlight);
+
+    /// <summary>How many other reads were already in progress on the service when this read started (#5506). A nested
+    /// scope carries its outermost scope's count.</summary>
+    internal int InFlightAtStart { get; private set; }
+
+    /// <summary>Whether this scope counts in <see cref="InFlight"/> now: an outermost scope does, except while its read waits
+    /// in the admission queue (<see cref="AdmitAsync"/>).</summary>
+    internal bool IsCounted => Volatile.Read(ref _counting) == 1;
+
+    /// <summary>
+    /// #5506 part 3: admits a read with this flow's scope uncounted while it waits. A read that queues for an admission
+    /// slot is not running, so it leaves <see cref="InFlight"/> until the slot is granted (or refused, or the caller
+    /// leaves), and its <see cref="InFlightAtStart"/> is taken again then: <c>max_in_flight</c> counts reads running,
+    /// as it did before admission existed. Not async itself: <see cref="ReadAdmission.AdmitAsync"/> sets its nesting
+    /// marker in the caller's flow, and an async wrapper would undo that marker on return.
+    /// </summary>
+    internal static Task<ReadAdmissionTicket> AdmitAsync(ReadAdmission admission, ReadSurface surface, string route, string? band,
+        CancellationToken cancellationToken)
+    {
+        var admitting = admission.AdmitAsync(surface, route, band, cancellationToken);
+        if (admitting.IsCompleted || s_current.Value is not { } current)
+        {
+            return admitting;
+        }
+
+        var outermost = current;
+        while (outermost._parent is { } parent)
+        {
+            outermost = parent;
+        }
+
+        if (Interlocked.Exchange(ref outermost._counting, 0) == 0)
+        {
+            return admitting;
+        }
+
+        Interlocked.Decrement(ref s_inFlight);
+        return ResumeAfterAsync(admitting, outermost);
+
+        static async Task<ReadAdmissionTicket> ResumeAfterAsync(Task<ReadAdmissionTicket> admitting, ReadScope scope)
+        {
+            try
+            {
+                return await admitting.ConfigureAwait(false);
+            }
+            finally
+            {
+                scope.InFlightAtStart = Interlocked.Increment(ref s_inFlight) - 1;
+                Volatile.Write(ref scope._counting, 1);
+            }
+        }
+    }
+
+    /// <summary>
+    /// #5506 part 3 (round 2, L3): this flow's outermost scope stops counting in <see cref="InFlight"/> for the rest of its
+    /// life. A caller answered from the read cache, or one that joined a read another caller runs, runs no read of its
+    /// own, so it must not count in <c>max_in_flight</c> or in another read's <see cref="InFlightAtStart"/> while it waits
+    /// (round 1, L7: reads running only), as a read waiting for an admission slot does not (<see cref="AdmitAsync"/>).
+    /// Exchanged, so the scope is uncounted exactly once whatever else uncounts it.
+    /// </summary>
+    internal void Uncount()
+    {
+        var outermost = this;
+        while (outermost._parent is { } parent)
+        {
+            outermost = parent;
+        }
+
+        if (Interlocked.Exchange(ref outermost._counting, 0) == 1)
+        {
+            Interlocked.Decrement(ref s_inFlight);
+        }
+    }
+
+    /// <summary>The time this read waited for a store connection, in milliseconds, apart from its run time (#5506): the
+    /// pool's queue wait plus the time to open a new physical connection, summed over every connection the read took.
+    /// <see cref="ReadConnectionWait"/> adds it.</summary>
+    internal long WaitMs => (long)(Interlocked.Read(ref _waitTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+
+    /// <summary>Adds connection wait to this scope and every scope it is nested in.</summary>
+    internal void AddWait(long stopwatchTicks)
+    {
+        if (stopwatchTicks <= 0)
+        {
+            return;
+        }
+
+        for (var scope = this; scope is not null; scope = scope._parent)
+        {
+            Interlocked.Add(ref scope._waitTicks, stopwatchTicks);
+        }
     }
 
     /// <summary>When the scope opened.</summary>
@@ -102,6 +215,71 @@ internal sealed class ReadScope
         if (s_current.Value is { } scope && serverId >= 0)
         {
             Interlocked.CompareExchange(ref scope._serverId, serverId, -1);
+        }
+    }
+
+    /// <summary>The start of the window the read ran with (#5814), UTC, or null when the read noted none.</summary>
+    internal DateTime? WindowStartUtc { get { lock (_gate) { return _windowStart; } } }
+
+    /// <summary>The end of the window the read ran with (#5814), UTC, or null when the read noted none.</summary>
+    internal DateTime? WindowEndUtc { get { lock (_gate) { return _windowEnd; } } }
+
+    /// <summary>True when the read noted that it ran with no window at all (#5844); see <see cref="NoteNoWindow"/>.</summary>
+    internal bool NotedNoWindow { get { lock (_gate) { return _noWindow; } } }
+
+    /// <summary>
+    /// Notes the window a read ran with (#5814): the window after the tool resolved its arguments, so a defaulted
+    /// <c>hours_back</c> is noted as the 24 hours it read, and a route whose window is fixed in code notes that window.
+    /// The slow-read row records it in place of a window lifted from the arguments. Ignored outside a scope, and for an
+    /// empty or inverted window. The first window noted stays: a tool notes its own window before any reader it calls
+    /// can note one.
+    /// </summary>
+    internal static void NoteWindow(DateTime startUtc, DateTime endUtc)
+    {
+        if (s_current.Value is not { } scope || endUtc <= startUtc)
+        {
+            return;
+        }
+
+        lock (scope._gate)
+        {
+            if (scope._windowEnd is null && !scope._noWindow)
+            {
+                scope._windowStart = startUtc;
+                scope._windowEnd = endUtc;
+            }
+        }
+    }
+
+    /// <summary>Notes a window <paramref name="hours"/> wide ending at <paramref name="endUtc"/>; see
+    /// <see cref="NoteWindow(DateTime, DateTime)"/>. Zero or negative hours note nothing.</summary>
+    internal static void NoteWindow(double hours, DateTime endUtc)
+    {
+        if (hours > 0 && !double.IsNaN(hours))
+        {
+            NoteWindow(endUtc.AddHours(-hours), endUtc);
+        }
+    }
+
+    /// <summary>
+    /// Notes that the read ran with no window (#5844): a read of one request by id spans its whole history, so the
+    /// slow-read row records no window, not one lifted from an <c>hours_back</c> the caller sent and the read ignored.
+    /// Silence still means "fall back to the arguments" for every read that notes nothing. Ignored outside a scope; like
+    /// <see cref="NoteWindow(DateTime, DateTime)"/>, the first note stays.
+    /// </summary>
+    internal static void NoteNoWindow()
+    {
+        if (s_current.Value is not { } scope)
+        {
+            return;
+        }
+
+        lock (scope._gate)
+        {
+            if (scope._windowEnd is null)
+            {
+                scope._noWindow = true;
+            }
         }
     }
 
@@ -172,9 +350,11 @@ internal sealed class ReadScope
     internal static Opened Open(ILogger? logger)
     {
         var previous = s_current.Value;
-        var scope = new ReadScope(logger);
+        var counted = previous is null;
+        var inFlightAtStart = counted ? Interlocked.Increment(ref s_inFlight) - 1 : previous!.InFlightAtStart;
+        var scope = new ReadScope(logger, previous, inFlightAtStart);
         s_current.Value = scope;
-        return new Opened(scope, previous);
+        return new Opened(scope, previous, counted);
     }
 
     /// <summary>Notes a fallback and logs it: a Warning through the scope's logger (the exception object, never
@@ -269,11 +449,13 @@ internal sealed class ReadScope
     internal readonly struct Opened : IDisposable
     {
         private readonly ReadScope? _previous;
+        private readonly bool _counted;
 
-        internal Opened(ReadScope scope, ReadScope? previous)
+        internal Opened(ReadScope scope, ReadScope? previous, bool counted)
         {
             Scope = scope;
             _previous = previous;
+            _counted = counted;
         }
 
         /// <summary>The scope this handle opened.</summary>
@@ -282,6 +464,13 @@ internal sealed class ReadScope
         /// <summary>The fallback noted into <see cref="Scope"/>.</summary>
         internal ReadFallback? Fallback => Scope.Fallback;
 
-        public void Dispose() => s_current.Value = _previous;
+        public void Dispose()
+        {
+            s_current.Value = _previous;
+            if (_counted && Interlocked.Exchange(ref Scope._counting, 0) == 1)
+            {
+                Interlocked.Decrement(ref s_inFlight);
+            }
+        }
     }
 }

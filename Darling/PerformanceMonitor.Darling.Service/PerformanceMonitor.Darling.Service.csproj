@@ -10,8 +10,19 @@
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
     <NoWarn>CA1849;CA2007;CA1508;CA1822;CA1805;CA1510;CA1816;CA1861;CA1845;CA2201;CA1848;CA1852;CA1305;CA1860;CA1707;CA1507;CA1806;CA2254</NoWarn>
+    <!-- #5796: true when this build targets Windows, which gates the three PowerShell scripts below. -->
+    <DarlingShipsWindowsScripts>false</DarlingShipsWindowsScripts>
+    <DarlingShipsWindowsScripts Condition="$(RuntimeIdentifier.StartsWith('win'))">true</DarlingShipsWindowsScripts>
+    <DarlingShipsWindowsScripts Condition="'$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">true</DarlingShipsWindowsScripts>
     <WarningsAsErrors>CS4014</WarningsAsErrors>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- #6365: SqlClient follows a mirroring partner the SERVER names, and that name gets no tcp: prefix (named pipe over SMB
+         with the process's Windows credentials). This writes the switch into runtimeconfig.json so it is set before any code
+         runs; ServerHostSetting also sets it in a static constructor as a backup. -->
+    <RuntimeHostConfigurationOption Include="Switch.Microsoft.Data.SqlClient.IgnoreServerProvidedFailoverPartner" Value="true" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.PI" />
@@ -20,6 +31,8 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
     <PackageReference Include="Microsoft.Data.SqlClient" />
+    <!-- #5802: lifts the transitive System.Security.Cryptography.Pkcs off SqlClient's vulnerable 9.0.18; see Directory.Packages.props. -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" />
     <!-- #3838: the Entra (Active Directory) authentication providers were split OUT of the core
          Microsoft.Data.SqlClient package in 7.x, so a project that sets
          SqlAuthenticationMethod.ActiveDirectory* on a connection string and does NOT carry this
@@ -59,6 +72,9 @@
          directly (it also flows transitively through Darling.Analysis) since it is a direct dependency. -->
     <ProjectReference Include="..\..\PerformanceMonitor.PlanAnalysis\PerformanceMonitor.PlanAnalysis.csproj" />
     <ProjectReference Include="..\PerformanceMonitor.Darling.Storage\PerformanceMonitor.Darling.Storage.csproj" />
+    <!-- #5632 step 7: the write code for force_query_store_plan and unforce_query_store_plan. Only DarlingMcpPlanForceTools may use it
+         (PlanForceNoWritePathTests pins that, and that this assembly still holds none of the three write statements). -->
+    <ProjectReference Include="..\PerformanceMonitor.Darling.Remediation\PerformanceMonitor.Darling.Remediation.csproj" />
     <!-- #3833: the triage page reads the AlertFamily census to decide whether a metric is a fleet-level
          store alert, so the taxonomy every new alert must be registered in is what selects its sections.
          Flows transitively through Alerting/Analysis already; named directly because it is now a direct
@@ -77,10 +93,14 @@
          upgrade-darling.ps1 has to be here for a second reason (#2525): the service's install-directory
          report tells operators to prune rollback backups with `upgrade-darling.ps1 -PruneOnly`, and advice
          naming a file that is not on the box is worse than no advice. DarlingDeployRollbackRetentionTests
-         pins this line for exactly that. -->
-    <None Include="..\tools\install-darling.ps1" Link="install-darling.ps1" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\tools\uninstall-darling.ps1" Link="uninstall-darling.ps1" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\tools\upgrade-darling.ps1" Link="upgrade-darling.ps1" CopyToOutputDirectory="PreserveNewest" />
+         pins this line for exactly that.
+         #5796: they ship to Windows only. They are Authenticode-signed in the Windows zip, and the Linux
+         publish (the tarball and the container image) has no use for them, so a Windows RID, or no RID on a
+         Windows build machine (the release and nightly zips publish without one), is the condition. The
+         Linux release job asserts its tarball holds no .ps1. -->
+    <None Include="..\tools\install-darling.ps1" Link="install-darling.ps1" CopyToOutputDirectory="PreserveNewest" Condition="$(DarlingShipsWindowsScripts)" />
+    <None Include="..\tools\uninstall-darling.ps1" Link="uninstall-darling.ps1" CopyToOutputDirectory="PreserveNewest" Condition="$(DarlingShipsWindowsScripts)" />
+    <None Include="..\tools\upgrade-darling.ps1" Link="upgrade-darling.ps1" CopyToOutputDirectory="PreserveNewest" Condition="$(DarlingShipsWindowsScripts)" />
   </ItemGroup>
 
   <ItemGroup>

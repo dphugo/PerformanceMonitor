@@ -22,6 +22,7 @@ namespace Darling.Tests;
 /// system_health_event_id / config_id+capture_time / running_jobs' no-id), and the index shapes
 /// mirror Lite's columns.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class PgSchemaGeneratorTests
 {
     [Fact]
@@ -51,13 +52,15 @@ public sealed class PgSchemaGeneratorTests
            pg_log_events (#3601, the classified server-log pipeline: the third reader of the same log the
            deadlock and plan collectors tail, and the first to carry more than one family) = 70, plus
            pg_database_size_stats (#3691 V136, the hourly per-database size series — the rung's other series, host
-           memory, is six columns on pg_cpu_utilization rather than a table) = 71. The catalog is
+           memory, is six columns on pg_cpu_utilization rather than a table) = 71, plus
+           attention (#5640 V179, client cancels and timeouts) = 72 — a plain table (StaysPlainTable), so the HYPERTABLE count stays 71. The catalog is
            deliberately
            engine-mixed: the schema generator walks it to
            create tables and one store can hold both engines' data, so splitting it per engine would
            fragment DDL generation. Dispatch is gated separately, by engine, in
            CollectorCatalog.AppliesTo(definition, target). */
-        Assert.Equal(71, CollectorCatalog.All.Count);
+        /* 73 since #5632: query_store_forced_plans (V195), also a plain table, so the hypertable count stays 71. */
+        Assert.Equal(73, CollectorCatalog.All.Count);
 
         /* Uniqueness is asserted AGAINST THE COUNT rather than against a second literal. The literals here
            had drifted to 45 while the real figure tracked the count, so the test that exists to catch a
@@ -509,7 +512,9 @@ public sealed class PgSchemaGeneratorTests
            contract as V37 above. */
         var v151ReplicaAlter = Lf(PgMigrations.Scripts.Single(m => m.Version == 151).Sql);
 
-        foreach (var column in replicaColumns.Skip(V37ReplicaColumnCount))
+        const int V151ReplicaColumnCount = 12;
+
+        foreach (var column in replicaColumns.Skip(V37ReplicaColumnCount).Take(V151ReplicaColumnCount - V37ReplicaColumnCount))
         {
             var generatedType = Lf(PgSchemaGenerator.CreateTable(new TruncatedSchema(AgReplicaStatesCollector.Instance, replicaColumns.Count)))
                 .Split('\n')
@@ -518,6 +523,20 @@ public sealed class PgSchemaGeneratorTests
                 .TrimEnd(',');
 
             Assert.Contains($"ADD COLUMN IF NOT EXISTS {generatedType}", v151ReplicaAlter, StringComparison.Ordinal);
+        }
+
+        /* V202 (#6159) appends primary_replica, the last replica-grain column, as its own additive rung - same contract again. */
+        var v202ReplicaAlter = Lf(PgMigrations.Scripts.Single(m => m.Version == 202).Sql);
+
+        foreach (var column in replicaColumns.Skip(V151ReplicaColumnCount))
+        {
+            var generatedType = Lf(PgSchemaGenerator.CreateTable(new TruncatedSchema(AgReplicaStatesCollector.Instance, replicaColumns.Count)))
+                .Split('\n')
+                .Single(l => l.TrimStart().StartsWith(column.Name + " ", StringComparison.Ordinal))
+                .Trim()
+                .TrimEnd(',');
+
+            Assert.Contains($"ADD COLUMN IF NOT EXISTS {generatedType}", v202ReplicaAlter, StringComparison.Ordinal);
         }
 
         /* No "V34 was not widened in place" sweep for this grain, unlike the database one below: the

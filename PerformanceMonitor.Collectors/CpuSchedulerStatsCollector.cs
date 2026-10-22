@@ -85,14 +85,14 @@ SELECT /* PerformanceMonitorLite */
     max_workers_count = osi.max_workers_count,
     scheduler_count = osi.scheduler_count,
     cpu_count = osi.cpu_count,
-    total_runnable_tasks_count = SUM(dos.runnable_tasks_count),
-    total_work_queue_count = SUM(dos.work_queue_count),
-    total_current_workers_count = SUM(dos.current_workers_count),
-    avg_runnable_tasks_count = CONVERT(decimal(38,2), AVG(CONVERT(decimal(38,2), dos.runnable_tasks_count))),
-    total_active_request_count = MAX(wg.active_request_count),
-    total_queued_request_count = MAX(wg.queued_request_count),
-    total_blocked_task_count = MAX(wg.blocked_task_count),
-    total_active_parallel_thread_count = MAX(wg.active_parallel_thread_count),
+    total_runnable_tasks_count = sched.total_runnable_tasks_count,
+    total_work_queue_count = sched.total_work_queue_count,
+    total_current_workers_count = sched.total_current_workers_count,
+    avg_runnable_tasks_count = sched.avg_runnable_tasks_count,
+    total_active_request_count = wg.active_request_count,
+    total_queued_request_count = wg.queued_request_count,
+    total_blocked_task_count = wg.blocked_task_count,
+    total_active_parallel_thread_count = wg.active_parallel_thread_count,
     runnable_request_count = r.runnable_count,
     total_request_count = CONVERT(integer, r.total_count),
     runnable_percent = r.runnable_pct,
@@ -101,7 +101,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN SUM(dos.current_workers_count) >= (osi.max_workers_count * 0.90)
+                WHEN sched.total_current_workers_count >= (osi.max_workers_count * 0.90)
                 THEN 1
                 ELSE 0
             END
@@ -111,7 +111,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN SUM(dos.runnable_tasks_count) >= osi.cpu_count
+                WHEN sched.total_runnable_tasks_count >= osi.cpu_count
                 THEN 1
                 ELSE 0
             END
@@ -121,7 +121,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN MAX(wg.blocked_task_count) >= 10
+                WHEN wg.blocked_task_count >= 10
                 THEN 1
                 ELSE 0
             END
@@ -131,7 +131,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN MAX(wg.queued_request_count) >= osi.cpu_count
+                WHEN wg.queued_request_count >= osi.cpu_count
                 THEN 1
                 ELSE 0
             END
@@ -151,23 +151,31 @@ SELECT /* PerformanceMonitorLite */
         ),
     total_node_count = CONVERT(integer, nodes.total_nodes),
     nodes_online_count = nodes.online_nodes,
-    offline_cpu_count = nodes.offline_cpus,
+    offline_cpu_count = CONVERT(integer, offline_cpus.offline_cpu_count),
     offline_cpu_warning =
         CONVERT
         (
             bit,
             CASE
-                WHEN
-                (
-                    SELECT COUNT_BIG(*)
-                    FROM sys.dm_os_schedulers AS dos_offline
-                    WHERE dos_offline.is_online = 0
-                ) > 0
+                WHEN offline_cpus.offline_cpu_count > 0
                 THEN 1
                 ELSE 0
             END
         )
-FROM sys.dm_os_schedulers AS dos
+FROM
+(
+    /*The scheduler aggregate stands alone with no grouping, so it is exactly one row whatever the plan does with the
+      single-row pieces cross joined below. It used to share one grouping with them (#5710): a piece read again per
+      scheduler row could return a moving value, and the schedulers fell into several groups, one stored row each.*/
+    SELECT
+        total_runnable_tasks_count = SUM(dos.runnable_tasks_count),
+        total_work_queue_count = SUM(dos.work_queue_count),
+        total_current_workers_count = SUM(dos.current_workers_count),
+        avg_runnable_tasks_count = CONVERT(decimal(38,2), AVG(CONVERT(decimal(38,2), dos.runnable_tasks_count)))
+    FROM sys.dm_os_schedulers AS dos
+    WHERE dos.status = N'VISIBLE ONLINE'
+    HAVING COUNT_BIG(*) > 0 /*no VISIBLE ONLINE scheduler writes no row (as before #5710), not one all-NULL row*/
+) AS sched
 CROSS JOIN sys.dm_os_sys_info AS osi
 CROSS JOIN sys.dm_os_sys_memory AS osm
 CROSS JOIN
@@ -178,23 +186,22 @@ CROSS JOIN
             SUM
             (
                 CASE
-                    WHEN n.node_state_desc = N'ONLINE'
-                    THEN 1
-                    ELSE 0
-                END
-            ),
-        offline_cpus =
-            SUM
-            (
-                CASE
-                    WHEN n.node_state_desc <> N'ONLINE'
+                    WHEN n.node_state_desc NOT LIKE N'OFFLINE%'
                     THEN 1
                     ELSE 0
                 END
             )
     FROM sys.dm_os_nodes AS n
-    WHERE n.node_id <> 32767 /*Exclude DAC node*/
+    WHERE n.node_state_desc NOT LIKE N'%DAC%' /*Exclude the DAC node by its state, not by node_id (#5656)*/
 ) AS nodes
+CROSS JOIN
+(
+    /*Offline CPUs are user schedulers SQL Server has taken offline; the warning flag reads this same count*/
+    SELECT
+        offline_cpu_count = COUNT_BIG(*)
+    FROM sys.dm_os_schedulers AS dos_offline
+    WHERE dos_offline.status = N'VISIBLE OFFLINE'
+) AS offline_cpus
 CROSS JOIN
 (
     SELECT
@@ -238,20 +245,6 @@ OUTER APPLY
     AND   der.session_id <> @@SPID
     AND   der.status NOT IN (N'background', N'sleeping')
 ) AS r
-WHERE dos.status = N'VISIBLE ONLINE'
-GROUP BY
-    osi.max_workers_count,
-    osi.scheduler_count,
-    osi.cpu_count,
-    r.runnable_count,
-    r.total_count,
-    r.runnable_pct,
-    osm.total_physical_memory_kb,
-    osm.available_physical_memory_kb,
-    osm.system_memory_state_desc,
-    nodes.total_nodes,
-    nodes.online_nodes,
-    nodes.offline_cpus
 OPTION(RECOMPILE);";
 
     public override string Name => "cpu_scheduler_stats";

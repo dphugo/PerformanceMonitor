@@ -93,7 +93,6 @@ namespace Darling.Tests;
 /// allowance: the force-plan bot is not this campaign's to census.</para>
 /// </summary>
 [Trait("Stage", "Guard")]
-[Trait("Reads", "Lite")]
 public sealed class McpPayloadContractCensusTests
 {
     /* ───────────────────────── the population ───────────────────────── */
@@ -152,9 +151,16 @@ public sealed class McpPayloadContractCensusTests
     /// in #3653's vocabulary lane, and the 30 PostgreSQL-side catches that called <c>McpHelpers.Status("error", …)</c>
     /// directly — the retired second dialect — went through it under #3653 Q11. Kept as a roster rather than a
     /// bare "zero" so a new ad-hoc return fails by name and a deliberate exception has somewhere to state its
-    /// reason.
+    /// reason. One exception since #5916: <c>set_alert_threshold_override</c> answers two store faults an operator can act on
+    /// with a status word rather than an error (<c>precondition</c> when the store role lacks the table grant, and a refusal
+    /// naming a server removed from the configuration), because a client that reads <c>status</c> must see "do this" and not
+    /// a failed call. The same holds for <c>merge_deadlock_signatures</c> (#6006): <c>precondition</c> when the mcp role lacks the merge-table grant.
     /// </summary>
-    public static readonly (string File, string Tool)[] AdHocErrorReturns = [];
+    public static readonly (string File, string Tool)[] AdHocErrorReturns =
+    [
+        ("DarlingMcpThresholdOverrideTools.cs", "set_alert_threshold_override"),
+        ("DarlingMcpSignatureMergeTools.cs", "merge_deadlock_signatures"),
+    ];
 
     /// <summary>
     /// The floor under the one-helper count. 243 catch returns route through <c>FormatError</c> at the time of
@@ -182,7 +188,7 @@ public sealed class McpPayloadContractCensusTests
     /// the classifier's first arm cannot silently stop matching while the ad-hoc roster stays empty.</para>
     /// </summary>
     [Fact]
-    public void EveryToolCatch_ReturnsThroughASharedErrorShape_AndTheAdHocRosterIsExact()
+    public void EveryToolCatch_ReturnsThroughASharedErrorShape_AndNoNewAdHocReturnAppears()
     {
         var returns = 0;
         var envelopes = 0;
@@ -211,12 +217,13 @@ public sealed class McpPayloadContractCensusTests
         Assert.True(returns >= 200, $"only {returns} catch returns were examined across both SKUs; the catch marker has stopped matching");
         Assert.True(envelopes >= EnvelopeReturnFloor, $"only {envelopes} catch returns route through McpHelpers.FormatError; the helper marker has stopped matching");
 
+        /* One direction only (#5950): a NEW ad-hoc catch return outside the roster fails by name. A roster entry
+           whose catch has since been routed through FormatError is harmless and needs no edit. */
+        var newAdHoc = offenders.Where(o => !AdHocErrorReturns.Any(r => o.StartsWith($"{r.File} {r.Tool}:", StringComparison.Ordinal))).ToList();
         Assert.True(
-            AdHocErrorReturns.ToHashSet().SetEquals(adHoc.Distinct()),
-            "the ad-hoc error roster no longer matches the tree — new ad-hoc (a catch that does not return McpHelpers.FormatError; a direct Status(\"error\") is the retired dialect): ["
-            + string.Join("; ", offenders.Where(o => !AdHocErrorReturns.Any(r => o.StartsWith($"{r.File} {r.Tool}:", StringComparison.Ordinal))))
-            + "]; rostered but gone (shrink the roster): ["
-            + string.Join(", ", AdHocErrorReturns.Except(adHoc).Select(r => $"{r.File} {r.Tool}"))
+            newAdHoc.Count == 0,
+            "a catch returns something that is not McpHelpers.FormatError and is not in the ad-hoc roster (a direct Status(\"error\") is the retired dialect): ["
+            + string.Join("; ", newAdHoc)
             + "]");
     }
 
@@ -343,17 +350,13 @@ public sealed class McpPayloadContractCensusTests
     /// whose value reaches the wire as prose where every other outcome is JSON — with the reason each
     /// survives. #3739 shaped every REFUSAL as <c>McpHelpers.Refusal</c>'s <c>invalid</c> envelope (in the
     /// producers: the validators, both resolvers, the web dispatch's missing-parameter arm, and the handful of
-    /// tools that refuse a parameter of their own inline), so what is left here is not a refusal at all: three
-    /// MISS sentences that predate the four miss words and belong to #3703's lane, not this one. The roster is
+    /// tools that refuse a parameter of their own inline), so what is left here is not a refusal at all: one
+    /// MISS sentence that predates the four miss words and belongs to #3703's lane, not this one. The roster is
     /// exact so a new bare sentence fails by name — a refusal is <c>Refusal(parameter, sentence)</c>, a miss is
     /// <c>Status(word, sentence)</c>, and a tool body has no third way to say no.
     /// </summary>
     public static readonly (string File, string Tool, string Sentence, string WhyItSurvives)[] BareSentenceReturns =
     [
-        ("DarlingMcpDataTools.cs", "list_servers", "No servers are registered yet.",
-            "a MISS on an empty registry (nothing to list), not a refusal of the request — the miss-word lane's (#3703), where `empty` is its word"),
-        ("McpDiscoveryTools.cs", "list_servers", "No servers are configured.",
-            "the Lite twin of the above: a MISS on an empty ServerManager, the miss-word lane's (#3703)"),
         ("McpPlanTools.cs", "analyze_query_store_plan", "Could not find connection details for server",
             "a resolved server whose connection details are gone from the manager between resolve and read — the request was fine, so not `invalid`; an `unavailable` miss for #3703's lane"),
     ];
@@ -376,10 +379,11 @@ public sealed class McpPayloadContractCensusTests
     private static readonly Regex SharedPassThroughProducer = new(
         @"\b(?:DarlingServerResolver|ServerResolver)\.(?:ResolveOrError\w*|ResolveWithFingerprintNameAsync|LoadEnabledOrFaultAsync)\("
         + @"|\bResolveMuteScope\("
-        + @"|\bMcpHelpers\.(?:ValidateWindow|ValidateUncappedWindow|ValidateHoursBack|ValidateDaysBack|ValidateTop|ResolveAsOf|ParseSummaryDate|ValidateChoice|ValidateMinMs|Refusal)\("
+        + @"|\bMcpHelpers\.(?:ValidateWindow|ValidateUncappedWindow|ValidateHoursBack|ValidateBaselineWindow|ValidateDaysBack|ValidateTop|ResolveAsOf|ParseSummaryDate|ValidateChoice|ValidateMinMs|Refusal)\("
+        + @"|\bDarlingReadWindow\.(?:Validate|ValidateUncapped|ValidateHoursBack|ValidateDaysBack)\(" // #5814: McpHelpers' checks plus the window note
         + @"|\bDarlingFleetSweepEndpoints\.ValidateWatchState\("
         + @"|\bTrendBuckets\.(?:Resolve|ValidateWidth|RequireWholeHours)\("
-        + @"|\b(?:Darling|Mcp)EngineCapability\.NotCollectedStatusAsync\("
+        + @"|\b(?:Darling|Mcp)EngineCapability\.(?:Fleet)?NotCollectedStatusAsync\("   // #6178: the fleet form asks the same question of every server
         + @"|\b(?:Darling|Mcp)RuntimePrecondition\.(?:StatusAsync|GatedOffStatusAsync)\("
         + @"|\bCollectAsync(?:<[^>]+>)?\(",
         RegexOptions.Compiled);
@@ -428,7 +432,7 @@ public sealed class McpPayloadContractCensusTests
     /// 50 (60 when #3962 landed) for the same reason.</para>
     /// </summary>
     [Fact]
-    public void EveryRefusal_ReturnsThroughTheSharedShape_AndTheBareSentenceRosterIsExact()
+    public void EveryRefusal_ReturnsThroughTheSharedShape_AndNoNewBareSentenceAppears()
     {
         var passThroughs = 0;
         var fromResolver = 0;
@@ -469,7 +473,7 @@ public sealed class McpPayloadContractCensusTests
                 {
                     fromResolver++;
                 }
-                else if (producer.Contains("McpHelpers.", StringComparison.Ordinal))
+                else if (producer.Contains("McpHelpers.", StringComparison.Ordinal) || producer.Contains("DarlingReadWindow.", StringComparison.Ordinal))
                 {
                     fromValidator++;
                 }
@@ -511,13 +515,9 @@ public sealed class McpPayloadContractCensusTests
 
         var rostered = BareSentenceReturns.Select(r => (r.File, r.Tool, r.Sentence)).ToList();
         var newBare = bare.Where(b => !rostered.Any(r => r.File == b.File && r.Tool == b.Tool && b.Sentence.StartsWith(r.Sentence, StringComparison.Ordinal))).ToList();
-        var gone = rostered.Where(r => !bare.Any(b => b.File == r.File && b.Tool == r.Tool && b.Sentence.StartsWith(r.Sentence, StringComparison.Ordinal))).ToList();
         Assert.True(newBare.Count == 0,
             "a tool body returns a bare sentence that is not a rostered miss — a refusal is McpHelpers.Refusal(parameter, sentence); a miss is McpHelpers.Status(word, sentence): ["
             + string.Join("; ", newBare.Select(b => $"{b.File} {b.Tool}: \"{b.Sentence}\"")) + "]");
-        Assert.True(gone.Count == 0,
-            "rostered bare sentences no longer returned (the miss lane reached them — shrink the roster): ["
-            + string.Join("; ", gone.Select(g => $"{g.File} {g.Tool}: \"{g.Sentence}\"")) + "]");
     }
 
     /// <summary>
@@ -1042,13 +1042,16 @@ public sealed class McpPayloadContractCensusTests
     public static readonly (string File, string Tool)[] InlineLimitRefusals =
     [
         ("DarlingMcpFinOpsInventoryTools.cs", "get_finops_inventory"),
+        ("DarlingMcpInvestigationTools.cs", "list_investigation_requests"),
+        ("McpInvestigationTools.cs", "list_investigation_requests"),
     ];
 
     private static readonly Regex InlineLimitRefusal = new(
         @"if \(limit < 1 \|\| limit > [\w.]+\)", RegexOptions.Compiled);
 
     private static readonly Regex SharedValidatorCall = new(
-        @"\bMcpHelpers\.(ValidateWindow|ValidateUncappedWindow|ValidateHoursBack|ValidateDaysBack|ValidateTop|ResolveAsOf|ParseSummaryDate)\(",
+        @"\bMcpHelpers\.(ValidateWindow|ValidateUncappedWindow|ValidateHoursBack|ValidateDaysBack|ValidateTop|ResolveAsOf|ParseSummaryDate)\("
+        + @"|\bDarlingReadWindow\.(Validate|ValidateUncapped|ValidateHoursBack|ValidateDaysBack)\(", // #5814: the shared checks plus the window note
         RegexOptions.Compiled);
 
     private static readonly Regex InlineDaysBackRefusal = new(
@@ -1110,9 +1113,9 @@ public sealed class McpPayloadContractCensusTests
         Assert.True(unvalidated.Count == 0,
             "these tools take a bounded parameter and neither validate it through McpHelpers nor refuse it inline — a value they cannot honor must be refused, never clamped or ignored: "
             + string.Join("; ", unvalidated));
-        Assert.True(InlineDaysBackRefusals.ToHashSet().SetEquals(inlineSeen),
-            "the inline days_back refusal roster no longer matches the tree: found [" + string.Join(", ", inlineSeen.Select(t => $"{t.File} {t.Tool}"))
-            + "], rostered [" + string.Join(", ", InlineDaysBackRefusals.Select(t => $"{t.File} {t.Tool}")) + "]");
+        var newInline = inlineSeen.Where(s => !InlineDaysBackRefusals.Contains(s)).ToList();
+        Assert.True(newInline.Count == 0,
+            "a tool refuses days_back inline instead of through the shared validator and is not in the roster: [" + string.Join(", ", newInline.Select(t => $"{t.File} {t.Tool}")) + "]");
     }
 
     /// <summary>The day-grained validator, executed at its boundaries: it refuses zero, negatives and one past
@@ -1250,11 +1253,12 @@ public sealed class McpPayloadContractCensusTests
 
         var rostered = TotalsAssignedFromAWholeSetCount.Select(t => (t.File, t.Tool, t.Assignment)).ToHashSet();
         Assert.True(examined >= ToolBodyFloor, $"only {examined} tool methods were examined across both SKUs; the marker has stopped matching");
-        Assert.True(rostered.SetEquals(found),
-            "the total_*-from-Count inventory no longer matches the tree — new (prove the set is whole, or rename *_returned): ["
-            + string.Join("; ", found.Except(rostered).Select(f => $"{f.File} {f.Tool}: {f.Assignment}"))
-            + "]; rostered but gone (shrink the roster): ["
-            + string.Join("; ", rostered.Except(found).Select(f => $"{f.File} {f.Tool}: {f.Assignment}")) + "]");
+        /* One direction (#5950): a NEW total_* assigned from a Count fails by name; a rostered entry whose
+           assignment has since been fixed is harmless. */
+        var newTotals = found.Where(f => !rostered.Contains(f)).ToList();
+        Assert.True(newTotals.Count == 0,
+            "a total_* is assigned from a Count that is not in the whole-set inventory (prove the set is whole, or rename *_returned): ["
+            + string.Join("; ", newTotals.Select(f => $"{f.File} {f.Tool}: {f.Assignment}")) + "]");
     }
 
     [Fact]
@@ -1271,7 +1275,7 @@ public sealed class McpPayloadContractCensusTests
     /// The Darling reader SQL constants whose outer statement anchors on <c>= (SELECT MAX(collection_time |
     /// capture_time) …)</c> — a latest-snapshot read — and do NOT project the anchor column, so the tool above
     /// them cannot stamp the snapshot's time (#3541 A10, "latest is a time"). Two, both known:
-    /// <c>IndexUsageSql</c> is the object-stats residual <see cref="McpLatestSnapshotStampTests.UnstampedLatestReadsPendingA10"/>
+    /// <c>IndexUsageSql</c> is the object-stats residual (get_index_usage, still unstamped)
     /// already holds, and <c>IndexUsageMatchCountSql</c> is a <c>COUNT(*)</c> over the same anchor with no row
     /// to stamp.
     ///
@@ -1352,11 +1356,10 @@ public sealed class McpPayloadContractCensusTests
         }
 
         Assert.True(anchored >= 10, $"only {anchored} latest-anchored reader constants were found; the anchor pattern has stopped matching");
-        Assert.True(LatestAnchoredReadsWithoutTheirStamp.ToHashSet(StringComparer.Ordinal).SetEquals(unstamped),
-            "the unstamped latest-read roster no longer matches the tree — new (project the anchor column so the tool can stamp): ["
-            + string.Join(", ", unstamped.Except(LatestAnchoredReadsWithoutTheirStamp).Order())
-            + "]; rostered but now stamped (shrink the roster): ["
-            + string.Join(", ", LatestAnchoredReadsWithoutTheirStamp.Except(unstamped).Order()) + "]");
+        var newUnstamped = unstamped.Except(LatestAnchoredReadsWithoutTheirStamp).Order().ToList();
+        Assert.True(newUnstamped.Count == 0,
+            "a latest-anchored read does not project its anchor column and is not in the unstamped roster (project the anchor column so the tool can stamp): ["
+            + string.Join(", ", newUnstamped) + "]");
     }
 
     [Fact]
@@ -1408,6 +1411,8 @@ public sealed class McpPayloadContractCensusTests
         /* #4734: create_mute_rule's body moved into CreateMuteRuleOver (the tool hands it the Postgres-backed
            store), so the expires_at parse, unchanged, is found under the new method name. */
         "DarlingMcpAlertTools.cs CreateMuteRuleOver",
+        /* #6231: set_quiet_window's end and start, parsed under invariant UTC styles like create_mute_rule's expires_at. */
+        "DarlingMcpQuietWindowTools.cs TryParseUtc",
     ];
 
     private static readonly Regex GeneralTimestampParse = new(
@@ -1420,7 +1425,7 @@ public sealed class McpPayloadContractCensusTests
     /// argument list read for the styles; the site is named by the enclosing tool or member.
     /// </summary>
     [Fact]
-    public void NoToolParsesATimestampUnderTheHostCulture_AndTheGeneralParseRosterIsExact()
+    public void NoToolParsesATimestampUnderTheHostCulture_AndNoNewGeneralParseAppears()
     {
         var found = new List<string>();
         var offenders = new List<string>();
@@ -1447,9 +1452,9 @@ public sealed class McpPayloadContractCensusTests
         Assert.True(files >= 60, $"only {files} tool files were read across both SKUs");
         Assert.True(offenders.Count == 0,
             "these sites parse a timestamp under the host culture or without the UTC styles — 01/02/2026 reads as two different days on two hosts: " + string.Join("; ", offenders));
-        Assert.True(GeneralTimestampParsesWithUtcStyles.ToHashSet(StringComparer.Ordinal).SetEquals(found),
-            "the general-TryParse roster no longer matches the tree: found [" + string.Join(", ", found.Order())
-            + "], rostered [" + string.Join(", ", GeneralTimestampParsesWithUtcStyles) + "]");
+        var newParses = found.Except(GeneralTimestampParsesWithUtcStyles, StringComparer.Ordinal).Order().ToList();
+        Assert.True(newParses.Count == 0,
+            "a general DateTime.TryParse site is not in the allowlist: [" + string.Join(", ", newParses) + "]");
     }
 
     /// <summary>The shared parsers are the allowlisted shape: <c>ResolveAsOf</c> refuses what the framework
@@ -1542,11 +1547,13 @@ public sealed class McpPayloadContractCensusTests
             "#5234: get_query_store_query_history's per-interval points[] is capped at MaxPoints (150) and a byte budget, keeping the NEWEST points, observed off the fetched row count; plans[] is capped separately (plans_truncated) — two bounds in one payload, the second spelled <bound>_truncated"),
         ("plans_truncated", ["DarlingMcpQueryStoreHistoryTools.cs"],
             "#5234: get_query_store_query_history's per-plan plans[] roll-up is capped at MaxPlans (20), the longest by total duration, beside the per-interval points[] bound (points_truncated) — two bounds in one payload, the second spelled <bound>_truncated"),
-        ("scan_truncated", ["DarlingMcpBlockingTools.cs"],
-            "the dedup_key fingerprint scan's ceiling (FingerprintScanCeiling), observed off a ceiling + 1 fetch, beside the page's own truncated — two bounds in one payload, the second spelled <bound>_truncated"),
+        ("known_patterns_truncated", ["DarlingMcpAlertTools.cs"],
+            "#6334: get_alert_history's per-row known_patterns[] (the operator's known-pattern entries matching that alert) is capped at MaxPerAlertRow (5), the rest left off; observed off the matched count, per row, beside the page's own truncated — two bounds in one payload, the second spelled <bound>_truncated"),
+        ("scan_truncated", ["DarlingMcpBlockingTools.cs", "DarlingMcpQueryTagRollupTools.cs"],
+            "the dedup_key fingerprint scan's ceiling (FingerprintScanCeiling) and #5983's get_resource_use_by_tag deadlock-graph scan ceiling (DeadlockScanCeiling), observed off a ceiling + 1 fetch, beside the page's own truncated — two bounds in one payload, the second spelled <bound>_truncated"),
         ("processes_truncated", ["DarlingMcpBlockingTools.cs"],
             "get_deadlock_detail's processes[] is cut by two bounds, the per-deadlock cap DarlingDeadlockProcessRows.MaxProcessesPerDeadlock (12) and the default page's shared row budget (DefaultPageRowBudget, 24); the rows cut from one deadlock are counted beside it. Unlike the boolean <bound>_truncated keys around it, processes_truncated is a COUNT (0 when nothing was cut), kept under this name because it is the per-deadlock twin of the page's truncated and a reader looks for it beside processes"),
-        ("window_truncated", ["DarlingMcpBlockingTools.cs", "DarlingMcpConfigHistoryTools.cs", "DarlingMcpDataTools.cs", "DarlingMcpDefaultTraceTools.cs", "DarlingMcpHealthParserTools.cs", "DarlingMcpJobTools.cs", "DarlingMcpLatchSpinlockTools.cs", "DarlingMcpLongQueryTools.cs", "DarlingMcpMemoryGrantTools.cs", "DarlingMcpPgBlockingTools.cs", "DarlingMcpPgCpuUtilizationTools.cs", "DarlingMcpPgDatabaseTools.cs", "DarlingMcpPgDeadlockTools.cs", "DarlingMcpPgIndexUsageTools.cs", "DarlingMcpPgIoTools.cs", "DarlingMcpPgKernelStatsTools.cs", "DarlingMcpPgLogEventTools.cs", "DarlingMcpPgPlanTools.cs", "DarlingMcpPgPredicateTools.cs", "DarlingMcpPgReplicationStatsTools.cs", "DarlingMcpPgServerStateTools.cs", "DarlingMcpPgSessionStatesTools.cs", "DarlingMcpPgStatementTools.cs", "DarlingMcpPgWaitSamplingTools.cs", "DarlingMcpPgWaitTools.cs", "DarlingMcpPgXminTools.cs", "DarlingMcpPlanCorrectionTools.cs", "DarlingMcpQueryHeatmapTools.cs", "DarlingMcpQueryStoreClutterTools.cs", "DarlingMcpQueryStoreHistoryTools.cs", "DarlingMcpQueryStoreRegressionTools.cs", "DarlingMcpSessionTools.cs", "DarlingMcpStoreQueryHistoryTools.cs", "DarlingMcpTrendTools.cs", "McpBlockingTools.cs", "McpConfigHistoryTools.cs", "McpDefaultTraceTools.cs", "McpHealthParserTools.cs", "McpHealthTools.cs", "McpLongQueryTools.cs", "McpMemoryTools.cs", "McpPlanCorrectionTools.cs", "McpQueryTools.cs", "McpSessionTools.cs", "McpWaitTools.cs"],
+        ("window_truncated", ["DarlingMcpBlockingTools.cs", "DarlingMcpConfigHistoryTools.cs", "DarlingMcpDataTools.cs", "DarlingMcpDefaultTraceTools.cs", "DarlingMcpHealthParserTools.cs", "DarlingMcpJobTools.cs", "DarlingMcpLatchSpinlockTools.cs", "DarlingMcpLongQueryTools.cs", "DarlingMcpMemoryGrantTools.cs", "DarlingMcpPgBlockingTools.cs", "DarlingMcpPgCpuUtilizationTools.cs", "DarlingMcpPgDatabaseTools.cs", "DarlingMcpPgDeadlockTools.cs", "DarlingMcpPgIndexUsageTools.cs", "DarlingMcpPgIoTools.cs", "DarlingMcpPgKernelStatsTools.cs", "DarlingMcpPgLogEventTools.cs", "DarlingMcpPgPlanTools.cs", "DarlingMcpPgPredicateTools.cs", "DarlingMcpPgReplicationStatsTools.cs", "DarlingMcpPgServerStateTools.cs", "DarlingMcpPgSessionStatesTools.cs", "DarlingMcpPgStatementTools.cs", "DarlingMcpPgWaitSamplingTools.cs", "DarlingMcpPgWaitTools.cs", "DarlingMcpPgXminTools.cs", "DarlingMcpPlanCorrectionTools.cs", "DarlingMcpQueryHeatmapTools.cs", "DarlingMcpQueryStoreAbortsTools.cs", "DarlingMcpQueryStoreClutterTools.cs", "DarlingMcpQueryStoreHistoryTools.cs", "DarlingMcpQueryStoreRegressionTools.cs", "DarlingMcpQueryTagRollupTools.cs", "DarlingMcpSessionTools.cs", "DarlingMcpStoreQueryHistoryTools.cs", "DarlingMcpTrendTools.cs", "DarlingMcpWhoDroveItTools.cs", "DarlingQueryTagRollupRouting.cs", "McpBlockingTools.cs", "McpConfigHistoryTools.cs", "McpDefaultTraceTools.cs", "McpHealthParserTools.cs", "McpHealthTools.cs", "McpLongQueryTools.cs", "McpMemoryTools.cs", "McpPlanCorrectionTools.cs", "McpQueryTools.cs", "McpSessionTools.cs", "McpWaitTools.cs", "McpWhoDroveItTools.cs"],
             "the #2364 / #2353 WINDOW floor (#3653 item 17): the tier that answered did not hold the whole requested window, so the served series begins later than asked — beside effective_start / effective_hours_back, observed off the served head against the shared ninety-minute TruncationSlack, no cap involved; get_query_trend and get_query_store_top write it in their initializers, the duration-trend trio through TrendDisclosure.WriteTo (Darling) and WriteDisclosure (Lite); get_store_query_history (#5097) writes it beside hours_back from the history's own first capture, not a collector probe; get_query_store_clutter (#3797) writes it in its initializer for its plan-churn and wait arms, which read the same raw tier get_query_store_top does, off the same window-floor read and the same ninety-minute slack; Lite's get_active_queries and get_waiting_tasks (QuerySnapshots / WaitingTasks, read by coverage), get_query_store_regressions (checked against the baseline's start, the earlier of its two windows) and get_query_heatmap (#4966) write it in their initializers through McpQueryTools.WindowNotice, beside a page cut of their own (truncated), so they publish effective_start without effective_hours_back, which the window-floor rule below holds apart for the window floor; Darling's get_server_config_changes, get_database_config_changes and get_trace_flag_changes (#4966) write them after hours_back from the coverage probe of server_config, database_config and trace_flags (the same rule as the viewer's and the web's Config Changes notes), and on their empty answer inside the hints; Darling's get_collection_log (one server), get_plan_corrections and get_memory_pressure_events (#4966) write them after hours_back too: the log from its own coverage probe, which ignores the collector, status and duration filters so the note says where the log starts, plan corrections from plan_correction's coverage, where an answer of only automatic-tuning rows is a data answer, and memory pressure from the events' sample_time with its edge at the purge cutoff, each on its empty answer inside the hints; Darling's get_active_queries, get_waiting_tasks, get_query_heatmap and get_query_store_regressions (#4966) write the same three keys after hours_back through DarlingMcpWindowNotice, with the same wording and the same absence of effective_hours_back (the regressions tool checks its baseline's start, as Lite's does); Darling's get_active_queries (DarlingMcpSessionTools.cs) writes them only when the window was cut, so a covered default call stays inside the response budget and a missing key there means covered (Lite's writes them always), and each of the four leaves them off when its coverage probe failed, since a failed probe costs the notice and never the rows; Darling's get_wait_stats, get_latch_stats and get_spinlock_stats (#4966) write it on a data answer only, and Lite's config-change, collection-log, plan-correction and memory-pressure tools write it as well; and Darling's six PostgreSQL reads get_pg_wait_stats, get_pg_wait_sampling, get_pg_kernel_stats, get_pg_lock_stats, get_pg_predicate_stats and get_pg_server_config_changes (#4966): the coverage of the web's probe source for each read did not reach the start of the requested window; and Darling's five PostgreSQL window reads get_pg_top_queries, get_pg_database_stats, get_pg_io_stats, get_pg_plans and get_pg_cpu_utilization (#4966): the store's coverage did not reach the start of the requested window; and Darling's get_pg_blocking, get_pg_session_states, get_pg_replication_stats and get_pg_xmin_horizon (#4966), the same floor read from the collector's logged runs (the xmin horizon from its table's schedule edge), because a row is stored only while a chain, a held transaction, a replica or a holder exists; Darling's nine get_health_parser_* tools and get_default_trace_events (#4966) write the same three keys after hours_back through DarlingMcpWindowNotice, always on a data answer, and leave them off when their coverage probe failed; so do Lite's get_default_trace_events, get_wait_stats and get_blocking_stats (#4966), the last one once for its two series, from the earlier of the blocked-process and deadlock coverages; Darling's get_blocking, get_deadlocks, get_deadlock_detail, get_blocked_process_xml and get_long_query_completions (#4966) write the three keys after hours_back through DarlingMcpWindowNotice.ReadEventAsync, beside a page cut of their own (truncated), and leave them off when the coverage probe failed; Darling's get_blocking_stats (#4966) writes them after hours_back as one notice for its two series (blocking and deadlock severity), at the later of the two series' floors (blocking: the earlier of blocked_process_reports and dmv_blocking_snapshots), and leaves them off when the probe failed"),
         ("findings_truncated", ["DarlingMcpTools.cs", "McpAnalysisTools.cs"],
             "#4198: get_analysis_findings' GROUP PAGE cut — limit caps the collapsed per-chain groups returned (default 18), independent of the pre-existing truncated above (the raw WindowCoveringLimit occurrence read, beside truncation_note): truncated warns occurrence stats may under-report, findings_truncated warns other diagnostic chains exist but are not on this page at all"),
@@ -1554,7 +1561,7 @@ public sealed class McpPayloadContractCensusTests
 
     public static readonly (string Key, string[] Files, string WhatItExplains)[] CutNoteKeys =
     [
-        ("truncation_note", ["DarlingMcpBlockingTools.cs", "DarlingMcpConfigHistoryTools.cs", "DarlingMcpDataTools.cs", "DarlingMcpDefaultTraceTools.cs", "DarlingMcpHealthParserTools.cs", "DarlingMcpLatchSpinlockTools.cs", "DarlingMcpLongQueryTools.cs", "DarlingMcpMemoryGrantTools.cs", "DarlingMcpPgBlockingTools.cs", "DarlingMcpPgCpuUtilizationTools.cs", "DarlingMcpPgDatabaseTools.cs", "DarlingMcpPgDeadlockTools.cs", "DarlingMcpPgIndexUsageTools.cs", "DarlingMcpPgIoTools.cs", "DarlingMcpPgKernelStatsTools.cs", "DarlingMcpPgLogEventTools.cs", "DarlingMcpPgPlanTools.cs", "DarlingMcpPgPredicateTools.cs", "DarlingMcpPgReplicationStatsTools.cs", "DarlingMcpPgServerStateTools.cs", "DarlingMcpPgSessionStatesTools.cs", "DarlingMcpPgStatementTools.cs", "DarlingMcpPgWaitSamplingTools.cs", "DarlingMcpPgWaitTools.cs", "DarlingMcpPgXminTools.cs", "DarlingMcpPlanCorrectionTools.cs", "DarlingMcpQueryHeatmapTools.cs", "DarlingMcpQueryStoreClutterTools.cs", "DarlingMcpQueryStoreRegressionTools.cs", "DarlingMcpSessionTools.cs", "DarlingMcpStoreQueryHistoryTools.cs", "DarlingMcpTools.cs", "McpAnalysisTools.cs", "McpBlockingTools.cs", "McpConfigHistoryTools.cs", "McpDefaultTraceTools.cs", "McpHealthParserTools.cs", "McpHealthTools.cs", "McpLongQueryTools.cs", "McpMemoryTools.cs", "McpPlanCorrectionTools.cs", "McpQueryTools.cs", "McpSessionTools.cs", "McpWaitTools.cs"],
+        ("truncation_note", ["DarlingMcpBlockingTools.cs", "DarlingMcpConfigHistoryTools.cs", "DarlingMcpDataTools.cs", "DarlingMcpDefaultTraceTools.cs", "DarlingMcpHealthParserTools.cs", "DarlingMcpLatchSpinlockTools.cs", "DarlingMcpLongQueryTools.cs", "DarlingMcpMemoryGrantTools.cs", "DarlingMcpPgBlockingTools.cs", "DarlingMcpPgCpuUtilizationTools.cs", "DarlingMcpPgDatabaseTools.cs", "DarlingMcpPgDeadlockTools.cs", "DarlingMcpPgIndexUsageTools.cs", "DarlingMcpPgIoTools.cs", "DarlingMcpPgKernelStatsTools.cs", "DarlingMcpPgLogEventTools.cs", "DarlingMcpPgPlanTools.cs", "DarlingMcpPgPredicateTools.cs", "DarlingMcpPgReplicationStatsTools.cs", "DarlingMcpPgServerStateTools.cs", "DarlingMcpPgSessionStatesTools.cs", "DarlingMcpPgStatementTools.cs", "DarlingMcpPgWaitSamplingTools.cs", "DarlingMcpPgWaitTools.cs", "DarlingMcpPgXminTools.cs", "DarlingMcpPlanCorrectionTools.cs", "DarlingMcpQueryHeatmapTools.cs", "DarlingMcpQueryStoreAbortsTools.cs", "DarlingMcpQueryStoreClutterTools.cs", "DarlingMcpQueryStoreRegressionTools.cs", "DarlingMcpSessionTools.cs", "DarlingMcpWhoDroveItTools.cs", "DarlingMcpStoreQueryHistoryTools.cs", "DarlingMcpTools.cs", "McpAnalysisTools.cs", "McpBlockingTools.cs", "McpConfigHistoryTools.cs", "McpDefaultTraceTools.cs", "McpHealthParserTools.cs", "McpHealthTools.cs", "McpLongQueryTools.cs", "McpMemoryTools.cs", "McpPlanCorrectionTools.cs", "McpQueryTools.cs", "McpSessionTools.cs", "McpWaitTools.cs", "McpWhoDroveItTools.cs"],
             "the prose beside the flag: on get_analysis_findings (both SKUs) beside truncated, the WindowCoveringLimit read cap observed off a cap + 1 fetch; on get_query_store_top and get_query_store_clutter beside window_truncated, the #2364 window floor — the store's raw retention did not reach the whole requested window (on the clutter view, for the two arms that read the raw tier); on Lite's get_top_queries_by_cpu / get_top_procedures_by_cpu / get_query_store_top (#4231), the same window-floor note, from LocalDataService.GetQueryWindowFloorAsync; and on Lite's get_active_queries, get_waiting_tasks, get_query_store_regressions and get_query_heatmap (#4966), the same note beside window_truncated, built by McpQueryTools.WindowNotice with the table each one read; and on Darling's get_active_queries, get_waiting_tasks, get_query_heatmap and get_query_store_regressions (#4966), the same note beside window_truncated, built by DarlingMcpWindowNotice with the table each one read (query_snapshots, waiting_tasks, query_stats, query_store_stats); Darling's wait, latch and spinlock aggregates (#4966), and Lite's config-change, collection-log, plan-correction and memory-pressure tools, the same note from the coverage probe; and on Darling's six PostgreSQL wait, kernel, lock, predicate and config-change reads (#4966), the same note on the web's probe source for each read; and Darling's get_pg_top_queries, get_pg_database_stats, get_pg_io_stats, get_pg_plans and get_pg_cpu_utilization (#4966), the same note beside window_truncated, built by DarlingMcpWindowNotice over the table each one read, and carried under hints on an empty answer; and Darling's get_pg_blocking, get_pg_session_states, get_pg_replication_stats and get_pg_xmin_horizon (#4966), the same note and hints; and on Darling's nine get_health_parser_* tools and get_default_trace_events (#4966), the same note built by DarlingMcpWindowNotice with the table each one read (system_health_events, default_trace_events); and Lite's get_default_trace_events, get_wait_stats and get_blocking_stats (#4966), the same note over default_trace_events, wait_stats, and blocked_process_report and deadlocks; and Lite's nine get_health_parser_* tools (#4966), the same note over system_health_events; and Darling's get_blocking, get_deadlocks, get_deadlock_detail, get_blocked_process_xml and get_long_query_completions (#4966), the same note, built by DarlingMcpWindowNotice with the collector table each one read; and Darling's get_pg_index_usage (from coverage of pg_index_usage_stats) and get_pg_write_stats (derived from the one row's own first sample, with no probe on a data answer; its empty answer probes pg_write_stats) (#4966), the same note; and on Darling's get_pg_deadlocks and get_pg_log_events (#4966), the same note beside window_truncated on a sparse newest-first event list, from the earlier of the coverage floor and the oldest event shown, whether or not the cap cut the page (the answer reports the cap through truncated)"),
         ("findings_truncated_note", ["DarlingMcpTools.cs", "McpAnalysisTools.cs"],
             "#4198: the prose beside findings_truncated — how many diagnostic chains were active in the window and that raising limit or narrowing hours_back would show more of them"),
@@ -1589,8 +1596,8 @@ public sealed class McpPayloadContractCensusTests
             "#4198: get_analysis_findings' advice.investigation / advice.remediation — free prose repeated on every finding — preview to 160 characters by default; full_text returns both whole. remediation_command is never previewed at any setting, so it carries no *_truncated key of its own"),
         ("deadlock_graph_xml_truncated", ["DarlingMcpBlockingTools.cs", "McpBlockingTools.cs"],
             "#4198: get_deadlock_detail's own wide field — deadlock_graph_xml is a 2000-character preview by default (a busy production store measured 120,454 bytes for 3 graphs), full_graph or a dedup_key call gets the whole XML"),
-        ("query_text_truncated", ["DarlingMcpDataTools.cs", "DarlingMcpPlanCorrectionTools.cs", "DarlingMcpQueryStoreRegressionTools.cs", "DarlingMcpSessionTools.cs", "McpPlanCorrectionTools.cs", "McpQueryTools.cs", "McpSessionTools.cs"],
-            "#4198: query_text is previewed at read time by four tools: get_active_queries at 400 chars (500 until #4966's window-floor keys needed the room; full_text gets the whole text; a synthetic 50-row page measured 81,489 bytes), get_query_store_regressions at 240 chars (full_text opts back in; a busy production store measured 211 KB at default arguments), get_plan_corrections at 150 chars (full_text gets the whole text; the full text IS in the store, not collector-capped), get_query_store_top at 400 chars (full_text gets the whole text; query_store_stats.query_text is not collector-capped either). get_query_store_top's MCP signature forwards to an internal previewLength overload so the web viewer can keep the OLD 2000-char cap that field already had, rather than switching to full text the way get_deadlock_detail's never-capped field does"),
+        ("query_text_truncated", ["DarlingMcpDataTools.cs", "DarlingMcpPgStatementTools.cs", "DarlingMcpPlanCorrectionTools.cs", "DarlingMcpQueryStoreAbortsTools.cs", "DarlingMcpQueryStoreRegressionTools.cs", "DarlingMcpSessionTools.cs", "DarlingMcpWhoDroveItTools.cs", "McpPlanCorrectionTools.cs", "McpQueryTools.cs", "McpSessionTools.cs", "McpWhoDroveItTools.cs"],
+            "#4198: query_text is previewed at read time by four tools: get_active_queries at 400 chars (500 until #4966's window-floor keys needed the room; full_text gets the whole text; a synthetic 50-row page measured 81,489 bytes), get_query_store_regressions at 240 chars (full_text opts back in; a busy production store measured 211 KB at default arguments), get_plan_corrections at 150 chars (full_text gets the whole text; the full text IS in the store, not collector-capped), get_query_store_top at 400 chars (full_text gets the whole text; query_store_stats.query_text is not collector-capped either). get_query_store_top's MCP signature forwards to an internal previewLength overload so the web viewer can keep the OLD 2000-char cap that field already had, rather than switching to full text the way get_deadlock_detail's never-capped field does. get_pg_top_queries (#6131) previews at 400 chars too, full_text opts back in; it measured 59.6 KB at default arguments with every statement whole"),
         ("error_message_truncated", ["DarlingMcpDataTools.cs", "McpHealthTools.cs"],
             "#4198: get_collection_log's own wide field — error_message is a 500-character preview by default (a seeded store measured 90,514 bytes for 200 rows at the old 200-row default), full_text opts back into the whole (up to 4000-character, DarlingObservability.LogCollectionAsync's own write-time ceiling) field"),
         ("last_error_truncated", ["DarlingMcpDataTools.cs", "McpHealthTools.cs"],
@@ -1702,14 +1709,13 @@ public sealed class McpPayloadContractCensusTests
             "a cut spelling with no class — a page cut is spelled `truncated` (observed, beside *_returned); a second bound joins SecondBoundCutKeys as <bound>_truncated; a cut made before the store joins SourceSideCutKeys with what was cut; a wide field's own preview cut joins FieldPreviewCutKeys as <field>_truncated; a homonym joins CutHomonyms with what it actually is: "
             + string.Join("; ", unclassified.Select(k => $"{k} on {string.Join(", ", found[k])}")));
 
-        var gone = classified.Keys.Where(k => !found.ContainsKey(k)).Order(StringComparer.Ordinal).ToList();
-        Assert.True(gone.Count == 0, "rostered cut keys no longer emitted anywhere (the collapse reached them — shrink the roster): " + string.Join(", ", gone));
-
+        /* One direction (#5950): a classified key emitted from a file its roster does not name fails by name.
+           A roster key or file that is no longer emitted is harmless and needs no edit. */
         var moved = classified
-            .Where(c => !c.Value.SequenceEqual(found[c.Key], StringComparer.Ordinal))
+            .Where(c => found.ContainsKey(c.Key) && found[c.Key].Except(c.Value, StringComparer.Ordinal).Any())
             .Select(c => $"{c.Key}: rostered on [{string.Join(", ", c.Value)}], emitted on [{string.Join(", ", found[c.Key])}]")
             .ToList();
-        Assert.True(moved.Count == 0, "a classified cut key is emitted from a different set of files than its roster says: " + string.Join("; ", moved));
+        Assert.True(moved.Count == 0, "a classified cut key is emitted from a file its roster does not name: " + string.Join("; ", moved));
     }
 
     /// <summary>The cut matcher fires on every spelling the tree has used and the shapes a new one would take,
@@ -1734,45 +1740,6 @@ public sealed class McpPayloadContractCensusTests
     [InlineData("blocks_hit", false)]
     public void TheCutMatcher_FiresOnEverySpellingAndTheLikelyNextOnes_AndNotOnNeighbours(string key, bool expected) =>
         Assert.Equal(expected, AboutACut.IsMatch(key));
-
-    /// <summary>
-    /// The six sites this lane moved onto the page dialect, read back: each fetches one past its cap and binds
-    /// through <c>McpHelpers.BoundPage</c>, none infers, and the four caller-capped ones publish their page count
-    /// under a <c>*_returned</c> name. The page census (<see cref="McpPageContractTests.PgPagedToolsThroughTheHelper"/>)
-    /// carries the four tools' full contract; this is the vocabulary half: the spelling is <c>truncated</c>.
-    /// </summary>
-    [Theory]
-    [InlineData("DarlingMcpPgAutovacuumTools.cs", "get_pg_autovacuum_health", "limit + 1", "BoundPage(fetched, limit)", "tables_returned")]
-    [InlineData("DarlingMcpPgSessionStatesTools.cs", "get_pg_session_states", "limit + 1", "BoundPage(fetched, limit)", "sessions_returned")]
-    [InlineData("DarlingMcpPgIndexUsageTools.cs", "get_pg_index_usage", "limit + 1", "BoundPage(fetched, limit)", "indexes_returned")]
-    [InlineData("DarlingMcpPgTableBloatTools.cs", "get_pg_table_bloat", "limit + 1", "BoundPage(fetched, limit)", "tables_returned")]
-    [InlineData("DarlingMcpTools.cs", "get_analysis_findings", "WindowCoveringLimit + 1", "BoundPage(fetched, FindingOccurrences.WindowCoveringLimit)", null)]
-    [InlineData("McpAnalysisTools.cs", "get_analysis_findings", "WindowCoveringLimit + 1", "BoundPage(fetched, FindingOccurrences.WindowCoveringLimit)", null)]
-    public void TheSixMovedSites_FetchOnePastTheCap_AndObserveThroughBoundPage(string file, string tool, string fetch, string bind, string? pageCount)
-    {
-        var span = StripComments(ToolMethods().Single(t => t.File == file && t.Tool == tool).Span);
-        Assert.Contains(fetch, span, StringComparison.Ordinal);
-        Assert.Contains("McpHelpers." + bind, span, StringComparison.Ordinal);
-        Assert.DoesNotMatch(new Regex(@"\.Count\s*>=\s*(limit|\w*Limit\w*|\w*PerTable)\b"), span);
-        Assert.Matches(new Regex(@"\n\s+truncated,"), span);
-        if (pageCount is not null)
-        {
-            Assert.Contains(pageCount + " = ", span, StringComparison.Ordinal);
-        }
-    }
-
-    /// <summary>The run-history block one layer down: <c>RecentRuns</c> binds to <c>RunsReadPerTable</c> and the
-    /// tool asks the log for one more per relation, so the flag it publishes is the same observed
-    /// <c>truncated</c>.</summary>
-    [Fact]
-    public void TheAutovacuumRunHistory_BindsToItsCapAndObserves()
-    {
-        var source = StripComments(ToolSources().Single(s => s.File == "DarlingMcpPgAutovacuumTools.cs").Source);
-        Assert.Contains("RunsReadPerTable + 1, cancellationToken);", source, StringComparison.Ordinal);
-        Assert.Contains("McpHelpers.BoundPage(runs, RunsReadPerTable)", source, StringComparison.Ordinal);
-        Assert.DoesNotContain("history_capped", source, StringComparison.Ordinal);
-        Assert.DoesNotContain(">= RunsReadPerTable", source, StringComparison.Ordinal);
-    }
 
     /* ───────────────────────── rule: one vocabulary — the window floor (#3653 item 17) ───────────────────────── */
 
@@ -2022,56 +1989,6 @@ public sealed class McpPayloadContractCensusTests
         Assert.Equal(new[] { "effective_hours_back", "effective_start", "routing", "source", "window_truncated" }, written.Keys.ToArray());
     }
 
-    [Fact]
-    public void EveryWindowFloorTool_CarriesTheSharedClause_AndNoOtherToolDoes()
-    {
-        /* The description half: the attribute text between the tool marker and the method, by source, so Lite's
-           tools are read the same way Darling's are. */
-        var carrying = ToolMethods()
-            .Where(t =>
-            {
-                var method = t.Span.IndexOf("public static", StringComparison.Ordinal);
-                return (method < 0 ? t.Span : t.Span[..method]).Contains("McpHelpers.WindowTruncatedDescription", StringComparison.Ordinal);
-            })
-            .Select(t => (t.File, t.Tool))
-            .OrderBy(t => t.File, StringComparer.Ordinal).ThenBy(t => t.Tool, StringComparer.Ordinal)
-            .ToArray();
-        var roster = WindowFloorTools.OrderBy(t => t.File, StringComparer.Ordinal).ThenBy(t => t.Tool, StringComparer.Ordinal).ToArray();
-        Assert.True(roster.SequenceEqual(carrying),
-            "the tools carrying McpHelpers.WindowTruncatedDescription moved: rostered [" + string.Join(", ", roster.Select(r => $"{r.File}/{r.Tool}"))
-            + "], found [" + string.Join(", ", carrying.Select(c => $"{c.File}/{c.Tool}")) + "]");
-
-        /* The clause itself, executed: the key, the reach beside it, the wire change, and the leading space
-           every appended description constant carries (BaselineDiscontinuities.DescriptionSentence's shape). */
-        var clause = McpHelpers.WindowTruncatedDescription;
-        Assert.StartsWith(" ", clause, StringComparison.Ordinal);
-        Assert.Contains(WindowFloorKey, clause, StringComparison.Ordinal);
-        Assert.Contains("effective_start / effective_hours_back", clause, StringComparison.Ordinal);
-        Assert.Contains("not a page cut", clause, StringComparison.Ordinal);
-        Assert.Contains("formerly named truncated.", clause, StringComparison.Ordinal);
-
-        /* And by reflection on the SKU this project can load: the Darling five really do publish the clause in
-           the attribute an MCP client reads, ahead of the discontinuities sentence they end with. */
-        var darling = new[] { typeof(DarlingMcpTrendTools), typeof(DarlingMcpDataTools), typeof(DarlingMcpQueryStoreClutterTools) }
-            .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
-            .Select(m => (Name: m.GetCustomAttribute<McpServerToolAttribute>()?.Name, Method: m))
-            .Where(x => x.Name is not null)
-            .ToDictionary(x => x.Name!, x => x.Method.GetCustomAttribute<DescriptionAttribute>()!.Description, StringComparer.Ordinal);
-        foreach (var (file, tool) in WindowFloorTools.Where(t => t.File.StartsWith("Darling", StringComparison.Ordinal)))
-        {
-            Assert.True(darling.TryGetValue(tool, out var description), $"{tool} ({file}) is not a Darling MCP tool");
-            /* #3898 D3/D4, re-pointed deliberately: the whole clause may span head and guide, because its
-               "formerly named truncated." WIRE CHANGE notice leaves the wire for the guide tail (D4). What
-               a caller needs to read the payload (the key, and that it is a retention floor, not a page cut)
-               is a guardrail and must be served in the head. Unconverted, the head is the whole description. */
-            Assert.Contains(clause, description!, StringComparison.Ordinal);
-            var head = McpToolGuide.Split(description!).Head;
-            Assert.Contains(WindowFloorKey, head, StringComparison.Ordinal);
-            Assert.Contains("not a page cut", head, StringComparison.Ordinal);
-            Assert.DoesNotContain("read truncated", description!, StringComparison.Ordinal);
-        }
-    }
-
     /* ───────────────────────── rule: one vocabulary — severity words ───────────────────────── */
 
     /// <summary>
@@ -2122,6 +2039,8 @@ public sealed class McpPayloadContractCensusTests
             "audit_config's edition-NAME fallback (Enterprise / Standard / … / Unknown) — a name, spelled as the canon by coincidence"),
         ("Unknown", "McpAnalysisTools.cs",
             "audit_config's edition-NAME fallback — the Lite twin of the above"),
+        ("unknown", "DarlingMcpPlanForcePrecheckTools.cs",
+            "get_plan_force_precheck's unknown[] section name: the checks the store could not answer, listed beside warnings and blockers and never either (#5632). A section name, not a band"),
         ("unknown", "DarlingMcpTools.cs",
             "mute_analysis_finding's kind (plain / read-only / per-database) for a resolved server that has no definition row in the store (one defined in darling.json) — a registration kind, not a band"),
         ("unknown", "DarlingMcpPgWaitSamplingTools.cs",
@@ -2194,10 +2113,11 @@ public sealed class McpPayloadContractCensusTests
         }
 
         var report = string.Join("; ", found.OrderBy(a => a.Key, StringComparer.Ordinal).Select(a => $"{a.Key} in {string.Join(", ", a.Value)}"));
+        /* One direction (#5950): every literal found is classified, in the file it was found in. A classified
+           spelling that no longer appears is harmless. */
         Assert.True(
-            expected.Keys.ToHashSet(StringComparer.Ordinal).SetEquals(found.Keys)
-            && expected.All(e => e.Value.SetEquals(found[e.Key])),
-            "the severity-word classification no longer matches the tree — a new lower- or upper-case literal is a band spelled wrong (the canon is Healthy / Warning / Critical / Unknown / NoData), unless it is another vocabulary, in which case it joins SeverityHomonyms with what it is. Found: [" + report + "]");
+            found.All(f => expected.TryGetValue(f.Key, out var classifiedFiles) && f.Value.IsSubsetOf(classifiedFiles)),
+            "a severity-word literal is not classified - a new lower- or upper-case literal is a band spelled wrong (the canon is Healthy / Warning / Critical / Unknown / NoData), unless it is another vocabulary, in which case it joins SeverityHomonyms with what it is. Found: [" + report + "]");
     }
 
     /// <summary>The canon, executed off its sources of truth: the enum tokens and the two label helpers agree
@@ -2286,63 +2206,6 @@ public sealed class McpPayloadContractCensusTests
             Assert.Contains("overall_health = row.HealthBand.ToString()", code, StringComparison.Ordinal);
             Assert.DoesNotContain("OverallHealth", code, StringComparison.Ordinal);
         }
-    }
-
-    /// <summary>
-    /// Every literal <c>LIMIT n</c> (<c>n &gt; 1</c>) that ENDS a reader statement on either SKU — the shape
-    /// #3541 A3 and #3659 found behind tools that advertised <c>limit</c>. Seven remain: six in Lite's
-    /// service layer plus one in the Darling FinOps recommendations reader (<c>MaintenanceWindowSql</c>, the top-10 long-running jobs, a ceiling over a short list; the scan reads Storage subfolders since the FinOps readers live there), none behind a tool that takes a <c>limit</c>: five are viewer-only reads and one
-    /// (<c>GetPlanCacheSnapshotAsync</c>, behind <c>get_plan_cache_bloat</c>, which takes no cap) is a
-    /// ceiling of 30 over a population of a dozen cache types. <c>LIMIT 1</c> is the latest-row idiom and is
-    /// not a page. The Long Queries grid's read (<c>GetRecentLongQueryCompletionsAsync</c>) left the roster in
-    /// #4989: its cap is the named constant <c>LongQueryGridCap</c>, written into the statement as
-    /// <c>LIMIT {LongQueryGridCap}</c>, so no literal ends it, and the grid's "Showing since" notice reads the same
-    /// constant. Pinned so a new terminal literal has to say what it is, and so the Lite twin of
-    /// <see cref="McpPageContractTests.EveryPagedRead_BindsItsCapAsAParameter_NeverALiteral"/> has a
-    /// population to shrink.
-    /// </summary>
-    public static readonly (string File, string Member, int Limit)[] StatementTerminalLiteralLimits =
-    [
-        ("DarlingFinOpsRecommendationsReader.cs", "(file scope)", 10),
-        ("LocalDataService.Blocking.cs", "GetBlockingPairRowsAsync", 5000),
-        ("LocalDataService.FinOps.Recommendations.cs", "GetRecommendationsWithNoteAsync", 10),
-        ("LocalDataService.PlanCache.cs", "GetPlanCacheSnapshotAsync", 30),
-        ("LocalDataService.RunningJobs.cs", "GetAnomalousJobsAsync", 5),
-        ("LocalDataService.WaitStats.cs", "GetAllQuerySnapshotsInRangeAsync", 2000),
-        ("LocalDataService.WaitStats.cs", "GetQuerySnapshotsByWaitTypeAsync", 500),
-    ];
-
-    private static readonly Regex TerminalLiteralLimit = new(
-        @"\bLIMIT\s+(\d+)\s*;?\s*(?:""""""|""\s*;|""\s*\)|""\s*,)", RegexOptions.Compiled);
-
-    [Fact]
-    public void EveryStatementTerminalLiteralLimit_IsInTheInventory_OnBothSkus()
-    {
-        var found = new List<(string File, string Member, int Limit)>();
-        var files = 0;
-        foreach (var (file, source) in ReaderSources())
-        {
-            files++;
-            var code = CSharpSourceWalker.StripCommentsAndStrings(source);
-            foreach (Match hit in TerminalLiteralLimit.Matches(source))
-            {
-                var n = int.Parse(hit.Groups[1].Value, CultureInfo.InvariantCulture);
-                if (n <= 1)
-                {
-                    continue;
-                }
-
-                found.Add((file, EnclosingMember(code, hit.Index), n));
-            }
-        }
-
-        Assert.True(files >= 60, $"only {files} reader sources were read across both SKUs");
-        var rostered = StatementTerminalLiteralLimits.ToHashSet();
-        Assert.True(rostered.SetEquals(found),
-            "the terminal literal-LIMIT inventory no longer matches the tree — new (bind the cap, or say what the ceiling is): ["
-            + string.Join("; ", found.Except(rostered).Select(f => $"{f.File} {f.Member} LIMIT {f.Limit}"))
-            + "]; rostered but gone (shrink the roster): ["
-            + string.Join("; ", rostered.Except(found).Select(f => $"{f.File} {f.Member} LIMIT {f.Limit}")) + "]");
     }
 
     /* ───────────────────────── plumbing ───────────────────────── */

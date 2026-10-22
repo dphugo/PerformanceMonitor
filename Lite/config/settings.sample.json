@@ -62,6 +62,28 @@
   "alert_poison_wait_enabled": true,
   "alert_poison_wait_threshold_ms": 500,
 
+  // ---- Runnable queue (#5641) --------------------------------------------------------
+  // Alerts on the AVERAGE runnable tasks per scheduler over the collections of the last 5 minutes
+  // (at least 3; otherwise the newest 3 if all fall in the last 10 minutes (or in 4 times the gap between cpu_scheduler_stats collections when that is longer, so the Low-Impact preset's 5-minute collection still evaluates)). The bars are whole numbers: Warning at least 1, Critical never below
+  // Warning (a lower Critical is raised to the Warning bar).
+  "alert_runnable_queue_enabled": true,
+  "alert_runnable_queue_warning_per_scheduler": 8,
+  "alert_runnable_queue_critical_per_scheduler": 16,
+
+  // ---- Client timeouts (#5640) -------------------------------------------------------
+  // Alerts on client attentions (a client cancelled a query or its timeout expired) per minute over the
+  // covered span of the attention collector's last runs (about 3 minutes). OFF by default. Since #5736 the
+  // two per-minute settings are FLOORS: each bar is the higher of its floor and a multiple of the server's
+  // own baseline (the p99.9 of its 3-minute average rate over the last 7 days). A server with under a day
+  // of capture, or under 720 minutes with a successful run, is graded on the floors alone. The floors and
+  // multiples are whole numbers: floor at least 1, multiple at least 1, Critical never below Warning (a
+  // lower Critical is raised to the Warning one).
+  "alert_client_timeouts_enabled": false,
+  "alert_client_timeouts_warning_per_minute": 10,
+  "alert_client_timeouts_critical_per_minute": 60,
+  "alert_client_timeouts_warning_multiple": 3,
+  "alert_client_timeouts_critical_multiple": 10,
+
   // ---- Long-running queries ----------------------------------------------------------
   // The five exclude_* switches suppress the queries that are long-running by design and
   // would otherwise be the only thing this alert ever reports.
@@ -90,6 +112,11 @@
   // ---- Database exclusions ------------------------------------------------------------
   // Applies to every alert type. Names only; anything blank is dropped on read.
   "alert_excluded_databases": [],
+
+  // ---- Volume exclusions ----------------------------------------------------------------
+  // Mount points the Volume Free Space alert ignores on every server, e.g. ["S:\\", "/mnt/scratch"].
+  // The whole mount point, any case; a trailing \ or / is ignored. Anything blank is dropped on read.
+  "alert_excluded_volumes": [],
 
   // ---- tempdb ---------------------------------------------------------------------------
   "alert_tempdb_space_enabled": true,
@@ -150,6 +177,11 @@
   "color_theme": "Dark",               // "Dark" | "Light" | "CoolBreeze"
   "default_time_range_hours": 4,       // initial range on every chart, in whole hours (older builds read only this)
   "default_time_range": "",            // optional (#5562), wins over the hours key: "30m" | "2d" | "1mo" | "today" | "previous-week" ... ("" = use the hours key)
+  // The Alert Details window's last size (#5847), written by the app when the window closes. 0 = the
+  // window's own default size; values are kept within 0-10000, and a size below the window's minimum
+  // (480 x 360) is not restored.
+  "alert_detail_window_width": 0,
+  "alert_detail_window_height": 0,
 
   // ---- Auto-refresh (#3479) ------------------------------------------------------------------------
   // The server-tab toolbar's Auto-refresh checkbox and interval picker, written by the app when
@@ -167,6 +199,7 @@
   // Written by the app as you use it, not settings you would normally hand-edit.
   "overview_sort_mode": "Cpu",         // "Cpu" | "Name"; unrecognised -> "Cpu"
   "collapsed_fleet_groups": [],        // tag-group headers left collapsed in the sidebar
+  "settings_window_tab": "",          // the Settings tab open when it last closed ("AlertRulesTab"); "" or unknown -> first tab
 
   // ---- Update check ------------------------------------------------------------------------------
   // NO UI. Off = Lite never contacts github.com on its own; the sidebar's About button
@@ -198,6 +231,8 @@
   "generic_webhook_enabled": false,
   "generic_proxy_address": "",
   "generic_body_template": "",
+  "generic_signing_set": false,
+  "generic_signing_until": "",
   "pagerduty_webhook_enabled": false,
   "pagerduty_use_eu_region": false,
   "pagerduty_proxy_address": "",
@@ -244,6 +279,24 @@
   // window is the supported route: that path also opens the firewall and restarts the host.
   "mcp_enabled": false,
   "mcp_port": 5151,
+  // NO UI. Off by default. The MCP write tools (mute_analysis_finding and unmute_analysis_finding) are served only
+  // when this is true; with it off a call to one fails as an unknown tool. Change it, then restart Lite. Mutes that
+  // already exist stay in force while it is off; turn it on to remove one with unmute_analysis_finding.
+  // Lite's MCP endpoint has no token or caller check: with this on, ANY program on this computer that can reach
+  // the port can mute or unmute analysis findings. Leave it off unless you trust every program that runs here.
+  "mcp_allow_writes": false,
+  // NO UI. Off by default. Serves the four investigation tools (list_investigation_requests, claim_investigation_request,
+  // submit_investigation_report, get_investigation_reports) only when this is true AND mcp_allow_writes is false: with
+  // both on, the investigation tools stay off and Lite logs one Critical line. With it off a call to one fails as an
+  // unknown tool. Change it, then restart Lite. There is no token: with this on, ANY program on this computer that can
+  // reach the port can list, claim and report on investigation requests.
+  "mcp_allow_investigations": false,
+  // NO UI. How much collected data the MCP answers hand out: "full" (the default), "maskLiterals" (statement text keeps
+  // its shape with every literal replaced) or "metadataOnly" (statement text, plans and input buffers are withheld, logins
+  // and host names are masked, each as the same login#xxxxxxxx or host#xxxxxxxx pseudonym in every answer; the key is kept in
+  // Windows Credential Manager as PerformanceMonitorLite_PseudonymKey and is never exported). Any other word keeps the MCP endpoint off and names the accepted words in the log.
+  // Change it, then restart Lite.
+  "mcp_data_detail": "full",
 
   // ---- Plan analysis (#4535) ------------------------------------------------------------------------------
   // NO UI. Per-rule overrides for the plan analyzer (the analyze_query_plan / analyze_procedure_plan /

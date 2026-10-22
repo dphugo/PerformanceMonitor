@@ -24,6 +24,7 @@ namespace Darling.Tests;
 /// Pins for <c>get_finops_inventory</c> that need no store: the tool surface, the refusals (which the tool decides
 /// before it touches the data source), and the row shape on hand-built inventory rows.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpFinOpsInventoryToolsTests
 {
     private static ServerInventoryDto Dto(
@@ -112,6 +113,19 @@ public sealed class DarlingMcpFinOpsInventoryToolsTests
         Assert.Equal(score, row.GetProperty("health_score").GetInt32());
         Assert.Equal(FinOpsUtilizationFigures.HealthBand(score), row.GetProperty("health_band").GetString());
         Assert.Equal(band, row.GetProperty("health_band").GetString());
+    }
+
+    /// <summary>#5633 item 20: no cost set is null with a reason, as every other FinOps tool says it, not a 0 that reads as a free server.</summary>
+    [Fact]
+    public void Row_WithNoCostSet_IsNullWithTheSameReasonTheOtherFinOpsToolsGive()
+    {
+        var row = Row(Dto(monthly: 0m), new ServerMetricsDto(12.25m, 3.05m, 4, "RIGHT_SIZED"));
+        Assert.False(row.TryGetProperty("monthly_cost_usd", out _), "null fields are left out of the row");
+        Assert.False(row.TryGetProperty("annual_cost_usd", out _));
+        Assert.Equal("monthly cost not set", row.GetProperty("cost_reason").GetString());
+
+        var priced = Row(Dto(monthly: 100m), new ServerMetricsDto(12.25m, 3.05m, 4, "RIGHT_SIZED"));
+        Assert.False(priced.TryGetProperty("cost_reason", out _));
     }
 
     [Fact]

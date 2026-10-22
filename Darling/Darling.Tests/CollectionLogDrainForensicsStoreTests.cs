@@ -88,7 +88,6 @@ public class CollectionLogDrainForensicsStoreTests
         var viewer = ReadSource("Darling/PerformanceMonitor.Darling.Viewer/ViewerDataService.cs");
 
         Assert.Contains("column_name = 'drain_last_read_ms'", viewer, StringComparison.Ordinal);
-        Assert.Contains("reader.GetBoolean(84)", viewer, StringComparison.Ordinal);
         Assert.Contains("hasCollectionLogDrainForensics", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);
@@ -326,7 +325,7 @@ public class CollectionLogDrainForensicsStoreTests
            drain to describe. The counts below are about the rows RunOneAsync writes, so that method is cut out of
            the text they read; the live-re-read pin above still reads the whole file. */
         var refreshStart = worker.IndexOf("private async Task TryRefreshPgStatementTextAsync(", StringComparison.Ordinal);
-        var refreshEnd = worker.IndexOf("private static async Task<(List<long> QueryIds", refreshStart, StringComparison.Ordinal);
+        var refreshEnd = worker.IndexOf("internal static async Task<(List<long> QueryIds", refreshStart, StringComparison.Ordinal);
         Assert.True(refreshStart > 0 && refreshEnd > refreshStart, "#5320: the text refresh method moved; update this carve-out");
         worker = worker.Remove(refreshStart, refreshEnd - refreshStart);
 

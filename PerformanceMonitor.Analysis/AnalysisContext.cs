@@ -161,7 +161,12 @@ public class AnalysisContext
     public static TimeSpan? LatestValueLookbackFor(int frequencyMinutes) =>
         frequencyMinutes <= 0
             ? null
-            : TimeSpan.FromMinutes(Math.Max(LatestValueLookback.TotalMinutes, 2.0 * frequencyMinutes));
+            : TimeSpan.FromMinutes(Math.Max(LatestValueLookback.TotalMinutes, 2.0 * Math.Min(frequencyMinutes, MaxLookbackFrequencyMinutes)));
+
+    /// <summary>The longest collector frequency the look-back honours, in minutes (one year): the same cap as
+    /// <c>CollectorScheduleDefaults.MaxFrequencyMinutes</c>, which this project cannot reference. A stored frequency above it would
+    /// push the look-back start before the earliest date a timestamp can hold (#6227).</summary>
+    public const int MaxLookbackFrequencyMinutes = 525_600;
 
     /// <summary>
     /// Each latest-value read's lower bound for this pass, keyed by the collector that feeds it (#3896) —
@@ -242,6 +247,15 @@ public class AnalysisContext
     public IReadOnlyList<PlanRegressionOffender>? PlanRegressionOffenders { get; set; }
 
     /// <summary>
+    /// The queries whose timeouts (Aborted runs) or errors (Exception runs) rose, as the PLAN_REGRESSION fact read them
+    /// this pass (#6267), stamped by the fact collector after that read. Null until then, and null when the read failed.
+    /// The regressed-queries drill-down lists them next to the cost offenders. A pass with failures and no cost offender
+    /// has an empty <see cref="PlanRegressionOffenders"/>, which the cost drill-down reads as "every query": it checks
+    /// this list first, so a fact raised by failures alone does not list cost rows it never reported.
+    /// </summary>
+    public IReadOnlyList<PlanRegressionFailureRule.Failure>? PlanRegressionFailures { get; set; }
+
+    /// <summary>
     /// Which source the PLAN_REGRESSION fact read this pass on Darling (#3953): true for the latest-snapshot interval
     /// table, false for the raw Query Store slice, null when the fact did not decide (it did not run, or this is
     /// Lite, which has no such table). The regressed-queries drill-down reads the SAME source, so it can always
@@ -257,6 +271,28 @@ public class AnalysisContext
     /// pass uses. The regressed-queries drill-down starts its window here when set, so its best plan is one the fact saw.
     /// </summary>
     public DateTime? PlanRegressionWindowStart { get; set; }
+
+    /// <summary>
+    /// Darling only (#5812): true when this pass may reuse the PLAN_REGRESSION candidate rows an earlier current pass on
+    /// the same server read, while they are fresh (<c>PgFactCollector.PlanRegressionCandidateCache</c>). Set by the
+    /// current-time on-demand callers (<c>analyze_server</c> and <c>get_analysis_facts</c> with no <c>as_of</c>). The
+    /// scheduled pass never sets it: it sets <see cref="RefreshPlanRegressionCandidates"/> instead. False everywhere else, so
+    /// a past <c>as_of</c> and every other caller read live, as before.
+    /// </summary>
+    public bool ReusePlanRegressionCandidates { get; set; }
+
+    /// <summary>
+    /// Darling only (#5812): true for the scheduled pass with no <c>as_of</c>. It never reuses PLAN_REGRESSION candidates; it
+    /// always reads and refills the cache, so the scheduled pass stays as fresh as before and the MCP and viewer calls that
+    /// follow within one analysis cadence reuse its read. False everywhere else.
+    /// </summary>
+    public bool RefreshPlanRegressionCandidates { get; set; }
+
+    /// <summary>
+    /// #5824: how long this pass's PLAN_REGRESSION read took, in milliseconds, whatever its outcome. Null when the read did
+    /// not run on this pass (an engine whose collector has no such read, or a pass that ended before it).
+    /// </summary>
+    public long? PlanRegressionReadMs { get; set; }
 
     /// <summary>
     /// Records one failed read. <paramref name="family"/> is the family label the caveat counts by
@@ -588,6 +624,14 @@ public sealed class WindowCoverage
 
     /// <summary>Distinct collections whose rows landed inside the window (the orphan first row included).</summary>
     public int SampleCount { get; init; }
+
+    /// <summary>When the first collection inside the window landed (UTC), or null when none did. With
+    /// <see cref="LastSampleTime"/> it lets the empty-window message say when collection came back instead of
+    /// guessing that it is still down (#6132).</summary>
+    public DateTime? FirstSampleTime { get; init; }
+
+    /// <summary>When the latest collection inside the window landed (UTC), or null when none did.</summary>
+    public DateTime? LastSampleTime { get; init; }
 
     /// <summary>
     /// The longest single unobserved stretch inside the window, in milliseconds: the largest interval

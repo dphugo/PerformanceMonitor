@@ -30,7 +30,6 @@ namespace Lite.Tests;
 /// dispatcher's five seconds, this host declares its own, and the declaration demonstrably ARRIVES rather
 /// than falling back to the default while looking configured.</para>
 /// </summary>
-[Trait("Reads", "Darling")]
 [Trait("Stage", "Guard")]
 public sealed class WriteLockBudgetTests
 {
@@ -283,9 +282,17 @@ public sealed class WriteLockBudgetTests
     {
         var source = ParitySource.ReadFile("Lite/Services/LocalDataService.cs");
 
-        Assert.Contains("AcquireWriteLock(timeout: WriteLockBudget)", source, StringComparison.Ordinal);
+        /* #5650: two entry points, each taking its instance's budget, which defaults to the host's static. The call goes on
+           with the caller's name (holderMember, holderFile), so the pin ends at the budget's comma. */
+        Assert.Contains("AcquireWriteLock(timeout: _backgroundWriteLockBudget,", source, StringComparison.Ordinal);
+        Assert.Contains("AcquireWriteLock(timeout: _userWriteLockBudget,", source, StringComparison.Ordinal);
+        Assert.Contains(": this(duckDb, WriteLockBudget, UserWriteLockBudget)", source, StringComparison.Ordinal);
         Assert.DoesNotContain("AcquireWriteLock(timeout: TimeSpan.", source, StringComparison.Ordinal);
     }
+
+    /* #5650: the callers of the two entry points, each named. A user write (a click) gets the 30 s budget; a
+       background caller that skips and retries on its own gets 5 s. A NEW caller of either fails this test until it
+       is added to the right list - which is the point: 30 s must be a decision, not an accident. */
 
     /* ── derivations ── */
 

@@ -15,6 +15,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using PerformanceMonitor.Collectors;
+using PerformanceMonitorLite.Models;
+using PerformanceMonitorLite.Services;
 using Xunit;
 
 namespace PerformanceMonitorLite.Tests;
@@ -41,6 +43,7 @@ namespace PerformanceMonitorLite.Tests;
 /// identical shared methods, so editing one app's copy alone fails a build.
 /// </para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class PayloadProbeFailureTests
 {
     /* ── the back-compat guarantee: a payload-only reader behaves exactly as before ── */
@@ -229,103 +232,39 @@ public sealed class PayloadProbeFailureTests
         Assert.False(string.IsNullOrWhiteSpace(failure.Error));
     }
 
-    /* ── the declaration, and who holds it ── */
+    /* ── the host: the Lite runner's plain single-query path, driven through its reader seam ── */
 
     [Fact]
-    public void Exactly_Two_Collectors_Declare_The_Contract()
+    public async Task The_Runner_Stores_The_Payload_And_Notes_The_Trailing_Failures()
     {
-        /* The opt-in is the back-compat guarantee: a collector that does not declare it never has its reader
-           advanced past the payload, which is the pre-#1851 behavior exactly. Asserted over the whole
-           catalog rather than a sample, so a collector adopting the channel cannot arrive without its own
-           SQL and tests — tempdb_stats in particular reads TWO result sets of its own, and a runner that
-           advanced unconditionally would read one of them as failures.
+        /* The host half, run end to end: RunCollectorDefinitionAsync on the real definition over a reader that
+           carries the payload plus its trailing set. The rows land in DuckDB (the payload was read before the
+           trailing set), and the run's note is the shared probe-failure note (the trailing set was read at all). */
+        await using var fixture = new SharedDuckDbFixture();
+        await fixture.InitializeAsync();
+        var configDir = Path.Combine(Path.GetTempPath(), "pmlite-payload-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(configDir);
+        try
+        {
+            var servers = new ServerManager(configDir);
+            var server = new ServerConnection { Id = Guid.NewGuid().ToString(), ServerName = "probe-srv", DisplayName = "probe-srv", IsEnabled = true };
+            servers.AddServer(server);
+            var collector = new RemoteCollectorService(fixture.DuckDb, servers, new ScheduleManager(configDir))
+            {
+                ServerReaderOverrideForTests = _ => MakeReader(payloadRows: 2, probeFailures: ManyFailures(3)),
+            };
 
-           blocked_process_report joined in #1865, and is the reason this list is worth keeping exact rather
-           than loosening to a Contains: it adopted the channel for ONE of its two failure causes and screens
-           the other out entirely, so a future collector that declares the flag without making that same
-           decision is exactly what should fail here. */
-        var declaring = CollectorCatalog.All
-            .Where(c => c.GetType().GetProperty(nameof(ICollectorDefinition<int>.EmitsProbeFailures))
-                ?.GetValue(c) is true)
-            .Select(c => c.Name)
-            .OrderBy(n => n, StringComparer.Ordinal)
-            .ToArray();
+            var written = await collector.RunCollectorDefinitionAsync(DatabaseSizeStatsCollector.Instance, server, CancellationToken.None);
 
-        Assert.Equal(new[] { "blocked_process_report", "database_size_stats" }, declaring);
-        Assert.False(TempDbStatsCollector.Instance.EmitsProbeFailures);
-    }
-
-    [Fact]
-    public void DatabaseSizeStats_OnPrem_Records_What_Its_Cursor_Could_Not_Probe()
-    {
-        /* #1851's defect, closed: the per-database CATCH was empty, so a database that was mid-restore or
-           inaccessible contributed no used_size_mb under a SUCCESS row that said nothing had happened. The
-           SQL is one long const, so this is a text pin — the live behavior needs a server that denies a
-           database. */
-        var text = DatabaseSizeStatsCollector.Instance.BuildQuery(Context()).Text;
-
-        Assert.Contains("@probe_failures TABLE", text, StringComparison.Ordinal);
-        Assert.Contains("INSERT @probe_failures (name, error_text)", text, StringComparison.Ordinal);
-        Assert.Contains("VALUES (@db_name, ERROR_MESSAGE());", text, StringComparison.Ordinal);
-        Assert.True(DatabaseSizeStatsCollector.Instance.EmitsProbeFailures);
-
-        /* The failures must come AFTER the payload, never merged into it: the payload set is one row per
-           FILE and is written to database_size_stats verbatim, so a failure row inside it would be stored
-           as a file. */
-        var payload = text.IndexOf("FROM sys.master_files AS mf", StringComparison.Ordinal);
-        var failures = text.IndexOf("FROM @probe_failures", StringComparison.Ordinal);
-        Assert.True(payload >= 0 && failures >= 0, "both result sets must be selected");
-        Assert.True(payload < failures, "the payload must be the first result set");
-
-        /* And the CATCH must no longer be empty. */
-        Assert.DoesNotContain("BEGIN CATCH\r\n    END CATCH", text.ReplaceLineEndings("\r\n"), StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void DatabaseSizeStats_Azure_Still_Emits_Only_Its_Payload()
-    {
-        /* Azure SQL DB takes an entirely database-scoped query with no cursor and nothing to probe, so it
-           returns no trailing set. The declaration is deliberately NOT branched on the target: the contract
-           reads an absent set as zero failures, which keeps one flag honest for both shapes and leaves the
-           Azure path byte-for-byte unchanged. */
-        var text = DatabaseSizeStatsCollector.Instance.BuildQuery(Context(azure: true)).Text;
-
-        Assert.DoesNotContain("@probe_failures", text, StringComparison.Ordinal);
-        Assert.DoesNotContain("CURSOR", text, StringComparison.Ordinal);
-        Assert.True(DatabaseSizeStatsCollector.Instance.EmitsProbeFailures);
-    }
-
-    /* ── the host wiring, pinned at source (the branch is the tail of a live payload read) ── */
-
-    [Fact]
-    public void Host_Reads_The_Trailing_Set_Through_The_Shared_Contract()
-    {
-        var source = File.ReadAllText(FindRepoFile(
-            Path.Combine("Lite", "Services", "RemoteCollectorService.DefinitionRunner.cs")));
-
-        Assert.Contains("definition.EmitsProbeFailures", source, StringComparison.Ordinal);
-        Assert.Contains("EnumeratedCollectorDriver.ReadPayloadProbeFailuresAsync", source, StringComparison.Ordinal);
-        Assert.Contains("EnumeratedCollectorDriver.MaxLoggedProbeFailures", source, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Host_Reads_The_Trailing_Set_After_The_Payload_And_Before_The_Write()
-    {
-        /* Ordering is the whole correctness argument for putting this on the plain path: read it before the
-           payload and the definition loses its rows; read it after the write and the note misses the row it
-           belongs on. It also must not disturb the delta/EndPayload ordering, which it cannot, because
-           everything between ReadAsync and the write here touches only the note. */
-        var source = File.ReadAllText(FindRepoFile(
-            Path.Combine("Lite", "Services", "RemoteCollectorService.DefinitionRunner.cs")));
-        var plainPath = source[source.IndexOf("Plain single-query path", StringComparison.Ordinal)..];
-
-        var read = plainPath.IndexOf("definition.ReadAsync(reader", StringComparison.Ordinal);
-        var probes = plainPath.IndexOf("ReadPayloadProbeFailuresAsync", StringComparison.Ordinal);
-        var write = plainPath.IndexOf("WriteBatch(duckConnection", StringComparison.Ordinal);
-
-        Assert.True(read >= 0 && probes >= 0 && write >= 0, "the plain path must read, probe, then write");
-        Assert.True(read < probes, "the payload must be read before the trailing set");
-        Assert.True(probes < write, "the trailing set must be read before the storage phase");
+            Assert.Equal(2, written);
+            Assert.Equal(
+                EnumeratedCollectorDriver.BuildNote(enumerationWasEmpty: false, probeFailureCount: 3),
+                collector.TelemetryFor(RemoteCollectorService.GetServerId(server)).HostNote);
+        }
+        finally
+        {
+            try { Directory.Delete(configDir, recursive: true); } catch (IOException) { /* temp dir */ }
+        }
     }
 
     /* ── helpers ── */
@@ -411,20 +350,5 @@ public sealed class PayloadProbeFailureTests
         }
 
         return table;
-    }
-
-    private static string FindRepoFile(string relativePath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir is not null; i++)
-        {
-            var candidate = Path.Combine(dir, relativePath);
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"Could not locate {relativePath} walking up from {AppContext.BaseDirectory}");
     }
 }

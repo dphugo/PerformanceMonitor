@@ -223,6 +223,21 @@ public partial class App : Application
     public static int AlertDeadlockThreshold { get; set; } = 1;
     public static bool AlertPoisonWaitEnabled { get; set; } = true;
     public static int AlertPoisonWaitThresholdMs { get; set; } = 500;
+    /* #5641: the Runnable Queue alert - runnable tasks per visible online scheduler, averaged over the last 5 minutes' collections
+       (at least 3, else the newest 3 inside 10 minutes). The pair is
+       clamped on read by RunnableQueueEvaluator.ClampBars (Warning at least 1, Critical never below Warning). */
+    public static bool AlertRunnableQueueEnabled { get; set; } = true;
+    public static int AlertRunnableQueueWarningPerScheduler { get; set; } = PerformanceMonitor.Alerting.RunnableQueueEvaluator.DefaultWarningPerScheduler;
+    public static int AlertRunnableQueueCriticalPerScheduler { get; set; } = PerformanceMonitor.Alerting.RunnableQueueEvaluator.DefaultCriticalPerScheduler;
+    /* #5640: the Client Timeouts alert - client attentions (cancels and timeouts) per minute over the covered span. OFF by default
+       (the bars are a guess until checked against captured data). The pair is clamped on read by AttentionEvaluator.ClampBars. */
+    public static bool AlertClientTimeoutsEnabled { get; set; }
+    public static int AlertClientTimeoutsWarningPerMinute { get; set; } = PerformanceMonitor.Alerting.AttentionEvaluator.DefaultWarningPerMinute;
+    public static int AlertClientTimeoutsCriticalPerMinute { get; set; } = PerformanceMonitor.Alerting.AttentionEvaluator.DefaultCriticalPerMinute;
+    /* #5736: the two bars above are FLOORS. The bar in force for a server is the higher of its floor and the multiple times the server's own
+       baseline (the p99.9 of its 3-minute average attention rate over the last 7 days). The pair is clamped on read by AttentionBaselineMath.ClampMultiples. */
+    public static int AlertClientTimeoutsWarningMultiple { get; set; } = PerformanceMonitor.Alerting.AttentionBaselineMath.DefaultWarningMultiple;
+    public static int AlertClientTimeoutsCriticalMultiple { get; set; } = PerformanceMonitor.Alerting.AttentionBaselineMath.DefaultCriticalMultiple;
     public static bool AlertLongRunningQueryEnabled { get; set; } = true;
     public static int AlertLongRunningQueryThresholdMinutes { get; set; } = 30;
     public static int AlertLongRunningQueryMaxResults { get; set; } = 5;
@@ -243,6 +258,9 @@ public partial class App : Application
     public static List<string> AlertLongRunningQueryExcludedProgramNamePrefixes { get; set; } = LongRunningQueryExclusions.DefaultProgramNamePrefixes.ToList();
     public static List<string> AlertLongRunningQueryExcludedLogins { get; set; } = LongRunningQueryExclusions.DefaultLogins.ToList();
     public static List<string> AlertExcludedDatabases { get; set; } = new();
+    /* #6098: mount points the Volume Free Space alert ignores on every server (VolumeExclusions is the match
+       rule). Empty by default; persisted as the alert_excluded_volumes array, edited on the Alerts tab. */
+    public static List<string> AlertExcludedVolumes { get; set; } = new();
     public static bool AlertTempDbSpaceEnabled { get; set; } = true;
     public static int AlertTempDbSpaceThresholdPercent { get; set; } = 80;
     public static bool AlertLowDiskEnabled { get; set; } = true;
@@ -325,8 +343,19 @@ public partial class App : Application
     /* Color theme ("Dark" or "Light") */
     public static string ColorTheme { get; set; } = "Dark";
 
+    /// <summary>The Alert Details window's last size (#5847), so a window enlarged to read a long blocking alert opens at
+    /// that size next time. 0 = never resized: the window's own default size.</summary>
+    public static double AlertDetailWindowWidth { get; set; }
+
+    /// <summary>The Alert Details window's last height (#5847); see <see cref="AlertDetailWindowWidth"/>.</summary>
+    public static double AlertDetailWindowHeight { get; set; }
+
     /* NOC Overview tile sort ("Cpu" = CPU% descending default, or "Name") */
     public static ServerOverviewSortMode OverviewSortMode { get; set; } = ServerOverviewSort.Default;
+
+    /// <summary>The Settings window tab open when it last closed (#5846), by the tab's name ("AlertRulesTab"). Empty, or
+    /// a name no tab has any more, opens the first tab. Written by the Settings window on close.</summary>
+    public static string SettingsWindowTab { get; set; } = "";
 
     /// <summary>Sidebar fleet-tree groups the user has collapsed (#2020 2b-i-b), each a
     /// <c>FleetGroupKey.ToStorageString()</c> value ("Favorites" / "Untagged" / "Tag:{id}"), so expand/collapse
@@ -357,6 +386,11 @@ public partial class App : Application
     public static string GenericWebhookBodyTemplate { get; set; } = "";
     public static string GenericWebhookProxyAddress { get; set; } = "";
 
+    /* #6012: the settings row's generic signing key. Only these two facts are plain prefs (settings.json): whether a key is saved
+       and when the previous key stops signing. The keys themselves are in Credential Manager (LiteWebhookSigningKeys). */
+    public static bool GenericSigningSet { get; set; } = false;
+    public static DateTime? GenericSigningUntilUtc { get; set; }
+
     /* PagerDuty webhook settings — Events API v2. The routing key is a bearer secret like the Teams/Slack
        URLs, so it lives in Credential Manager, never in settings.json; only the enable flag and the EU-region
        toggle are plain prefs. */
@@ -384,7 +418,7 @@ public partial class App : Application
     {
         try
         {
-            var credService = new Services.CredentialService();
+            var credService = NewCredentialService();
             var cred = credService.GetCredential(credentialKey);
             return cred?.Password ?? "";
         }
@@ -396,25 +430,66 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Saves a webhook URL to Windows Credential Manager.
+    /// A credential service wired to the app log, so a refused or failed Credential Manager write leaves a
+    /// log line (#5772). It used to be created bare, which made every failure invisible.
     /// </summary>
-    public static void SaveWebhookUrl(string credentialKey, string url)
+    private static Services.CredentialService NewCredentialService() =>
+        new(new AppLoggerAdapter<Services.CredentialService>());
+
+    /// <summary>
+    /// The name the Settings window shows for a webhook credential key, used in the "was not saved" message.
+    /// </summary>
+    public static string WebhookDisplayName(string credentialKey) => credentialKey switch
     {
+        TeamsWebhookCredentialKey => "Teams webhook URL",
+        SlackWebhookCredentialKey => "Slack webhook URL",
+        GenericWebhookCredentialKey => "generic webhook URL",
+        GenericWebhookHeadersCredentialKey => "generic webhook headers",
+        PagerDutyWebhookCredentialKey => "PagerDuty routing key",
+        _ => "webhook setting"
+    };
+
+    /// <summary>
+    /// Saves a webhook URL (or header JSON, or routing key) to Windows Credential Manager, up to the
+    /// <see cref="CredentialStore.MaxSecretLength"/> characters Windows allows. A blank value deletes the
+    /// entry; an entry that is already gone counts as deleted. Returns null when the value was saved or
+    /// deleted, otherwise a sentence saying which webhook was not saved or not removed and why, fit to show
+    /// the user (#5772). The log line and the sentence carry the key name and the length, never the value.
+    /// </summary>
+    public static string? SaveWebhookUrl(string credentialKey, string url)
+    {
+        var name = WebhookDisplayName(credentialKey);
         try
         {
-            var credService = new Services.CredentialService();
+            var credService = NewCredentialService();
             if (string.IsNullOrWhiteSpace(url))
             {
-                credService.DeleteCredential(credentialKey);
+                /* The blank box is the one way to stop a channel for good: the store is read first at every
+                   start, so an entry that could not be removed would come back. Say so instead of
+                   reporting a save. */
+                var removed = credService.TryDeleteCredential(credentialKey);
+                if (removed.Succeeded)
+                {
+                    return null;
+                }
+
+                AppLogger.Error("App", $"Failed to remove {credentialKey}: {removed.Failure}");
+                return $"The {name} was not removed because {removed.Failure}.";
             }
-            else
+
+            var result = credService.TrySaveCredential(credentialKey, "webhook", url);
+            if (result.Succeeded)
             {
-                credService.SaveCredential(credentialKey, "webhook", url);
+                return null;
             }
+
+            AppLogger.Error("App", $"Failed to save {credentialKey} ({url.Length} characters): {result.Failure}");
+            return $"The {name} was not saved because {result.Failure}.";
         }
         catch (Exception ex)
         {
-            AppLogger.Error("App", $"Failed to save webhook URL for {credentialKey}: {ex.Message}");
+            AppLogger.Error("App", $"Failed to save webhook URL for {credentialKey} ({url?.Length ?? 0} characters): {ex.Message}");
+            return $"The {name} was not saved because {ex.Message.TrimEnd('.', ' ')}.";
         }
     }
 
@@ -436,7 +511,7 @@ public partial class App : Application
     {
         try
         {
-            var credService = new Services.CredentialService();
+            var credService = NewCredentialService();
             var cred = credService.GetCredential(SmtpCredentialKey);
             return cred?.Password;
         }
@@ -448,18 +523,42 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Saves the SMTP password to Windows Credential Manager.
+    /// Saves the SMTP password to Windows Credential Manager; a blank password removes the entry. Returns
+    /// null when it was saved or removed, otherwise a sentence saying why it was not, fit to show the user
+    /// (#5772). The log line and the sentence never carry the password.
     /// </summary>
-    public static void SaveSmtpPassword(string password)
+    public static string? SaveSmtpPassword(string password)
     {
+        const string name = "SMTP password";
         try
         {
-            var credService = new Services.CredentialService();
-            credService.SaveCredential(SmtpCredentialKey, string.IsNullOrEmpty(SmtpUsername) ? "smtp" : SmtpUsername, password);
+            var credService = NewCredentialService();
+            if (string.IsNullOrEmpty(password))
+            {
+                var removed = credService.TryDeleteCredential(SmtpCredentialKey);
+                if (removed.Succeeded)
+                {
+                    return null;
+                }
+
+                AppLogger.Error("App", $"Failed to remove the SMTP password: {removed.Failure}");
+                return $"The {name} was not removed because {removed.Failure}.";
+            }
+
+            var result = credService.TrySaveCredential(
+                SmtpCredentialKey, string.IsNullOrEmpty(SmtpUsername) ? "smtp" : SmtpUsername, password);
+            if (result.Succeeded)
+            {
+                return null;
+            }
+
+            AppLogger.Error("App", $"Failed to save the SMTP password ({password.Length} characters): {result.Failure}");
+            return $"The {name} was not saved because {result.Failure}.";
         }
         catch (Exception ex)
         {
             AppLogger.Error("App", $"Failed to save SMTP password: {ex.Message}");
+            return $"The {name} was not saved because {ex.Message.TrimEnd('.', ' ')}.";
         }
     }
 
@@ -566,6 +665,9 @@ public partial class App : Application
         LoadDuckDbMemoryLimit();
         LoadDefaultTimeRange();
         LoadAlertSettings();
+        /* An SMTP setup saved before the settings window warned about it is named in the log when it loads. */
+        if (LoadedSmtpCleartextWarning(GetSmtpPassword) is { } smtpWarning)
+            AppLogger.Warn("SMTP", smtpWarning);
 
         /* #3577: the operator's per-theme color overrides live beside settings.json, in the same per-user
            config directory, and are read by ThemeManager on every Apply — so the path and the log hooks
@@ -1182,7 +1284,20 @@ public partial class App : Application
             settings.State == SettingsFileState.Unreadable ? null : settings.Text);
     }
 
-    public static void LoadAlertSettings() => LoadAlertSettings(ConfigDirectory, GetWebhookUrl, SaveWebhookUrl);
+    public static void LoadAlertSettings() => LoadAlertSettings(ConfigDirectory, GetWebhookUrl, (key, url) => SaveWebhookUrl(key, url));
+
+    /// <summary>
+    /// The settings window's SMTP warning, for the settings just loaded: non-null when SMTP is on, SSL is off and a
+    /// username and password are set, so the login would cross the network readable. The password is read only
+    /// when the earlier conditions hold, through <paramref name="readPassword"/> so a test needs no credential store.
+    /// </summary>
+    internal static string? LoadedSmtpCleartextWarning(Func<string?> readPassword)
+    {
+        if (!SmtpEnabled || SmtpUseSsl || string.IsNullOrWhiteSpace(SmtpUsername))
+            return null;
+
+        return EmailSendCore.CleartextCredentialsWarning(SmtpUseSsl, SmtpUsername, !string.IsNullOrEmpty(readPassword()));
+    }
 
     /// <summary>
     /// Path- and secret-store-injected form, so the "secrets load even without settings.json" contract is
@@ -1268,6 +1383,14 @@ public partial class App : Application
             if (read.TryGetProperty("alert_deadlock_threshold", out v)) AlertDeadlockThreshold = v.WholeNumber(AlertDeadlockThreshold);
             if (read.TryGetProperty("alert_poison_wait_enabled", out v)) AlertPoisonWaitEnabled = v.Bool(AlertPoisonWaitEnabled);
             if (read.TryGetProperty("alert_poison_wait_threshold_ms", out v)) AlertPoisonWaitThresholdMs = v.WholeNumber(AlertPoisonWaitThresholdMs);
+            if (read.TryGetProperty("alert_runnable_queue_enabled", out v)) AlertRunnableQueueEnabled = v.Bool(AlertRunnableQueueEnabled);
+            if (read.TryGetProperty("alert_runnable_queue_warning_per_scheduler", out v)) AlertRunnableQueueWarningPerScheduler = v.WholeNumber(AlertRunnableQueueWarningPerScheduler, 1, int.MaxValue);
+            if (read.TryGetProperty("alert_runnable_queue_critical_per_scheduler", out v)) AlertRunnableQueueCriticalPerScheduler = v.WholeNumber(AlertRunnableQueueCriticalPerScheduler, 1, int.MaxValue);
+            if (read.TryGetProperty("alert_client_timeouts_enabled", out v)) AlertClientTimeoutsEnabled = v.Bool(AlertClientTimeoutsEnabled);
+            if (read.TryGetProperty("alert_client_timeouts_warning_per_minute", out v)) AlertClientTimeoutsWarningPerMinute = v.WholeNumber(AlertClientTimeoutsWarningPerMinute, 1, int.MaxValue);
+            if (read.TryGetProperty("alert_client_timeouts_critical_per_minute", out v)) AlertClientTimeoutsCriticalPerMinute = v.WholeNumber(AlertClientTimeoutsCriticalPerMinute, 1, int.MaxValue);
+            if (read.TryGetProperty("alert_client_timeouts_warning_multiple", out v)) AlertClientTimeoutsWarningMultiple = v.WholeNumber(AlertClientTimeoutsWarningMultiple, 1, int.MaxValue);
+            if (read.TryGetProperty("alert_client_timeouts_critical_multiple", out v)) AlertClientTimeoutsCriticalMultiple = v.WholeNumber(AlertClientTimeoutsCriticalMultiple, 1, int.MaxValue);
             if (read.TryGetProperty("alert_long_running_query_enabled", out v)) AlertLongRunningQueryEnabled = v.Bool(AlertLongRunningQueryEnabled);
             if (read.TryGetProperty("alert_long_running_query_threshold_minutes", out v)) AlertLongRunningQueryThresholdMinutes = v.WholeNumber(AlertLongRunningQueryThresholdMinutes);
             if (read.TryGetProperty("alert_long_running_query_max_results", out v)) AlertLongRunningQueryMaxResults = v.WholeNumber(AlertLongRunningQueryMaxResults, 1, 1000);
@@ -1289,6 +1412,10 @@ public partial class App : Application
                     var db = elem.ValueKind == JsonValueKind.String ? elem.GetString() : null;
                     if (!string.IsNullOrWhiteSpace(db)) AlertExcludedDatabases.Add(db);
                 }
+
+                /* #6098 input checks: the same name bounds the MCP write enforces (a name over 128 characters or with a
+                   control character is dropped, at most 256 kept), so a hand-edited file and the tools agree. */
+                AlertExcludedDatabases = ExcludedDatabaseNames.Normalize(AlertExcludedDatabases).ToList();
             }
             /* #3653 (A5, Q5): the two opt-out lists, read with the same element-kind filter as the database list
                above and normalised through the shared rule so a hand-edited file and the Settings window agree.
@@ -1303,6 +1430,13 @@ public partial class App : Application
             if (read.TryGetProperty("alert_long_running_query_excluded_logins", out v) && v.IsArray())
             {
                 AlertLongRunningQueryExcludedLogins = LongRunningQueryExclusions.Normalize(
+                    v.Element.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String).Select(e => e.GetString()!)).ToList();
+            }
+            /* #6098: the Volume Free Space alert's fleet-wide excluded mount points, read like the database list
+               (element-kind filtered) and normalised through the shared rule (VolumeExclusions). */
+            if (read.TryGetProperty("alert_excluded_volumes", out v) && v.IsArray())
+            {
+                AlertExcludedVolumes = VolumeExclusions.Normalize(
                     v.Element.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String).Select(e => e.GetString()!)).ToList();
             }
             if (read.TryGetProperty("alert_tempdb_space_enabled", out v)) AlertTempDbSpaceEnabled = v.Bool(AlertTempDbSpaceEnabled);
@@ -1369,6 +1503,10 @@ public partial class App : Application
                 }
             }
 
+            /* Alert Details window size (#5847) */
+            if (read.TryGetProperty("alert_detail_window_width", out v)) AlertDetailWindowWidth = v.Number(0, 0, 10000);
+            if (read.TryGetProperty("alert_detail_window_height", out v)) AlertDetailWindowHeight = v.Number(0, 0, 10000);
+
             /* Color theme */
             if (read.TryGetProperty("color_theme", out v))
             {
@@ -1378,6 +1516,9 @@ public partial class App : Application
 
             /* NOC Overview tile sort */
             if (read.TryGetProperty("overview_sort_mode", out v)) OverviewSortMode = ServerOverviewSort.ParseMode(v.TextOrNull());
+
+            /* Settings window: the tab it reopens on (#5846) */
+            if (read.TryGetProperty("settings_window_tab", out v)) SettingsWindowTab = v.TextOrNull() ?? "";
 
             /* Sidebar fleet-tree collapsed groups (#2020 2b-i-b) */
             if (read.TryGetProperty("collapsed_fleet_groups", out v) && v.IsArray())
@@ -1404,6 +1545,13 @@ public partial class App : Application
             if (read.TryGetProperty("generic_webhook_enabled", out v)) GenericWebhookEnabled = v.Bool(GenericWebhookEnabled);
             if (read.TryGetProperty("generic_proxy_address", out v)) GenericWebhookProxyAddress = v.Text(GenericWebhookProxyAddress);
             if (read.TryGetProperty("generic_body_template", out v)) GenericWebhookBodyTemplate = v.Text(GenericWebhookBodyTemplate);
+            if (read.TryGetProperty("generic_signing_set", out v)) GenericSigningSet = v.Bool(GenericSigningSet);
+            if (read.TryGetProperty("generic_signing_until", out v)
+                && DateTime.TryParse(v.TextOrNull(), System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var signingUntil))
+            {
+                GenericSigningUntilUtc = signingUntil;
+            }
 
             /* PagerDuty webhook settings. The routing key is a secret and loads from Credential Manager below;
                only the enable flag and EU-region toggle are plain prefs. */
@@ -1550,17 +1698,25 @@ public partial class App : Application
     /// <see cref="SettingsRootForWrite"/>, which is what keeps an unparseable file from being replaced
     /// unrecorded.
     /// </summary>
-    public static void WriteSetting(string what, Action<JsonNode> mutate)
+    public static void WriteSetting(string what, Action<JsonNode> mutate) => _ = TryWriteSetting(what, mutate);
+
+    /// <summary>
+    /// <see cref="WriteSetting"/> that says whether settings.json was written (#6012): true only when the file was written, false
+    /// when the document could not be read for write, <paramref name="mutate"/> threw, or the write failed. The error is logged
+    /// the same way. A caller that must not show something the file does not hold (a new signing key) uses this one.
+    /// </summary>
+    public static bool TryWriteSetting(string what, Action<JsonNode> mutate)
     {
         try
         {
             JsonNode root = SettingsRootForWrite();
             mutate(root);
-            WriteSettingsDocument(root, what);
+            return WriteSettingsDocument(root, what);
         }
         catch (Exception ex)
         {
             AppLogger.Error("Settings", $"Failed to save {what}: {ex.Message}");
+            return false;
         }
     }
 

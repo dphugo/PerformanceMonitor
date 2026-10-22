@@ -63,8 +63,27 @@ public static class AlertFamily
     /// rules and analysis findings. The fall-through family for any name the census does not know.</summary>
     public const string Performance = "performance";
 
+    /// <summary>Alerts another service raised through <c>config.submit_external_alert</c> (#5654), named
+    /// <c>External:&lt;source&gt;:&lt;key&gt;</c>. Its own family so a route can send everything an outside system
+    /// raises to its own channel; with no route it goes where every other alert goes, to the parent channels.</summary>
+    public const string External = "external";
+
+    /// <summary>The metric-name prefix of an external alert (#5654): <c>External:&lt;source&gt;:&lt;key&gt;</c>.</summary>
+    public const string ExternalMetricPrefix = "External:";
+    /// <summary>
+    /// The Client Timeouts alert's metric name (#5640): the ONE declaration. The engine's evaluator
+    /// (<c>AttentionEvaluator.MetricName</c>) takes it from here, because this assembly sits below the engine, and the
+    /// severity map in this assembly uses it too. Only <c>AlertMetricClassifier</c> (a leaf assembly that cannot see
+    /// this one) spells it as a literal, and a test pins that literal to this constant.
+    /// </summary>
+    public const string ClientTimeoutsMetric = "Client Timeouts";
+
     /// <summary>Every family, in the order the settings surfaces list them.</summary>
-    public static readonly IReadOnlyList<string> All = new[] { SelfMonitor, Reports, AgentJobs, Performance };
+    public static readonly IReadOnlyList<string> All = new[] { SelfMonitor, Reports, AgentJobs, Performance, External };
+
+    /// <summary>#6003, D8: the self-alert for an investigation request that expired with no agent on it and nowhere else to go.
+    /// A WEBHOOK AUTOMATION KEY like every metric name, so it must stay stable across releases.</summary>
+    public const string InvestigationUnansweredMetric = "Investigation Not Picked Up";
 
     /// <summary>
     /// The exact metric NAME → family census. Every entry is a string the engines deliver verbatim — the
@@ -72,6 +91,7 @@ public static class AlertFamily
     /// evaluator's — spelled here as literals only because this assembly sits below the ones that declare
     /// them; the census test asserts each literal equals its declaring constant.
     /// </summary>
+
     public static readonly IReadOnlyDictionary<string, string> MetricFamilies = new Dictionary<string, string>(StringComparer.Ordinal)
     {
         /* ---- performance: the shared engine's SQL Server alerts ---- */
@@ -80,6 +100,8 @@ public static class AlertFamily
         ["Blocking Wait Time"] = Performance,
         ["Deadlocks Detected"] = Performance,
         ["Poison Wait"] = Performance,
+        ["Runnable Queue"] = Performance,
+        [ClientTimeoutsMetric] = Performance,
         ["Long-Running Query"] = Performance,
         ["tempdb Space"] = Performance,
         ["Volume Free Space"] = Performance,
@@ -123,6 +145,12 @@ public static class AlertFamily
         ["Store Job Over Cadence"] = SelfMonitor,
         ["Retention Held"] = SelfMonitor,
         ["Custom Alert Rules Unhealthy"] = SelfMonitor,
+        /* #5654: external alerts the drain could not deliver (expired, interrupted or failed rows). Its
+           "External Alerts Delivered Again" recovery is a resolution row, like "Custom Alert Rules Recovered". */
+        ["External Alerts Undelivered"] = SelfMonitor,
+        /* #6003, D8: an investigation request expired with no agent on it, and its agent route has no fallback route and no
+           human channel. Never an investigation itself (InvestigationFamily.Of). */
+        [InvestigationUnansweredMetric] = SelfMonitor,
         ["Stale Mute Rules"] = SelfMonitor,
         ["Web TLS Certificate Expiring"] = SelfMonitor,
         /* #5288: the MCP endpoint's twin of the web certificate alert, its own metric so a mute or route for
@@ -136,6 +164,8 @@ public static class AlertFamily
         ["Collector Cost Regression"] = SelfMonitor,
         /* #4299: the raw-retention over-horizon self-alert. */
         ["Raw Purge Over Horizon"] = SelfMonitor,
+        /* #5867: hours of the Query Store compose rollup whose build is retried only once a day. */
+        ["Compose Rollup Hours Stuck"] = SelfMonitor,
         /* #4750: a webhook channel that has failed three times in a row. */
         ["Notification Channel Failing"] = SelfMonitor,
         /* #3783: the store's own TOAST slack and checkpointer pressure — informational conditions about the
@@ -215,14 +245,51 @@ public static class AlertFamily
         RecoveryPairs.ContainsKey(metricName)
         || RecoveryPairs.Values.Any(value => string.Equals(value, metricName, StringComparison.Ordinal));
 
-    /// <summary>The metric-name prefixes of the two dynamic alert shapes, each with its family.</summary>
+    /// <summary>The metric-name prefixes of the dynamic alert shapes, each with its family.</summary>
     public static readonly IReadOnlyList<(string Prefix, string Family)> PrefixFamilies = new[]
     {
         /* CustomAlertEvaluator.MetricNameFor: "Custom:" + rule id. */
         ("Custom:", Performance),
+        /* ExternalAlertDrain.MetricNameFor (#5654): "External:" + source + ":" + key. */
+        (ExternalMetricPrefix, External),
         /* FindingMessageFormatter.MetricName: "Analysis: {category} [{hash}]". */
-        ("Analysis: ", Performance),
+        (AnalysisMetricPrefix, Performance),
     };
+
+    /// <summary>The prefix of an analysis finding's metric name, <c>Analysis: {category} [{hash8}]</c>
+    /// (<c>FindingMessageFormatter.MetricName</c>).</summary>
+    public const string AnalysisMetricPrefix = "Analysis: ";
+
+    /// <summary>
+    /// The finding category out of an analysis metric name of the shape <c>Analysis: {category} [{hash8}]</c> (#5632).
+    /// False for any other name, including a name that has the prefix but no bracketed hash suffix, so a digest
+    /// title or a route's own <c>Analysis: {category}</c> match is never read as a finding.
+    /// </summary>
+    public static bool TryGetAnalysisCategory(string? metricName, out string category)
+    {
+        category = string.Empty;
+        if (metricName is null
+            || !metricName.StartsWith(AnalysisMetricPrefix, StringComparison.Ordinal)
+            || !metricName.EndsWith(']'))
+        {
+            return false;
+        }
+
+        var bracket = metricName.LastIndexOf(" [", StringComparison.Ordinal);
+        if (bracket < AnalysisMetricPrefix.Length)
+        {
+            return false;
+        }
+
+        var found = metricName[AnalysisMetricPrefix.Length..bracket].Trim();
+        if (found.Length == 0)
+        {
+            return false;
+        }
+
+        category = found;
+        return true;
+    }
 
     /// <summary>Whether <paramref name="name"/> spells a family (case-insensitively, trimmed) — the test a
     /// route's <c>metric_match</c> is read through to decide whether it is a family route or an exact one.</summary>
@@ -303,6 +370,90 @@ public static class AlertFamily
 
         return Performance;
     }
+
+    /// <summary>
+    /// A SQL boolean expression over <paramref name="column"/> that is true exactly when <see cref="Of"/> answers
+    /// <paramref name="family"/> for the stored metric name (#6074), so the alert history read filters by family in
+    /// the database, ahead of its row cap, rather than trimming a page after the cap. Spelled with the census
+    /// as quoted LITERALS because the census is compiled-in code, never caller input, and so the one fragment
+    /// serves both stores (PostgreSQL and DuckDB both have <c>starts_with</c>). A census entry decides first, then
+    /// a prefix rule, then the fall-through, the order <see cref="Of"/> reads: the fall-through family
+    /// (<see cref="Performance"/>) takes every name the census and the prefixes do not know. A recovery name
+    /// (<c>Server Restored</c>) is in its firing's family. <paramref name="family"/> must be a value
+    /// <see cref="NormalizeFamily"/> returned; any other value yields a predicate that matches nothing.
+    /// </summary>
+    public static string SqlFamilyPredicate(string column, string family)
+    {
+        if (column is null)
+        {
+            throw new ArgumentNullException(nameof(column));
+        }
+
+        if (NormalizeFamily(family) is not { } canonicalFamily)
+        {
+            return "(1 = 0)";
+        }
+
+        var census = MetricFamilies.Keys.Concat(RecoveryPairs.Keys).Distinct(StringComparer.Ordinal).ToList();
+        var inFamily = census.Where(name => string.Equals(Of(name), canonicalFamily, StringComparison.Ordinal))
+            .OrderBy(name => name, StringComparer.Ordinal).Select(SqlLiteral).ToList();
+        var allCensus = census.OrderBy(name => name, StringComparer.Ordinal).Select(SqlLiteral).ToList();
+        var prefixesIn = PrefixFamilies.Where(p => p.Family == canonicalFamily).Select(p => p.Prefix).Distinct(StringComparer.Ordinal).ToList();
+        var prefixesAny = PrefixFamilies.Select(p => p.Prefix).Distinct(StringComparer.Ordinal).ToList();
+
+        string Starts(IEnumerable<string> prefixes) =>
+            "(" + string.Join(" OR ", prefixes.Select(prefix => "starts_with(" + column + ", " + SqlLiteral(prefix) + ")")) + ")";
+
+        var arms = new List<string>();
+        if (inFamily.Count > 0)
+        {
+            arms.Add(column + " IN (" + string.Join(", ", inFamily) + ")");
+        }
+
+        var uncensused = column + " NOT IN (" + string.Join(", ", allCensus) + ")";
+        if (prefixesIn.Count > 0)
+        {
+            arms.Add("(" + uncensused + " AND " + Starts(prefixesIn) + ")");
+        }
+
+        if (string.Equals(canonicalFamily, Performance, StringComparison.Ordinal))
+        {
+            arms.Add("(" + uncensused + " AND NOT " + Starts(prefixesAny) + ")");
+        }
+
+        return arms.Count == 0 ? "(1 = 0)" : "(" + string.Join(" OR ", arms) + ")";
+    }
+
+    /// <summary>The trimmed <c>metric_name</c> and <c>family</c> inputs of an alert history read (#6074), null when blank.
+    /// A family that spells no family keeps its trimmed text, and <see cref="SqlFamilyPredicate"/> matches nothing for it,
+    /// so an unknown family reads as an EMPTY page whose status sentence names the filter rather than as an error.</summary>
+    public static (string? MetricName, string? Family) NormalizeHistoryFilter(string? metricName, string? family)
+    {
+        var metric = string.IsNullOrWhiteSpace(metricName) ? null : metricName.Trim();
+        var fam = string.IsNullOrWhiteSpace(family) ? null : (NormalizeFamily(family) ?? family.Trim());
+        return (metric, fam);
+    }
+
+    /// <summary>The clause an empty alert history page appends to say which filters were on, e.g.
+    /// <c> for metric_name 'High CPU' and family 'performance'</c>; empty when neither was set. A family that names no family
+    /// says so, with the list of the real ones.</summary>
+    public static string DescribeHistoryFilter(string? metricName, string? family)
+    {
+        var parts = new List<string>();
+        if (metricName is not null)
+        {
+            parts.Add("metric_name '" + metricName + "'");
+        }
+
+        if (family is not null)
+        {
+            parts.Add("family '" + family + "'" + (IsFamily(family) ? string.Empty : " (not a family; the families are " + string.Join(", ", All) + ")"));
+        }
+
+        return parts.Count == 0 ? string.Empty : " for " + string.Join(" and ", parts);
+    }
+
+    private static string SqlLiteral(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
 
     /// <summary>Whether the census names <paramref name="metricName"/> (after canonicalization) explicitly —
     /// by entry or by prefix — as opposed to answering through the fall-through.</summary>

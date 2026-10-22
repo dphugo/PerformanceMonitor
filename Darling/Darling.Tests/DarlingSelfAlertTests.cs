@@ -51,6 +51,14 @@ public sealed class DarlingSelfAlertTests
         public bool BlockingEnabled { get; set; } = true;
         public bool DeadlockEnabled { get; set; } = true;
         public bool PoisonWaitEnabled { get; set; }
+        public bool RunnableQueueEnabled { get; set; }
+        public int RunnableQueueWarningPerScheduler { get; set; } = 8;
+        public int RunnableQueueCriticalPerScheduler { get; set; } = 16;
+        public bool ClientTimeoutsEnabled { get; set; }
+        public int ClientTimeoutsWarningPerMinute { get; set; } = 10;
+        public int ClientTimeoutsCriticalPerMinute { get; set; } = 60;
+        public int ClientTimeoutsWarningMultiple { get; set; } = 3;
+        public int ClientTimeoutsCriticalMultiple { get; set; } = 10;
         public bool LongRunningQueryEnabled { get; set; }
         public bool TempDbSpaceEnabled { get; set; }
         public bool LowDiskEnabled { get; set; }
@@ -98,12 +106,77 @@ public sealed class DarlingSelfAlertTests
         public int CooldownMinutes { get; set; } = 5;
         public List<string> ExcludedDatabasesList { get; } = new();
         public IReadOnlyList<string> ExcludedDatabases => ExcludedDatabasesList;
+        public IReadOnlyList<string> ExcludedVolumes { get; } = new List<string>();
         public CpuAlertMode CpuAlertMode { get; set; } = CpuAlertMode.TotalServer;
+    }
+
+    /// <summary>
+    /// #6034: the outcomes a <see cref="RecordingDeliverer"/> has seen. The fleet pass adds from its own thread while a test
+    /// polls the list from the test thread; a bare <c>List&lt;T&gt;</c> bumps its size before it stores the element, so
+    /// that poll could see a null <see cref="AlertOutcome"/> (a NullReferenceException in the poll lambda). Every write and
+    /// every read here holds one lock, and an enumeration walks a snapshot, so a poll sees whole outcomes only and never
+    /// throws "collection was modified".
+    /// </summary>
+    internal sealed class OutcomeLog : IReadOnlyList<AlertOutcome>
+    {
+        private readonly object _gate = new();
+        private readonly List<AlertOutcome> _items = new();
+
+        public void Add(AlertOutcome outcome)
+        {
+            lock (_gate)
+            {
+                _items.Add(outcome);
+            }
+        }
+
+        public void Clear()
+        {
+            lock (_gate)
+            {
+                _items.Clear();
+            }
+        }
+
+        public int Count
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _items.Count;
+                }
+            }
+        }
+
+        public AlertOutcome this[int index]
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _items[index];
+                }
+            }
+        }
+
+        public IEnumerator<AlertOutcome> GetEnumerator()
+        {
+            AlertOutcome[] snapshot;
+            lock (_gate)
+            {
+                snapshot = _items.ToArray();
+            }
+
+            return ((IEnumerable<AlertOutcome>)snapshot).GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     internal sealed class RecordingDeliverer : IAlertDeliverer
     {
-        public List<AlertOutcome> Outcomes { get; } = new();
+        public OutcomeLog Outcomes { get; } = new();
 
         /// <summary>#5481 round 2: when set, every outcome is also handed to this deliverer (a live test gives it the
         /// production <c>DarlingAlertDeliverer</c> over the real history writer), and its report is returned.</summary>
@@ -2657,9 +2730,9 @@ public sealed class DarlingSelfAlertTests
     [Fact]
     public void McpTlsCert_IsRegisteredAsItsOwnSingleton_AndSweptOnTheWebCertificatesHourlyGate()
     {
-        var program = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Program.cs");
-        Assert.Contains("builder.Services.AddSingleton<WebTlsCertificateState>();", program, StringComparison.Ordinal);
-        Assert.Contains("builder.Services.AddSingleton<McpTlsCertificateState>();", program, StringComparison.Ordinal);
+        var program = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "DarlingProcessServices.cs");
+        Assert.Contains("services.AddSingleton<WebTlsCertificateState>();", program, StringComparison.Ordinal);
+        Assert.Contains("services.AddSingleton<McpTlsCertificateState>();", program, StringComparison.Ordinal);
         Assert.DoesNotContain("AddSingleton<ListenerTlsCertificateState>", program, StringComparison.Ordinal);
 
         var lines = RepoFile
@@ -5511,6 +5584,28 @@ public sealed class DarlingSelfAlertTests
         Assert.Empty(h.History.Records);
     }
 
+    /* #6042: capture-down is a SQL Server Extended Events judgment; a PostgreSQL target never writes those
+       collectors, so the read only probed every chunk to answer "none". */
+    [Theory]
+    [InlineData(PerformanceMonitor.Collectors.CollectorTargetEngine.PostgreSql, 0)]
+    [InlineData(PerformanceMonitor.Collectors.CollectorTargetEngine.SqlServer, 1)]
+    public async Task EvaluateStoreAlerts_CaptureDownRead_RunsOnlyForSqlServerTargets(
+        PerformanceMonitor.Collectors.CollectorTargetEngine engine, int expectedReads)
+    {
+        var h = new Harness();
+        var e = h.Build();
+        var reads = 0;
+        e.CaptureDownReadOverride = (_, _, _) =>
+        {
+            reads++;
+            return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+        };
+
+        await e.EvaluateStoreAlertsAsync(null!, ServerId, Name, connected: true, Ct, engine);
+
+        Assert.Equal(expectedReads, reads);
+    }
+
     /* ---------------- resolution-record shape + engine wiring (finding #4) ---------------- */
 
     [Fact]
@@ -5583,10 +5678,17 @@ public sealed class DarlingSelfAlertTests
             Task.FromResult(new List<DeadlockAlertRow>());
         public Task<List<PoisonWaitAccumulation>> GetPoisonWaitAccumulationAsync(string serverKey, int windowMinutes, CancellationToken cancellationToken = default) =>
             Task.FromResult(new List<PoisonWaitAccumulation>());
+        public Task<AttentionWindow> GetAttentionWindowAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default) =>
+            Task.FromResult(AttentionWindow.Empty);
+        public Task<AttentionBaseline?> GetAttentionBaselineAsync(string serverKey, DateTime nowUtc, CancellationToken cancellationToken = default) =>
+            Task.FromResult<AttentionBaseline?>(null);
+        
+        public Task<IReadOnlyList<RunnableQueueSample>> GetRunnableQueueSamplesAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<RunnableQueueSample>>(new List<RunnableQueueSample>());
         public Task<LongRunningQueryReadResult> GetLongRunningQueriesAsync(
             string serverKey, int thresholdMinutes, int maxResults,
             bool excludeSpServerDiagnostics, bool excludeWaitFor, bool excludeBackups, bool excludeMiscWaits, bool excludeCdc,
-            IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, CancellationToken cancellationToken = default) =>
+            IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, bool orderByCpu = false, CancellationToken cancellationToken = default) =>
             Task.FromResult(LongRunningQueryReadResult.Empty);
         public Task<List<VolumeFreeSpaceInfo>> GetVolumeFreeSpaceAsync(string serverKey, CancellationToken cancellationToken = default) =>
             Task.FromResult(new List<VolumeFreeSpaceInfo>());
@@ -5652,6 +5754,8 @@ public sealed class DarlingSelfAlertTests
     /// be static any more. Nothing else on it is exercised by these fixtures: they assert the raw signals a
     /// read returns from seeded rows, so the deliverer, the history store and the mute seam are inert.
     /// </summary>
+    internal static DarlingSelfAlertEvaluator LiveReadEvaluatorForTests() => LiveReadEvaluator();
+
     private static DarlingSelfAlertEvaluator LiveReadEvaluator()
     {
         var h = new Harness();
@@ -5743,6 +5847,67 @@ public sealed class DarlingSelfAlertTests
             /* Fresh connection + body-aware masking (#1794): this class showed the "Connection is not
                open" signature on a reused local store, and cleanup on the body's connection is exactly
                how that masks the real failure and strands the seeded rows. */
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                await DeleteLiveRowsAsync(cleanup, cleanupCt);
+            });
+        }
+    }
+
+    /// <summary>
+    /// #5735: a server whose only RECENT rows are <c>collection_cycle</c> skipped-slots rows still raises Collection
+    /// Stopped. The signals read counts <c>SKIPPED</c> as a healthy no-op, so a skip row counted as a run would be the
+    /// newest "success", reset the staleness clock and stand in for a collection that never happened: the late-collection
+    /// record would mask the outage it records. The old success is 45 minutes old and a skip row lands every minute.
+    /// </summary>
+    [Fact]
+    public async Task LiveStoreReads_SkipRowsAreNotRunsAndNeverMaskCollectionStopped()
+    {
+        var connectionString = Environment.GetEnvironmentVariable("DARLING_TEST_PG");
+        Assert.SkipWhen(string.IsNullOrEmpty(connectionString),
+            "Set DARLING_TEST_PG to a Postgres connection string to run the live self-alert store reads.");
+
+        var ct = Ct;
+        using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+        await PgMigrations.MigrateAsync(connection, ct);
+        await DeleteLiveRowsAsync(connection, ct);
+
+        await using var postgres = NpgsqlDataSource.Create(connectionString!);
+        var bodySucceeded = false;
+        try
+        {
+            var utcNow = LiveClock.Now();
+            long logId = 9_500_000;
+            await InsertLogAsync(connection, ct, logId++, "wait_stats", utcNow.AddMinutes(-45), "SUCCESS");
+            for (var i = 0; i < 12; i++)
+            {
+                await InsertLogAsync(connection, ct, logId++, CollectionCycleRow.CollectorName, utcNow.AddMinutes(-1 - i / 4.0), CollectionCycleRow.Status);
+            }
+
+            var (lastSuccess, recentRuns, recentSuccess) = await LiveReadEvaluator().ReadCollectionSignalsAsync(
+                postgres, LiveServerId, DarlingSelfAlertEvaluator.ConsecutiveFailureThreshold, ct);
+
+            /* The last success is the 45-minute-old collector run, not a skip row; the skip rows are not runs. */
+            Assert.NotNull(lastSuccess);
+            Assert.True(lastSuccess <= utcNow.AddMinutes(-44), $"last success was {lastSuccess:o}");
+            Assert.Equal(1, recentRuns);
+            Assert.Equal(1, recentSuccess);
+
+            var hDown = new Harness { Now = DateTime.SpecifyKind(LiveClock.Now(), DateTimeKind.Utc) };
+            var evaluator = hDown.Build();
+            await evaluator.EvaluateStoreAlertsAsync(postgres, LiveServerId, Name, connected: false, ct);
+            Assert.DoesNotContain(hDown.Deliverer.Outcomes, o => o.MetricName == "Collection Stopped");
+
+            hDown.Now = hDown.Now.AddMinutes(31);
+            await evaluator.EvaluateStoreAlertsAsync(postgres, LiveServerId, Name, connected: false, ct);
+            var stopped = Assert.Single(hDown.Deliverer.Outcomes, o => o.MetricName == "Collection Stopped");
+            Assert.StartsWith("No successful collection in 76 minutes", stopped.CurrentValue, StringComparison.Ordinal);
+
+            bodySucceeded = true;
+        }
+        finally
+        {
             await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
             {
                 await DeleteLiveRowsAsync(cleanup, cleanupCt);
@@ -6450,6 +6615,32 @@ VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, 0, 0, 0)", connection);
 
         var resolved = Assert.Single(h.History.Records);
         Assert.Equal(DarlingSelfAlertEvaluator.RawPurgeOverHorizonClearedMetric, resolved.MetricName);
+    }
+
+    private static QueryStoreComposeStamp.HourFailure ComposeFailure(int failures, bool inBackoff) =>
+        new(new DateTime(2026, 10, 7, 15, 0, 0), failures, "57014", "canceling statement due to statement timeout", 240,
+            new DateTime(2026, 10, 15, 14, 5, 0), new DateTime(2026, 10, 15, 16, 5, 0), new DateTime(2026, 10, 16, 16, 5, 0), inBackoff);
+
+    /// <summary>#5867: an hour in daily backoff fires one WARNING naming the hour, its count and reason; an hour still retried every
+    /// tick does not; and once no hour is in backoff the alert resolves.</summary>
+    [Fact]
+    public async Task ComposeHoursStuck_FiresForAnHourInBackoff_NotForOneStillRetried_AndResolvesWhenNoneIsLeft()
+    {
+        var h = new Harness();
+        var e = h.Build();
+
+        await e.ApplyComposeHoursStuckAsync(new[] { ComposeFailure(1, inBackoff: false) }, Ct);
+        Assert.Empty(h.Deliverer.Outcomes);
+
+        await e.ApplyComposeHoursStuckAsync(new[] { ComposeFailure(2, inBackoff: true), ComposeFailure(1, inBackoff: false) with { Hour = new DateTime(2026, 10, 15, 9, 0, 0) } }, Ct);
+        var fired = Assert.Single(h.Deliverer.Outcomes);
+        Assert.Equal(DarlingSelfAlertEvaluator.ComposeHoursStuckMetric, fired.MetricName);
+        Assert.Contains("1 hour(s) of the Query Store compose rollup", fired.DetailText, StringComparison.Ordinal);
+        Assert.Contains("2026-10-07 15:00 UTC: 2 failure(s), last reason 57014: canceling statement due to statement timeout", fired.DetailText, StringComparison.Ordinal);
+
+        await e.ApplyComposeHoursStuckAsync(Array.Empty<QueryStoreComposeStamp.HourFailure>(), Ct);
+        var resolved = Assert.Single(h.History.Records);
+        Assert.Equal(DarlingSelfAlertEvaluator.ComposeHoursStuckClearedMetric, resolved.MetricName);
     }
 
     [Fact]

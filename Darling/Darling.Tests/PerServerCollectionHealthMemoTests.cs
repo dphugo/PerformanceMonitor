@@ -481,8 +481,12 @@ public sealed class PerServerCollectionHealthMemoTests
         var tool = RepoFile.ReadRepoFileLf(
             "Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpDataTools.cs");
 
+        /* #5814: the window start is named once so the tool can note it for the slow-read row. It is still cut from the
+           one nowUtc read, and it is still the fleet rollup's 7 days (ReadWindowBand.CollectionHealthHours). */
+        Assert.Equal(24 * 7, PerformanceMonitor.Darling.Service.ReadWindowBand.CollectionHealthHours);
+        Assert.Contains("var nowUtc = DateTime.UtcNow;\n", tool, StringComparison.Ordinal);
         Assert.Contains(
-            "var nowUtc = DateTime.UtcNow;\n            var (rows, collectionHealthAgeSeconds) = await DarlingDataReader.GetCollectionHealthMemoizedAsync(\n                postgres, resolved.ServerId, nowUtc.AddDays(-7), nowUtc, cancellationToken);",
+            "var windowStartUtc = nowUtc.AddHours(-ReadWindowBand.CollectionHealthHours);\n            ReadScope.NoteWindow(windowStartUtc, nowUtc);\n            var (rows, collectionHealthAgeSeconds) = await DarlingDataReader.GetCollectionHealthMemoizedAsync(\n                postgres, resolved.ServerId, windowStartUtc, nowUtc, cancellationToken);",
             tool,
             StringComparison.Ordinal);
 
@@ -524,7 +528,7 @@ public sealed class PerServerCollectionHealthMemoTests
         Assert.Contains("GetCollectionHealthAsync(postgres, scanServerId, scanWindowStart, scanToken)", line, StringComparison.Ordinal);
 
         Assert.Contains(
-            "await using var command = postgres.CreateCommand(CollectionHealthSql);\n        command.CommandTimeout = McpCommandDeadlines.ReadSeconds;",
+            "await using var command = postgres.CreateCommand(CollectionHealthComposedSql);\n        command.CommandTimeout = McpCommandDeadlines.ReadSeconds;",
             reader,
             StringComparison.Ordinal);
         Assert.Contains("FROM v_collection_log\n            WHERE server_id = $1\n            AND   collection_time >= $2", reader, StringComparison.Ordinal);

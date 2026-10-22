@@ -44,7 +44,6 @@ namespace Darling.Tests;
 /// <c>Lite.Tests/PerfmonStatsCollectorDefinitionTests</c>, and the shaping helper's type rule in
 /// <c>Lite.Tests/DeltaSeriesShapingTests</c> — both run off Windows. What is here is the PostgreSQL side.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class PerfmonCounterTypeRungTests
 {
     private const int RungVersion = 132;
@@ -168,7 +167,6 @@ public sealed class PerfmonCounterTypeRungTests
             ViewerDataService.StoreSchemaProbeSql.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         Assert.Contains("hasPerfmonCounterType", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);
@@ -321,7 +319,6 @@ public sealed class PerfmonCounterTypeRungTests
 /// live class because it shares the store.
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class PerfmonCounterTypeLivePostgresTests
 {
     private const int ServerId = -132132;

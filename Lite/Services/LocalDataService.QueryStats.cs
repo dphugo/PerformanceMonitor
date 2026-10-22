@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
 using Microsoft.Data.SqlClient;
@@ -26,7 +27,8 @@ public partial class LocalDataService
     /// Validates that a database name exists on the server and returns the properly quoted name.
     /// This prevents SQL injection via malicious database names.
     /// </summary>
-    private static async Task<string?> GetValidatedDatabaseNameAsync(SqlConnection connection, string databaseName)
+    private static async Task<string?> GetValidatedDatabaseNameAsync(
+        SqlConnection connection, string databaseName, CancellationToken cancellationToken = default)
     {
         using var command = new SqlCommand(@"
 SELECT
@@ -34,7 +36,7 @@ SELECT
 FROM sys.databases AS d
 WHERE d.name = @database_name;", connection);
         command.Parameters.Add(new SqlParameter("@database_name", SqlDbType.NVarChar, 128) { Value = databaseName });
-        var result = await command.ExecuteScalarAsync();
+        var result = await command.ExecuteScalarAsync(cancellationToken);
         return result as string;
     }
 
@@ -187,6 +189,12 @@ module AS (
         WHERE server_id = $1
         AND   sql_handle IS NOT NULL
         AND   sql_handle <> ''
+        /* #6096: only the handles of the ranked groups. Without this the window below ranked EVERY procedure_stats row
+           the archive holds for the server (432,000 rows from one day of a 344-database server, 3.2 s of the read; it grows
+           with the archive, not the window, so a month of history made this read take minutes). The page joins on
+           sql_handle alone, so a handle outside the ranked groups was never used, and a handle inside them keeps the
+           same newest row. */
+        AND   sql_handle IN (SELECT sql_handle FROM ranked)
     ) ranked_modules
     WHERE rn = 1
 ),
@@ -256,6 +264,43 @@ LEFT JOIN page p ON TRUE
 ORDER BY p.page_ord";
 
     /// <summary>
+    /// #6127: what an empty <see cref="GetTopQueriesByCpuAsync"/> left unsaid. The ranking keeps only groups whose summed
+    /// deltas are above zero, so a window of first sightings and unmoved repeats ranks nothing while the archive holds its
+    /// snapshots. Returns how many snapshots the window stored and the newest snapshot at or before the window's end that
+    /// carries a measured delta (null when none does), over the same database filter. Darling's twin is
+    /// <c>GetQueryStatsSnapshotProbeAsync</c>.
+    /// </summary>
+    public async Task<(long SnapshotsInWindow, DateTime? NewestMeasuredDeltaAt)> GetQueryStatsSnapshotProbeAsync(
+        int serverId, int hoursBack, DateTime? asOfUtc = null, IReadOnlyList<string>? databaseNames = null)
+    {
+        using var _q = TimeQuery("GetQueryStatsSnapshotProbeAsync", "v_query_stats snapshot probe");
+        using var connection = await OpenConnectionAsync();
+
+        var (startTime, endTime) = GetTimeRange(hoursBack, null, null, asOfUtc);
+        var dbClause = BuildDbInClause(databaseNames, "database_name", 4, out var dbValues);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT
+    (SELECT COUNT(*) FROM v_query_stats
+     WHERE server_id = $1 AND collection_time >= $2 AND collection_time <= $3" + dbClause + @"),
+    (SELECT MAX(collection_time) FROM v_query_stats
+     WHERE server_id = $1 AND collection_time <= $3" + dbClause + @"
+     AND   (delta_execution_count > 0 OR delta_elapsed_time > 0))";
+        command.Parameters.Add(new DuckDBParameter { Value = serverId });
+        command.Parameters.Add(new DuckDBParameter { Value = startTime });
+        command.Parameters.Add(new DuckDBParameter { Value = endTime });
+        foreach (var db in dbValues)
+            command.Parameters.Add(new DuckDBParameter { Value = db });
+
+        using var reader = await command.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return (
+            reader.IsDBNull(0) ? 0 : Convert.ToInt64(reader.GetValue(0)),
+            reader.IsDBNull(1) ? null : DateTime.SpecifyKind(reader.GetDateTime(1), DateTimeKind.Utc));
+    }
+
+    /// <summary>
     /// The top-N query-stats groups by CPU over the window. <paramref name="minMaxDop"/> is the lifetime
     /// <c>max_dop</c> floor a group must reach to be RANKED at all (#3541 A13): 0 for no parallelism filter
     /// (the grids' read, byte-identical to before), 2 for the MCP tool's <c>parallel_only</c>, the caller's
@@ -264,19 +309,23 @@ ORDER BY p.page_ord";
     /// returned top-N page in C#, and a box whose hottest plans were all serial answered an empty page while
     /// the window held parallel plans. Darling's <c>TopQueriesSql</c> carries the same floor as its $6.
     /// </summary>
-    public async Task<List<QueryStatsRow>> GetTopQueriesByCpuAsync(int serverId, int hoursBack = 24, int top = 50, DateTime? fromDate = null, DateTime? toDate = null, ServerClock? serverClock = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null, int minMaxDop = 0)
+    public async Task<List<QueryStatsRow>> GetTopQueriesByCpuAsync(int serverId, int hoursBack = 24, int top = 50, DateTime? fromDate = null, DateTime? toDate = null, ServerClock? serverClock = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null, int minMaxDop = 0, QueryTagReadScope? tags = null)
     {
         using var _q = TimeQuery("GetTopQueriesByCpuAsync", "v_query_stats top N by CPU");
         using var connection = await OpenConnectionAsync();
 
         var (startTime, endTime) = GetTimeRange(hoursBack, fromDate, toDate, asOfUtc);
         var dbClause = BuildDbInClause(databaseNames, "database_name", 7, out var dbValues);
+        /* #5992: the query tag filter rides the same place as the database filter, before the ranking and the cap. */
+        var tagValues = new List<object>();
+        if (tags is not null) { dbClause += QueryTagReadScope.HashToken("query_hash"); tagValues.AddRange(tags.ParameterValues); }
 
         /* #5313: one round at a candidate limit; TopFill asks again with a larger one while WAITFOR shells left the page short. */
         async Task<(List<QueryStatsRow> Rows, int CandidateCount)> RunRoundAsync(int candidates)
         {
         using var command = connection.CreateCommand();
         command.CommandText = TopQueriesByCpuSql(dbClause, candidates);
+        if (tags is not null) command.CommandText = tags.Apply(command.CommandText, 7 + dbValues.Count);
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = startTime });
@@ -289,6 +338,8 @@ ORDER BY p.page_ord";
         command.Parameters.Add(new DuckDBParameter { Value = minMaxDop });
         foreach (var db in dbValues)
             command.Parameters.Add(new DuckDBParameter { Value = db });
+        foreach (var tagValue in tagValues)
+            command.Parameters.Add(new DuckDBParameter { Value = tagValue });
 
         var items = new List<QueryStatsRow>();
         var candidateCount = 0;
@@ -1000,7 +1051,7 @@ ORDER BY bucket";
         return items;
     }
 
-    public async Task<List<ProcedureStatsRow>> GetTopProceduresByCpuAsync(int serverId, int hoursBack = 24, int top = 50, DateTime? fromDate = null, DateTime? toDate = null, ServerClock? serverClock = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null)
+    public async Task<List<ProcedureStatsRow>> GetTopProceduresByCpuAsync(int serverId, int hoursBack = 24, int top = 50, DateTime? fromDate = null, DateTime? toDate = null, ServerClock? serverClock = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null, IReadOnlyList<string>? excludeDatabaseNames = null, QueryTagReadScope? tags = null)
     {
         using var _q = TimeQuery("GetTopProceduresByCpuAsync", "v_procedure_stats top N by CPU");
         using var connection = await OpenConnectionAsync();
@@ -1009,6 +1060,9 @@ ORDER BY bucket";
         var (startTime, endTime) = GetTimeRange(hoursBack, fromDate, toDate, asOfUtc);
         var dbClause = BuildDbInClause(databaseNames, "database_name", 6, out var dbValues);
 
+        /* #5633 review: databases the server dropped, left out of an all-databases ranking. NULL-safe: a row with no database name stays. */
+        var excludeClause = BuildDbExcludeClause(excludeDatabaseNames, "database_name", 6 + dbValues.Count, out var excludeValues);
+        var tagValues = new List<object>();
         command.CommandText = @"
 SELECT
     database_name,
@@ -1043,11 +1097,16 @@ FROM v_procedure_stats
 WHERE server_id = $1
 AND   collection_time >= $2
 AND   collection_time <= $3
-AND   last_execution_time >= $2 + $5 * INTERVAL '1' MINUTE" + dbClause + @"
+AND   last_execution_time >= $2 + $5 * INTERVAL '1' MINUTE" + dbClause + excludeClause + (tags is null ? "" : QueryTagReadScope.ObjectToken("database_name", "schema_name", "object_name")) + @"
 GROUP BY database_name, schema_name, object_name, object_type
 HAVING SUM(delta_execution_count) > 0 OR SUM(delta_elapsed_time) > 0
 ORDER BY SUM(delta_worker_time) DESC
 LIMIT $4";
+        if (tags is not null)
+        {
+            command.CommandText = tags.Apply(command.CommandText, 6 + dbValues.Count + excludeValues.Count);
+            tagValues.AddRange(tags.ParameterValues);
+        }
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = startTime });
@@ -1057,6 +1116,10 @@ LIMIT $4";
         command.Parameters.Add(new DuckDBParameter { Value = (serverClock ?? ServerClock.Utc).OffsetMinutesAt(startTime) });
         foreach (var db in dbValues)
             command.Parameters.Add(new DuckDBParameter { Value = db });
+        foreach (var db in excludeValues)
+            command.Parameters.Add(new DuckDBParameter { Value = db });
+        foreach (var tagValue in tagValues)
+            command.Parameters.Add(new DuckDBParameter { Value = tagValue });
 
         var items = new List<ProcedureStatsRow>();
         using var reader = await command.ExecuteReaderAsync();
@@ -1989,6 +2052,12 @@ public class QueryTrendPoint
 
 public class QueryStatsRow
 {
+    /// <summary>#5993: the row's query tag as a path ("Parent / Child"), or null. Set from the map after the read; the grid shows it.</summary>
+    public string? QueryTag { get; set; }
+
+    /// <summary>#5993: the row carries a key the "Assign query tag..." menu item can bind.</summary>
+    public bool CanAssignQueryTag => Helpers.QueryTagGrid.TargetOf(this) != null;
+
     /// <summary>Gates "Get Actual Plan (re-run)" — see <see cref="QuerySnapshotRow.CanGetActualPlan"/>.</summary>
     public bool CanGetActualPlan => !string.IsNullOrEmpty(QueryText);
 
@@ -2081,6 +2150,12 @@ public class QueryStatsRow
 
 public class ProcedureStatsRow
 {
+    /// <summary>#5993: the row's query tag as a path ("Parent / Child"), or null. Set from the map after the read; the grid shows it.</summary>
+    public string? QueryTag { get; set; }
+
+    /// <summary>#5993: the row carries a key the "Assign query tag..." menu item can bind.</summary>
+    public bool CanAssignQueryTag => Helpers.QueryTagGrid.TargetOf(this) != null;
+
     public string DatabaseName { get; set; } = "";
     public string SchemaName { get; set; } = "";
     public string ObjectName { get; set; } = "";

@@ -44,8 +44,19 @@ internal static class GuardStageScanner
     /// <summary>The attribute a guard class carries, as it is written in source.</summary>
     internal const string GuardTraitText = "[Trait(\"Stage\", \"Guard\")]";
 
-    /// <summary>The attribute a class that reads a Lite file carries, as it is written in source (#5459 cut 3a).</summary>
-    internal const string LiteTraitText = "[Trait(\"Reads\", \"Lite\")]";
+    /// <summary>
+    /// The catalog-wide classes (rule R4, #5776) that stay off the guard stage because they are slow: 50 s or more in
+    /// the nightly test map. They carry no Stage trait and run on the shards, as every untagged class does. Together they
+    /// were 501 s of the 545 s the R4 set took in Darling.Tests; without them the Guard-tagged R4 classes are about 44 s,
+    /// so the guard job stays fast. A rule-R4-only class may be listed here; one that is guard-style by name (R1) or
+    /// walks the repo root (R2) may not. Shrinks only: GuardStageCensusTests pins its size.
+    /// </summary>
+    internal static readonly IReadOnlyDictionary<string, string> SlowCatalogClasses = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["ConsumedTimestampFrameDisciplineTests"] = "slow: 188 s in the nightly map of 2026-10-13",
+        ["QueryStatsWriterCensusPins"] = "slow: 56 s in the nightly map of 2026-10-13",
+        ["WebDataStartNoteTests"] = "slow: 257 s in the nightly map of 2026-10-13",
+    };
 
     /// <summary>The name shapes the census treats as guard-style (ruling 2, R1).</summary>
     internal static readonly Regex GuardStyleName = new(
@@ -67,6 +78,22 @@ internal static class GuardStageScanner
     private static readonly Regex s_repoRootExpression = new(
         @"^(?:\w+\.)*\w*(?:RepoRoot|FindRoot|ResolveRoot)\w*\(\s*\)$|^(?:RepoFile\.)?Root$", RegexOptions.CultureInvariant);
 
+    /* R4 (#5776): a reach over a whole catalog. The MCP tool catalog is read by filtering types on the tool-type
+       attribute or by registering every tool in an assembly; the collector set is CollectorCatalog.All. */
+    private static readonly Regex s_catalogReach = new(
+        @"\b(?:McpServerToolTypeAttribute|WithToolsFromAssembly)\b|\bCollectorCatalog\s*\.\s*All\b",
+        RegexOptions.CultureInvariant);
+
+    /* R4: every type of an assembly. The receiver is captured so a test assembly's own type list (typeof(SomeTests)
+       .Assembly, or GetExecutingAssembly()) is not taken for a product assembly. */
+    private static readonly Regex s_assemblyTypes = new(
+        @"(?<receiver>(?:typeof\s*\(\s*[\w.]+\s*\)|GetExecutingAssembly\s*\(\s*\)|[\w.]+)(?:\s*\.\s*Assembly)?)\s*\.\s*(?:GetTypes|GetExportedTypes)\s*\(\s*\)",
+        RegexOptions.CultureInvariant);
+
+    private static readonly Regex s_testAssemblyReceiver = new(
+        @"^typeof\s*\(\s*(?:[\w.]+\.)?\w+Tests\s*\)\s*\.\s*Assembly$|GetExecutingAssembly",
+        RegexOptions.CultureInvariant);
+
     private static readonly Regex s_testAttribute = new(@"\[(?:Fact|Theory)\b", RegexOptions.CultureInvariant);
 
     private static readonly Regex s_testVariable = new(@"^DARLING_TEST_\w+$", RegexOptions.CultureInvariant);
@@ -81,14 +108,16 @@ internal static class GuardStageScanner
         bool EnumeratesRepoRoot,
         bool ReadsTestVariable,
         bool UsesStoreHelper,
-        bool ReadsLite = false,
-        bool TaggedLite = false)
+        bool ReachesACatalog = false)
     {
         /// <summary>Whether the class is guard-style by name (R1).</summary>
         internal bool GuardStyleByName => GuardStyleName.IsMatch(Name);
 
-        /// <summary>Whether the class is a guard candidate by either rule (R1 or R2).</summary>
-        internal bool Candidate => IsTest && (GuardStyleByName || EnumeratesRepoRoot);
+        /// <summary>Whether the class is a guard candidate by any rule (R1, R2 or R4).</summary>
+        internal bool Candidate => IsTest && (GuardStyleByName || EnumeratesRepoRoot || ReachesACatalog);
+
+        /// <summary>Whether rule R4 alone makes the class a candidate, so it may sit on <see cref="SlowCatalogClasses"/>.</summary>
+        internal bool CatalogOnly => IsTest && ReachesACatalog && !GuardStyleByName && !EnumeratesRepoRoot;
 
         /// <summary>Whether tagging the class would break rule R3: the guard job has no store.</summary>
         internal bool NeedsAStore => LiveCollection || ReadsTestVariable || UsesStoreHelper;
@@ -113,8 +142,7 @@ internal static class GuardStageScanner
         bool EnumeratesRepoRoot,
         bool ReadsTestVariable,
         string OwnCode,
-        bool ReadsLite,
-        bool TaggedLite);
+        bool ReachesACatalog);
 
     /// <summary>
     /// Every test class under <paramref name="testsRoot"/>, one row per class name. When <paramref name="projectFile"/>
@@ -175,8 +203,7 @@ internal static class GuardStageScanner
                 EnumeratesRepoRoot: group.Any(d => d.EnumeratesRepoRoot),
                 ReadsTestVariable: group.Any(d => d.ReadsTestVariable),
                 UsesStoreHelper: usesHelper,
-                ReadsLite: group.Any(d => d.ReadsLite),
-                TaggedLite: group.Any(d => d.TaggedLite)));
+                ReachesACatalog: group.Any(d => d.ReachesACatalog)));
         }
 
         return rows;
@@ -184,23 +211,47 @@ internal static class GuardStageScanner
 
     /// <summary>
     /// What is wrong with the suite's tagging, one line per fault; empty when it is right. Rules R1 and R2: a
-    /// guard candidate carries the trait or is exempt. Rule R3: a tagged class needs no store. And an exemption
-    /// must still be one: it names a candidate that is untagged, with a reason.
+    /// guard candidate carries Stage=Guard or is exempt. Rule R4 (#5776): a catalog-wide class carries Stage=Guard,
+    /// is exempt, or is on <paramref name="slow"/> (a class that rule R4 alone flags, 50 s or more in the nightly map).
+    /// Rule R3: a tagged class needs no store. And an exemption must still be one: it names a candidate that is
+    /// untagged, with a reason. Lite.Tests passes no slow list: <see cref="SlowCatalogClasses"/> names Darling.Tests classes.
     /// </summary>
-    internal static List<string> Problems(IReadOnlyList<Row> rows, IReadOnlyDictionary<string, string> exempt)
+    internal static List<string> Problems(
+        IReadOnlyList<Row> rows, IReadOnlyDictionary<string, string> exempt, IReadOnlyDictionary<string, string>? slow = null)
     {
+        slow ??= new Dictionary<string, string>();
         var problems = new List<string>();
         var byName = rows.ToDictionary(r => r.Name, StringComparer.Ordinal);
 
-        foreach (var r in rows.Where(r => r.Candidate && !r.Tagged && !exempt.ContainsKey(r.Name)).OrderBy(r => r.Name, StringComparer.Ordinal))
+        foreach (var r in rows
+            .Where(r => r.Candidate && !r.Tagged && !exempt.ContainsKey(r.Name) && !(r.CatalogOnly && slow.ContainsKey(r.Name)))
+            .OrderBy(r => r.Name, StringComparer.Ordinal))
         {
-            var why = r.GuardStyleByName ? "guard-style name" : "enumerates the repo root recursively";
+            var why = r.GuardStyleByName ? "guard-style name"
+                : r.EnumeratesRepoRoot ? "enumerates the repo root recursively"
+                : "reaches a whole catalog: the MCP tools, a product assembly's types or every collector (R4)";
             problems.Add($"MISSING {r.File}: {r.Name} ({why}; store: {(r.NeedsAStore ? r.StoreReasons : "none")})");
         }
 
         foreach (var r in rows.Where(r => r.Tagged && r.NeedsAStore).OrderBy(r => r.Name, StringComparer.Ordinal))
         {
             problems.Add($"STORE {r.File}: {r.Name} is tagged Stage=Guard but {r.StoreReasons}; the guard job has no PostgreSQL");
+        }
+
+        foreach (var (name, reason) in slow)
+        {
+            if (!reason.StartsWith("slow: ", StringComparison.Ordinal))
+            {
+                problems.Add($"REASON {name}: a slow entry's reason reads 'slow: <N> s in the nightly map of <date>'");
+            }
+            else if (!byName.TryGetValue(name, out var row) || !row.CatalogOnly)
+            {
+                problems.Add($"STALE {name}: is on the slow list but rule R4 alone does not flag it (renamed, deleted, or R1/R2 now applies); drop the entry");
+            }
+            else if (row.Tagged)
+            {
+                problems.Add($"STALE {name}: is on the slow list but now carries the trait; drop the entry");
+            }
         }
 
         foreach (var (name, reason) in exempt)
@@ -248,9 +299,6 @@ internal static class GuardStageScanner
         var rootVariables = RepoRootVariables(code);
         var recursiveOptions = Regex.IsMatch(code, @"RecurseSubdirectories\s*=\s*true", RegexOptions.CultureInvariant);
         var literals = CSharpSourceWalker.StringLiteralBodies(text).ToList();
-        /* File-level, like Lite.Tests' Darling census: a helper class in the same file may hold the path a test
-           class in it reads, so every test class in a file that reads Lite needs the trait. */
-        var fileReadsLite = ReadsALitePath(text, code, rootVariables, recursiveOptions);
 
         foreach (var d in found)
         {
@@ -280,53 +328,39 @@ internal static class GuardStageScanner
                 EnumeratesRepoRootRecursively(ownCode, rootVariables, recursiveOptions),
                 readsVariable,
                 ownCode,
-                fileReadsLite,
-                attributes.Any(a => Squash(a).Contains(Squash(LiteTraitText), StringComparison.Ordinal)));
+                ReachesACatalog(ownCode));
         }
     }
 
     /// <summary>
-    /// Whether a source file reads a file under <c>Lite/</c> or <c>Lite.Tests/</c>: a string literal (not a comment)
-    /// naming a path segment <c>Lite</c> (alone, or beside a slash), <c>Lite.Tests</c> or a <c>PerformanceMonitorLite*</c>
-    /// project, or a recursive enumeration from the repo root, which reads every Lite file without naming one. The bare
-    /// literal <c>"Lite"</c> counts in any position: a label such as <c>("Lite", source)</c> also counts, which only ever
-    /// over-tags (the safe direction). A path assembled from a constant another file declares is not visible to a
-    /// source scan; the replay of the failure corpus and the nightly are the backstop for that.
+    /// Rule R4 (#5776): whether a class's code (comments and strings already blanked) reaches a whole catalog: the
+    /// MCP tool catalog (types filtered on <c>McpServerToolTypeAttribute</c>, or <c>WithToolsFromAssembly</c>), every
+    /// type of a product assembly (<c>GetTypes()</c> or <c>GetExportedTypes()</c>, unless the receiver is a test
+    /// class's own assembly), or every collector definition (<c>CollectorCatalog.All</c>). Such a class names no
+    /// symbol a change touches, so a lane's symbol selection cannot find it; a new tool or collector is what breaks
+    /// it. It therefore runs in the always-run stage.
     /// </summary>
-    private static bool ReadsALitePath(string text, string code, HashSet<string> rootVariables, bool recursiveOptions)
+    internal static bool ReachesACatalog(string code)
     {
-        foreach (var (_, body) in CSharpSourceWalker.StringLiteralBodies(text))
+        if (s_catalogReach.IsMatch(code))
         {
-            var normalized = body.Replace('\\', '/');
-            var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            return true;
+        }
 
-            if (segments.Any(seg => seg.StartsWith("PerformanceMonitorLite", StringComparison.Ordinal)
-                || seg.Equals("Lite.Tests", StringComparison.Ordinal)))
-            {
-                return true;
-            }
-
-            if (body.Equals("Lite", StringComparison.Ordinal)
-                || (normalized.Contains('/', StringComparison.Ordinal)
-                    && segments.Any(seg => seg.Equals("Lite", StringComparison.Ordinal))))
+        foreach (Match m in s_assemblyTypes.Matches(code))
+        {
+            if (!s_testAssemblyReceiver.IsMatch(m.Groups["receiver"].Value.Trim()))
             {
                 return true;
             }
         }
 
-        return EnumeratesRepoRootRecursively(code, rootVariables, recursiveOptions);
+        return false;
     }
 
-    /// <summary>The same question over one source text, for the census's own detector tests.</summary>
-    internal static bool ReadsALitePath(string text)
-    {
-        var code = CSharpSourceWalker.StripCommentsAndStrings(text);
-        return ReadsALitePath(
-            text,
-            code,
-            RepoRootVariables(code),
-            Regex.IsMatch(code, @"RecurseSubdirectories\s*=\s*true", RegexOptions.CultureInvariant));
-    }
+    /// <summary>The R4 question over one source text, comments and strings blanked first, for the detector tests.</summary>
+    internal static bool ReachesACatalogInText(string text) =>
+        ReachesACatalog(CSharpSourceWalker.StripCommentsAndStrings(text));
 
     private static string Squash(string s) => s.Replace(" ", string.Empty, StringComparison.Ordinal);
 
@@ -410,7 +444,7 @@ internal static class GuardStageScanner
         return decls
             .Select(d => new Row(
                 d.Name, d.File, true, d.Tagged, d.LiveCollection, d.EnumeratesRepoRoot, d.ReadsTestVariable, false,
-                d.ReadsLite, d.TaggedLite))
+                d.ReachesACatalog))
             .ToList();
     }
 

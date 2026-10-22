@@ -108,6 +108,7 @@ public partial class SettingsWindow : Window
 
         _appSettingsStore = appSettingsStore;
         _appSettings = appSettingsStore.Load();
+        SelectTabByName(_appSettings.SettingsWindowTab);
         _dataService = dataService;
         _servers = servers ?? Array.Empty<DarlingServer>();
 
@@ -131,6 +132,7 @@ public partial class SettingsWindow : Window
         QueryStoreBackfillCheckBox.IsChecked = true;
         QueryStoreTextBudgetMbTextBox.Text = "64";
         MaxConcurrentSweepsTextBox.Text = "4";
+        QueryStoreFetchTopNTextBox.Text = "100";
 
         /* Manage Mute Rules writes the shared Postgres config; needs a live store connection. */
         ManageMuteRulesButton.IsEnabled = _dataService is not null;
@@ -170,6 +172,7 @@ public partial class SettingsWindow : Window
             if (sections.Notification is not null)
             {
                 SeedNotificationControlsFrom(sections.Notification);
+                await RefreshGenericSigningKeyAsync();
             }
 
             if (sections.Service is not null)
@@ -178,6 +181,7 @@ public partial class SettingsWindow : Window
                 QueryStoreBackfillCheckBox.IsChecked = sections.Service.QueryStoreBackfillEnabled;
                 QueryStoreTextBudgetMbTextBox.Text = sections.Service.QueryStoreTextBudgetMb.ToString(CultureInfo.InvariantCulture);
                 MaxConcurrentSweepsTextBox.Text = sections.Service.MaxConcurrentSweeps.ToString(CultureInfo.InvariantCulture);
+                QueryStoreFetchTopNTextBox.Text = sections.Service.QueryStoreFetchTopN.ToString(CultureInfo.InvariantCulture);
                 McpEnabledCheckBox.IsChecked = sections.Service.McpEnabled;
                 McpPortTextBox.Text = sections.Service.McpPort.ToString(CultureInfo.InvariantCulture);
                 WebEnabledCheckBox.IsChecked = sections.Service.WebEnabled;
@@ -255,6 +259,90 @@ public partial class SettingsWindow : Window
 
     /// <summary>Reflects a read-only seat: a banner + the operator-action buttons disabled. The threshold
     /// inputs stay visible for reference; a Save attempt surfaces the friendly read-only message.</summary>
+    // ── Tabs (#5846) ──
+
+    /// <summary>The tab that holds <paramref name="element"/>, or null for the window-wide parts (the title, the
+    /// read-only banner, Save and Close). Walks the LOGICAL tree: a tab that is not selected keeps its content as a
+    /// logical child, while that content is out of the visual tree.</summary>
+    internal static TabItem? TabOf(DependencyObject? element)
+    {
+        for (var node = element; node is not null; node = LogicalTreeHelper.GetParent(node))
+        {
+            if (node is TabItem tab)
+            {
+                return tab;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Opens the tab holding <paramref name="element"/>, if it is on one.</summary>
+    private void SelectTabOf(DependencyObject element)
+    {
+        if (TabOf(element) is { } tab)
+        {
+            SettingsTabs.SelectedItem = tab;
+        }
+    }
+
+    /// <summary>Opens the first tab, in tab order, that holds a control with an invalid value, and returns it
+    /// (null when no error sits on a tab). Tab order, not the order Save checked the fields in, so the operator
+    /// starts from the left.</summary>
+    internal TabItem? SelectFirstTabWithError(SettingsValidationErrors errors)
+    {
+        var first = errors.Sources
+            .Select(TabOf)
+            .OfType<TabItem>()
+            .OrderBy(tab => SettingsTabs.Items.IndexOf(tab))
+            .FirstOrDefault();
+        if (first is not null)
+        {
+            SettingsTabs.SelectedItem = first;
+        }
+        return first;
+    }
+
+    /// <summary>Each message prefixed with the name of the tab its field is on.</summary>
+    private static IEnumerable<string> DescribeErrors(SettingsValidationErrors errors) =>
+        errors.Messages.Zip(errors.Sources, (message, source) =>
+            TabOf(source) is { } tab ? $"{tab.Header}: {message}" : message);
+
+    private void SelectTabByName(string? name)
+    {
+        var tab = SettingsTabs.Items.OfType<TabItem>().FirstOrDefault(t => t.Name == name);
+        if (tab is not null)
+        {
+            SettingsTabs.SelectedItem = tab;
+        }
+    }
+
+    private void SettingsTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        /* SelectionChanged bubbles: a ComboBox inside a tab raises it here too. Only the tab strip's own counts,
+           and not while InitializeComponent is still building the window (the settings are not loaded yet). */
+        if (!IsInitialized || !ReferenceEquals(e.OriginalSource, SettingsTabs) || SettingsTabs.SelectedItem is not TabItem tab)
+        {
+            return;
+        }
+        /* Kept on the in-memory copy too, so a Save (which writes that whole copy) carries the current tab. */
+        _appSettings.SettingsWindowTab = tab.Name;
+    }
+
+    /// <summary>Writes the open tab to the viewer's own settings (#5846), the way the overview sort is kept: read
+    /// the file fresh, change the one value, write it. Runs on close, after any Save, and only on a change.</summary>
+    internal void RememberSelectedTab()
+    {
+        var current = (SettingsTabs.SelectedItem as TabItem)?.Name ?? "";
+        var settings = _appSettingsStore.Load();
+        if (settings.SettingsWindowTab == current)
+        {
+            return;
+        }
+        settings.SettingsWindowTab = current;
+        /* A failed write only means the window opens on another tab next time; the store logs why. */
+        _appSettingsStore.Save(settings);
+    }
+
     private void ApplyReadOnlyGating()
     {
         var readOnly = _dataService?.IsReadOnly == true;
@@ -354,6 +442,8 @@ public partial class SettingsWindow : Window
         var pausing = !_paused;
         PauseResumeButton.IsEnabled = false;
         PauseResumeButton.Content = pausing ? "Pausing..." : "Resuming...";
+        /* The pause waits for an agent change in progress to finish, up to a minute (#5632). */
+        CollectionStatusText.Text = "Status: waiting for an agent change in progress to finish, if there is one...";
         try
         {
             var result = pausing
@@ -362,7 +452,7 @@ public partial class SettingsWindow : Window
 
             if (result is null)
             {
-                CollectionStatusText.Text = "Status: command sent — the service has not confirmed yet";
+                CollectionStatusText.Text = "Status: the service is running the command — check again later";
             }
             else if (result.Status == ViewerDataService.StatusSucceeded)
             {
@@ -430,11 +520,12 @@ public partial class SettingsWindow : Window
     /// with a bad port keeps its last-known value and does not block the save).</summary>
     private bool TryReadServiceFlags(
         out bool capturePlans, out bool mcpEnabled, out int mcpPort, out bool webEnabled, out int webPort,
-        out int textBudgetMb, out int maxSweeps)
+        out int textBudgetMb, out int maxSweeps, out int fetchTopN)
     {
         capturePlans = CapturePlansCheckBox.IsChecked == true;
         textBudgetMb = 64;
         maxSweeps = 4;
+        fetchTopN = 100;
         mcpEnabled = McpEnabledCheckBox.IsChecked == true;
         mcpPort = _appSettings.McpPort;
         webEnabled = WebEnabledCheckBox.IsChecked == true;
@@ -446,6 +537,7 @@ public partial class SettingsWindow : Window
         }
         else if (mcpEnabled)
         {
+            SelectTabOf(McpPortTextBox);
             MessageBox.Show(
                 "MCP port must be between 1024 and 65535.\nPorts 0-1023 are well-known privileged ports reserved by the operating system.",
                 "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -458,6 +550,7 @@ public partial class SettingsWindow : Window
         }
         else if (webEnabled)
         {
+            SelectTabOf(WebPortTextBox);
             MessageBox.Show(
                 "Web dashboard port must be between 1024 and 65535.\nPorts 0-1023 are well-known privileged ports reserved by the operating system.",
                 "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -473,6 +566,7 @@ public partial class SettingsWindow : Window
         }
         else
         {
+            SelectTabOf(QueryStoreTextBudgetMbTextBox);
             MessageBox.Show(
                 "Query Store text budget must be between 4 and 256 MB.",
                 "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -485,8 +579,24 @@ public partial class SettingsWindow : Window
         }
         else
         {
+            SelectTabOf(MaxConcurrentSweepsTextBox);
             MessageBox.Show(
                 "Concurrent server sweeps must be between 1 and 16.",
+                "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return false;
+        }
+
+        /* #6211: plans per database-hour and metric whose text and plan the Query Store collector fetches. 0 means every new plan, so the floor
+           is 0; the service clamps on read as defense in depth. */
+        if (int.TryParse(QueryStoreFetchTopNTextBox.Text, out var parsedTopN) && parsedTopN is >= 0 and <= 100000)
+        {
+            fetchTopN = parsedTopN;
+        }
+        else
+        {
+            SelectTabOf(QueryStoreFetchTopNTextBox);
+            MessageBox.Show(
+                "Query Store fetch top N must be between 0 and 100000 (0 fetches every new plan).",
                 "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
             return false;
         }
@@ -766,6 +876,14 @@ public partial class SettingsWindow : Window
         AlertPgDeadlockThresholdBox.Text = r.PgDeadlockCountThreshold.ToString(CultureInfo.InvariantCulture);
         AlertPoisonWaitCheckBox.IsChecked = r.PoisonWaitEnabled;
         AlertPoisonWaitThresholdBox.Text = r.PoisonWaitThresholdMs.ToString(CultureInfo.InvariantCulture);
+        AlertRunnableQueueCheckBox.IsChecked = r.RunnableQueueEnabled;
+        AlertRunnableQueueWarningBox.Text = r.RunnableQueueWarningPerScheduler.ToString(CultureInfo.InvariantCulture);
+        AlertRunnableQueueCriticalBox.Text = r.RunnableQueueCriticalPerScheduler.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCheckBox.IsChecked = r.ClientTimeoutsEnabled;
+        AlertClientTimeoutsWarningBox.Text = r.ClientTimeoutsWarningPerMinute.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCriticalBox.Text = r.ClientTimeoutsCriticalPerMinute.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsWarningMultipleBox.Text = r.ClientTimeoutsWarningMultiple.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCriticalMultipleBox.Text = r.ClientTimeoutsCriticalMultiple.ToString(CultureInfo.InvariantCulture);
         AlertLongRunningQueryCheckBox.IsChecked = r.LongRunningQueryEnabled;
         AlertLongRunningQueryThresholdBox.Text = r.LongRunningQueryThresholdMinutes.ToString(CultureInfo.InvariantCulture);
         /* V20: the long-running-query read shape (max-results + the five noise filters) is store-backed now. */
@@ -777,7 +895,8 @@ public partial class SettingsWindow : Window
         LrqExcludeCdcCheckBox.IsChecked = r.LongRunningQueryExcludeCdc;
         AlertLrqExcludedProgramNamePrefixesBox.Text = string.Join(", ", r.LongRunningQueryExcludedProgramNamePrefixes);
         AlertLrqExcludedLoginsBox.Text = string.Join(", ", r.LongRunningQueryExcludedLogins);
-        AlertExcludedDatabasesBox.Text = string.Join(", ", r.ExcludedDatabases);
+        AlertExcludedDatabasesBox.Text = SettingsListText.Join(r.ExcludedDatabases);
+        AlertExcludedVolumesBox.Text = SettingsListText.Join(r.ExcludedVolumes);
         AlertTempDbSpaceCheckBox.IsChecked = r.TempDbSpaceEnabled;
         AlertTempDbSpaceThresholdBox.Text = r.TempDbSpaceThresholdPercent.ToString(CultureInfo.InvariantCulture);
         AlertLowDiskCheckBox.IsChecked = r.LowDiskEnabled;
@@ -836,7 +955,7 @@ public partial class SettingsWindow : Window
 
     /// <summary>Builds the store row from the alert + analysis controls, validating the numeric fields. Adds
     /// range errors to <paramref name="errors"/>; a bad field keeps its default rather than throwing.</summary>
-    private AlertSettingsRow BuildAlertRowFromControls(List<string> errors)
+    internal AlertSettingsRow BuildAlertRowFromControls(SettingsValidationErrors errors)
     {
         var row = new AlertSettingsRow
         {
@@ -860,6 +979,8 @@ public partial class SettingsWindow : Window
             BlockingEnabled = AlertBlockingCheckBox.IsChecked == true,
             DeadlockEnabled = AlertDeadlockCheckBox.IsChecked == true,
             PoisonWaitEnabled = AlertPoisonWaitCheckBox.IsChecked == true,
+            RunnableQueueEnabled = AlertRunnableQueueCheckBox.IsChecked == true,
+            ClientTimeoutsEnabled = AlertClientTimeoutsCheckBox.IsChecked == true,
             LongRunningQueryEnabled = AlertLongRunningQueryCheckBox.IsChecked == true,
             /* V20 long-running-query read shape (the five noise-filter opt-outs; max-results parsed below). */
             LongRunningQueryExcludeSpServerDiagnostics = LrqExcludeSpServerDiagnosticsCheckBox.IsChecked == true,
@@ -884,11 +1005,8 @@ public partial class SettingsWindow : Window
                the bind normalises the spelling. */
             AnalysisUncorroboratedRoute = SelectedAnalysisUncorroboratedRoute(),
             FleetSweepEnabled = FleetSweepEnabledCheckBox.IsChecked == true,
-            ExcludedDatabases = AlertExcludedDatabasesBox.Text
-                .Split(',')
-                .Select(s => s.Trim())
-                .Where(s => s.Length > 0)
-                .ToList(),
+            ExcludedDatabases = SettingsListText.SplitLines(AlertExcludedDatabasesBox.Text),
+            ExcludedVolumes = VolumeExclusions.Normalize(SettingsListText.SplitLinesAndCommas(AlertExcludedVolumesBox.Text)).ToList(),
         };
 
         if (int.TryParse(AlertCpuThresholdBox.Text, out var cpu) && cpu is > 0 and <= 100)
@@ -913,6 +1031,61 @@ public partial class SettingsWindow : Window
             row.PgBlockingCountThreshold = pgBlocking;
         if (int.TryParse(AlertPoisonWaitThresholdBox.Text, out var poisonWait) && poisonWait > 0)
             row.PoisonWaitThresholdMs = poisonWait;
+        /* #5641: the Runnable Queue bars, the engine's own rule (RunnableQueueEvaluator.ClampBars): Warning at least 1 and
+           Critical never below Warning. An invalid entry is reported here rather than silently clamped, so what is saved is
+           what the operator typed. A bad pair is refused whatever the checkbox says (as Lite does, round 1 of #5709): the row
+           is built fresh with the 8/16 defaults, so letting an unchecked alert skip the error would save 8/16 over the
+           operator's stored bars. */
+        var warningOk = int.TryParse(AlertRunnableQueueWarningBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rqWarning) && rqWarning >= 1;
+        var criticalOk = int.TryParse(AlertRunnableQueueCriticalBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rqCritical) && rqCritical >= 1;
+        if (warningOk && criticalOk && rqCritical >= rqWarning)
+        {
+            row.RunnableQueueWarningPerScheduler = rqWarning;
+            row.RunnableQueueCriticalPerScheduler = rqCritical;
+        }
+        else
+        {
+            errors.Add(!warningOk
+                ? "Runnable queue Warning must be a whole number of at least 1 runnable task per scheduler."
+                : "Runnable queue Critical must be a whole number no lower than the Warning bar.",
+                AlertRunnableQueueWarningBox);
+        }
+        /* #5640: the Client Timeouts bars, the engine's own rule (AttentionEvaluator.ClampBars: Warning at least 1, Critical never
+           below Warning), refused rather than clamped, and whatever the checkbox says, for the reason above (the row is built fresh
+           with the 10/60 defaults). */
+        var ctWarningOk = int.TryParse(AlertClientTimeoutsWarningBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ctWarning) && ctWarning >= 1;
+        var ctCriticalOk = int.TryParse(AlertClientTimeoutsCriticalBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ctCritical) && ctCritical >= 1;
+        if (ctWarningOk && ctCriticalOk && ctCritical >= ctWarning)
+        {
+            row.ClientTimeoutsWarningPerMinute = ctWarning;
+            row.ClientTimeoutsCriticalPerMinute = ctCritical;
+        }
+        else
+        {
+            errors.Add(!ctWarningOk
+                ? "Client timeouts Warning must be a whole number of at least 1 attention per minute."
+                : !ctCriticalOk
+                    ? "Client timeouts Critical must be a whole number of at least 1 attention per minute."
+                    : "Client timeouts Critical must be a whole number no lower than the Warning bar.",
+                AlertClientTimeoutsWarningBox);
+        }
+        /* #5736: the two multiples, the same rule as the floors (at least 1, Critical never below Warning), refused rather than clamped. */
+        var ctWarningMultipleOk = int.TryParse(AlertClientTimeoutsWarningMultipleBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ctWarningMultiple) && ctWarningMultiple >= 1;
+        var ctCriticalMultipleOk = int.TryParse(AlertClientTimeoutsCriticalMultipleBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ctCriticalMultiple) && ctCriticalMultiple >= 1;
+        if (ctWarningMultipleOk && ctCriticalMultipleOk && ctCriticalMultiple >= ctWarningMultiple)
+        {
+            row.ClientTimeoutsWarningMultiple = ctWarningMultiple;
+            row.ClientTimeoutsCriticalMultiple = ctCriticalMultiple;
+        }
+        else
+        {
+            errors.Add(!ctWarningMultipleOk
+                ? "Client timeouts Warning multiple must be a whole number of at least 1."
+                : !ctCriticalMultipleOk
+                    ? "Client timeouts Critical multiple must be a whole number of at least 1."
+                    : "Client timeouts Critical multiple must be a whole number no lower than the Warning multiple.",
+                AlertClientTimeoutsWarningMultipleBox);
+        }
         if (int.TryParse(AlertLongRunningQueryThresholdBox.Text, out var lrq) && lrq > 0)
             row.LongRunningQueryThresholdMinutes = lrq;
         /* V20: max-results (the read adapter re-clamps 1–1000; a bad value keeps the default 5). */
@@ -987,23 +1160,23 @@ public partial class SettingsWindow : Window
         if (int.TryParse(AlertCooldownBox.Text, out var alertCooldown) && alertCooldown is >= 1 and <= 120)
             row.CooldownMinutes = alertCooldown;
         else
-            errors.Add("Tray notification cooldown must be between 1 and 120 minutes.");
+            errors.Add("Tray notification cooldown must be between 1 and 120 minutes.", AlertCooldownBox);
 
         if (int.TryParse(AnalysisIntervalBox.Text, out var analysisInterval) && analysisInterval is >= 5 and <= 360)
             row.AnalysisIntervalMinutes = analysisInterval;
         else
-            errors.Add("Analysis interval must be between 5 and 360 minutes.");
+            errors.Add("Analysis interval must be between 5 and 360 minutes.", AnalysisIntervalBox);
 
         if (double.TryParse(AnalysisNotifySeverityBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var analysisSeverity)
             && analysisSeverity is >= 0.0 and <= 2.0)
             row.AnalysisNotifySeverity = analysisSeverity;
         else
-            errors.Add("Analysis notify severity must be between 0.0 and 2.0.");
+            errors.Add("Analysis notify severity must be between 0.0 and 2.0.", AnalysisNotifySeverityBox);
 
         if (int.TryParse(AnalysisNotifyCooldownBox.Text, out var analysisCooldown) && analysisCooldown is >= 30 and <= 10080)
             row.AnalysisNotifyCooldownMinutes = analysisCooldown;
         else
-            errors.Add("Analysis re-notify cooldown must be between 30 and 10080 minutes.");
+            errors.Add("Analysis re-notify cooldown must be between 30 and 10080 minutes.", AnalysisNotifyCooldownBox);
 
         /* #3466 (V124): the bounds are the same named constants update_alert_settings enforces and the
            worker clamps to, so the three writers into this column cannot disagree about what is
@@ -1013,20 +1186,20 @@ public partial class SettingsWindow : Window
             && fleetSweepInterval <= FleetSweepCadence.IntervalMinutesCeiling)
             row.FleetSweepIntervalMinutes = fleetSweepInterval;
         else
-            errors.Add($"Fleet sweep interval must be between {FleetSweepCadence.IntervalMinutesFloor} and {FleetSweepCadence.IntervalMinutesCeiling} minutes.");
+            errors.Add($"Fleet sweep interval must be between {FleetSweepCadence.IntervalMinutesFloor} and {FleetSweepCadence.IntervalMinutesCeiling} minutes.", FleetSweepIntervalBox);
 
         /* #1141/#1236: delivery mode + per-event cap (store-backed). */
         row.DeliveryMode = AlertDeliveryModeBox.SelectedIndex == 1 ? "PerEvent" : "Summary";
         if (int.TryParse(AlertPerEventMaxBox.Text, out var perEventMax) && perEventMax is >= 1 and <= 100)
             row.PerEventMax = perEventMax;
         else
-            errors.Add("Per-event max-per-cycle must be between 1 and 100.");
+            errors.Add("Per-event max-per-cycle must be between 1 and 100.", AlertPerEventMaxBox);
 
         return row;
     }
 
     /// <summary>Persists the viewer-LOCAL alert fields to <see cref="ViewerAppSettings"/> (the store never sees them).</summary>
-    private void SaveViewerLocalAlertFields(List<string> errors)
+    private void SaveViewerLocalAlertFields(SettingsValidationErrors errors)
     {
         _appSettings.MinimizeToTray = MinimizeToTrayCheckBox.IsChecked == true;
         /* AlertDeliveryMode/PerEventMax, the long-running-query read shape (max-results + the five noise filters),
@@ -1051,6 +1224,12 @@ public partial class SettingsWindow : Window
         AlertPgBlockingThresholdBox.Text =
             PostgresAlertEvaluator.BlockingCountThresholdDefault.ToString(CultureInfo.InvariantCulture);
         AlertPoisonWaitThresholdBox.Text = "500";
+        AlertRunnableQueueWarningBox.Text = RunnableQueueEvaluator.DefaultWarningPerScheduler.ToString(CultureInfo.InvariantCulture);
+        AlertRunnableQueueCriticalBox.Text = RunnableQueueEvaluator.DefaultCriticalPerScheduler.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsWarningBox.Text = AttentionEvaluator.DefaultWarningPerMinute.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCriticalBox.Text = AttentionEvaluator.DefaultCriticalPerMinute.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsWarningMultipleBox.Text = AttentionBaselineMath.DefaultWarningMultiple.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCriticalMultipleBox.Text = AttentionBaselineMath.DefaultCriticalMultiple.ToString(CultureInfo.InvariantCulture);
         AlertLongRunningQueryThresholdBox.Text = "30";
         /* V20: the long-running-query read shape resets to Lite's App defaults (5 rows, every filter on). */
         AlertLongRunningQueryMaxResultsBox.Text = "5";
@@ -1117,6 +1296,7 @@ public partial class SettingsWindow : Window
         FleetSweepEnabledCheckBox.IsChecked = true;
         FleetSweepIntervalBox.Text = FleetSweepCadence.DefaultIntervalMinutes.ToString(CultureInfo.InvariantCulture);
         AlertExcludedDatabasesBox.Text = "";
+        AlertExcludedVolumesBox.Text = "";
         MuteRuleDefaultExpirationCombo.SelectedIndex = 1; // 24 hours
         UpdateAlertPreviewText();
     }
@@ -1140,6 +1320,30 @@ public partial class SettingsWindow : Window
         }
 
         var window = new NotificationRoutesWindow(_dataService) { Owner = this };
+        window.ShowDialog();
+    }
+
+    /// <summary>#5916: the per-server threshold overrides, beside the global thresholds they replace.</summary>
+    private void ManageThresholdOverridesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService is null)
+        {
+            return;
+        }
+
+        var window = new ThresholdOverridesWindow(_dataService) { Owner = this };
+        window.ShowDialog();
+    }
+
+    /// <summary>#5632 Phase A: the investigations an agent route opens, beside the routes that open them.</summary>
+    private void ManageInvestigationsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService is null)
+        {
+            return;
+        }
+
+        var window = new InvestigationsWindow(_dataService) { Owner = this };
         window.ShowDialog();
     }
 
@@ -1174,6 +1378,12 @@ public partial class SettingsWindow : Window
             /* #3539 A4: the live bar, from the shared constants — not the retired ms box, which nothing reads. */
             parts.Add(string.Create(CultureInfo.InvariantCulture,
                 $"poison waits >= {PoisonWaitEvaluator.WarningAvgWaiters * PoisonWaitEvaluator.WindowMinutes * 60:N0}s accumulated in {PoisonWaitEvaluator.WindowMinutes}min"));
+        if (AlertRunnableQueueCheckBox.IsChecked == true)
+            parts.Add(string.Create(CultureInfo.InvariantCulture,
+                $"runnable queue >= {AlertRunnableQueueWarningBox.Text}/{AlertRunnableQueueCriticalBox.Text} per scheduler (avg {RunnableQueueEvaluator.WindowMinutes}min)"));
+        if (AlertClientTimeoutsCheckBox.IsChecked == true)
+            parts.Add(string.Create(CultureInfo.InvariantCulture,
+                $"client timeouts >= max({AlertClientTimeoutsWarningBox.Text}/{AlertClientTimeoutsCriticalBox.Text} per minute, {AlertClientTimeoutsWarningMultipleBox.Text}x/{AlertClientTimeoutsCriticalMultipleBox.Text}x the server's own baseline) (avg {AttentionEvaluator.WindowMinutes}min)"));
         if (AlertLongRunningQueryCheckBox.IsChecked == true)
             parts.Add($"queries > {AlertLongRunningQueryThresholdBox.Text}min");
         if (AlertTempDbSpaceCheckBox.IsChecked == true)
@@ -1251,6 +1461,14 @@ public partial class SettingsWindow : Window
            master switch — the XAML sets IsEnabled="False", and this loop must not re-enable it on load or
            on toggle, or the operator is back to tuning a number the engine ignores. */
         AlertPoisonWaitThresholdBox.IsEnabled = false;
+        AlertRunnableQueueCheckBox.IsEnabled = enabled;
+        AlertRunnableQueueWarningBox.IsEnabled = enabled;
+        AlertRunnableQueueCriticalBox.IsEnabled = enabled;
+        AlertClientTimeoutsCheckBox.IsEnabled = enabled;
+        AlertClientTimeoutsWarningBox.IsEnabled = enabled;
+        AlertClientTimeoutsCriticalBox.IsEnabled = enabled;
+        AlertClientTimeoutsWarningMultipleBox.IsEnabled = enabled;
+        AlertClientTimeoutsCriticalMultipleBox.IsEnabled = enabled;
         AlertLongRunningQueryCheckBox.IsEnabled = enabled;
         AlertLongRunningQueryThresholdBox.IsEnabled = enabled;
         /* V20 long-running-query read-shape controls follow the master switch like the rest of the engine. */
@@ -1313,6 +1531,7 @@ public partial class SettingsWindow : Window
         SmtpFromBox.Text = r.SmtpFromAddress;
         SmtpRecipientsBox.Text = r.SmtpRecipients;
         EmailCooldownBox.Text = r.EmailCooldownMinutes.ToString(CultureInfo.InvariantCulture);
+        EmailSendResolutionsCheckBox.IsChecked = r.EmailSendResolutions;
 
         /* A saved password is never put back in the box, sealed or in the older format: the box stays blank and says the
            password is saved (#5366). A blank box keeps it; a changed host, port, SSL flag or user name asks for it again. */
@@ -1326,10 +1545,12 @@ public partial class SettingsWindow : Window
         TeamsWebhookUrlBox.Text = ViewerWebhookSealing.ShownText(r.TeamsUrl);
         TeamsStatusText.Text = ViewerWebhookSealing.IsSaved(r.TeamsUrl) ? ViewerWebhookSealing.KeepHint : "";
         TeamsProxyAddressBox.Text = r.TeamsProxy;
+        TeamsSendResolutionsCheckBox.IsChecked = r.TeamsSendResolutions;
         SlackWebhookEnabledCheckBox.IsChecked = !string.IsNullOrWhiteSpace(r.SlackUrl);
         SlackWebhookUrlBox.Text = ViewerWebhookSealing.ShownText(r.SlackUrl);
         SlackStatusText.Text = ViewerWebhookSealing.IsSaved(r.SlackUrl) ? ViewerWebhookSealing.KeepHint : "";
         SlackProxyAddressBox.Text = r.SlackProxy;
+        SlackSendResolutionsCheckBox.IsChecked = r.SlackSendResolutions;
 
         GenericWebhookEnabledCheckBox.IsChecked = !string.IsNullOrWhiteSpace(r.GenericUrl);
         GenericWebhookUrlBox.Text = ViewerWebhookSealing.ShownText(r.GenericUrl);
@@ -1343,6 +1564,7 @@ public partial class SettingsWindow : Window
             ? WebhookAlertService.DefaultGenericBodyTemplate
             : r.GenericBodyTemplate;
         GenericWebhookProxyAddressBox.Text = r.GenericProxy;
+        GenericSendResolutionsCheckBox.IsChecked = r.GenericSendResolutions;
 
         PagerDutyWebhookEnabledCheckBox.IsChecked = !string.IsNullOrWhiteSpace(r.PagerDutyRoutingKey);
         PagerDutyRoutingKeyBox.Text = ViewerWebhookSealing.ShownText(r.PagerDutyRoutingKey);
@@ -1361,7 +1583,7 @@ public partial class SettingsWindow : Window
     /// <summary>Builds the <see cref="NotificationRow"/> from the SMTP + webhook controls. A DISABLED channel
     /// writes EMPTY key fields so the service (which derives enablement from non-empty fields) treats it as off;
     /// an enabled SMTP channel seals the typed password (or preserves the existing blob when left unchanged).</summary>
-    private NotificationRow BuildNotificationRowFromControls(List<string> errors)
+    private NotificationRow BuildNotificationRowFromControls(SettingsValidationErrors errors)
     {
         var row = new NotificationRow();
         _smtpPasswordToSeal = null;
@@ -1369,7 +1591,7 @@ public partial class SettingsWindow : Window
         if (int.TryParse(EmailCooldownBox.Text, out var emailCooldown) && emailCooldown is >= 1 and <= 120)
             row.EmailCooldownMinutes = emailCooldown;
         else
-            errors.Add("Email alert cooldown must be between 1 and 120 minutes.");
+            errors.Add("Email alert cooldown must be between 1 and 120 minutes.", EmailCooldownBox);
 
         if (SmtpEnabledCheckBox.IsChecked == true)
         {
@@ -1381,6 +1603,7 @@ public partial class SettingsWindow : Window
             row.SmtpUsername = string.IsNullOrWhiteSpace(username) ? null : username;
             row.SmtpFromAddress = SmtpFromBox.Text?.Trim() ?? "";
             row.SmtpRecipients = SmtpRecipientsBox.Text?.Trim() ?? "";
+            row.EmailSendResolutions = EmailSendResolutionsCheckBox.IsChecked == true;
             ResolveSmtpPassword(row, errors);
         }
 
@@ -1388,12 +1611,14 @@ public partial class SettingsWindow : Window
         {
             row.TeamsUrl = ViewerWebhookSealing.CarryKept(TeamsWebhookUrlBox.Text, _loadedNotification?.TeamsUrl);
             row.TeamsProxy = TeamsProxyAddressBox.Text?.Trim() ?? "";
+            row.TeamsSendResolutions = TeamsSendResolutionsCheckBox.IsChecked == true;
         }
 
         if (SlackWebhookEnabledCheckBox.IsChecked == true)
         {
             row.SlackUrl = ViewerWebhookSealing.CarryKept(SlackWebhookUrlBox.Text, _loadedNotification?.SlackUrl);
             row.SlackProxy = SlackProxyAddressBox.Text?.Trim() ?? "";
+            row.SlackSendResolutions = SlackSendResolutionsCheckBox.IsChecked == true;
         }
 
         if (GenericWebhookEnabledCheckBox.IsChecked == true)
@@ -1404,7 +1629,7 @@ public partial class SettingsWindow : Window
                     GenericWebhookHeadersBox.Text, GenericWebhookUrlBox.Text,
                     _loadedNotification?.GenericHeaders, _loadedNotification?.GenericUrl))
             {
-                errors.Add(ViewerWebhookSealing.RetypeUrlForHeadersText);
+                errors.Add(ViewerWebhookSealing.RetypeUrlForHeadersText, GenericWebhookUrlBox);
             }
             /* Persist the empty "use built-in default" sentinel unless the operator actually edited the body box
                (the Settings load pre-fills it with the default), so a future release can still improve it. */
@@ -1412,6 +1637,7 @@ public partial class SettingsWindow : Window
                 ? ""
                 : GenericWebhookBodyBox.Text?.Trim() ?? "";
             row.GenericProxy = GenericWebhookProxyAddressBox.Text?.Trim() ?? "";
+            row.GenericSendResolutions = GenericSendResolutionsCheckBox.IsChecked == true;
 
             /* A malformed headers JSON / body template would let the service accept the channel and then
                drop every alert with only a log line to show for it — block the Save instead (#1506). */
@@ -1420,7 +1646,7 @@ public partial class SettingsWindow : Window
                 row.GenericBodyTemplate);
             if (configError != null)
             {
-                errors.Add(configError);
+                errors.Add(configError, GenericWebhookHeadersBox);
             }
         }
 
@@ -1434,6 +1660,155 @@ public partial class SettingsWindow : Window
 
         return row;
     }
+
+    // ── Generic webhook signing key (#5998) ──
+
+    /// <summary>The key block of the generic webhook, as last read from the store. Null for a read-only seat.</summary>
+    private ViewerSigningKeyState? _genericSigningState;
+
+    /// <summary>Reads the settings row's key columns and puts the block in line with them. The key itself is never read in the
+    /// clear: only whether a sealed key is saved and when the previous key stops being sent.</summary>
+    private async Task RefreshGenericSigningKeyAsync()
+    {
+        _genericSigningState = null;
+        var readOnly = _dataService is null || _dataService.IsReadOnly;
+        if (!readOnly)
+        {
+            try
+            {
+                _genericSigningState = await _dataService!.GetSettingsSigningKeyStateAsync();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                ViewerLogger.Warn("SettingsWindow", "The generic webhook signing key state could not be read: " + ex.Message);
+            }
+        }
+
+        GenericSigningKeyButton.Content = ViewerWebhookSigningKeys.ActionText(_genericSigningState);
+        GenericSigningKeyButton.IsEnabled = !readOnly;
+        GenericSigningKeyRemoveButton.IsEnabled = !readOnly && _genericSigningState is { HasKey: true };
+        GenericSigningKeyStatusText.Text = readOnly
+            ? "A read-only connection cannot make or remove a key."
+            : ViewerWebhookSigningKeys.StatusText(_genericSigningState, DateTime.UtcNow);
+        GenericUnsignedTestText.Text = _genericSigningState is { HasKey: true } ? ViewerWebhookSigningKeys.UnsignedTestText : "";
+    }
+
+    /// <summary>Shows a new key once, in a box to copy from. It is not logged, not copied for the person, and is gone when the window closes.</summary>
+    private void ShowNewGenericSigningKey(string key)
+    {
+        GenericSigningKeyShownBox.Text = key;
+        GenericSigningKeyShownText.Text = ViewerWebhookSigningKeys.ShownOnceText;
+        GenericSigningKeyShownPanel.Visibility = Visibility.Visible;
+        GenericSigningKeyShownBox.SelectAll();
+    }
+
+    private void HideNewGenericSigningKey()
+    {
+        GenericSigningKeyShownBox.Text = "";
+        GenericSigningKeyShownText.Text = "";
+        GenericSigningKeyShownPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private async void GenericSigningKeyButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService is null)
+        {
+            return;
+        }
+
+        /* A key is tied to the saved URL, so a URL typed here and not yet saved would be the wrong one. */
+        if (!string.Equals(
+                GenericWebhookUrlBox.Text?.Trim() ?? "",
+                ViewerWebhookSealing.ShownText(_loadedNotification.GenericUrl).Trim(), StringComparison.Ordinal))
+        {
+            MessageBox.Show(ViewerWebhookSigningKeys.SaveUrlFirstText, "Signing key", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (_genericSigningState is { HasKey: true }
+            && MessageBox.Show(
+                $"Make a new key? The current key keeps signing alongside it for {WebhookSigning.RotationOverlapDays} days, so the receiver has time to switch.",
+                "Rotate signing key", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        GenericSigningKeyButton.IsEnabled = false;
+        try
+        {
+            var key = await ViewerPasswordKey.GetSealKeyAsync(_dataService, this);
+            if (key.Notice is { } notice)
+            {
+                MessageBox.Show(notice, "Signing key", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+
+            if (key.Sealer is null)
+            {
+                MessageBox.Show(key.Refusal ?? ViewerPasswordKey.NoKeyText, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            ShowNewGenericSigningKey(await _dataService.GenerateSettingsSigningKeyAsync(key.Sealer));
+        }
+        catch (ViewerPasswordRefusedException ex)
+        {
+            MessageBox.Show(ex.Message, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        catch (ViewerReadOnlyException ex)
+        {
+            MessageBox.Show(ex.Message, "Read-only connection", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        catch (ViewerSchemaSkewException ex)
+        {
+            MessageBox.Show(ex.Message, "Store out of date", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            MessageBox.Show("The signing key was not saved:\n\n" + ex.Message, "Signing key", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            await RefreshGenericSigningKeyAsync();
+        }
+    }
+
+    private async void GenericSigningKeyRemoveButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService is null
+            || MessageBox.Show(
+                "Remove the signing key and the previous key? Posts to this URL go out unsigned from the next alert, and a receiver that checks signatures will refuse them.",
+                "Remove signing key", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            await _dataService.RemoveSettingsSigningKeyAsync();
+            HideNewGenericSigningKey();
+        }
+        catch (ViewerReadOnlyException ex)
+        {
+            MessageBox.Show(ex.Message, "Read-only connection", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            MessageBox.Show("The signing key was not removed:\n\n" + ex.Message, "Signing key", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            await RefreshGenericSigningKeyAsync();
+        }
+    }
+
+    /// <summary>
+    /// The sentence that refuses a save that would leave a signing key unreadable (#5998), or null: a key is sealed for the stored
+    /// generic URL text and the generic proxy, and a route's key for the settings row's proxy. It runs inside the save's own
+    /// transaction (<see cref="ViewerDataService.UpsertNotificationCheckingSigningKeysAsync"/>), on rows that transaction has locked.
+    /// </summary>
+    private string? SigningKeyRefusal(NotificationRow row, ViewerSigningKeyState? stored, System.Collections.Generic.IReadOnlyList<int> routeIdsHoldingKeys) =>
+        ViewerWebhookSigningKeys.SaveRefusal(stored, row.GenericUrl, row.GenericProxy, checkProxy: true)
+            ?? ViewerWebhookSigningKeys.RouteKeyRefusal(routeIdsHoldingKeys, row.GenericProxy, stored?.Proxy ?? _loadedNotification.GenericProxy);
 
     /// <summary>
     /// Seals the typed webhook values for the settings row (#5366): kept values stay as stored, anything typed is sealed to the
@@ -1481,7 +1856,7 @@ public partial class SettingsWindow : Window
     /// SSL flag or user name changed (the stored password only opens for the settings it was sealed for). A typed password
     /// is sealed later, in <see cref="SealSmtpPasswordAsync"/>, once the service's key has been read; its text is checked here.
     /// </summary>
-    private void ResolveSmtpPassword(NotificationRow row, List<string> errors)
+    private void ResolveSmtpPassword(NotificationRow row, SettingsValidationErrors errors)
     {
         _smtpPasswordToSeal = null;
         row.SmtpEncryptedPassword = _loadedNotification.SmtpEncryptedPassword;
@@ -1490,16 +1865,16 @@ public partial class SettingsWindow : Window
         switch (ViewerSmtpSeal.Decide(_loadedNotification, null, row, typed))
         {
             case ViewerSmtpPasswordAction.Refuse:
-                errors.Add(ViewerSmtpSeal.ReenterText);
+                errors.Add(ViewerSmtpSeal.ReenterText, SmtpPasswordBox);
                 break;
             case ViewerSmtpPasswordAction.Seal:
                 if (!ViewerSmtpSeal.IsValidText(typed))
                 {
-                    errors.Add(ViewerPasswordSealer.PasswordCharactersText);
+                    errors.Add(ViewerPasswordSealer.PasswordCharactersText, SmtpPasswordBox);
                 }
                 else if (ViewerSmtpSeal.FirstInvalidBoundField(row.SmtpHost, row.SmtpUsername) is { } field)
                 {
-                    errors.Add(ViewerPasswordSealer.FieldCharactersText(field));
+                    errors.Add(ViewerPasswordSealer.FieldCharactersText(field), SmtpServerBox);
                 }
                 else
                 {
@@ -1560,6 +1935,7 @@ public partial class SettingsWindow : Window
         SmtpPasswordBox.IsEnabled = enabled;
         SmtpFromBox.IsEnabled = enabled;
         SmtpRecipientsBox.IsEnabled = enabled;
+        EmailSendResolutionsCheckBox.IsEnabled = enabled;
         TestEmailButton.IsEnabled = enabled;
         ValidateSmtpButton.IsEnabled = enabled;
     }
@@ -1581,7 +1957,8 @@ public partial class SettingsWindow : Window
 
         if (errors.Count == 0)
         {
-            SmtpStatusText.Text = "Settings look good. Use 'Send Test Email' to verify delivery.";
+            SmtpStatusText.Text = CleartextSmtpWarning(includeStoredPassword: true)
+                ?? "Settings look good. Use 'Send Test Email' to verify delivery.";
         }
         else
         {
@@ -1592,8 +1969,50 @@ public partial class SettingsWindow : Window
         }
     }
 
+    /// <summary>
+    /// The unencrypted-login warning for the SMTP settings as they stand in the boxes, or null. A Save keeps
+    /// the store's existing password when the box is empty (<see cref="ResolveSmtpPassword"/>), so it counts that
+    /// one too (<paramref name="includeStoredPassword"/>); a test sends only what the box holds.
+    /// </summary>
+    private string? CleartextSmtpWarning(bool includeStoredPassword) =>
+        EmailSendCore.CleartextCredentialsWarning(
+            SmtpSslCheckBox.IsChecked == true,
+            SmtpUsernameBox.Text?.Trim(),
+            !string.IsNullOrEmpty(SmtpPasswordBox.Password)
+                || (includeStoredPassword && !string.IsNullOrEmpty(_loadedNotification.SmtpEncryptedPassword)));
+
+    /// <summary>
+    /// Non-blocking confirm shown at Save and Send Test when SSL is off and a login is set, so the username
+    /// and password would go to the mail server unencrypted. Yes proceeds; No cancels the action.
+    /// <paramref name="action"/> is the verb ("Save" / "Send"). Not blocked outright: an internal relay on
+    /// port 25 is a real setup.
+    /// </summary>
+    private bool ConfirmCleartextSmtp(string action, bool includeStoredPassword)
+    {
+        if (SmtpEnabledCheckBox.IsChecked != true)
+        {
+            return true;
+        }
+
+        var warning = CleartextSmtpWarning(includeStoredPassword);
+        if (warning == null)
+        {
+            return true;
+        }
+
+        var result = MessageBox.Show(
+            $"{warning}\n\n{action} anyway?",
+            "Unencrypted SMTP Login", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        return result == MessageBoxResult.Yes;
+    }
+
     private async void TestEmailButton_Click(object sender, RoutedEventArgs e)
     {
+        if (!ConfirmCleartextSmtp("Send", includeStoredPassword: false))
+        {
+            return;
+        }
+
         TestEmailButton.IsEnabled = false;
         TestEmailButton.Content = "Sending...";
 
@@ -1635,6 +2054,7 @@ public partial class SettingsWindow : Window
         var enabled = TeamsWebhookEnabledCheckBox.IsChecked == true;
         TeamsWebhookUrlBox.IsEnabled = enabled;
         TeamsProxyAddressBox.IsEnabled = enabled;
+        TeamsSendResolutionsCheckBox.IsEnabled = enabled;
         TestTeamsButton.IsEnabled = enabled;
     }
 
@@ -1643,6 +2063,7 @@ public partial class SettingsWindow : Window
         var enabled = SlackWebhookEnabledCheckBox.IsChecked == true;
         SlackWebhookUrlBox.IsEnabled = enabled;
         SlackProxyAddressBox.IsEnabled = enabled;
+        SlackSendResolutionsCheckBox.IsEnabled = enabled;
         TestSlackButton.IsEnabled = enabled;
     }
 
@@ -1655,6 +2076,7 @@ public partial class SettingsWindow : Window
         GenericWebhookHeadersBox.IsEnabled = enabled;
         GenericWebhookBodyBox.IsEnabled = enabled;
         GenericWebhookProxyAddressBox.IsEnabled = enabled;
+        GenericSendResolutionsCheckBox.IsEnabled = enabled;
         TestGenericButton.IsEnabled = enabled;
     }
 
@@ -1872,10 +2294,10 @@ public partial class SettingsWindow : Window
 
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
     {
-        var errors = new List<string>();
+        var errors = new SettingsValidationErrors();
         var mcpValid = TryReadServiceFlags(
             out var capturePlans, out var mcpEnabled, out var mcpPort, out var webEnabled, out var webPort,
-            out var textBudgetMb, out var maxSweeps);
+            out var textBudgetMb, out var maxSweeps, out var fetchTopN);
         var alertRow = BuildAlertRowFromControls(errors);
         SaveViewerLocalAlertFields(errors);
         var notifyRow = BuildNotificationRowFromControls(errors);
@@ -1886,6 +2308,14 @@ public partial class SettingsWindow : Window
         if (GenericWebhookEnabledCheckBox.IsChecked == true
             && WebhookAlertService.IsCleartextHttpWithHeaders(GenericWebhookUrlBox.Text?.Trim(), GenericWebhookHeadersBox.Text?.Trim())
             && !ConfirmCleartextWebhook("Save"))
+        {
+            return;
+        }
+
+        /* An SMTP login that would go to the mail server unencrypted (SSL off with a password set) is confirmed
+           the same way, before anything is persisted. NOT blocked - an internal relay on port 25 is a real
+           setup. */
+        if (!ConfirmCleartextSmtp("Save", includeStoredPassword: true))
         {
             return;
         }
@@ -1917,8 +2347,11 @@ public partial class SettingsWindow : Window
 
         if (errors.Count > 0)
         {
+            /* #5846: the field may sit on a tab that is not showing. Open the first tab holding one, and name
+               each message's tab, so the warning never points at a page the operator cannot see. */
+            SelectFirstTabWithError(errors);
             MessageBox.Show(
-                "Some settings have invalid values and were not saved:\n\n" + string.Join("\n", errors),
+                "Some settings have invalid values and were not saved:\n\n" + string.Join("\n", DescribeErrors(errors)),
                 "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
@@ -1958,9 +2391,9 @@ public partial class SettingsWindow : Window
                 await SealWebhookValuesAsync(notifyRow);
                 var routeValuesNeedEnteringAgain = await RouteValuesNeedEnteringAgainAsync(notifyRow);
                 await _dataService.UpsertAlertSettingsAsync(alertRow);
-                await _dataService.UpsertNotificationAsync(notifyRow);
+                await _dataService.UpsertNotificationCheckingSigningKeysAsync(notifyRow, (stored, ids) => SigningKeyRefusal(notifyRow, stored, ids));
                 await _dataService.UpdateServiceFlagsAsync(capturePlans, mcpEnabled, mcpPort, webEnabled, webPort,
-                    QueryStoreBackfillCheckBox.IsChecked == true, textBudgetMb, maxSweeps);
+                    QueryStoreBackfillCheckBox.IsChecked == true, textBudgetMb, maxSweeps, fetchTopN);
                 if (routeValuesNeedEnteringAgain)
                 {
                     /* The settings were saved; the routes' sealed values were bound to the old proxy (#5366). */
@@ -2011,6 +2444,8 @@ public partial class SettingsWindow : Window
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
+        RememberSelectedTab();
+
         /* Catches the title-bar X / Esc: an unsaved theme preview reverts to what was active on open. */
         if (!_themeSaved)
         {

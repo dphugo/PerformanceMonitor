@@ -79,6 +79,41 @@ switch (process.argv[3]) {
     out.headAfterEnter = cell.all((n) => n.hasClass("dlg-side-head"))[0].textContent;
     break;
   }
+  case "sqlHandles": {
+    const g = graph();
+    g.processes[1].sql_frames = [
+      { position: 1, sql_handle: "0x0300AA", stmt_start: 20, stmt_end: 140, proc_name: "dbo.Inner", line: 9 },
+      { position: 3, sql_handle: "0x0300BB", stmt_start: 0, stmt_end: -1 },
+    ];
+    const cell = mod.deadlockGraphCell("srv", { dedup_key: "k1", deadlock_time: "2026-01-01T00:00:00Z", graph: g });
+    open(cell);
+    const nodes = cell.all((n) => n.hasClass("dlg-node"));
+    nodes[1].fire("click");
+    out.pres = cell.tags("pre").map((n) => n.textContent);
+    out.labels = cell.all((n) => n.hasClass("dlg-prop")).map((n) => n.textContent).filter((t) => t.includes("handle") && t.endsWith(":"));
+    nodes[0].fire("click");
+    out.presNoHandles = cell.tags("pre").map((n) => n.textContent);
+    out.labelsNoHandles = cell.all((n) => n.hasClass("dlg-prop")).map((n) => n.textContent).filter((t) => t.includes("handle") && t.endsWith(":"));
+    break;
+  }
+  case "sqlProcessHandle": {
+    const g = graph();
+    g.processes[0].sql_process_handle = { sql_handle: "0x0300CC", stmt_start: 4, stmt_end: 88 };
+    g.processes[1].sql_process_handle = { sql_handle: "0x0300DD", stmt_start: 0, stmt_end: -1 };
+    g.processes[1].sql_frames = [{ position: 1, sql_handle: "0x0300AA", stmt_start: 20, stmt_end: 140 }];
+    const cell = mod.deadlockGraphCell("srv", { dedup_key: "k1", deadlock_time: "2026-01-01T00:00:00Z", graph: g });
+    open(cell);
+    const nodes = cell.all((n) => n.hasClass("dlg-node"));
+    const read = () => ({
+      pres: cell.tags("pre").map((n) => n.textContent),
+      labels: cell.all((n) => n.hasClass("dlg-prop")).map((n) => n.textContent).filter((t) => t.includes("handle") && t.endsWith(":")),
+    });
+    nodes[0].fire("click");
+    out.alone = read();
+    nodes[1].fire("click");
+    out.withFrames = read();
+    break;
+  }
   case "hostile": {
     const g = graph();
     g.processes[0].sql_text = '<script>alert(1)</script><img src=x onerror=alert(1)>';

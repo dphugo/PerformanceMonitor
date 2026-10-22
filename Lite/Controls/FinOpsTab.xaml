@@ -569,7 +569,7 @@
                               LoadingRow="MarkedGrid_LoadingRow">
                                     <DataGrid.Columns>
                                         <DataGridTextColumn Header="Database" Binding="{Binding DatabaseName}" Width="*"/>
-                                        <DataGridTextColumn Header="Avg CPU (ms)" Binding="{Binding CpuTimeMs, StringFormat='{}{0:N2}'}" Width="110">
+                                        <DataGridTextColumn Header="Avg CPU (ms)" Binding="{Binding AvgCpuMs, StringFormat='{}{0:N2}'}" Width="110">
                                             <DataGridTextColumn.ElementStyle>
                                                 <Style TargetType="TextBlock"><Setter Property="HorizontalAlignment" Value="Right"/></Style>
                                             </DataGridTextColumn.ElementStyle>
@@ -3123,7 +3123,7 @@
                                 </DataGridTextColumn.Header>
                                 <DataGridTextColumn.ElementStyle><Style TargetType="TextBlock"><Setter Property="HorizontalAlignment" Value="Right"/></Style></DataGridTextColumn.ElementStyle>
                             </DataGridTextColumn>
-                            <DataGridTextColumn Binding="{Binding UptimeDisplay}" Width="100">
+                            <DataGridTextColumn Binding="{Binding UptimeDisplay}" SortMemberPath="UptimeSeconds" Width="100">
                                 <DataGridTextColumn.Header>
                                     <StackPanel Orientation="Horizontal">
                                         <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="UptimeDisplay" Click="FilterButton_Click" Margin="0,0,4,0"/>

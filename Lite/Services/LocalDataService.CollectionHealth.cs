@@ -189,6 +189,17 @@ WITH health AS
         -- productivity sits BEFORE the streak rather than inside it, which is the ORDER that makes this a
         -- regression rather than two unrelated facts.
         MAX(CASE WHEN rows_collected > 0 THEN collection_time END) AS last_productive_time,
+        -- #5646: the success flags of the NEWEST three runs, newest first (the recovery rule's input). max_by with a
+        -- count is a top-3 aggregate: DuckDB keeps three rows while it makes the pass this CTE already makes, so
+        -- it neither sorts the window (the cost #5371 removed) nor reads it a second time. The order is the full
+        -- timestamp (DuckDB keeps microseconds), then log_id, the unique id, compared as one struct (field by
+        -- field), so two runs at the same instant are ordered the same way every time. The success test is
+        -- success_count's own (SUCCESS, not an abandoned cycle) over the rows total_runs counts. Fewer than three
+        -- runs leave the list short, and the CASE below reads the missing flags as not-success.
+        max_by(CASE WHEN status = 'SUCCESS'
+                     AND NOT {EnumeratedCollectorDriver.AbandonedByNotePredicateSql}
+                    THEN 1 ELSE 0 END,
+               struct_pack(t := collection_time, i := log_id), 3) AS recent_flags,
         -- #5371: the instants the keyed lookups below read at. The statement used to rank every run of the
         -- window four times (ROW_NUMBER over each collector, sorted on collection_time and a VARCHAR) to
         -- reach the newest row of four classes; that sorts the whole window. These are plain aggregates, so
@@ -216,6 +227,9 @@ WITH health AS
     FROM v_collection_log
     WHERE server_id = $1
     AND   collection_time >= $2
+    -- #5643: the loop's skipped-slots row is not a collector run; as a collector it would show a row here and its
+    -- SKIPPED status would count as a healthy run (last_success_time).
+    AND   collector_name <> '{CollectionCycleSkip.CollectorName}'
     GROUP BY collector_name
 )
 SELECT
@@ -319,7 +333,16 @@ SELECT
     -- collector's current state. The newest run of any status, and the SUCCESS gate matches last_note's
     -- (only the SUCCESS write carries a note). APPENDED, read positionally; Darling's twin carries it at
     -- the same ordinal.
-    CASE WHEN newest.pick.status = 'SUCCESS' THEN newest.pick.error_message END AS latest_run_note
+    CASE WHEN newest.pick.status = 'SUCCESS' THEN newest.pick.error_message END AS latest_run_note,
+    -- #5646: how many of the NEWEST runs in a row succeeded, counted to 3 and no further (the recovery rule's
+    -- input). The window's runs ordered newest first on the FULL timestamp (DuckDB keeps microseconds), then
+    -- log_id DESC, the unique id, so two runs at the same instant are ordered the same way every time. The
+    -- success test is success_count's own (SUCCESS, not an abandoned cycle) over the rows total_runs counts.
+    -- APPENDED, read positionally; Darling's twin carries it at the same ordinal.
+    CASE WHEN h.recent_flags[1] = 1 AND h.recent_flags[2] = 1 AND h.recent_flags[3] = 1 THEN 3
+         WHEN h.recent_flags[1] = 1 AND h.recent_flags[2] = 1 THEN 2
+         WHEN h.recent_flags[1] = 1 THEN 1
+         ELSE 0 END AS trailing_success_runs
 FROM health h
 -- #5371: the keyed lookups. Each reads ONE collector's rows at an instant the aggregate above already
 -- found, so the scan of v_collection_log carries an equality on collection_time (the hot table's
@@ -491,6 +514,7 @@ ORDER BY h.collector_name";
         }
 
         var items = await TimedReadAsync("GetCollectionHealthAsync", timer => ReadCollectionHealthAsync(serverId, timer, cancellationToken));
+        await ApplyReadSourceAsync(items, serverId, cancellationToken);
 
         if (allowMemo)
         {
@@ -511,6 +535,58 @@ ORDER BY h.collector_name";
     /// reports. A read that ended in <see cref="OperationCanceledException"/> reports as cancelled (one plain line), not as
     /// a slow method.
     /// </summary>
+    /// <summary>
+    /// #6254: the newest Query Store run's <c>read_source</c> on this server in the trailing 7 days. The newest run, not the newest run that
+    /// had one, so a server whose Query Store replica setting was turned off stops showing a source as soon as its runs stop writing one.
+    /// </summary>
+    internal const string CollectionHealthReadSourceSql = @"
+SELECT read_source
+FROM v_collection_log
+WHERE server_id = $1
+AND   collector_name = 'query_store'
+AND   collection_time >= $2
+ORDER BY collection_time DESC, log_id DESC
+LIMIT 1";
+
+    /// <summary>
+    /// #6254: stamps the Query Store row with <see cref="CollectionHealthReadSourceSql"/>'s value, before the rows are memoized. Null everywhere
+    /// with the setting off, and then no row changes. A failed read leaves the rows unstamped: the view answers without the extra note.
+    /// A cancellation is not swallowed.
+    /// </summary>
+    private async Task ApplyReadSourceAsync(List<CollectorHealthRow> rows, int serverId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var connection = await OpenConnectionAsync(timer: null, cancellationToken);
+            using var command = connection.CreateCommand();
+            command.CommandText = CollectionHealthReadSourceSql;
+            command.Parameters.Add(new DuckDBParameter { Value = serverId });
+            command.Parameters.Add(new DuckDBParameter { Value = DateTime.UtcNow.AddDays(-7) });
+            ApplyReadSource(rows, await command.ExecuteScalarAsync(cancellationToken) as string);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"#6254 collection health could not read the Query Store read source for server {serverId}; it is shown without one: {ex.GetType().Name}");
+        }
+    }
+
+    /// <summary>#6254: puts <paramref name="readSource"/> on the <c>query_store</c> row. Blank or null changes nothing. Pure, so a test needs no store.</summary>
+    internal static void ApplyReadSource(IEnumerable<CollectorHealthRow> rows, string? readSource)
+    {
+        if (string.IsNullOrWhiteSpace(readSource))
+        {
+            return;
+        }
+
+        foreach (var row in rows)
+        {
+            if (string.Equals(row.CollectorName, "query_store", StringComparison.Ordinal))
+            {
+                row.ReadSource = readSource;
+            }
+        }
+    }
+
     private async Task<T> TimedReadAsync<T>(string readName, Func<ReadPhaseTimer, Task<T>> read)
     {
         var timer = new ReadPhaseTimer();
@@ -596,7 +672,9 @@ ORDER BY h.collector_name";
                    arrives as a BigInteger that Convert.ToInt64 cannot take. */
                 TrailingZeroRowSuccessRuns = reader.IsDBNull(29) ? 0 : ToInt64(reader.GetValue(29)),
                 /* Appended (#4748), for the same reason every column before it was. */
-                LatestRunNote = reader.IsDBNull(30) ? null : reader.GetString(30)
+                LatestRunNote = reader.IsDBNull(30) ? null : reader.GetString(30),
+                /* Appended (#5646): the newest runs' success streak, the band's recovery input. */
+                TrailingSuccessRuns = reader.IsDBNull(31) ? 0 : ToInt64(reader.GetValue(31))
             });
         }
 
@@ -676,10 +754,11 @@ ORDER BY h.collector_name";
         using var connection = await OpenConnectionAsync();
         using var command = connection.CreateCommand();
 
-        command.CommandText = @"
+        command.CommandText = $@"
 SELECT 1
 FROM v_collection_log
 WHERE server_id = $1
+AND   collector_name <> '{CollectionCycleSkip.CollectorName}'
 LIMIT 1";
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
@@ -741,6 +820,9 @@ LIMIT 1";
             ? "ORDER BY collection_time DESC, duration_ms DESC NULLS LAST"
             : "ORDER BY duration_ms DESC NULLS LAST, collection_time DESC";
 
+        /* #5731: no collection_cycle exclusion predicate, on purpose. This is the log as ROWS (the grid and
+           get_collection_log), where a late cycle's collection_cycle/SKIPPED row belongs; status = SKIPPED finds it.
+           get_collection_log counts it apart from the runs (skipped_cycle_rows). */
         command.CommandText = @"
 SELECT
     collector_name,
@@ -751,7 +833,8 @@ SELECT
     rows_collected,
     status,
     error_message,
-    server_name
+    server_name,
+    read_source
 FROM v_collection_log
 WHERE server_id = $1
 AND   collection_time >= $2
@@ -790,7 +873,8 @@ LIMIT $4";
                 RowsCollected = reader.IsDBNull(5) ? null : (int?)Convert.ToInt32(reader.GetValue(5)),
                 Status = reader.GetString(6),
                 ErrorMessage = reader.IsDBNull(7) ? null : reader.GetString(7),
-                ServerName = reader.IsDBNull(8) ? null : reader.GetString(8)
+                ServerName = reader.IsDBNull(8) ? null : reader.GetString(8),
+                ReadSource = reader.IsDBNull(9) ? null : reader.GetString(9)
             });
         }
 
@@ -880,6 +964,7 @@ ORDER BY 1, 2";
 SELECT 1
 FROM v_collection_log
 WHERE server_id IN ({string.Join(",", serverIds)})
+AND   collector_name <> '{CollectionCycleSkip.CollectorName}'
 LIMIT 1";
 
         return await command.ExecuteScalarAsync() is not null and not DBNull;
@@ -907,6 +992,7 @@ LIMIT 1";
             ? "ORDER BY collection_time DESC, duration_ms DESC NULLS LAST"
             : "ORDER BY duration_ms DESC NULLS LAST, collection_time DESC";
 
+        /* #5731: no collection_cycle exclusion predicate here either, on purpose: the fleet form of the log as rows. */
         command.CommandText = $@"
 SELECT
     collector_name,
@@ -917,7 +1003,8 @@ SELECT
     rows_collected,
     status,
     error_message,
-    server_name
+    server_name,
+    read_source
 FROM v_collection_log
 WHERE server_id IN ({string.Join(",", serverIds)})
 AND   collection_time >= $1
@@ -949,7 +1036,8 @@ LIMIT $3";
                 RowsCollected = reader.IsDBNull(5) ? null : (int?)Convert.ToInt32(reader.GetValue(5)),
                 Status = reader.GetString(6),
                 ErrorMessage = reader.IsDBNull(7) ? null : reader.GetString(7),
-                ServerName = reader.IsDBNull(8) ? null : reader.GetString(8)
+                ServerName = reader.IsDBNull(8) ? null : reader.GetString(8),
+                ReadSource = reader.IsDBNull(9) ? null : reader.GetString(9)
             });
         }
 
@@ -978,7 +1066,8 @@ SELECT
     rows_collected,
     status,
     error_message,
-    server_name
+    server_name,
+    read_source
 FROM v_collection_log
 WHERE server_id = $1
 AND   collector_name = $2
@@ -1005,7 +1094,8 @@ ORDER BY collection_time DESC";
                 RowsCollected = reader.IsDBNull(5) ? null : (int?)Convert.ToInt32(reader.GetValue(5)),
                 Status = reader.GetString(6),
                 ErrorMessage = reader.IsDBNull(7) ? null : reader.GetString(7),
-                ServerName = reader.IsDBNull(8) ? null : reader.GetString(8)
+                ServerName = reader.IsDBNull(8) ? null : reader.GetString(8),
+                ReadSource = reader.IsDBNull(9) ? null : reader.GetString(9)
             });
         }
 
@@ -1044,6 +1134,14 @@ public class CollectionLogRow
     public int? RowsCollected { get; set; }
     public string Status { get; set; } = "";
     public string? ErrorMessage { get; set; }
+
+    /// <summary>#6254: where this run's Query Store rows were read from (for example <c>replica 12, primary 2</c>), or null: every run of a server with the
+    /// replica setting off, every collector but Query Store, and every run stored before the column existed.</summary>
+    public string? ReadSource { get; set; }
+
+    /// <summary>#6254: the grids' message cell, <see cref="ErrorMessage"/> with the run's read source after it when it has one. Identical to
+    /// <see cref="ErrorMessage"/> (blank for none) when it has none. Shared wording with the health views' Note column.</summary>
+    public string MessageFormatted => CollectorHealthClassifier.FormatRunMessage(ErrorMessage, ReadSource);
 
     /// <summary>
     /// The clock of the server this run belongs to (#4766), stamped by the tab or window that lists it; null (a row
@@ -1265,6 +1363,21 @@ public class CollectorHealthRow
     public string? LatestRunNote { get; set; }
 
     /// <summary>
+    /// #5646: how many of the collector's newest runs in a row succeeded, counted to
+    /// <see cref="CollectorHealthClassifier.RecoveryTrailingSuccessRuns"/> and no further. The per-server read
+    /// sets it from the newest runs (full timestamp precision, then the unique log id, newest first). A row
+    /// built from plain aggregates (a fleet roll-up, which Lite does not have) would start at 0.
+    /// </summary>
+    public long TrailingSuccessRuns { get; set; }
+
+    /// <summary>#5646: the "recovered" sentence for a collector the recovery rule kept off WARNING, or null. Only
+    /// a row whose displayed <see cref="HealthStatus"/> is HEALTHY carries it, so a row another rung bands
+    /// (abandon rate, lost databases, stopped, regression) never does. Display text only; it carries the last
+    /// failure time.</summary>
+    public string? RecoveredNote => CollectorHealthClassifier.FormatRecoveredNote(
+        HealthStatus, TotalRuns, ErrorCount, TrailingSuccessRuns, LastErrorTime, FrequencyMinutes);
+
+    /// <summary>
     /// #1852: whether the store saw user databases on this target inside the health window
     /// (<c>has_user_databases</c>) — what tells a legitimately empty server apart from one that is
     /// enumerating nothing despite having databases. False also covers "no inventory to go on", which
@@ -1365,7 +1478,9 @@ public class CollectorHealthRow
         CollectorHealthClassifier.FormatOutputFinding(
                 RowsStored, TotalRuns, DeniedSinceLastSuccess, NoteCount,
                 faultedRuns: ErrorCount + SessionMissingCount,
-                isEventCollector: CollectorHealthClassifier.IsEventCollector(CollectorName))
+                isEventCollector: CollectorHealthClassifier.IsEventCollector(CollectorName),
+                isZeroNormal: CollectorHealthClassifier.IsZeroNormalCollector(CollectorName),
+                bandedNoPermissions: string.Equals(HealthStatus, CollectorHealthClassifier.NoPermissions, StringComparison.Ordinal))
             is { Length: > 0 } finding
             ? finding
             : null;
@@ -1432,7 +1547,7 @@ public class CollectorHealthRow
     public string HealthStatus => CollectorHealthClassifier.BandWithRegression(
         CollectorHealthClassifier.Classify(
             TotalRuns, SuccessCount, ErrorCount, PermissionDeniedCount, ExtensionMissingCount, AbandonedCount,
-            HoursSinceLastSuccess, HoursSinceLastRun, FrequencyMinutes, LatestRunNote),
+            HoursSinceLastSuccess, HoursSinceLastRun, FrequencyMinutes, LatestRunNote, TrailingSuccessRuns),
         /* #3885: both regression classes reach the floor. A produced-then-stopped collector is the one
            that most needs it — its successes are FRESH, so the staleness ladder has nothing to say and
            would return HEALTHY forever. */
@@ -1474,6 +1589,10 @@ public class CollectorHealthRow
     /// identically. Never feeds <see cref="HealthStatus"/>.
     /// </summary>
     public string NoteFormatted =>
-        CollectorHealthClassifier.FormatCollectionNote(LastNote, NoteCount, TotalRuns, CollectorName, TargetHasUserDatabases);
+        CollectorHealthClassifier.FormatCollectionNote(LastNote, NoteCount, TotalRuns, CollectorName, TargetHasUserDatabases, RecoveredNote, ReadSource);
+
+    /// <summary>#6254: where the newest Query Store run read its rows from (for example <c>replica 12, primary 2</c>), shown in the Note column.
+    /// Null for every collector but Query Store and for every server with the replica setting off. Informational only: it never feeds <see cref="HealthStatus"/>.</summary>
+    public string? ReadSource { get; set; }
 }
 

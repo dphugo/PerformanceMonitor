@@ -27,7 +27,6 @@ namespace Lite.Tests;
 /// knows nothing about, and any event but a pull request). Nothing in build.yml calls <c>map-select</c> yet.</para>
 /// </summary>
 [Trait("Stage", "Guard")]
-[Trait("Reads", "Darling")]
 public sealed class CiSelectMapSelectGuardTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ci-map-select-" + Guid.NewGuid().ToString("N"));
@@ -40,9 +39,14 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         File.WriteAllText(Path.Combine(tests, "Own.cs"), "public class OwnTests { }\n");
         File.WriteAllText(Path.Combine(tests, "Cov.cs"), "public class CoverTests { }\n");
         File.WriteAllText(Path.Combine(tests, "Text.cs"), "public class TextTests { }\n");
-        File.WriteAllText(Path.Combine(tests, "Fresh.cs"), "public class FreshTests { }\n");
-        File.WriteAllText(Path.Combine(tests, "G.cs"), "[Trait(\"Stage\", \"Guard\")]\npublic class GateTests { }\n");
+        File.WriteAllText(Path.Combine(tests, "Fresh.cs"), "public class FreshTests\n{" + AFact + "}\n");
+        File.WriteAllText(Path.Combine(tests, "G.cs"), "[Trait(\"Stage\", \"Guard\")]\npublic class GateTests\n{" + AFact + "}\n");
+        // #5872: a helper type a test file declares holds no test, so it is never a "new class".
+        File.WriteAllText(Path.Combine(tests, "Helper.cs"), "public sealed class CapturingThing : IDisposable { public void Dispose() { } }\n");
     }
+
+    /// <summary>One test method, so the tree scan sees the class holds a test (#5872).</summary>
+    private const string AFact = "\n    [Fact]\n    public void Runs() { }\n";
 
     public void Dispose()
     {
@@ -61,14 +65,16 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
     {
         var path = Path.Combine(_dir, "map-" + Guid.NewGuid().ToString("N") + ".json");
         builtAt ??= DateTime.UtcNow.ToString("o");
-        // ids: 0 Lite/Services/A.cs, 1 Lite/Services/B.cs, 2 Own.cs, 3 assets/data.json, 4 Cov.cs, 5 Text.cs
+        // ids: 0 Lite/Services/A.cs, 1 Lite/Services/B.cs, 2 Own.cs, 3 assets/data.json, 4 Cov.cs, 5 Text.cs,
+        // 6 and 7 shared-project files, 8 the shared registration file McpSchemaCompat.cs (#5951)
         File.WriteAllText(path, """
             {"schema": @SCHEMA@, "sha": "0000000", "built_at": "@BUILT@", "tool": "synthetic",
              "files": ["Lite/Services/A.cs", "Lite/Services/B.cs", "Lite.Tests/Own.cs", "assets/data.json",
-                       "Lite.Tests/Cov.cs", "Lite.Tests/Text.cs"],
+                       "Lite.Tests/Cov.cs", "Lite.Tests/Text.cs", "PerformanceMonitor.Common/Shared.cs",
+                       "PerformanceMonitor.PlanAnalysis/Planner.cs", "PerformanceMonitor.Common/Mcp/McpSchemaCompat.cs"],
              "classes": {"lite": {
                 "OwnTests":   {"own": 2, "files": [0], "seconds": 1.5},
-                "CoverTests": {"own": 4, "files": [1, 3], "seconds": 2.5},
+                "CoverTests": {"own": 4, "files": [1, 3, 6, 7, 8], "seconds": 2.5},
                 "TextTests":  {"own": 5, "files": [], "seconds": 4.0}}},
              "text_patterns": {"TextTests": [@PATTERNS@]}}
             """.Replace("@SCHEMA@", schema.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal)
@@ -78,7 +84,8 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
     }
 
     private (int ExitCode, JsonElement Result) MapSelect(string map, string[] files, string[]? drift = null,
-        string eventName = "pull_request", string? root = null, string? baseRef = null)
+        string eventName = "pull_request", string? root = null, string? baseRef = null, bool guardStageSeparate = false,
+        string? diff = null)
     {
         var psi = new ProcessStartInfo("python")
         {
@@ -96,6 +103,19 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         psi.ArgumentList.Add(root ?? Path.Combine(_dir, "tree"));
         psi.ArgumentList.Add("--event");
         psi.ArgumentList.Add(eventName);
+        if (guardStageSeparate)
+        {
+            psi.ArgumentList.Add("--guard-stage-separate");
+        }
+
+        if (diff is not null)
+        {
+            var diffPath = Path.Combine(_dir, "diff-" + Guid.NewGuid().ToString("N") + ".patch");
+            File.WriteAllText(diffPath, diff);
+            psi.ArgumentList.Add("--diff-file");
+            psi.ArgumentList.Add(diffPath);
+        }
+
         if (baseRef is not null)
         {
             psi.ArgumentList.Add("--base-ref");
@@ -143,6 +163,13 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         return map;
     }
 
+    private static string[] Selected(JsonElement result)
+    {
+        return result.GetProperty("selected").TryGetProperty("lite", out var lite)
+            ? lite.EnumerateArray().Select(e => e.GetString() ?? "").OrderBy(n => n, StringComparer.Ordinal).ToArray()
+            : [];
+    }
+
     private static void AssertFull(JsonElement result, string reasonPart)
     {
         Assert.True(result.GetProperty("full").GetBoolean(), "expected FULL:\n" + result);
@@ -183,12 +210,114 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
     }
 
     [Fact]
-    public void FileChangedSinceTheMap_CountsAsChanged()
+    public void FileChangedSinceTheMap_CountsAsChanged_WhenThePullRequestChangesProductSource()
     {
-        // The pull request itself touches no code; A.cs changed between the map and the merge base.
-        var (_, r) = MapSelect(WriteMap(), new[] { "README.md" }, new[] { "Lite/Services/A.cs" });
+        // #5872: B.cs is product source the map knows, so a drifted file may have grown a call edge into it; A.cs changed
+        // between the map and the merge base, and the class that runs A.cs is selected for it.
+        var (_, r) = MapSelect(WriteMap(), new[] { "Lite/Services/B.cs" }, new[] { "Lite/Services/A.cs" });
 
         Assert.Equal("covers a changed file", Why(r)["OwnTests"]);
+        Assert.Equal("Lite/Services/A.cs", r.GetProperty("via").GetProperty("lite").GetProperty("OwnTests").GetString());
+        Assert.Equal(1, r.GetProperty("drift").GetInt32());
+    }
+
+    [Theory]
+    [InlineData("README.md")]
+    [InlineData("docs/alerts.md")]
+    [InlineData("llms.txt")]
+    [InlineData("Lite.Tests/Own.cs")]
+    [InlineData(".github/scripts/pre-push.sh")]
+    public void DocsScriptOrLeafTestChange_GetsNoDrift(string file)
+    {
+        // #5872: nothing grows a call edge into a doc, a script under .github/ or a test file, so the drift (A.cs and B.cs
+        // changed on dev since the map) selects nothing for this pull request.
+        var (_, r) = MapSelect(WriteMap(), new[] { file }, new[] { "Lite/Services/A.cs", "Lite/Services/B.cs" });
+
+        Assert.False(r.GetProperty("full").GetBoolean(), r.ToString());
+        var why = Why(r);
+        Assert.DoesNotContain("CoverTests", why.Keys);
+        Assert.NotEqual("covers a changed file", why.GetValueOrDefault("OwnTests"));
+        Assert.Equal(0, r.GetProperty("drift").GetInt32());
+    }
+
+    [Fact]
+    public void DocsOnly_SelectsOnlyTheClassThatReadsTheDoc()
+    {
+        // #5872 (the shape of 1ec666f50): README.md and docs pages. TextTests reads README.md by name, so it still runs.
+        // #5894: nothing else does: CI's docs fast path runs no test for such a change, so the Guard and new classes
+        // that every other narrowed run keeps are left out.
+        var map = WriteMap(textPatterns: "\"README.md\"");
+
+        var (_, r) = MapSelect(map, new[] { "README.md", "docs/alerts.md", "llms.txt" }, new[] { "Lite/Services/B.cs" });
+
+        Assert.False(r.GetProperty("full").GetBoolean(), r.ToString());
+        Assert.True(r.GetProperty("docs_only").GetBoolean(), r.ToString());
+        Assert.Equal(new Dictionary<string, string> { ["TextTests"] = "text pattern" }, Why(r));
+        Assert.Equal(["TextTests"], Selected(r));
+    }
+
+    [Fact]
+    public void DocsOnly_ThatNoClassReads_SelectsNothing()
+    {
+        // #5894: a docs-only diff (one clause in a skill file) ran 367 classes locally while CI ran none. The guard stage,
+        // the classes the map never saw and the environment-gated classes are not reasons to run for a document.
+        var (_, r) = MapSelect(WriteMap(), new[] { ".claude/skills/lane-orders/SKILL.md" });
+
+        Assert.False(r.GetProperty("full").GetBoolean(), r.ToString());
+        Assert.True(r.GetProperty("docs_only").GetBoolean(), r.ToString());
+        Assert.Contains("documentation-only", r.GetProperty("reason").GetString(), StringComparison.Ordinal);
+        Assert.Empty(Selected(r));
+        Assert.Empty(Why(r));
+    }
+
+    [Fact]
+    public void DocsAndCode_Together_IsNotDocsOnly_AndKeepsTheGuardClass()
+    {
+        var (_, r) = MapSelect(WriteMap(), new[] { ".claude/skills/lane-orders/SKILL.md", "Lite.Tests/Own.cs" });
+
+        Assert.False(r.GetProperty("docs_only").GetBoolean(), r.ToString());
+        Assert.Contains("GateTests", Selected(r));
+        Assert.Contains("OwnTests", Selected(r));
+    }
+
+    [Fact]
+    public void GuardStageSeparate_LeavesGuardClassesOutOfTheSelection_ButOnlyWhenAsked()
+    {
+        // #5894: the pre-push gate runs the whole Stage=Guard trait as its own stage, so the selection's batches ran every
+        // Guard class a second time. With the flag the Guard class is not selected (its `why` entry stays for the
+        // summary); without it, the selection is as before (CI's shards still need it).
+        var files = new[] { "Lite.Tests/Own.cs" };
+
+        var (_, withFlag) = MapSelect(WriteMap(), files, guardStageSeparate: true);
+        var (_, without) = MapSelect(WriteMap(), files);
+
+        Assert.DoesNotContain("GateTests", Selected(withFlag));
+        Assert.Equal("run in the guard stage", Why(withFlag)["GateTests"]);
+        Assert.Equal(["FreshTests", "OwnTests"], Selected(withFlag));
+        Assert.Contains("GateTests", Selected(without));
+        Assert.Equal("new class", Why(without)["GateTests"]);
+    }
+
+    [Fact]
+    public void UnknownScriptUnderDotGithub_IsNamed_AndSelectsNothingOfItsOwn()
+    {
+        // #5872 (the shape of aa4b889a9): a script no class runs or reads is reported by name with the rule that caught
+        // it, and the selection is not FULL.
+        var (_, r) = MapSelect(WriteMap(), new[] { ".github/scripts/tests/new-test.sh" });
+
+        Assert.False(r.GetProperty("full").GetBoolean(), r.ToString());
+        Assert.Equal("selecting the classes that read it as text (none)",
+            r.GetProperty("unknown").GetProperty(".github/scripts/tests/new-test.sh").GetString());
+        Assert.Equal(["FreshTests", "GateTests"], Why(r).Keys.OrderBy(k => k, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void AHelperTypeWithNoTest_IsNeverANewClass()
+    {
+        // #5872: 377 Darling and 143 Lite helper types (fakes, loggers, harnesses) were "new classes" on every pull request.
+        var (_, r) = MapSelect(WriteMap(), new[] { "Lite.Tests/Own.cs" });
+
+        Assert.DoesNotContain("CapturingThing", Why(r).Keys);
     }
 
     [Fact]
@@ -197,7 +326,7 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         // Reflection, DI and attribute scanning find types no covered file mentions.
         var (_, r) = MapSelect(WriteMap(), new[] { "Lite/Services/Brand.cs" }, new[] { "Lite/Services/A.cs" });
 
-        AssertFull(r, "new file not in the map: Lite/Services/Brand.cs");
+        AssertFull(r, "unknown file: Lite/Services/Brand.cs: selecting everything");
     }
 
     [Fact]
@@ -247,10 +376,82 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
     [InlineData(".github/workflows/build.yml")]
     [InlineData("Lite/Lite.csproj")]
     [InlineData("global.json")]
-    [InlineData("PerformanceMonitor.Common/Anything.cs")]
     public void KeepFullFile_InThePullRequest_RunsEverything(string file)
     {
         var (_, r) = MapSelect(WriteMap(), new[] { "Lite.Tests/Own.cs", file });
+
+        AssertFull(r, "keep-full");
+    }
+
+    /// <summary>A unified -U0 diff of one shared-project file, with the hunk header the csharp diff driver prints.</summary>
+    private static string SharedDiff(string file, string header, params string[] lines)
+    {
+        return $"diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -10,1 +10,1 @@ {header}\n"
+            + string.Concat(lines.Select(l => l + "\n"));
+    }
+
+    private const string SharedFile = "PerformanceMonitor.Common/Shared.cs";
+
+    [Fact]
+    public void SharedProject_DiffThatAddsAConst_RunsEverything()
+    {
+        var diff = SharedDiff(SharedFile, "public static class Shared", "+    public const int Limit = 5;");
+
+        var (_, r) = MapSelect(WriteMap(), new[] { SharedFile }, diff: diff);
+
+        AssertFull(r, "changes a const");
+    }
+
+    [Fact]
+    public void SharedProject_DiffThatChangesAnEnumMember_RunsEverything()
+    {
+        var diff = SharedDiff(SharedFile, "public enum Kind", "-        Two = 2,", "+        Two = 22,");
+
+        var (_, r) = MapSelect(WriteMap(), new[] { SharedFile }, diff: diff);
+
+        AssertFull(r, "changes an enum member");
+    }
+
+    [Fact]
+    public void SharedProject_DiffThatChangesAMethodBody_SelectsByTheMapsEdges()
+    {
+        var diff = SharedDiff(SharedFile, "public int Run(int x)", "-        return x + 1;", "+        return x + 2;");
+
+        var (_, r) = MapSelect(WriteMap(), new[] { SharedFile }, diff: diff);
+
+        Assert.False(r.GetProperty("full").GetBoolean(), "a method-body change must not run everything:\n" + r);
+        var why = Why(r);
+        Assert.Equal("covers a changed file", why["CoverTests"]);
+        Assert.DoesNotContain("OwnTests", why.Keys);
+    }
+
+    [Fact]
+    public void SharedProject_ChangeToARegistrationFile_RunsEverything_EvenForAMethodBody()
+    {
+        const string registration = "PerformanceMonitor.Common/Mcp/McpSchemaCompat.cs";
+        var diff = SharedDiff(registration, "public static void AddTools()", "-        var n = 1;", "+        var n = 2;");
+
+        var (_, r) = MapSelect(WriteMap(), new[] { registration }, diff: diff);
+
+        AssertFull(r, "registration file");
+    }
+
+    [Fact]
+    public void SharedProject_UnlistedFile_SelectsByEdges()
+    {
+        const string unlisted = "PerformanceMonitor.PlanAnalysis/Planner.cs";
+        var diff = SharedDiff(unlisted, "public int Score()", "+        // a comment");
+
+        var (_, r) = MapSelect(WriteMap(), new[] { unlisted }, diff: diff);
+
+        Assert.False(r.GetProperty("full").GetBoolean(), "an unlisted shared file selects by edges:\n" + r);
+        Assert.Equal("covers a changed file", Why(r)["CoverTests"]);
+    }
+
+    [Fact]
+    public void SharedProject_WithNoDiffToRead_RunsEverything()
+    {
+        var (_, r) = MapSelect(WriteMap(), new[] { SharedFile });
 
         AssertFull(r, "keep-full");
     }
@@ -262,7 +463,8 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         // as text is selected; the rest are not, and the run is not FULL.
         var map = WriteMap(textPatterns: "\"install/**/*.sql\", \".github/workflows/build.yml\"");
 
-        var (_, r) = MapSelect(map, new[] { "Lite.Tests/Own.cs" }, new[] { ".github/workflows/build.yml" });
+        // A.cs (product source) is in the change, so the drift counts (#5872).
+        var (_, r) = MapSelect(map, new[] { "Lite.Tests/Own.cs", "Lite/Services/A.cs" }, new[] { ".github/workflows/build.yml" });
 
         Assert.False(r.GetProperty("full").GetBoolean(), r.ToString());
         var why = Why(r);
@@ -274,9 +476,9 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
     [Fact]
     public void KeepFullFile_InTheDrift_ThatNoClassKnows_IsFullForThatReason_NotAsAKeepFullFile()
     {
-        var (_, r) = MapSelect(WriteMap(), new[] { "Lite.Tests/Own.cs" }, new[] { "Directory.Packages.props" });
+        var (_, r) = MapSelect(WriteMap(), new[] { "Lite.Tests/Own.cs", "Lite/Services/A.cs" }, new[] { "Directory.Packages.props" });
 
-        AssertFull(r, "Directory.Packages.props is in no class");
+        AssertFull(r, "unknown file: Directory.Packages.props: selecting everything");
     }
 
     [Fact]
@@ -408,15 +610,15 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         var tests = Path.Combine(tree, "Lite.Tests");
         Directory.CreateDirectory(tests);
         File.WriteAllText(Path.Combine(tests, "Gated.cs"),
-            "public class GatedTests { string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PG_CSVLOG\"); }\n");
+            "public class GatedTests\n{" + AFact + "string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PG_CSVLOG\"); }\n");
         File.WriteAllText(Path.Combine(tests, "Plain.cs"),
-            "public class PlainTests { string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PG\"); }\n");
+            "public class PlainTests\n{" + AFact + "string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PG\"); }\n");
         File.WriteAllText(Path.Combine(tests, "Runtime.cs"),
-            "public class RuntimeTests { string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PGRUNTIME\"); }\n");
+            "public class RuntimeTests\n{" + AFact + "string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PGRUNTIME\"); }\n");
         File.WriteAllText(Path.Combine(tests, "Upgrade.cs"),
-            "public class UpgradeTests { string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PGRUNTIME_OLD\"); }\n");
+            "public class UpgradeTests\n{" + AFact + "string? T => Environment.GetEnvironmentVariable(\"DARLING_TEST_PGRUNTIME_OLD\"); }\n");
         File.WriteAllText(Path.Combine(tests, "Comment.cs"),
-            "/// <c>DARLING_TEST_PG_CSVLOG</c> in a comment only\npublic class CommentTests { }\n");
+            "/// <c>DARLING_TEST_PG_CSVLOG</c> in a comment only\npublic class CommentTests\n{" + AFact + "}\n");
         var map = Path.Combine(_dir, "gated-map.json");
         File.WriteAllText(map, """
             {"schema": 1, "sha": "0000000", "built_at": "@BUILT@", "tool": "synthetic",
@@ -438,6 +640,45 @@ public sealed class CiSelectMapSelectGuardTests : IDisposable
         var why = Why(r);
         Assert.Equal(["GatedTests", "UpgradeTests"], why.Keys.OrderBy(k => k, StringComparer.Ordinal));
         Assert.Equal("gated on an environment the map shards lack", why["GatedTests"]);
+    }
+
+    [Fact]
+    public void OneTestFileChange_SelectsThatClass_ItsCollectionMates_AndNothingElse()
+    {
+        // #5872 (the shape of a5b6360e3): one test file whose [Collection] attribute changed. Its class and the classes
+        // in the same xunit collection run; a class in another collection, a class the walk does not reach and the
+        // drift (product files changed on dev since the map) do not. Live0.cs changed too: its collection of 61 is over the
+        // mate cap (live-postgres, about 650 in the tree), so it adds no mates.
+        var tree = Path.Combine(_dir, "coll-tree");
+        var tests = Path.Combine(tree, "Lite.Tests");
+        Directory.CreateDirectory(tests);
+        File.WriteAllText(Path.Combine(tests, "Moved.cs"),
+            "[Collection(\"app-logger-statics\")]\npublic class MovedTests\n{" + AFact + "}\n");
+        File.WriteAllText(Path.Combine(tests, "Mate.cs"), "[Collection(\"app-logger-statics\")]\npublic class MateTests\n{" + AFact + "}\n");
+        File.WriteAllText(Path.Combine(tests, "Other.cs"), "[Collection(\"other\")]\npublic class OtherTests\n{" + AFact + "}\n");
+        for (var i = 0; i < 61; i++)
+        {
+            File.WriteAllText(Path.Combine(tests, $"Live{i}.cs"), $"[Collection(\"live-postgres\")]\npublic class Live{i}Tests\n{{" + AFact + "}\n");
+        }
+
+        var files = string.Join(", ", new[] { "\"Lite/Services/A.cs\"", "\"Lite.Tests/Moved.cs\"", "\"Lite.Tests/Mate.cs\"", "\"Lite.Tests/Other.cs\"" }
+            .Concat(Enumerable.Range(0, 61).Select(i => $"\"Lite.Tests/Live{i}.cs\"")));
+        var classes = string.Join(", ", new[] { "\"MovedTests\": {\"own\": 1, \"files\": [0]}", "\"MateTests\": {\"own\": 2, \"files\": [0]}",
+                "\"OtherTests\": {\"own\": 3, \"files\": [0]}" }
+            .Concat(Enumerable.Range(0, 61).Select(i => $"\"Live{i}Tests\": {{\"own\": {i + 4}, \"files\": [0]}}")));
+        var map = Path.Combine(_dir, "coll-map.json");
+        File.WriteAllText(map, "{\"schema\": 1, \"sha\": \"0000000\", \"built_at\": \"" + DateTime.UtcNow.ToString("o") + "\", \"tool\": \"synthetic\", "
+            + "\"files\": [" + files + "], \"classes\": {\"lite\": {" + classes + "}}, \"text_patterns\": {}}");
+
+        var (_, r) = MapSelect(map, new[] { "Lite.Tests/Moved.cs", "Lite.Tests/Live0.cs" }, new[] { "Lite/Services/A.cs" }, root: tree);
+
+        Assert.False(r.GetProperty("full").GetBoolean(), r.ToString());
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["MateTests"] = "shares a collection with a changed class",
+            ["Live0Tests"] = "own file changed",
+            ["MovedTests"] = "own file changed",
+        }, Why(r));
     }
 
     [Fact]

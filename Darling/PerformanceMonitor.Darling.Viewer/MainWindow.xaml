@@ -268,7 +268,7 @@
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0" x:Name="SidebarHeaderText">
                         <TextBlock Text="Servers" Style="{StaticResource SectionHeader}" Margin="0,0,0,2"/>
-                        <TextBlock Text="Double-click to open a server tab" Foreground="{DynamicResource ForegroundMutedBrush}" FontSize="11" Margin="0,0,0,6"/>
+                        <TextBlock Text="Double-click or press Enter to open a server tab" Foreground="{DynamicResource ForegroundMutedBrush}" FontSize="11" Margin="0,0,0,6"/>
                     </StackPanel>
                     <Button Grid.Column="1" x:Name="SidebarToggleButton" Content="«" Click="ToggleSidebar_Click"
                             Style="{StaticResource DarkButton}"
@@ -436,13 +436,16 @@
                            TextWrapping="Wrap"
                            Margin="2,8,2,0"
                            Visibility="Collapsed"/>
-                <ListBox x:Name="ServerList"
+                <ui:InvokableListBox x:Name="ServerList" AutomationProperties.AutomationId="ServerPicker"
+                         Style="{DynamicResource {x:Type ListBox}}"
+                         ItemInvoked="ServerList_ItemInvoked"
                          Background="{DynamicResource BackgroundDarkBrush}"
                          BorderBrush="{DynamicResource BorderBrush}"
                          BorderThickness="1"
                          Foreground="{DynamicResource ForegroundBrush}"
                          SelectionChanged="ServerList_SelectionChanged"
-                         MouseDoubleClick="ServerList_MouseDoubleClick">
+                         MouseDoubleClick="ServerList_MouseDoubleClick"
+                         KeyDown="ServerList_KeyDown">
                     <ListBox.ItemContainerStyle>
                         <Style TargetType="ListBoxItem">
                             <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName, Mode=OneTime}"/>
@@ -613,12 +616,15 @@
                                     <!-- Server name -->
                                     <TextBlock Grid.Column="1" Grid.Row="0"
                                                Text="{Binding Server.DisplayName}"
+                                               ToolTip="{Binding Server.SameMachineTooltip}"
                                                FontSize="13" FontWeight="SemiBold"
                                                Foreground="{DynamicResource ForegroundBrush}"/>
 
                                     <!-- Details (SQL version) -->
                                     <TextBlock Grid.Column="1" Grid.Row="1"
-                                               Text="{Binding Server.VersionLabel}"
+                                               Text="{Binding Server.SidebarDetail}"
+                                               TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding Server.SameMachineTooltip}"
                                                FontSize="11"
                                                Foreground="{DynamicResource ForegroundMutedBrush}"/>
 
@@ -647,6 +653,7 @@
                                         </Border.Style>
                                         <!-- #3609: the ink on a status fill is a theme key. White was 1.41:1 on Dark's amber. -->
                                         <TextBlock Text="{Binding Server.AttentionText}"
+                                                   AutomationProperties.Name="{Binding Server.AttentionAutomationName}"
                                                    Foreground="{DynamicResource StatusForegroundBrush}" FontSize="9" FontWeight="Bold"
                                                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
                                     </Border>
@@ -748,7 +755,7 @@
                     <ListBox.ItemTemplateSelector>
                         <StaticResource ResourceKey="FleetRowSelector"/>
                     </ListBox.ItemTemplateSelector>
-                </ListBox>
+                </ui:InvokableListBox>
             </DockPanel>
 
             <!-- Right: the top tab strip. Fixed aggregate tabs (Overview, Recommendations, Alerts) plus
@@ -786,8 +793,20 @@
                                 Margin="6,0,6,10" Padding="16,12" Visibility="Collapsed">
                             <StackPanel>
                                 <!-- Header -->
-                                <DockPanel Margin="0,0,0,10">
-                                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                                <!-- #6244: a WrapPanel header, the shape the tab pages use for a heading with controls beside it (Alert History,
+                                     Job History). It was a DockPanel with the controls docked right: a DockPanel gives the right-docked block its
+                                     whole desired width and the heading only what is left, so in a narrow window the block was drawn over the
+                                     "Fleet Health" heading. A WrapPanel moves a control group to the next line instead of over its neighbour.
+                                     Each group is one StackPanel so a label never wraps away from its box. -->
+                                <WrapPanel Margin="0,0,0,10">
+                                    <TextBlock Text="Fleet Health" FontSize="16" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource ForegroundBrush}"
+                                               VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                    <TextBlock Text="{Binding MonitoringText}" FontSize="11"
+                                               Foreground="{DynamicResource ForegroundMutedBrush}"
+                                               VerticalAlignment="Center" Margin="0,1,14,0"
+                                               TextTrimming="CharacterEllipsis"/>
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,2,14,2">
                                         <!-- #2424: the needs-attention filter over the card grid below. It sits
                                              beside Sort because it is the same kind of thing — a view control over
                                              the same cards — and it lives in the roll-up header, which is docked and
@@ -802,6 +821,8 @@
                                         <TextBlock x:Name="OverviewAttentionCountText" FontSize="11" VerticalAlignment="Center"
                                                    Foreground="{DynamicResource WarningBrush}" Margin="0,0,14,0"
                                                    Visibility="Collapsed"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,2,14,2">
                                         <!-- #5352: Lite's Overview search, ported. Filters the cards by server name or tag
                                              and composes with the toggle and sort here through
                                              ApplyOverviewCardFilter. The hit-test-invisible watermark shows the placeholder
@@ -826,6 +847,8 @@
                                                 </TextBlock.Style>
                                             </TextBlock>
                                         </Grid>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,2,14,2">
                                         <TextBlock Text="Sort:" FontSize="11" VerticalAlignment="Center"
                                                    Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,0,6,0"/>
                                         <ComboBox x:Name="OverviewSortSelector" Width="120" VerticalAlignment="Center"
@@ -835,13 +858,7 @@
                                             <ComboBoxItem Content="Name"/>
                                         </ComboBox>
                                     </StackPanel>
-                                    <TextBlock Text="Fleet Health" FontSize="16" FontWeight="SemiBold"
-                                               Foreground="{DynamicResource ForegroundBrush}"/>
-                                    <TextBlock Text="{Binding MonitoringText}" FontSize="11"
-                                               Foreground="{DynamicResource ForegroundMutedBrush}"
-                                               VerticalAlignment="Center" Margin="12,1,0,0"
-                                               TextTrimming="CharacterEllipsis"/>
-                                </DockPanel>
+                                </WrapPanel>
 
                                 <!-- (1) Health-band summary tiles: total + counts by band. Tile colours are
                                      the card severity palette (green / amber / red / grey-for-offline). -->
@@ -938,17 +955,30 @@
                                      when the fleet is healthy (toggled in code-behind). -->
                                 <TextBlock Text="Needs Attention" FontSize="12" FontWeight="SemiBold"
                                            Foreground="{DynamicResource ForegroundBrush}" Margin="0,0,0,4"/>
-                                <ItemsControl x:Name="FleetWorstServersList" ItemsSource="{Binding WorstServers}">
+                                <!-- #6138: each row answers Invoke (an automation client opens the tab as a click does), takes
+                                     the keyboard (Enter opens it) and is named for the server and why it needs attention. -->
+                                <ui:InvokableItemsControl x:Name="FleetWorstServersList" ItemsSource="{Binding WorstServers}"
+                                                          ItemInvoked="FleetWorstServersList_ItemInvoked">
+                                    <ItemsControl.ItemContainerStyle>
+                                        <Style TargetType="ContentPresenter">
+                                            <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName, Mode=OneTime}"/>
+                                        </Style>
+                                    </ItemsControl.ItemContainerStyle>
                                     <ItemsControl.ItemTemplate>
                                         <DataTemplate>
                                             <Border Cursor="Hand" Padding="2,3" Margin="0,1"
                                                     ToolTip="Open this server's tab"
-                                                    MouseLeftButtonUp="FleetWorstServer_Click">
+                                                    Focusable="True"
+                                                    MouseLeftButtonUp="FleetWorstServer_Click"
+                                                    KeyDown="FleetWorstServer_KeyDown">
                                                 <Border.Style>
                                                     <Style TargetType="Border">
                                                         <Setter Property="Background" Value="Transparent"/>
                                                         <Style.Triggers>
                                                             <Trigger Property="IsMouseOver" Value="True">
+                                                                <Setter Property="Background" Value="{DynamicResource ViewerHoverBrush}"/>
+                                                            </Trigger>
+                                                            <Trigger Property="IsKeyboardFocused" Value="True">
                                                                 <Setter Property="Background" Value="{DynamicResource ViewerHoverBrush}"/>
                                                             </Trigger>
                                                         </Style.Triggers>
@@ -969,7 +999,7 @@
                                             </Border>
                                         </DataTemplate>
                                     </ItemsControl.ItemTemplate>
-                                </ItemsControl>
+                                </ui:InvokableItemsControl>
                                 <!-- #2424: the overflow line is the way TO the overflow, not a report that it
                                      exists. It was a bare TextBlock: on a 57-server fleet it read "+52 more need
                                      attention" and the reporter's question was literally "where do I find these?".
@@ -1010,7 +1040,7 @@
                         </Border>
 
                         <ScrollViewer VerticalScrollBarVisibility="Auto">
-                        <ItemsControl x:Name="OverviewItemsControl">
+                        <ui:InvokableItemsControl x:Name="OverviewItemsControl" ItemInvoked="OverviewItemsControl_ItemInvoked">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
                                     <WrapPanel/>
@@ -1028,7 +1058,7 @@
                                         <Grid>
                                             <StackPanel Margin="16">
                                                 <DockPanel Margin="0,0,0,4">
-                                                    <TextBlock Text="{Binding DisplayName}" FontSize="16" FontWeight="SemiBold"
+                                                    <TextBlock Text="{Binding DisplayName}" AutomationProperties.AutomationId="OverviewServerCardName" FontSize="16" FontWeight="SemiBold"
                                                                Foreground="{DynamicResource ForegroundBrush}"/>
                                                     <Ellipse Width="10" Height="10" Fill="{Binding StatusBrush}"
                                                              ToolTip="{Binding StatusTooltip}"
@@ -1150,7 +1180,7 @@
                                     </Border>
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
-                        </ItemsControl>
+                        </ui:InvokableItemsControl>
                         </ScrollViewer>
                     </DockPanel>
                 </TabItem>
@@ -1245,6 +1275,7 @@
 
                                     <!-- Title -->
                                     <TextBlock Text="{Binding Title}" FontWeight="SemiBold" FontSize="13"
+                                               Visibility="{Binding ShowTitle, Converter={StaticResource RecoBoolToVis}}"
                                                TextWrapping="Wrap"
                                                Foreground="{DynamicResource ForegroundBrush}" Margin="0,0,0,4"/>
 
@@ -1256,10 +1287,10 @@
                                     <!-- Affordances (advise-only): Open in Active Queries (incidents), Copy
                                          fix (when derivable), Ask AI. -->
                                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
-                                        <Button Content="Open in Active Queries" Padding="10,3" Margin="0,0,8,0"
+                                        <Button Content="{Binding OpenLinkLabel}" Padding="10,3" Margin="0,0,8,0"
                                                 Visibility="{Binding ShowOpenInActiveQueries, Converter={StaticResource RecoBoolToVis}}"
                                                 Click="OpenInActiveQueries_Click"
-                                                ToolTip="Open this server's Active Queries scoped to the finding's time window"/>
+                                                ToolTip="{Binding OpenLinkToolTip}"/>
                                         <Button Content="Copy fix" Padding="10,3" Margin="0,0,8,0"
                                                 Visibility="{Binding ShowCopyFix, Converter={StaticResource RecoBoolToVis}}"
                                                 Click="CopyFix_Click"
@@ -1524,7 +1555,7 @@
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
-            <TextBlock Grid.Column="0" x:Name="StatusText" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="0" x:Name="StatusText" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center" TextWrapping="Wrap"/>
             <TextBlock Grid.Column="1" x:Name="SeatText" Text="Seat: --" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="16,0" VerticalAlignment="Center"/>
             <TextBlock Grid.Column="2" x:Name="CollectorHealthText" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="16,0" VerticalAlignment="Center"/>
             <TextBlock Grid.Column="3" x:Name="DatabaseSizeText" Text="Database: --" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="16,0" VerticalAlignment="Center"/>

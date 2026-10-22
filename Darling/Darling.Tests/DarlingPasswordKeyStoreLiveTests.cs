@@ -61,7 +61,8 @@ public sealed class DarlingPasswordKeyStoreLiveTests
 
             // A second start finds the file and the published key agree and says "loaded".
             var again = await store.StartAsync(logger: logger);
-            Assert.Equal("ok", again.State);
+            /* #5829: CI once saw this second start answer "refused" with nothing to say why; the state row's note does. */
+            Assert.True(again.State == "ok", $"The second start answered {again.State}: {(await store.ReadStateAsync("example-host")).Note}");
             Assert.Equal(runtime.Ring.Status.KeyId, again.Ring.Status.KeyId);
             Assert.Contains(logger.Lines, l => l.StartsWith($"Password key {PasswordSeal.DisplayKeyId(published.KeyId)} loaded from ", StringComparison.Ordinal));
 
@@ -330,7 +331,7 @@ public sealed class DarlingPasswordKeyStoreLiveTests
             Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes("legacy-remediation-blob")), pins["1/remediation"].Value);
             Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes("legacy-smtp-blob")), pins["0/smtp"].Value);
 
-            var server = ServerConnectionIdentity.FromStoredColumns("alpha-example", 1433, "sqlserver", "", false, "sql", "monitor_login", "Mandatory", false, false);
+            var server = ServerConnectionIdentity.FromStoredColumns("alpha-example", 1433, "sqlserver", "", false, "sql", "monitor_login", "Mandatory", false, false, null);
             Assert.Equal(PasswordBinding.ForServer(server).LegacyPinHash(), pins["1/server"].Binding);
             Assert.Equal(PasswordBinding.ForRemediation(server, "fix_login").LegacyPinHash(), pins["1/remediation"].Binding);
             Assert.Equal(PasswordBinding.ForSmtp("smtp.example.com", 587, true, "mail_login").LegacyPinHash(), pins["0/smtp"].Binding);
@@ -519,7 +520,7 @@ VALUES (6, 'zeta-example', 'zeta-example', NULL, 'sql', 'monitor_login', 'legacy
             {
                 // Holds the first snapshot's transaction open until the second one is waiting on the marker.
                 firstOpening.Set();
-                Thread.Sleep(1500);
+                TestWait.Elapse(TimeSpan.FromMilliseconds(1500));
                 return stored.StartsWith("legacy-", StringComparison.Ordinal) ? true : throw new CryptographicException("not a blob");
             }
 

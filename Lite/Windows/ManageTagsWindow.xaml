@@ -19,7 +19,7 @@
                    TextWrapping="Wrap"
                    Foreground="{DynamicResource ForegroundMutedBrush}"/>
 
-        <Grid Grid.Row="1">
+        <Grid Grid.Row="1" x:Name="TagWorkArea">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="300"/>
                 <ColumnDefinition Width="12"/>
@@ -30,14 +30,18 @@
             <DockPanel Grid.Column="0">
                 <TextBlock DockPanel.Dock="Top" Text="Tags" FontWeight="Bold" Margin="0,0,0,6"
                            Foreground="{DynamicResource ForegroundBrush}"/>
-                <!-- WrapPanel (not a single row): the fifth button pushes the toolbar past the 300px column,
+                <!-- WrapPanel (not a single row): the fifth and later buttons push the toolbar past the 300px column,
                      so let them flow to a second row rather than clip. -->
                 <WrapPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
-                    <Button x:Name="NewRootButton" Content="_New Tag" Width="78" Margin="0,0,6,6" Click="NewRoot_Click"/>
-                    <Button x:Name="NewChildButton" Content="New C_hild" Width="78" Margin="0,0,6,6" Click="NewChild_Click"/>
-                    <Button x:Name="RenameButton" Content="_Rename" Width="72" Margin="0,0,6,6" Click="Rename_Click"/>
-                    <Button x:Name="ColourButton" Content="_Colour…" Width="72" Margin="0,0,6,6" Click="Colour_Click"/>
-                    <Button x:Name="DeleteButton" Content="_Delete" Width="66" Margin="0,0,6,6" Click="Delete_Click"/>
+                    <Button x:Name="NewRootButton" Content="_New Tag" MinWidth="78" Padding="10,3" Margin="0,0,6,6" Click="NewRoot_Click"/>
+                    <Button x:Name="NewChildButton" Content="New C_hild" MinWidth="78" Padding="10,3" Margin="0,0,6,6" Click="NewChild_Click"/>
+                    <Button x:Name="RenameButton" Content="_Rename" MinWidth="72" Padding="10,3" Margin="0,0,6,6" Click="Rename_Click"/>
+                    <Button x:Name="ColourButton" Content="_Colour…" MinWidth="72" Padding="10,3" Margin="0,0,6,6" Click="Colour_Click"/>
+                    <Button x:Name="DeleteButton" Content="_Delete" MinWidth="66" Padding="10,3" Margin="0,0,6,6" Click="Delete_Click"/>
+                    <Button x:Name="MoveUpButton" Content="Move U_p" MinWidth="78" Padding="10,3" Margin="0,0,6,6" Click="MoveUp_Click"
+                            ToolTip="Move the selected tag one place earlier among its siblings"/>
+                    <Button x:Name="MoveDownButton" Content="Move Do_wn" MinWidth="78" Padding="10,3" Margin="0,0,6,6" Click="MoveDown_Click"
+                            ToolTip="Move the selected tag one place later among its siblings"/>
                 </WrapPanel>
                 <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
                     <TreeView x:Name="TagTree"
@@ -58,6 +62,7 @@
                         <TreeView.ItemContainerStyle>
                             <Style TargetType="TreeViewItem">
                                 <Setter Property="IsExpanded" Value="True"/>
+                                <Setter Property="IsSelected" Value="{Binding IsSelected, Mode=TwoWay}"/>
                                 <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}"/>
                             </Style>
                         </TreeView.ItemContainerStyle>
@@ -82,9 +87,9 @@
                              Foreground="{DynamicResource ForegroundBrush}"
                              BorderBrush="{DynamicResource BorderBrush}"
                              TextChanged="ServerFilterBox_TextChanged"/>
-                    <Button x:Name="CheckAllButton" Grid.Column="1" Content="_Add all" Width="66" Margin="6,0,0,0"
+                    <Button x:Name="CheckAllButton" Grid.Column="1" Content="_Add all" MinWidth="66" Padding="10,3" Margin="6,0,0,0"
                             Click="CheckAll_Click" IsEnabled="False"/>
-                    <Button x:Name="UncheckAllButton" Grid.Column="2" Content="Re_move all" Width="82" Margin="6,0,0,0"
+                    <Button x:Name="UncheckAllButton" Grid.Column="2" Content="Re_move all" MinWidth="82" Padding="10,3" Margin="6,0,0,0"
                             Click="UncheckAll_Click" IsEnabled="False"/>
                 </Grid>
                 <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
@@ -117,6 +122,11 @@
                 </Border>
             </DockPanel>
         </Grid>
+
+        <!-- #5650: a write can wait up to 30 s for the local database; this line says so while TagWorkArea is greyed out. -->
+        <TextBlock Grid.Row="2" x:Name="WriteWaitText" Visibility="Collapsed" HorizontalAlignment="Left"
+                   VerticalAlignment="Center" Margin="0,12,100,0" TextWrapping="Wrap" FontStyle="Italic"
+                   Foreground="{DynamicResource ForegroundMutedBrush}"/>
 
         <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
             <!-- IsCancel keeps Esc closing the window; IsDefault is gone because Enter in the server

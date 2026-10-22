@@ -38,12 +38,12 @@ namespace PerformanceMonitorLite.Tests;
 /// today's #4198 backlog. A fix lands by deleting its row: an exempt tool that now fits fails this test until
 /// its row is gone, and a tool that is NOT exempt and goes over fails it too.
 ///
-/// <para><b>Why a roster, not a heuristic, for write tools.</b> Lite serves 89 MCP tools and none of their
+/// <para><b>Why a roster, not a heuristic, for write tools.</b> Lite serves 90 MCP tools and none of their
 /// names is add_servers/create_*/update_*/delete_*/remove_server/set_*_enabled -- Lite has no server-onboarding,
 /// custom-view, custom-alert-rule or notification-route MCP surface at all. Checked against every tool name in
 /// the assembly (not just a grep for a mutating verb): the only tool outside <c>get_*</c>/<c>list_servers</c>/
-/// <c>analyze_*</c>/<c>compare_*</c>/<c>audit_config</c> is <c>mute_analysis_finding</c>, so it is the whole
-/// write surface. <see cref="WriteToolRoster"/> stays an exact, hand-maintained list regardless, so a new write
+/// <c>analyze_*</c>/<c>compare_*</c>/<c>audit_config</c> is <c>mute_analysis_finding</c> and its undo
+/// <c>unmute_analysis_finding</c>, so those two are the whole write surface. <see cref="WriteToolRoster"/> stays an exact, hand-maintained list regardless, so a new write
 /// tool has to be added to it on purpose, or this test will actually invoke it.</para>
 ///
 /// <para><b>The fixture</b> is DuckDB only -- no live rig, no Postgres, no fleet simulation (Lite has no
@@ -67,6 +67,7 @@ namespace PerformanceMonitorLite.Tests;
 /// this bucket, matching Darling's twin's own gaps for the same tables; each run's GAPS output (and the PR
 /// body) names exactly which.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class McpReadToolBudgetTests : IClassFixture<SharedDuckDbFixture>, IDisposable
 {
     private const string ServerName = "mcp-read-tool-budget-4198";
@@ -120,6 +121,7 @@ public sealed class McpReadToolBudgetTests : IClassFixture<SharedDuckDbFixture>,
     private static readonly HashSet<string> WriteToolRoster = new(StringComparer.Ordinal)
     {
         "mute_analysis_finding",
+        "unmute_analysis_finding",
     };
 
     /// <summary>
@@ -132,7 +134,9 @@ public sealed class McpReadToolBudgetTests : IClassFixture<SharedDuckDbFixture>,
     /// SUCCESS/ERROR collectors could not compact away, and now the rows that need a look carry the leaner
     /// partial_detail shape instead.</para>
     /// </summary>
-    private static readonly Dictionary<string, int> ExemptOffenders = new(StringComparer.Ordinal);
+    private static readonly Dictionary<string, int> ExemptOffenders = new(StringComparer.Ordinal)
+    {
+    };
 
     [Fact]
     public async Task EveryReadToolAnswersUnderTheDefaultBudget_UnlessListedAsA4198Offender()
@@ -178,7 +182,7 @@ public sealed class McpReadToolBudgetTests : IClassFixture<SharedDuckDbFixture>,
             .ToArray();
         var missingExemptTools = ExemptOffenders.Keys.Where(name => measured.All(m => m.Name != name)).ToArray();
 
-        /* 89 tools total, minus mute_analysis_finding, five analyze_*, compare_analysis and audit_config = 81
+        /* 90 tools total, minus the two mute tools, five analyze_*, compare_analysis and audit_config = 81
            read tools attempted; a tool with no usable default throws and lands in gaps, not measured, so the
            floor is set under 81 rather than at it. */
         /* An empty store answers every tool in a few hundred bytes and would pass the budget vacuously. The
@@ -196,6 +200,55 @@ public sealed class McpReadToolBudgetTests : IClassFixture<SharedDuckDbFixture>,
 
         var allNames = AllToolMethods().Select(x => x.Name).ToHashSet(StringComparer.Ordinal);
         Assert.All(WriteToolRoster, w => Assert.Contains(w, allNames));
+    }
+
+    /// <summary>
+    /// #5748: the worst case for get_collection_health, every collector with mixed SUCCESS/ERROR runs so no row can
+    /// compact, must keep its headroom as collectors are added. The 75% line (24,576 B) is the ruling's target:
+    /// at 43 collectors the partial_detail rows used to answer 33,084 B, over the budget, because each row spelled out
+    /// ~20 keys including the null, false and 0 ones. A partial row now omits those, so a collector costs far fewer
+    /// bytes. Lite's twin of Darling's CollectionHealthPayloadBudgetLiveTests.WorstCase_EveryCollectorNeedsALook_AnswersUnder75PercentOfTheBudget.
+    /// </summary>
+    [Fact]
+    public async Task CollectionHealthWorstCaseAnswersUnder75PercentOfTheBudget()
+    {
+        await SeedAsync();
+
+        var json = await McpHealthTools.GetCollectionHealth(_dataService, _serverManager);
+        var bytes = Encoding.UTF8.GetByteCount(json);
+        var breakdown = CollectionHealthBreakdown(json);
+        TestContext.Current.TestOutputHelper?.WriteLine(breakdown);
+
+        Assert.True(bytes <= McpResponseBudget.DefaultBytes * 3 / 4,
+            $"get_collection_health's worst case answered {bytes:N0} B, over 75% of the {McpResponseBudget.DefaultBytes:N0} B budget (#5748). " + breakdown);
+    }
+
+    /// <summary>The byte breakdown #5748 asked for: partial rows, split into key names, null/false/0 values and the
+    /// rest, and the bytes outside the rows.</summary>
+    private static string CollectionHealthBreakdown(string json)
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        long rows = 0, keyNames = 0, defaultKeys = 0, defaults = 0, other = 0;
+        string? sample = null;
+        var count = 0;
+        foreach (var row in doc.RootElement.GetProperty("collectors").EnumerateArray())
+        {
+            if (!row.TryGetProperty("partial_detail", out _)) continue;
+            count++;
+            rows += Encoding.UTF8.GetByteCount(row.GetRawText());
+            sample ??= row.GetRawText();
+            foreach (var prop in row.EnumerateObject())
+            {
+                var value = prop.Value;
+                keyNames += Encoding.UTF8.GetByteCount(prop.Name) + 4;
+                var raw = Encoding.UTF8.GetByteCount(value.GetRawText());
+                var isDefault = value.ValueKind is System.Text.Json.JsonValueKind.Null or System.Text.Json.JsonValueKind.False
+                    || (value.ValueKind == System.Text.Json.JsonValueKind.Number && value.GetDouble() == 0);
+                if (isDefault) { defaults += raw; defaultKeys += Encoding.UTF8.GetByteCount(prop.Name) + 4; } else other += raw;
+            }
+        }
+        var total = Encoding.UTF8.GetByteCount(json);
+        return $"total {total:N0} B; {count} partial rows {rows:N0} B (key names+punctuation {keyNames:N0}, of which on null/false/0 values {defaultKeys:N0}; null/false/0 values {defaults:N0}; other values {other:N0}); outside the rows {total - rows:N0} B; sample row {sample}";
     }
 
     /* ═══════════════════════════ reflection: enumerate, exclude, bind, invoke ═══════════════════════════ */

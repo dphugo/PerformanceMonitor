@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
 using Microsoft.Data.SqlClient;
@@ -161,7 +162,7 @@ ORDER BY bucket";
         return items;
     }
 
-    public async Task<List<QueryStoreRow>> GetQueryStoreTopQueriesAsync(int serverId, int hoursBack = 24, int top = 50, DateTime? fromDate = null, DateTime? toDate = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null, string? executionType = null, string? moduleName = null)
+    public async Task<List<QueryStoreRow>> GetQueryStoreTopQueriesAsync(int serverId, int hoursBack = 24, int top = 50, DateTime? fromDate = null, DateTime? toDate = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null, string? executionType = null, string? moduleName = null, QueryTagReadScope? tags = null)
     {
         using var _q = TimeQuery("GetQueryStoreTopQueriesAsync", "v_query_store_stats top N");
         using var connection = await OpenConnectionAsync();
@@ -169,6 +170,8 @@ ORDER BY bucket";
         var (startTime, endTime) = GetTimeRange(hoursBack, fromDate, toDate, asOfUtc);
         /* #5381: $4 used to be the page limit; the limit is applied after the text lookup now, so the filter parameters start at $4. */
         var dbClause = BuildDbInClause(databaseNames, "database_name", 4, out var dbValues);
+        /* #5992: the query tag filter, in the population before the ranking and the cap. */
+        var tagValues = new List<object>();
         var executionTypeParameterIndex = 4 + dbValues.Count;
         var executionTypeClause = string.IsNullOrWhiteSpace(executionType)
             ? ""
@@ -178,6 +181,7 @@ ORDER BY bucket";
         var moduleClause = string.IsNullOrWhiteSpace(moduleName)
             ? ""
             : $" AND module_name = ${moduleParameterIndex}";
+        if (tags is not null) { dbClause += QueryTagReadScope.HashToken("query_hash"); tagValues.AddRange(tags.ParameterValues); }
 
         /* #5313: one round at a candidate limit; TopFill asks again with a larger one while WAITFOR shells left the page short. */
         async Task<(List<QueryStoreRow> Rows, int CandidateCount)> RunRoundAsync(int candidates)
@@ -388,6 +392,7 @@ SELECT p.*
 FROM page p
 ORDER BY p.page_ord";
 
+        if (tags is not null) command.CommandText = tags.Apply(command.CommandText, moduleParameterIndex + (string.IsNullOrWhiteSpace(moduleName) ? 0 : 1));
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = startTime });
         command.Parameters.Add(new DuckDBParameter { Value = endTime });
@@ -397,6 +402,8 @@ ORDER BY p.page_ord";
             command.Parameters.Add(new DuckDBParameter { Value = executionType });
         if (!string.IsNullOrWhiteSpace(moduleName))
             command.Parameters.Add(new DuckDBParameter { Value = moduleName });
+        foreach (var tagValue in tagValues)
+            command.Parameters.Add(new DuckDBParameter { Value = tagValue });
 
         var candidateRows = new List<QueryStoreRow>();
         using (var reader = await command.ExecuteReaderAsync())
@@ -1032,16 +1039,17 @@ ORDER BY collection_time";
     /// Fetches a query plan on-demand from Query Store by plan_id.
     /// Uses three-part naming with sp_executesql for Azure SQL DB compatibility.
     /// </summary>
-    public static async Task<string?> FetchQueryStorePlanAsync(string connectionString, string databaseName, long planId)
+    public static async Task<string?> FetchQueryStorePlanAsync(
+        string connectionString, string databaseName, long planId, CancellationToken cancellationToken = default)
     {
         using var connection = new SqlConnection(connectionString);
-        await connection.OpenAsync();
+        await connection.OpenAsync(cancellationToken);
 
         /*
         Validate the database name exists and get the QUOTENAME'd version
         to prevent SQL injection via malicious database names
         */
-        var quotedDbName = await GetValidatedDatabaseNameAsync(connection, databaseName);
+        var quotedDbName = await GetValidatedDatabaseNameAsync(connection, databaseName, cancellationToken);
         if (quotedDbName == null)
         {
             return null;
@@ -1065,7 +1073,7 @@ OPTION(RECOMPILE);',
 
         using var command = new SqlCommand(query, connection) { CommandTimeout = 30 };
         command.Parameters.Add(new SqlParameter("@plan_id", SqlDbType.BigInt) { Value = planId });
-        var result = await command.ExecuteScalarAsync();
+        var result = await command.ExecuteScalarAsync(cancellationToken);
         return result as string;
     }
     /// <summary>
@@ -1225,6 +1233,12 @@ ORDER BY point_time";
 
 public class QueryStoreRow
 {
+    /// <summary>#5993: the row's query tag as a path ("Parent / Child"), or null. Set from the map after the read; the grid shows it.</summary>
+    public string? QueryTag { get; set; }
+
+    /// <summary>#5993: the row carries a key the "Assign query tag..." menu item can bind.</summary>
+    public bool CanAssignQueryTag => Helpers.QueryTagGrid.TargetOf(this) != null;
+
     /// <summary>Gates "Get Actual Plan (re-run)" — see <see cref="QuerySnapshotRow.CanGetActualPlan"/>.</summary>
     public bool CanGetActualPlan => !string.IsNullOrEmpty(QueryText);
 

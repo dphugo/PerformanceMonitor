@@ -16,6 +16,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
+using NpgsqlTypes;
 using PerformanceMonitor.Analysis.Baselines;
 using PerformanceMonitor.Collectors;
 using PerformanceMonitor.Darling.Storage;
@@ -96,7 +97,7 @@ public static class DarlingRetention
     /// </summary>
     internal static int EffectivePurgeRetentionDays(string collectorName, int resolvedDays)
     {
-        var retentionDays = Math.Max(1, resolvedDays);
+        var retentionDays = Math.Clamp(resolvedDays, 1, CollectorScheduleDefaults.MaxRetentionDays);
         return BaselineServingRawCollectors.Contains(collectorName)
             ? Math.Max(retentionDays, BaselineMath.BaselineWindowDays)
             : retentionDays;
@@ -183,9 +184,13 @@ public static class DarlingRetention
     /// <summary>
     /// #3953 (V145): the WIDE interval table's own horizon, on <c>first_execution_time</c>, kept separately from
     /// <see cref="QueryStoreIntervalLatestRetentionDays"/> because the two tables serve different readers at
-    /// different windows. The table keeps 9 days and deletes row by row on <c>first_execution_time</c>. A Query
+    /// different windows. The table keeps 10 days and deletes row by row on <c>first_execution_time</c>. A Query
     /// Store interval can span a day, so 8 days is exactly the edge for an interval that starts just past the
-    /// horizon and closes inside a 7-day window; 9 days gives a day of margin. Reads use the table below raw's
+    /// horizon and closes inside a 7-day window; 9 days gave a day of margin. #5809 raised it to 10 so
+    /// get_query_store_regressions can read this table: its span is the 7-day baseline plus the window (8 days for
+    /// a 24-hour call), and the wide gate's #5541 edge (span start - 26 h at or above the table floor) needs
+    /// 8 days + 26 h = 9 days 2 hours held, which 9 days never is. Windows up to about 46 hours now take the
+    /// table; longer ones read raw. Reads use the table below raw's
     /// chunk floor, down to L = max(window start, filled_since, table floor + 26 h (the purge-edge margin)), where the table floor is
     /// the oldest <c>first_execution_time</c> the purge has left. Like <see cref="QueryStoreIntervalLatestRetentionDays"/>
     /// this is a named constant, not a knob, and in no collector schedule.
@@ -215,6 +220,84 @@ public static class DarlingRetention
     /// service has not run yet — the reaper's job, not retention's.
     /// </summary>
     internal const string TerminalCommandStatuses = "status IN ('succeeded', 'failed')";
+
+    /// <summary>
+    /// config.external_alert_pending (the queue of alerts other services submit, #5654) keeps its FINISHED rows this long.
+    /// Like the command queue it is not an audit surface: the alert history row is the record of an alert, and the queue
+    /// row only says what the drain did with the submission, which is worth as long as the metric data it sits beside
+    /// (<see cref="DataRetentionBaseDays"/>). It is the only thing that bounds the table, because a source may submit up to
+    /// its per-minute cap for as long as it runs.
+    /// </summary>
+    internal const int ExternalAlertRetentionDays = DataRetentionBaseDays;
+
+    /// <summary>
+    /// The finished-row filter for the external alert queue purge: every status except the two a live row holds. A
+    /// <c>pending</c> row is never purged however old, because it has not been delivered or expired yet, and a
+    /// <c>claimed</c> row belongs to a run that may still be sending (the reaper marks a dead run's claims
+    /// <c>interrupted</c>, which makes them finished). Compile-time constant, never user input.
+    /// </summary>
+    internal const string FinishedExternalAlertStatuses = "status NOT IN ('pending', 'claimed')";
+
+    /// <summary>
+    /// The purge filter for config.external_alert_state (#5654): a subject that is not firing. A cleared subject's row only
+    /// keeps the identity of its last episode, which the next fire overwrites, so deleting it changes nothing a clear or a
+    /// fire reads (an absent row reads as not firing). A firing row is never purged, however old. Compile-time constant,
+    /// never user input. The age column is <c>last_fired_at</c>, which a clear does not move, so it is the last time the
+    /// subject fired and a row cleared long after its fire goes with the horizon too.
+    /// </summary>
+    internal const string ClearedExternalAlertState = "NOT firing";
+
+    /// <summary>
+    /// config.investigation_requests and config.investigation_journal (#5632 Phase A) keep their rows this long: a year, like
+    /// <see cref="PlanForceLedgerRetentionDays"/>, because an investigation records what an agent was asked and answered.
+    /// <para>config.investigation_feedback (V191, #5909) needs no pass of its own: it references its request with
+    /// <c>ON DELETE CASCADE</c>, and the request purge below is a DELETE, so a report's feedback goes with the aged request
+    /// and a younger request's stays. A practice request (<c>practice_of</c>) is a request and ages like any other.
+    /// config.config_threshold_overrides is configuration and is never aged.</para>
+    /// <para>config.investigation_notes and config.agent_environment_profiles get no retention pass: a person writes or
+    /// approves them, so they are configuration, and a note already carries its own <c>expires_at</c>, past which no brief
+    /// states it.</para>
+    /// </summary>
+    internal const int InvestigationRetentionDays = 365;
+
+    /// <summary>The brief of an investigation request is cleared this long after the request opened (#5632 Phase A); the
+    /// rest of the row keeps <see cref="InvestigationRetentionDays"/>.</summary>
+    internal const int InvestigationBriefRetentionDays = 90;
+
+    /// <summary>The purge filter for investigation requests: a request that is still open or claimed is never deleted.
+    /// Compile-time constant, never user input.</summary>
+    internal const string FinishedInvestigationStates = "state NOT IN ('open', 'claimed')";
+
+    /// <summary>Clears the brief of every request opened before the cutoff (<c>$1</c>). A second run clears nothing, so the
+    /// purge loop stops.</summary>
+    internal const string ClearInvestigationBriefSql =
+        "UPDATE config.investigation_requests SET brief = NULL WHERE brief IS NOT NULL AND opened_at < $1";
+
+    /// <summary>The evidence rows of a request (config.investigation_evidence, V193, #5997) are cleared with its brief, at
+    /// <see cref="InvestigationBriefRetentionDays"/>, and the rest of the request keeps <see cref="InvestigationRetentionDays"/>.
+    /// A request that is still open or claimed keeps its evidence however old (<see cref="FinishedInvestigationStates"/>, the
+    /// request purge's own filter): an agent may still be reading it. Evidence also goes with its request at the year
+    /// (<c>ON DELETE CASCADE</c>). The delete is capped at <see cref="InvestigationEvidenceBatchRows"/> rows a statement and
+    /// the drain loop repeats it until a statement deletes nothing. Compile-time constant, never user input; <c>$1</c> is the
+    /// cutoff.</summary>
+    internal static readonly string ClearInvestigationEvidenceSql =
+        "DELETE FROM config.investigation_evidence WHERE evidence_id IN ("
+        + "SELECT e.evidence_id FROM config.investigation_evidence AS e "
+        + "JOIN config.investigation_requests AS r ON r.request_id = e.request_id "
+        + "WHERE r.opened_at < $1 AND r." + FinishedInvestigationStates + $" LIMIT {InvestigationEvidenceBatchRows})";
+
+    /// <summary>The row cap of <see cref="ClearInvestigationEvidenceSql"/>'s statement, also the batchSize the PurgeOneAsync call
+    /// for it passes. Evidence is at most 32 KB a row.</summary>
+    internal const int InvestigationEvidenceBatchRows = 5000;
+
+    /// <summary>The daily deadlock signature counts (config.investigation_signature_days, V193, #5997) keep this many days: the
+    /// 7-day average and the 24-hour count the gate compares need no more, and the rest is a count per day per signature.</summary>
+    internal const int InvestigationSignatureDayRetentionDays = 30;
+
+    /// <summary>Deletes every signature day before the cutoff's date (<c>$1</c>). A second run deletes nothing, so the drain loop
+    /// stops. The table holds one small row per server, signature and day, so one statement is the whole purge.</summary>
+    internal const string PurgeInvestigationSignatureDaysSql =
+        "DELETE FROM config.investigation_signature_days WHERE day < $1::date";
 
     /// <summary>
     /// The row cap for <see cref="QueryStorePlanMap"/>'s and <see cref="QueryStoreTextStore"/>'s prune
@@ -319,11 +402,17 @@ public static class DarlingRetention
     /// The wall time a pass with a <paramref name="collectionPressure"/> may run before it stops at a batch boundary;
     /// null takes <see cref="RetentionCollectionYield.DefaultWallBudget"/>.
     /// </param>
+    /// <param name="queryTextPruneGate">
+    /// The once-per-24-hours rule for the <c>collect.query_store_text</c> prune. The scheduled pass hands in the worker's
+    /// gate, so the prune runs at most once in 24 hours even when budget-stopped passes follow each other within the hour.
+    /// Null (the on-demand <c>purge_now</c> command, and every test that predates the rule) prunes on every pass.
+    /// </param>
     public static async Task<PurgeSummary> PurgeAsync(
         NpgsqlDataSource postgres, bool timescaleAvailable, ILogger? logger, CancellationToken cancellationToken,
         Func<string, int>? retentionDaysFor = null, int planContentRetentionDays = 0,
         int livenessTouchedTablePruneRowCap = LivenessTouchedTablePruneRowCap, bool paceWal = false,
-        string? runLabel = null, ICollectionPressure? collectionPressure = null, TimeSpan? wallBudget = null)
+        string? runLabel = null, ICollectionPressure? collectionPressure = null, TimeSpan? wallBudget = null,
+        QueryTextPruneGate? queryTextPruneGate = null)
     {
         /* One pacer per run, its rate read once from the store's own checkpoint settings before the first
            table is touched. */
@@ -338,7 +427,7 @@ public static class DarlingRetention
 
         return await PurgeWithPacerAsync(
             postgres, timescaleAvailable, logger, cancellationToken, retentionDaysFor, planContentRetentionDays,
-            livenessTouchedTablePruneRowCap, walPacer, runLabel);
+            livenessTouchedTablePruneRowCap, walPacer, runLabel, queryTextPruneGate);
     }
 
     /// <summary>
@@ -350,7 +439,7 @@ public static class DarlingRetention
         NpgsqlDataSource postgres, bool timescaleAvailable, ILogger? logger, CancellationToken cancellationToken,
         Func<string, int>? retentionDaysFor = null, int planContentRetentionDays = 0,
         int livenessTouchedTablePruneRowCap = LivenessTouchedTablePruneRowCap, RetentionWalPacer? walPacer = null,
-        string? runLabel = null)
+        string? runLabel = null, QueryTextPruneGate? queryTextPruneGate = null)
     {
         /* Clamp at the destructive sink, like retentionDaysFor's clamp below (review catch): the value
            arrives pre-clamped only when a store read succeeded and ApplyToConfig ran. On a
@@ -449,7 +538,10 @@ public static class DarlingRetention
                     continue;
                 }
 
-                if (timescaleAvailable)
+                /* #5640: a catalog entry that stays a plain table (the attention table) has no chunks to drop, so on
+                   a TimescaleDB store it takes the same time-sliced DELETE a plain-PostgreSQL store runs, straight
+                   away, instead of a drop_chunks call that fails and warns once per sweep before falling back. */
+                if (timescaleAvailable && !definition.StaysPlainTable)
                 {
                     var dropped = await DropChunksOneAsync(
                         postgres, definition.TargetTable, DropChunksSqlFor(definition, retentionDays),
@@ -689,22 +781,34 @@ public static class DarlingRetention
                 /* #2150: query_store statement text, same shape and same direction of margin as the two
                    above — it must outlive the facts that reference it, because text retired early reads as a
                    statement that never had text rather than as one whose text expired. */
-                var queryTextCutoff = utcNow.AddDays(-(widestFactRetentionDays + QueryStoreTextStore.PruneMarginDays));
-                var queryTextDeleted = await PurgeOneAsync(
-                    postgres, QueryStoreTextStore.TableName,
-                    UnorderedRowCappedDeleteSql(
-                        QueryStoreTextStore.TableName, QueryStoreTextStore.LastSeenColumn, livenessTouchedTablePruneRowCap),
-                    queryTextCutoff, logger, cancellationToken,
-                    batchSize: livenessTouchedTablePruneRowCap,
-                    pacer: walPacer);
-                if (queryTextDeleted is not null)
+                var tablesLeftBefore = walPacer?.Yield?.TablesLeft ?? 0;
+                if (queryTextPruneGate is null || queryTextPruneGate.IsDue())
                 {
-                    tablesPurged++;
-                    totalRowsDeleted += queryTextDeleted.Value;
-                }
-                else
-                {
-                    tablesFailed++;
+                    var queryTextCutoff = utcNow.AddDays(-(widestFactRetentionDays + QueryStoreTextStore.PruneMarginDays));
+                    var queryTextDeleted = await PurgeOneAsync(
+                        postgres, QueryStoreTextStore.TableName,
+                        UnorderedRowCappedDeleteSql(
+                            QueryStoreTextStore.TableName, QueryStoreTextStore.LastSeenColumn, livenessTouchedTablePruneRowCap),
+                        queryTextCutoff, logger, cancellationToken,
+                        batchSize: livenessTouchedTablePruneRowCap,
+                        pacer: walPacer);
+                    if (queryTextDeleted is not null)
+                    {
+                        tablesPurged++;
+                        totalRowsDeleted += queryTextDeleted.Value;
+
+                        /* Counts as a run only when the pass's wall budget did not cut THIS table short (a spent budget skips
+                           the table with a clean 0, and a stop part-way leaves rows behind): the next pass tries again. A stop
+                           on a later table does not matter, this one had finished. */
+                        if ((walPacer?.Yield?.TablesLeft ?? 0) == tablesLeftBefore)
+                        {
+                            queryTextPruneGate?.MarkRan();
+                        }
+                    }
+                    else
+                    {
+                        tablesFailed++;
+                    }
                 }
 
                 foreach (var dimTable in PayloadDimensions.DimTables)
@@ -747,6 +851,28 @@ public static class DarlingRetention
                         tablesFailed++;
                     }
                 }
+            }
+
+            /* collect.query_tag_sightings (#5977): a sighting is the record of a query key (or caller) seen in the fact tables
+               that carry query statistics, so it is kept as long as the longest raw retention of those tables
+               (widestFactRetentionDays, resolved above through the same resolver the fact purge uses) and no longer. last_seen is
+               NOT NULL and defaulted, so no row can slip past the horizon by never being stamped. Only this table is aged: the
+               tags, assignments and rules are configuration and the map is rebuilt from them, so retention never touches
+               them. The cutoff is bound like the external alert purge below (the store's sessions are pinned to UTC).
+               Failure-isolated like every sibling. */
+            var sightingsDeleted = await PurgeOneAsync(
+                postgres, "collect.query_tag_sightings",
+                TimeSlicedDeleteSql("collect.query_tag_sightings", "last_seen"),
+                utcNow.AddDays(-widestFactRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            if (sightingsDeleted is not null)
+            {
+                tablesPurged++;
+                totalRowsDeleted += sightingsDeleted.Value;
+            }
+            else
+            {
+                tablesFailed++;
             }
 
             /* collection_log retention. Since V23 it is a TimescaleDB hypertable (converted DIRECTLY by the V23
@@ -831,7 +957,7 @@ public static class DarlingRetention
                 tablesFailed++;
             }
 
-            /* #3953 (V145): the WIDE interval table beside V143's, at its own 9-day horizon
+            /* #3953 (V145): the WIDE interval table beside V143's, at its own 10-day horizon
                (QueryStoreIntervalWideRetentionDays) on first_execution_time — a shorter horizon than V143's 15
                days. Same batched-DELETE shape, same pending-replay horizon reasoning, failure-isolated like every
                sibling. The purge deletes row by row on first_execution_time, so the table floor the read gate
@@ -915,6 +1041,102 @@ public static class DarlingRetention
                 tablesFailed++;
             }
 
+            /* config.external_alert_pending (#5654): the queue of alerts other services submit. Finished rows go at
+               ExternalAlertRetentionDays; pending and claimed rows are never touched, however old (expiry and the
+               reaper finish them, retention does not). SCHEMA-QUALIFIED like config.config_command: a bare name would
+               resolve to nothing in `collect`. Keyed on submitted_at (NOT NULL, defaulted), so no row can slip past the
+               horizon by never being stamped. The cutoff is bound as an unspecified-kind DateTime and the store's
+               sessions are pinned to UTC (DarlingStoreConnection), so it compares against the timestamptz column as UTC.
+               config.external_alert_state is purged below. external_alert_source is the registry and is not purged here.
+               Failure-isolated like every sibling. */
+            var externalAlertsDeleted = await PurgeOneAsync(
+                postgres, "config.external_alert_pending",
+                TimeSlicedDeleteSql("config.external_alert_pending", "submitted_at", FinishedExternalAlertStatuses),
+                utcNow.AddDays(-ExternalAlertRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            if (externalAlertsDeleted is not null)
+            {
+                tablesPurged++;
+                totalRowsDeleted += externalAlertsDeleted.Value;
+            }
+            else
+            {
+                tablesFailed++;
+            }
+
+            /* config.external_alert_state (#5654): one row per subject, and a subject is (source, alert_key, server_label),
+               all free text a submitter chooses, so the row count is the number of distinct keys a source has used and a
+               clear only sets firing = false. Rows that are not firing go ExternalAlertRetentionDays after the subject last
+               fired (last_fired_at, set on every fire; a NULL one is never aged out, and a fire always sets it). A firing
+               row stays however old: it is an open incident a clear still has to close. */
+            var externalStateDeleted = await PurgeOneAsync(
+                postgres, "config.external_alert_state",
+                TimeSlicedDeleteSql("config.external_alert_state", "last_fired_at", ClearedExternalAlertState),
+                utcNow.AddDays(-ExternalAlertRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            if (externalStateDeleted is not null)
+            {
+                tablesPurged++;
+                totalRowsDeleted += externalStateDeleted.Value;
+            }
+            else
+            {
+                tablesFailed++;
+            }
+
+            /* config.investigation_requests and config.investigation_journal (#5632 Phase A): a request and the journal of what
+               happened to it are kept InvestigationRetentionDays (a year, like the plan-force ledger: an investigation is an
+               audit of what an agent was asked and answered). A request that is still open or claimed is never deleted, however
+               old (the sweep expires it first). Its alert rows and its report go with it (ON DELETE CASCADE). The brief, the
+               largest column, is cleared at InvestigationBriefRetentionDays; the rest of the row stays. Each statement is
+               failure-isolated like every sibling, and the cutoff is bound like the external alert purge above. */
+            var investigationsDeleted = await PurgeOneAsync(
+                postgres, "config.investigation_requests",
+                TimeSlicedDeleteSql("config.investigation_requests", "opened_at", FinishedInvestigationStates),
+                utcNow.AddDays(-InvestigationRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            var investigationJournalDeleted = await PurgeOneAsync(
+                postgres, "config.investigation_journal",
+                TimeSlicedDeleteSql("config.investigation_journal", "event_time"),
+                utcNow.AddDays(-InvestigationRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            var investigationBriefsCleared = await PurgeOneAsync(
+                postgres, "config.investigation_requests (brief)",
+                ClearInvestigationBriefSql,
+                utcNow.AddDays(-InvestigationBriefRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            /* config.investigation_evidence and config.investigation_signature_days (V193, #5997): the evidence is cleared with the
+               brief at InvestigationBriefRetentionDays, except for a request still open or claimed; the daily signature counts
+               are purged at InvestigationSignatureDayRetentionDays. config.investigation_signature_merges is a recorded decision
+               and is never aged. Each is failure-isolated like the passes above. */
+            var investigationEvidenceCleared = await PurgeOneAsync(
+                postgres, "config.investigation_evidence",
+                ClearInvestigationEvidenceSql,
+                utcNow.AddDays(-InvestigationBriefRetentionDays), logger, cancellationToken,
+                batchSize: InvestigationEvidenceBatchRows,
+                pacer: walPacer);
+            var investigationSignatureDaysDeleted = await PurgeOneAsync(
+                postgres, "config.investigation_signature_days",
+                PurgeInvestigationSignatureDaysSql,
+                utcNow.AddDays(-InvestigationSignatureDayRetentionDays), logger, cancellationToken,
+                pacer: walPacer);
+            foreach (var investigationResult in new[]
+            {
+                investigationsDeleted, investigationJournalDeleted, investigationBriefsCleared,
+                investigationEvidenceCleared, investigationSignatureDaysDeleted,
+            })
+            {
+                if (investigationResult is not null)
+                {
+                    tablesPurged++;
+                    totalRowsDeleted += investigationResult.Value;
+                }
+                else
+                {
+                    tablesFailed++;
+                }
+            }
+
             /* collect.plan_force_actions (the force-plan bot's decision journal) purges on its own action_time
                column at PlanForceLedgerRetentionDays — the longest horizon in the store. NOT in
                CollectorCatalog.All (it is written by the service's post-analysis bot pass, not a collector), so
@@ -979,6 +1201,28 @@ public static class DarlingRetention
                 tablesFailed++;
             }
 
+            /* collect.query_store_watermarks (#5684, V178): the per-batch watermark side table of the Query Store per-database
+               watermark read. NOT in CollectorCatalog.All (the collector runner's COPY transaction writes it), so the loop above skips it.
+               A FIXED two days (QueryStoreWatermarks.RetentionDays), NOT Query Store's retention: the read never looks back more than
+               three hours, so the table only has to clear that. A plain table and a plain DELETE served by its collection_time index;
+               about one row per database per collection, so one execution IS the whole purge and dispatches single-shot, like the hour
+               ledger above. The one-row coverage table beside it is never purged. Failure-isolated like every sibling. */
+            var queryStoreWatermarksDeleted = await PurgeOneAsync(
+                postgres, QueryStoreWatermarks.Table,
+                QueryStoreWatermarks.PruneSql,
+                utcNow.AddDays(-QueryStoreWatermarks.RetentionDays), logger, cancellationToken,
+                batchSize: SingleShotStatement,
+                pacer: walPacer);
+            if (queryStoreWatermarksDeleted is not null)
+            {
+                tablesPurged++;
+                totalRowsDeleted += queryStoreWatermarksDeleted.Value;
+            }
+            else
+            {
+                tablesFailed++;
+            }
+
             /* collect.pg_io_stats_hourly (#5495, V170): the hourly rollup of pg_io_stats. NOT in CollectorCatalog.All (the hourly
                tick's builder writes it), so the loop above skips it. It keeps exactly the raw collector's retention (the same
                resolved days, so a per-collector override moves both): a rollup hour whose raw rows are gone makes the read's count guard
@@ -998,6 +1242,44 @@ public static class DarlingRetention
             {
                 tablesPurged++;
                 totalRowsDeleted += pgIoHourlyDeleted.Value;
+            }
+            else
+            {
+                tablesFailed++;
+            }
+            /* collect.procedure_stats_totals (#5638, V176): the per-collection totals of procedure_stats. NOT in CollectorCatalog.All
+               (the collector runner's COPY transaction writes it), so the loop above skips it. It ages with the raw collector it
+               summarises: the same resolved days as procedure_stats (EffectivePurgeRetentionDays, so a per-collector override moves both),
+               and a row is never purged before the procedure_stats rows of its age (ProcedureStatsTotals.PrunePredicate also keeps every
+               totals row at or after the oldest raw row, because on TimescaleDB the raw chunks leave through the gated purge, which can
+               hold them past the horizon). A plain table with a plain time-sliced DELETE on both store kinds; about one row per database
+               per collection, so a slice is a small fraction of a raw slice. Failure-isolated like every sibling. */
+            var procedureTotalsDays = EffectivePurgeRetentionDays(
+                "procedure_stats",
+                retentionDaysFor?.Invoke("procedure_stats")
+                    ?? (CollectorScheduleDefaults.All.TryGetValue("procedure_stats", out var procedureSchedule) ? procedureSchedule.RetentionDays : DataRetentionBaseDays));
+            /* The raw floor is measured ONCE, by PurgeOneAsync itself, and bound as $2 (review of #5706, #1815): the predicate used to
+               carry an unbounded min() over procedure_stats that the slice statement expands three times, a whole-table scan each, and
+               the chunk-catalog form is how the digest floor above survives compressed chunks. The measurement is a callback that runs
+               on the purge's own connection AFTER PurgeOneAsync's #5592 wall-budget gate (round 2, L4), so a pass whose budget is spent
+               opens no connection and runs no probe for this table. A floor that cannot be measured throws out of the callback, so the
+               table counts failed and its purge is skipped for the cycle: without the floor the guard against deleting totals the raw
+               trend still reads is unknown, and the totals only age out a sweep later. */
+            var procedureTotalsDeleted = await PurgeOneAsync(
+                postgres, ProcedureStatsTotals.Table,
+                TimeSlicedDeleteSql(ProcedureStatsTotals.Table, "collection_time", ProcedureStatsTotals.PrunePredicate),
+                utcNow.AddDays(-procedureTotalsDays), logger, cancellationToken,
+                pacer: walPacer,
+                secondParameterFactory: async (floorConnection, ct) =>
+                {
+                    var procedureRawFloor = await ProcedureStatsTotals.MeasureRawFloorAsync(
+                        floorConnection, timescaleAvailable, DeleteTimeoutSeconds, ct);
+                    return new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = procedureRawFloor is { } floorValue ? floorValue : DBNull.Value };
+                });
+            if (procedureTotalsDeleted is not null)
+            {
+                tablesPurged++;
+                totalRowsDeleted += procedureTotalsDeleted.Value;
             }
             else
             {
@@ -1322,7 +1604,9 @@ public static class DarlingRetention
     /// is retried by the next hourly pass, not an error.</description></item>
     /// <item><description><b>The legacy table's row-capped purge (#5569).</b> It names <c>X_legacy</c>, never the
     /// parent: a <c>ctid</c> repeats across partitions, so <c>ctid IN (SELECT ctid ...)</c> against the parent could
-    /// delete live rows of another day. Skipped, with no warning, when the legacy table no longer exists.</description></item>
+    /// delete live rows of another day. Skipped, with no warning, when the legacy table no longer exists. Also skipped once
+    /// the parent is promoted and the legacy table has a bound S: the drops above take the whole table when S reaches the
+    /// cutoff, so deleting its expired rows until then is wasted work.</description></item>
     /// <item><description><b>The DEFAULT partition</b>, a plain DELETE of rows older than the cutoff, skipped when
     /// DEFAULT does not exist.</description></item>
     /// </list>
@@ -1360,8 +1644,13 @@ public static class DarlingRetention
         {
             failed++;
         }
-        else if (legacyExists.Value)
+        else if (legacyExists.Value && !await LegacyDropsWholeAsync(postgres, table, logger, cancellationToken))
         {
+            /* Not promoted (or no readable bound S): the legacy table holds live data and is never dropped, so its expired rows
+               are row-purged by name. Once promoted with a bound S, DropExpiredAsync drops the whole table when S is at or
+               before the cutoff, and row-deleting its expired rows until then is wasted WAL, index work and vacuum (the
+               production store spent about 4 minutes a day on it). Every reader of these tables filters at its own analysis
+               window, so an expired legacy row left until the drop is never read as a wrong answer. */
             var legacyDeleted = await PurgeOneAsync(
                 postgres, table.Legacy,
                 RowCappedDeleteSql(table.Legacy, "first_execution_time", IntervalDeleteRowCap),
@@ -1405,6 +1694,28 @@ public static class DarlingRetention
         }
 
         return new IntervalPartitionPurge(purged, rows, failed);
+    }
+
+    /// <summary>
+    /// True when the legacy table's rows are left for <see cref="QueryStoreIntervalPartitions.DropExpiredAsync"/> to drop whole:
+    /// the parent is promoted and the legacy table carries a bound S the drop can read. An unpromoted store, a bound that does
+    /// not parse (the drop never takes such a table) and a state read that fails all return false, so the row purge runs as
+    /// it did before.
+    /// </summary>
+    private static async Task<bool> LegacyDropsWholeAsync(
+        NpgsqlDataSource postgres, QueryStoreIntervalPartitions.IntervalTable table, ILogger? logger, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await postgres.OpenConnectionAsync(cancellationToken);
+            var state = await QueryStoreIntervalPartitions.ReadStateAsync(connection, table, cancellationToken);
+            return state.Promoted && state.LegacyExists && state.LegacyUpper.HasValue;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogWarning("Retention could not read the partition state of {Table}: {Failure}", table.Parent, DescribePurgeFailure(ex));
+            return false;
+        }
     }
 
     /// <summary>Whether a schema-qualified relation exists: true or false, or null (warned) when the probe itself failed.</summary>
@@ -1804,6 +2115,10 @@ public static class DarlingRetention
     /// COMMAND-TIMEOUT batch at half its cap instead of failing the table outright — the field failure this
     /// exists for was one 50k-row batch passing the 300 s command timeout under first-start load, on a
     /// store whose steady-state margin was ~2x rather than the cap's designed 5x.</para>
+    ///
+    /// <para><paramref name="secondParameterFactory"/> (the unsliced shape only) builds the statement's <c>$2</c> from the purge's own
+    /// connection once the #5592 budget gate has passed, so a measurement the second parameter needs (the procedure totals' raw
+    /// floor) is never taken for a table the pass will not start. A throw out of it fails the table like any other fault.</para>
     /// </summary>
     private static async Task<int?> PurgeOneAsync(
         NpgsqlDataSource postgres,
@@ -1814,7 +2129,8 @@ public static class DarlingRetention
         CancellationToken cancellationToken,
         int batchSize = 1,
         string? adaptiveRowCapTimeColumn = null,
-        RetentionWalPacer? pacer = null)
+        RetentionWalPacer? pacer = null,
+        Func<NpgsqlConnection, CancellationToken, Task<NpgsqlParameter>>? secondParameterFactory = null)
     {
         /* #5592: a pass whose wall budget is already spent starts no further table: no connection, no statement.
            Every table's purge comes through here, so this is the one place that skips them. Nothing was deleted,
@@ -1871,6 +2187,10 @@ public static class DarlingRetention
             {
                 using var command = new NpgsqlCommand(deleteSql, connection) { CommandTimeout = DeleteTimeoutSeconds };
                 command.Parameters.AddWithValue(cutoff);
+                if (secondParameterFactory is not null)
+                {
+                    command.Parameters.Add(await secondParameterFactory(connection, cancellationToken));
+                }
 
                 drained = await DrainBatchesAsync(
                     async ct =>
@@ -2260,4 +2580,35 @@ public readonly record struct PurgeSummary(int TablesPurged, int RowsDeleted, in
 
     /// <summary>Rows deleted plus whole chunks dropped — the coarse "how much did this purge remove" count.</summary>
     public int TotalPurged => RowsDeleted + ChunksDropped;
+}
+
+/// <summary>
+/// The once-per-24-hours rule for the <c>collect.query_store_text</c> prune. Each prune statement is a full serial scan of the
+/// table's heap (about 33 seconds on the production store with 42 SQL Server servers), because the table has no
+/// <c>last_seen</c> index on purpose (it would stop the liveness touch from updating in place). A retention pass is due daily,
+/// but a pass the wall budget stops brings the next one forward to within the hour, and each service start runs one at once, so
+/// the passes themselves are not a daily cadence. The gate holds the time of the last prune that finished, in memory, so the
+/// worker's passes share it. A restart forgets it, which costs one extra prune. A day's backlog is far under the prune's
+/// 300,000-row cap, so one run a day clears it. The prune's cutoff, including <see cref="QueryStoreTextStore.PruneMarginDays"/>,
+/// is unchanged.
+/// </summary>
+public sealed class QueryTextPruneGate
+{
+    /// <summary>The least time between two prunes.</summary>
+    public static readonly TimeSpan Interval = TimeSpan.FromHours(24);
+
+    private readonly Func<DateTime> _utcNow;
+    private DateTime? _lastRanUtc;
+
+    public QueryTextPruneGate(Func<DateTime>? utcNow = null) => _utcNow = utcNow ?? (() => DateTime.UtcNow);
+
+    /// <summary>True when no prune has finished yet, the last one was <see cref="Interval"/> or more ago, or the clock stepped back past it.</summary>
+    public bool IsDue() => IsDue(_lastRanUtc, _utcNow());
+
+    /// <summary>The rule on its own, so a test can pin the table.</summary>
+    public static bool IsDue(DateTime? lastRanUtc, DateTime nowUtc) =>
+        lastRanUtc is not { } last || nowUtc < last || nowUtc - last >= Interval;
+
+    /// <summary>Records that a prune finished now.</summary>
+    public void MarkRan() => _lastRanUtc = _utcNow();
 }

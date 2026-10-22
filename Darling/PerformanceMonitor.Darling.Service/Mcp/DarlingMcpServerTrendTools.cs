@@ -103,7 +103,7 @@ public sealed class DarlingMcpServerTrendTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         var widthError = TrendBuckets.ValidateWidth(bucket_minutes);
@@ -134,7 +134,7 @@ public sealed class DarlingMcpServerTrendTools
 
             var envelope = new Dictionary<string, object?>
             {
-                ["server"] = resolved.ServerName,
+                ["server"] = resolved.DisplayName,
                 ["metric"] = name,
                 ["hours_back"] = hours_back,
                 ["bucket"] = TrendBuckets.Word(bucketMinutes),
@@ -295,7 +295,7 @@ public sealed class DarlingMcpServerTrendTools
 
     /// <summary>Series were named and none has a sample in the window: say so, and list what the window did record.</summary>
     private static async Task<string> NoNamedSeriesAsync(
-        NpgsqlDataSource postgres, (int ServerId, string ServerName) resolved, SeriesKind kind, List<string> named, DateTime start, DateTime end,
+        NpgsqlDataSource postgres, (int ServerId, string ServerName, string DisplayName) resolved, SeriesKind kind, List<string> named, DateTime start, DateTime end,
         int hoursBack, string metric, CancellationToken cancellationToken)
     {
         var heaviest = await ReadTopNamesAsync(postgres, kind, resolved.ServerId, start, end, metric, cancellationToken);
@@ -307,7 +307,7 @@ public sealed class DarlingMcpServerTrendTools
         var spelling = kind.Param == "names" ? "Names" : "Clerk types";
         return McpHelpers.Status(
             "empty",
-            $"None of the named {kind.Noun} were recorded for {resolved.ServerName} in the last {hoursBack} hour(s). {spelling} are matched exactly, so check the spelling and case. The window does hold others: {kind.HeaviestKey} lists the top of them.",
+            $"None of the named {kind.Noun} were recorded for {resolved.DisplayName} in the last {hoursBack} hour(s). {spelling} are matched exactly, so check the spelling and case. The window does hold others: {kind.HeaviestKey} lists the top of them.",
             new Dictionary<string, object?> { [kind.Missing] = named, [kind.HeaviestKey] = heaviest });
     }
 
@@ -328,27 +328,45 @@ public sealed class DarlingMcpServerTrendTools
 
     /// <summary>The two kinds of nothing, plus the gated engine: asked only on the path that already found no rows.</summary>
     private static async Task<string> EmptyAsync(
-        NpgsqlDataSource postgres, (int ServerId, string ServerName) resolved, string metric, int hoursBack, CancellationToken cancellationToken)
+        NpgsqlDataSource postgres, (int ServerId, string ServerName, string DisplayName) resolved, string metric, int hoursBack, CancellationToken cancellationToken)
     {
         var (_, collector, everSql, what) = Describe(metric);
         /* One literal per metric, so the engine-capability census can read which collectors this tool asks about. */
         var gated = metric switch
         {
-            "total_waits" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "wait_stats", cancellationToken),
-            "cpu_scheduler" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "cpu_scheduler_stats", cancellationToken),
-            "memory_clerks" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "memory_clerks", cancellationToken),
-            "latch" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "latch_stats", cancellationToken),
-            "spinlock" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "spinlock_stats", cancellationToken),
-            "session_stats" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "session_stats", cancellationToken),
+            "total_waits" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "wait_stats", cancellationToken),
+            "cpu_scheduler" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "cpu_scheduler_stats", cancellationToken),
+            "memory_clerks" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "memory_clerks", cancellationToken),
+            "latch" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "latch_stats", cancellationToken),
+            "spinlock" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "spinlock_stats", cancellationToken),
+            "session_stats" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "session_stats", cancellationToken),
             "collector_duration" => null,
-            "tempdb_file_io" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "file_io_stats", cancellationToken),
-            "tempdb_size" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "tempdb_stats", cancellationToken),
-            "file_io_throughput" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "file_io_stats", cancellationToken),
-            _ => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "plan_cache_stats", cancellationToken),
+            "tempdb_file_io" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "file_io_stats", cancellationToken),
+            "tempdb_size" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "tempdb_stats", cancellationToken),
+            "file_io_throughput" => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "file_io_stats", cancellationToken),
+            _ => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "plan_cache_stats", cancellationToken),
         };
         if (gated != null)
         {
             return gated;
+        }
+
+        /* #6439: an Azure SQL Database never has tempdb file rows (file_io_stats runs there but sees only the user database's
+           files), so the tempdb file I/O read says the permanent engine gap instead of "check that collection is running". */
+        if (metric == "tempdb_file_io"
+            && await DarlingEngineCapability.TempDbFileIoNotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, cancellationToken) is { } azureGap)
+        {
+            return azureGap;
+        }
+
+        /* #6177: the tempdb reads are fed by the tempdb DMVs, which a contained database user on Azure SQL Database is
+           refused on every run. That is a setup step (a server login in ##MS_ServerStateReader##), so it answers
+           precondition with the one message the Collection Health row and get_tempdb_trend carry, not "check that
+           collection is running". tempdb_file_io is asked about too: its rows arrive with the same tempdb read. */
+        if (metric is "tempdb_size" or "tempdb_file_io"
+            && await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.ServerName, "tempdb_stats", cancellationToken) is { } refused)
+        {
+            return refused;
         }
 
         await using var command = postgres.CreateCommand(everSql);
@@ -359,10 +377,12 @@ public sealed class DarlingMcpServerTrendTools
         return everCollected
             ? McpHelpers.Status(
                 "empty",
-                $"No {what} recorded for {resolved.ServerName} in the last {hoursBack} hour(s). This server HAS collected them before, so this window is genuinely quiet rather than broken - widen hours_back to find the most recent samples.")
+                $"No {what} recorded for {resolved.DisplayName} in the last {hoursBack} hour(s). This server HAS collected them before, so this window is genuinely quiet rather than broken - widen hours_back to find the most recent samples.")
             : McpHelpers.Status(
                 "unavailable",
-                $"No {what} have EVER been recorded for {resolved.ServerName}. This is not an empty window - the {collector} collector has stored nothing at all for this server. Check that collection is running and that the server is enabled.");
+                metric == "tempdb_file_io"
+                    ? $"No {what} have EVER been recorded for {resolved.DisplayName}. This is not an empty window - the {collector} collector has stored no rows for the tempdb files of this server (it may have stored other databases' files). Check that collection is running and that the server is enabled."
+                    : $"No {what} have EVER been recorded for {resolved.DisplayName}. This is not an empty window - the {collector} collector has stored nothing at all for this server. Check that collection is running and that the server is enabled.");
     }
 
     private static async Task<List<string>> ReadTopNamesAsync(

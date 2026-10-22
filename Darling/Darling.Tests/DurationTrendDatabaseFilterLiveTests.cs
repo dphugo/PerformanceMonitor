@@ -112,7 +112,7 @@ public sealed class DurationTrendDatabaseFilterLiveTests
                 /* A repeated name and a blank one are one name, and the public method's answer is the All one. */
                 Assert.Equal(2_000 * perSecond, LastRate(await Read(Of(B, B, " ")))!.Value, 9);
                 Assert.Equal(LastRate(all), LastRate(procedures
-                    ? await DarlingMcpTrendTools.GetProcedureDurationTrend(postgres, serverName, 24, null, null, null, ct)
+                    ? await DarlingMcpTrendTools.GetProcedureDurationTrend(postgres, serverName, 24, null, null, null, null, ct)
                     : await DarlingMcpTrendTools.GetQueryDurationTrend(postgres, serverName, 24, null, null, null, ct)));
             }
 
@@ -362,7 +362,9 @@ public sealed class DurationTrendDatabaseFilterLiveTests
 
         /* Raw: the per-collection CTE, the filter at $4 and the bucket width at $5. */
         Assert.Equal(3, Count(DarlingTrendReader.QueryDurationTrendFilteredSql, filterPredicate4));
-        Assert.Equal(3, Count(DarlingTrendReader.ProcedureDurationTrendFilteredSql, filterPredicate4));
+        /* #5638: the procedure statement's stored CTE has two arms, the rows below the totals floor and the per-database totals from
+           it, and each carries the three FILTERs (elapsed, executions, matched rows), so six. */
+        Assert.Equal(6, Count(DarlingTrendReader.ProcedureDurationTrendFilteredSql, filterPredicate4));
         Assert.Equal(0, Count(DarlingTrendReader.QueryDurationTrendFilteredSql, predicate4));
         Assert.Equal(0, Count(DarlingTrendReader.ProcedureDurationTrendFilteredSql, predicate4));
         /* #5414 round 2: empty is decided once for the whole window, never per bucket (a per-bucket HAVING dropped the

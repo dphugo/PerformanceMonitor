@@ -71,7 +71,7 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetQueryStatsPlanXmlByHashAsync(
                 postgres, resolved.ServerId, query_hash, database_name, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_stats", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored plan found for query_hash '{query_hash}'{DbSuffix(database_name)}. The plan collector may not have captured a plan for this query, or the row has aged out of the store.");
@@ -80,7 +80,7 @@ public sealed class DarlingMcpPlanTools
             // Server Context card can see cost threshold/max memory/database. Non-fatal (null on a miss or a
             // read failure) — the analyzer then falls back to its Info branch.
             var metadata = await DarlingServerMetadataReader.ReadAsync(postgres, resolved.ServerId, database_name, cancellationToken);
-            return AnalyzeFilteredPlan(xml, resolved.ServerName, "query_stats", query_hash, analyzerConfig, metadata, cancellationToken);
+            return AnalyzeFilteredPlan(xml, resolved.DisplayName, "query_stats", query_hash, analyzerConfig, metadata, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -112,7 +112,7 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetProcedurePlanXmlBySqlHandleAsync(
                 postgres, resolved.ServerId, sql_handle, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "procedure_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "procedure_stats", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored plan found for sql_handle '{sql_handle}'. The plan collector may not have captured a plan for this procedure, or the row has aged out of the store.");
@@ -120,7 +120,7 @@ public sealed class DarlingMcpPlanTools
             // #4530: one store read per call so rule 38 can see the server's edition/MAXDOP. No database
             // name is available for a procedure looked up by sql_handle alone, so Database stays null (#4597).
             var metadata = await DarlingServerMetadataReader.ReadAsync(postgres, resolved.ServerId, cancellationToken: cancellationToken);
-            return AnalyzeFilteredPlan(xml, resolved.ServerName, "procedure_stats", sql_handle, analyzerConfig, metadata, cancellationToken);
+            return AnalyzeFilteredPlan(xml, resolved.DisplayName, "procedure_stats", sql_handle, analyzerConfig, metadata, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -150,7 +150,8 @@ public sealed class DarlingMcpPlanTools
                 postgres, resolved.ServerId, database_name, query_id, plan_id, cancellationToken: cancellationToken);
             var xml = read?.PlanXml;
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store", cancellationToken)
+                    ?? await QueryStoreNotCollectedAsync(postgres, resolved.ServerId, database_name, query_id, plan_id, cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored Query Store plan found for query_id {query_id} in database '{database_name}'{PlanSuffix(plan_id)}. The plan may not have been collected yet, the database's Query Store may be off or its capture mode may exclude this query, or the plan has been purged.");
@@ -162,12 +163,23 @@ public sealed class DarlingMcpPlanTools
             // #4530/#4597: one store read per call so rule 38 can see the server's edition/MAXDOP, and the
             // Server Context card can see cost threshold/max memory/database.
             var metadata = await DarlingServerMetadataReader.ReadAsync(postgres, resolved.ServerId, database_name, cancellationToken);
-            return AnalyzeFilteredPlan(xml, resolved.ServerName, "query_store", identifier, analyzerConfig, metadata, cancellationToken);
+            return AnalyzeFilteredPlan(xml, resolved.DisplayName, "query_store", identifier, analyzerConfig, metadata, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return McpHelpers.FormatError("analyze_query_store_plan", ex);
         }
+    }
+
+    /// <summary>
+    /// #6211: a Query Store plan that is not stored although its runtime statistics are: say it was not collected, and why (not in its
+    /// database-hour's top N), as a <c>not_collected</c> answer. <c>null</c> when nothing was seen at all, so the caller's own answer stands.
+    /// </summary>
+    internal static async Task<string?> QueryStoreNotCollectedAsync(
+        NpgsqlDataSource postgres, int serverId, string databaseName, long queryId, long? planId, CancellationToken cancellationToken)
+    {
+        var reason = await DarlingStoredPlanReader.QueryStoreNotCollectedReasonAsync(postgres, serverId, databaseName, queryId, planId, "plan XML", cancellationToken);
+        return reason is null ? null : McpHelpers.Status("not_collected", reason);
     }
 
     [McpServerTool(Name = "analyze_plan_xml"), Description(
@@ -188,6 +200,11 @@ public sealed class DarlingMcpPlanTools
     {
         if (string.IsNullOrWhiteSpace(plan_xml))
             return McpHelpers.Refusal("plan_xml", "No plan XML provided.");
+
+        // The caller wrote this XML, so bound it before it reaches the parser (the stored-plan tools skip this).
+        var tooLarge = CallerPlanXml.RefusalReason(plan_xml);
+        if (tooLarge != null)
+            return McpHelpers.Refusal("plan_xml", tooLarge);
 
         try
         {
@@ -221,7 +238,7 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetQueryStatsPlanXmlByHashAsync(
                 postgres, resolved.ServerId, query_hash, database_name, maxOutputChars: PlanXmlOutputChars, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", $"No stored plan found for query_hash '{query_hash}'{DbSuffix(database_name)}.");
 
             return McpHelpers.Truncate(xml, PlanXmlOutputChars) ?? "No plan XML available.";
@@ -250,7 +267,8 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetQueryStorePlanTextAsync(
                 postgres, resolved.ServerId, database_name, query_id, plan_id, maxOutputChars: PlanXmlOutputChars, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store", cancellationToken)
+                    ?? await QueryStoreNotCollectedAsync(postgres, resolved.ServerId, database_name, query_id, plan_id, cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored Query Store plan found for query_id {query_id} in database '{database_name}'{PlanSuffix(plan_id)}.");
@@ -282,7 +300,7 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetProcedurePlanXmlBySqlHandleAsync(
                 postgres, resolved.ServerId, sql_handle, maxOutputChars: PlanXmlOutputChars, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "procedure_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "procedure_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", $"No stored plan found for sql_handle '{sql_handle}'.");
 
             return McpHelpers.Truncate(xml, PlanXmlOutputChars) ?? "No plan XML available.";
@@ -336,7 +354,7 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetQuerySnapshotPlanXmlAsync(
                 postgres, resolved.ServerId, collectionTimeUtc, session_id, request_id, live, maxOutputChars: PlanXmlOutputChars, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_snapshots", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_snapshots", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored {(live ? "live " : "")}plan found for session_id {session_id} (request_id {request_id}) at collection_time '{collection_time}'.");
@@ -461,10 +479,21 @@ public sealed class DarlingMcpPlanTools
                    name, which answers "supported" and restores the generic message. */
                 var notCollected = kind switch
                 {
-                    DarlingReproScript.KindQueryHash => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_stats", cancellationToken),
-                    DarlingReproScript.KindQueryStore => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store", cancellationToken),
-                    _ => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_snapshots", cancellationToken),
+                    DarlingReproScript.KindQueryHash => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_stats", cancellationToken),
+                    DarlingReproScript.KindQueryStore => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store", cancellationToken),
+                    _ => await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_snapshots", cancellationToken),
                 };
+                /* #6211: a Query Store query whose statistics are stored but whose text was not fetched (not in its database-hour's top N). */
+                if (notCollected is null && kind == DarlingReproScript.KindQueryStore)
+                {
+                    var reason = await DarlingStoredPlanReader.QueryStoreNotCollectedReasonAsync(
+                        postgres, resolved.ServerId, database_name!, query_id!.Value, plan_id, "statement text", cancellationToken);
+                    if (reason is not null)
+                    {
+                        notCollected = McpHelpers.Status("not_collected", reason);
+                    }
+                }
+
                 return notCollected
                     ?? McpHelpers.Status("unavailable", $"No stored query text found for this {kind} key, so no repro script can be built.");
             }
@@ -527,7 +556,7 @@ public sealed class DarlingMcpPlanTools
             var xml = await DarlingStoredPlanReader.GetBlockingPlanXmlAsync(
                 postgres, resolved.ServerId, eventTimeUtc, blocked_spid, blocked_ecid, blocking_spid, blocking_ecid, blockingSide, database_name, maxOutputChars: PlanXmlOutputChars, cancellationToken: cancellationToken);
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "blocked_process_report", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "blocked_process_report", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored {(blockingSide ? BlockingSide : BlockedSide)} plan found for blocked_spid {blocked_spid} and blocking_spid {blocking_spid} at event_time '{event_time}'{DbSuffix(database_name)}. " +
@@ -575,7 +604,7 @@ public sealed class DarlingMcpPlanTools
 
             var xml = read.PlanXml;
             if (string.IsNullOrEmpty(xml))
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "deadlocks", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "deadlocks", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No stored victim plan found for the deadlock at deadlock_time '{deadlock_time}' (collection_time '{collection_time}'){DbSuffix(database_name)}. " +

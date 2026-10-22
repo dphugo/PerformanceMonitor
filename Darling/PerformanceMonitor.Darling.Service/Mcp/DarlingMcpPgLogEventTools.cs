@@ -40,10 +40,10 @@ public sealed class DarlingMcpPgLogEventTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         var limitError = McpHelpers.ValidateTop(limit);
@@ -90,16 +90,16 @@ public sealed class DarlingMcpPgLogEventTools
                    turns "no events" into not-collected WITH THE REASON. Then the honest quiet answer, which
                    names the settings a family depends on, because an all-off target is the likeliest
                    reason a log has nothing for a family and nothing else on this surface says so. */
-                return await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_log_events", cancellationToken)
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, await DarlingEngineCapability.NotCollectedStatusAsync(
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_log_events", cancellationToken)
                     ?? await DarlingRuntimePrecondition.StatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "pg_log_events", cancellationToken)
+                        postgres, resolved.ServerId, resolved.DisplayName, "pg_log_events", cancellationToken)
                     /* #4966: not_collected and the precondition stay bare; a quiet answer carries the window keys under hints. */
                     ?? McpHelpers.Status(
-                        "no_events",
+                        "empty",
                         $"No log event{(familyFilter is null ? string.Empty : $" in family '{familyFilter}'")}"
                         + $"{(minRank > 1 ? $" at {severityLabel} or worse" : string.Empty)} was stored for "
-                        + $"{resolved.ServerName} in the last {hours_back} hour(s). Four things produce that: "
+                        + $"{resolved.DisplayName} in the last {hours_back} hour(s). Four things produce that: "
                         + "the server wrote none, which is the healthy answer for the error and lock_wait "
                         + "families; the setting that family depends on is off on the target "
                         + "(log_connections / log_disconnections for connection, log_lock_waits for "
@@ -115,7 +115,7 @@ public sealed class DarlingMcpPgLogEventTools
                         + "is the problem rather than the server.",
                         (await DarlingMcpWindowNotice.ReadEventAsync(
                             () => DarlingMcpWindowNotice.Probe(postgres, "pg_log_events", resolved.ServerName, windowStart, windowEnd, cancellationToken),
-                            null, windowStart, windowEnd, "pg_log_events", emptyAnswer: true, logger: logger, cancellationToken: cancellationToken)).AsHints());
+                            null, windowStart, windowEnd, "pg_log_events", emptyAnswer: true, logger: logger, cancellationToken: cancellationToken)).AsHints()), cancellationToken);
             }
 
             var truncated = page.Rows.Count > limit;
@@ -130,7 +130,7 @@ public sealed class DarlingMcpPgLogEventTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,

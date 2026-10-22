@@ -12,6 +12,7 @@ using System.ComponentModel;
 using System.Threading;
 using System.Threading.Tasks;
 using ModelContextProtocol.Server;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using PerformanceMonitor.Common;
 
@@ -88,6 +89,25 @@ public sealed partial class DarlingMcpFinOpsTools
         _ => MaxLimit,
     };
 
+    /// <summary>
+    /// Notes the window <paramref name="normalizedView"/> reads on the <see cref="ReadScope"/>, for its slow-read row
+    /// (#5814): the <paramref name="hoursBack"/> hours ending now, after the check passed. Only a view that reads that window
+    /// notes it. index_analysis and database_sizes read the newest snapshot, so a noted window would record a span the read
+    /// never touched. storage_growth and utilization read a span their <c>hours_back</c> does not name (storage_growth 30 days at
+    /// the default, utilization a 7-day trend beside its 24 hours), so each notes the span it reads itself, in
+    /// <see cref="ReadStorageGrowthAsync"/> and <see cref="ReadUtilizationAsync"/>.
+    /// </summary>
+    internal static void NoteViewWindow(string normalizedView, int hoursBack)
+    {
+        if (normalizedView is StorageGrowthView or UtilizationView or IndexAnalysisView or DatabaseSizesView)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        ReadScope.NoteWindow(now.AddHours(-hoursBack), now);
+    }
+
     [McpServerTool(Name = "get_finops"), Description(
         "FinOps views for one server, picked by view. Windowed over hours_back, UTC; no as_of." + SetAViewLines + SetBViewLines + " An unknown view is refused with the valid list. <<GUIDE>>" + SetAGuides + SetBGuides)]
     public static async Task<string> GetFinOps(
@@ -99,6 +119,7 @@ public sealed partial class DarlingMcpFinOpsTools
         [Description("Database to limit the view to (index_analysis, storage_growth).")] string? database_name = null,
         [Description("Return full script and definition text (index_analysis only; default false).")] bool full_text = false,
         [Description("schema.table of one object (storage_growth only, with database_name).")] string? object_name = null,
+        ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
@@ -121,6 +142,7 @@ public sealed partial class DarlingMcpFinOpsTools
         object_name = NormalizeOptionalText(object_name);
         var misuse = OptionalParamMisuse(normalized, database_name, full_text, object_name);
         if (misuse is { } m) return McpHelpers.Refusal(m.Parameter, m.Message);
+        NoteViewWindow(normalized, hours_back); // #5814: after every check, so a refused call notes nothing
 
         try
         {
@@ -130,7 +152,7 @@ public sealed partial class DarlingMcpFinOpsTools
                 case UtilizationView:
                     return await ReadUtilizationAsync(postgres, resolved, hours_back, limit, cancellationToken);
                 case IndexAnalysisView:
-                    return await ReadIndexAnalysisAsync(postgres, resolved, hours_back, limit, database_name, full_text, cancellationToken);
+                    return await ReadIndexAnalysisAsync(postgres, resolved, hours_back, limit, database_name, full_text, cancellationToken, logger);
                 // FinOps web parity (#4843), set A ends.
                 // Each set belongs to one series of changes. Append to your own set only,
                 // so the two series never edit the same lines of this switch.

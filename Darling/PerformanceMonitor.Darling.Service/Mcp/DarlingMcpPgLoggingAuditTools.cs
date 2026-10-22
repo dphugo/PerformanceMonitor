@@ -42,13 +42,14 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 [McpServerToolType]
 public sealed class DarlingMcpPgLoggingAuditTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_pg_logging_audit"), Description("Audits a PostgreSQL target's logging settings against the STORED configuration snapshot pg_server_config already collects hourly, never the live server. LATEST IS A TIME: captured_at is when that snapshot was taken. Verdicts: instrumented, partial, off or unknown - unknown means the setting is missing from the snapshot, not the same as off, and nothing is inferred. partial means a THRESHOLD is filtering; for log_min_duration_statement that threshold IS the recommended posture, not a shortfall. PostgreSQL-only. <<GUIDE>> Audits a PostgreSQL target's LOGGING settings - log_min_duration_statement, log_lock_waits, log_temp_files, log_autovacuum_min_duration, log_checkpoints, log_connections, log_disconnections - and says, per setting, whether it is producing the lines it could, what telemetry those lines unlock, the recommended value WITH its cost, and the remedy in the syntax this server's hosting needs (ALTER SYSTEM plus a reload where the server is yours to administer; a parameter group on RDS/Aurora, decided from rds.* parameters in the stored snapshot rather than guessed). It reads the STORED configuration snapshot pg_server_config already collects hourly, never the live server. LATEST IS A TIME: captured_at is the instant that snapshot was taken, the collector runs hourly, so every value here is 'as of' that stamp and a change made since is not reflected until the next collection. Read it at onboarding and whenever a target-side log read comes back empty: a target with every one of these off looks identical to a fully instrumented one from every counter-based read, and the difference shows up at incident time when the log somebody reaches for holds nothing. Verdicts are instrumented, partial, off or unknown - partial means a THRESHOLD is filtering (statements faster than N ms, temp files under N kB) and the row says what falls below it; for log_min_duration_statement the threshold IS the recommended posture, and its cost_note says so, because 0 logs every statement the server runs. unknown means the setting is not in the snapshot and nothing is inferred. Every facet names the Darling family that would consume its lines and says PLANNED where that consumer does not ship yet - the counter reads that exist today are named beside it with what they cannot see. Plan capture's own settings (auto_explain, log_line_prefix %Q, lc_messages) are LISTED as observed for completeness but judged by get_pg_plan_capture_readiness, which owns their traps; lc_messages decides whether any of these lines are written in the English the parsers match. PostgreSQL-only.")]
     public static async Task<string> GetPgLoggingAudit(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
         try
@@ -60,14 +61,14 @@ public sealed class DarlingMcpPgLoggingAuditTools
                 /* The same miss vocabulary as get_pg_server_config, because it is the same absence: the
                    collector this reads never ran here (engine gate), or has not run YET. Neither is an audit
                    result, and an audit of an empty snapshot would say 'unknown' seven times and look like one. */
-                return await DarlingEngineCapability.NotCollectedStatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "pg_server_config", cancellationToken)
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, DateTime.UtcNow, await DarlingEngineCapability.NotCollectedStatusAsync(
+                        postgres, resolved.ServerId, resolved.DisplayName, "pg_server_config", cancellationToken)
                     ?? McpHelpers.Status(
                         "empty",
-                        $"No configuration snapshot has been collected for {resolved.ServerName} yet, so there "
+                        $"No configuration snapshot has been collected for {resolved.DisplayName} yet, so there "
                         + "is nothing to audit. pg_server_config runs hourly; a server registered in the last "
                         + "hour has not reached its first collection. This is not a verdict about the "
-                        + "server's logging - it is the absence of the evidence.");
+                        + "server's logging - it is the absence of the evidence."), cancellationToken);
             }
 
             /* #4251: the collector's own cached verdict, no store read - see the identical comment on
@@ -76,11 +77,11 @@ public sealed class DarlingMcpPgLoggingAuditTools
                grants this caveat asks for fix nothing on a non-Windows target. */
             var fileSettingsUnreadable =
                 PgFileSettingsCapability.TryGetCachedVerdict(
-                    resolved.ServerName, out var fileSettingsReadable, out var fileSettingsIsWindows)
+                    resolved.DisplayName, out var fileSettingsReadable, out var fileSettingsIsWindows)
                 && fileSettingsIsWindows
                 && !fileSettingsReadable;
 
-            return BuildAuditJson(resolved.ServerName, DarlingPgLoggingAudit.Audit(snapshot), fileSettingsUnreadable);
+            return BuildAuditJson(resolved.DisplayName, DarlingPgLoggingAudit.Audit(snapshot), fileSettingsUnreadable);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -88,7 +89,7 @@ public sealed class DarlingMcpPgLoggingAuditTools
                store where this collector never runs should still answer not_collected rather than a raw
                error, because the gate is the more specific fact and the exception is its symptom. */
             var gated = await DarlingEngineCapability.NotCollectedStatusAsync(
-                postgres, resolved.ServerId, resolved.ServerName, "pg_server_config", cancellationToken);
+                postgres, resolved.ServerId, resolved.DisplayName, "pg_server_config", cancellationToken);
             if (gated != null)
             {
                 return gated;

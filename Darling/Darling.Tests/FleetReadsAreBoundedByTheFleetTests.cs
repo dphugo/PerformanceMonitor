@@ -221,13 +221,13 @@ public sealed class FleetReadsAreBoundedByTheFleetTests
         return blocks;
     }
 
-    /// <summary>Every public SQL constant on the reader, by name — found by reflection so a statement added
+    /// <summary>Every public SQL constant (or static readonly string, as FleetThreadsSql is since #5710 composes the combine text) on the reader, by name — found by reflection so a statement added
     /// later is swept without anyone remembering to list it.</summary>
     private static Dictionary<string, string> FleetStatements() =>
         typeof(DarlingFleetReader)
             .GetFields(BindingFlags.Public | BindingFlags.Static)
-            .Where(f => f.IsLiteral && f.FieldType == typeof(string) && f.Name.EndsWith("Sql", StringComparison.Ordinal))
-            .ToDictionary(f => f.Name, f => (string)f.GetRawConstantValue()!, StringComparer.Ordinal);
+            .Where(f => (f.IsLiteral || f.IsInitOnly) && f.FieldType == typeof(string) && f.Name.EndsWith("Sql", StringComparison.Ordinal))
+            .ToDictionary(f => f.Name, f => (string)(f.IsLiteral ? f.GetRawConstantValue()! : f.GetValue(null)!), StringComparer.Ordinal);
 }
 
 /// <summary>
@@ -319,7 +319,9 @@ SELECT
     COALESCE(xe.cnt, 0) AS xe_count,
     COALESCE(xe.max_wait, 0) AS xe_max_wait,
     COALESCE(dmv.cnt, 0) AS dmv_count,
-    COALESCE(dmv.max_wait, 0) AS dmv_max_wait
+    COALESCE(dmv.max_wait, 0) AS dmv_max_wait,
+    COALESCE(xe.cnt, 0) AS xe_reports,
+    COALESCE(dmv.cnt, 0) AS dmv_reports
 FROM
 (
     SELECT server_id, COUNT(*) AS cnt, MAX(wait_time_ms) AS max_wait

@@ -135,17 +135,24 @@ internal static class WebReadReach
 
         /* Lists, rankings and unbucketed series. */
         ["get_top_queries_by_cpu"] = List("query_stats"),
+        ["get_cpu_by_database"] = List("query_stats"),
+        ["get_query_pileups"] = List("query_snapshots"),
         ["get_top_procedures_by_cpu"] = List("procedure_stats"),
         ["get_query_trend"] = List("query_stats"),
         ["get_query_store_top"] = List("query_store"),
         ["get_query_store_regressions"] = List("query_store"),
         ["get_query_store_clutter"] = List("query_store"),
         ["get_query_store_query_history"] = List("query_store"),
+        ["get_plan_force_precheck"] = List("query_store"),
+        ["get_forced_plans"] = List("query_store_forced_plans"),
+        ["get_query_store_aborts"] = List("query_store"),
+        ["get_resource_use_by_tag"] = List("query_stats"),
         ["get_long_query_completions"] = List("long_query_completions"),
         ["get_plan_corrections"] = List("plan_correction"),
         ["get_blocked_process_xml"] = List("blocked_process_report"),
         ["get_blocking"] = List("blocked_process_report"),
         ["get_deadlocks"] = List("deadlocks"),
+        ["get_client_timeouts"] = List("attention"),
         ["get_deadlock_detail"] = List("deadlocks"),
         ["get_database_config_changes"] = List("database_config"),
         ["get_server_config_changes"] = List("server_config"),
@@ -187,6 +194,7 @@ internal static class WebReadReach
 
         /* Latest snapshots: the window is a freshness bound. */
         ["get_active_queries"] = Snapshot("query_snapshots"),
+        ["get_load_by_caller"] = List("query_snapshots"),
         ["get_waiting_tasks"] = Snapshot("waiting_tasks"),
         ["get_memory_grants"] = Snapshot("memory_grant_stats"),
         ["get_cpu_scheduler_pressure"] = Snapshot("cpu_scheduler_stats"),
@@ -208,6 +216,8 @@ internal static class WebReadReach
         ["get_analysis_facts"] = List(null),
         ["get_analysis_findings"] = List(null),
         ["get_alert_history"] = List(null, AlertHistoryHours),
+        /* #5632 Phase A: the investigation requests and reports, by when a request opened; a list, so the default reach. */
+        ["get_investigation_reports"] = List(null),
         ["get_fleet_overview"] = List(null),
         ["get_sweep_reports"] = List(null),
         ["get_store_log"] = List(null),

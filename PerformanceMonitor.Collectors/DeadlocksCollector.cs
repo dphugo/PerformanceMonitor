@@ -15,6 +15,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using PerformanceMonitor.Common;
+using PerformanceMonitor.Common.QueryTags;
 
 namespace PerformanceMonitor.Collectors;
 
@@ -110,19 +111,30 @@ SET @shred_needed =
 
 IF @shred_needed = 1
 BEGIN
-    INSERT
-        @PerformanceMonitor_Deadlock
-    (
-        ring_buffer
-    )
+    {RingBufferXml.DeclareSql}
+
     SELECT /* PerformanceMonitorLite */
-        ring_xml = TRY_CAST(xet.target_data AS xml)
+        @ring_text = CONVERT(nvarchar(max), xet.target_data),
+        @ring_session = xes.name
     FROM sys.dm_xe_database_session_targets AS xet
     JOIN sys.dm_xe_database_sessions AS xes
       ON xes.address = xet.event_session_address
     WHERE xes.name = N'{XeSessionName}'
     AND   xet.target_name = N'ring_buffer'
     OPTION(RECOMPILE);
+
+    {RingBufferXml.ParseSql}
+
+    {RingBufferXml.TruncationSql}
+
+    INSERT
+        @PerformanceMonitor_Deadlock
+    (
+        ring_buffer
+    )
+    SELECT
+        ring_xml = @ring_xml
+    WHERE @ring_xml IS NOT NULL;
 END;
 
 SELECT
@@ -176,7 +188,9 @@ OPTION(RECOMPILE);
    above -- always one row, whichever branch the IF took. */
 SELECT
     execution_count = @execution_count,
-    gated = CASE WHEN @shred_needed = 1 THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END;";
+    gated = CASE WHEN @shred_needed = 1 THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END,
+    /* #6441: whether SQL Server truncated the ring buffer's XML (all NULL when the gate skipped the read). */
+    {RingBufferXml.TruncationColumnsSql};";
 
     /* On-prem / Azure MI / AWS RDS: read from ring_buffer (server-scoped session)
        Use .query() to get XML with structure intact, then CONVERT to nvarchar(max) */
@@ -213,19 +227,30 @@ SET @shred_needed =
 
 IF @shred_needed = 1
 BEGIN
-    INSERT
-        @PerformanceMonitor_Deadlock
-    (
-        ring_buffer
-    )
+    {RingBufferXml.DeclareSql}
+
     SELECT /* PerformanceMonitorLite */
-        ring_xml = TRY_CAST(xet.target_data AS xml)
+        @ring_text = CONVERT(nvarchar(max), xet.target_data),
+        @ring_session = xes.name
     FROM sys.dm_xe_session_targets AS xet
     JOIN sys.dm_xe_sessions AS xes
       ON xes.address = xet.event_session_address
     WHERE xes.name = N'{XeSessionName}'
     AND   xet.target_name = N'ring_buffer'
     OPTION(RECOMPILE);
+
+    {RingBufferXml.ParseSql}
+
+    {RingBufferXml.TruncationSql}
+
+    INSERT
+        @PerformanceMonitor_Deadlock
+    (
+        ring_buffer
+    )
+    SELECT
+        ring_xml = @ring_xml
+    WHERE @ring_xml IS NOT NULL;
 END;
 
 SELECT
@@ -250,7 +275,9 @@ OPTION(RECOMPILE);
    above -- always one row, whichever branch the IF took. */
 SELECT
     execution_count = @execution_count,
-    gated = CASE WHEN @shred_needed = 1 THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END;";
+    gated = CASE WHEN @shred_needed = 1 THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END,
+    /* #6441: whether SQL Server truncated the ring buffer's XML (all NULL when the gate skipped the read). */
+    {RingBufferXml.TruncationColumnsSql};";
 
     /* Best-effort victim plan capture (CapturePlanXml only — Darling). Resolve the victim's deadlocked
        statement plan from the live plan cache by its executionStack frame's sql_handle + statement
@@ -692,6 +719,9 @@ OUTER APPLY
             }
 
             context.Measure(ShredGatedMeasurement, !reader.IsDBNull(1) && reader.GetBoolean(1) ? 1 : 0);
+
+            /* #6441: SQL Server cuts a ring buffer's XML at about 4 MB and keeps the OLDEST events. */
+            RingBufferXml.MeasureTruncation(reader, 2, context);
         }
 
         return rows;
@@ -804,5 +834,32 @@ OUTER APPLY
         {
             return (null, null);
         }
+    }
+
+    /// <summary>
+    /// #5980: one caller sighting per process in the deadlock graph, from the application, login, host and database
+    /// each process carries. Null when the graph is absent or does not parse (the victim-only fallback has no caller
+    /// fields to describe), and a process that names no application, login or host is left out.
+    /// </summary>
+    public override IReadOnlyList<QueryTagSighting>? DescribeQueryTagSightings(Row row)
+    {
+        if (!DeadlockGraphProcessParser.TryParseGraph<DeadlockProcessInfo>(
+                new DeadlockGraphProcessParser.DeadlockGraphInput(row.GraphXml, row.DeadlockTime, row.VictimSqlText, null),
+                out var processes))
+        {
+            return null;
+        }
+
+        List<QueryTagSighting>? sightings = null;
+        foreach (var p in processes)
+        {
+            var s = QueryTagSightings.Caller(p.DatabaseName, p.ClientApp, p.LoginName, p.HostName, p.SqlText);
+            if (s is not null)
+            {
+                (sightings ??= new List<QueryTagSighting>(processes.Count)).Add(s);
+            }
+        }
+
+        return sightings;
     }
 }

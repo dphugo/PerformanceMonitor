@@ -158,9 +158,13 @@ public sealed partial class PgFactCollector : IFactCollector
     private void ReportCollectionFailure(
         Exception ex,
         AnalysisContext context,
-        [CallerMemberName] string collectMethod = "")
+        [CallerMemberName] string collectMethod = "",
+        bool record = true)
     {
-        context.RecordCollectionFailure(CollectionFailure.FamilyOf(collectMethod), collectMethod, ClassifyOutcome(ex), ex);
+        /* record: false logs the classified reason without marking the family unread — for a read whose caller decides, once
+           per pass, whether the family counts as unread (#5630's plan-input check: a fact that carries the gap is not unread). */
+        if (record)
+            context.RecordCollectionFailure(CollectionFailure.FamilyOf(collectMethod), collectMethod, ClassifyOutcome(ex), ex);
 
         if (PgBaselineProvider.IsCommandTimeout(ex))
         {
@@ -291,9 +295,11 @@ public sealed partial class PgFactCollector : IFactCollector
     /// Every query this collector executes, for the ungated dialect/hygiene pins in
     /// Darling.Tests (no QUALIFY, no bare NOW()/CURRENT_TIMESTAMP, no read_parquet, $N
     /// positional parameters only, and every FROM/JOIN target resolves to a V4 passthrough
-    /// view or a V1/V2 table).
+    /// view or a V1/V2 table). Built on each read, not once at type initialization: <see cref="RunnableTaskStatsSql"/> is a
+    /// static readonly (it composes the #5710 combine text) and the order static fields initialize in across the
+    /// partial files is not defined, so a once-built list could capture it as null.
     /// </summary>
-    public static IReadOnlyList<string> AllSql { get; } = new[]
+    public static IReadOnlyList<string> AllSql => new[]
     {
         CoverageSql,
         WaitStatsSql,

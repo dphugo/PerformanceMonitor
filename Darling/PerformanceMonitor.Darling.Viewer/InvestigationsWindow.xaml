@@ -1,0 +1,328 @@
+<Window x:Class="PerformanceMonitor.Darling.Viewer.InvestigationsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:PerformanceMonitor.Darling.Viewer"
+        Title="Investigations"
+        Height="680" Width="1180"
+        WindowStartupLocation="CenterOwner"
+        Icon="EDD.ico"
+        ResizeMode="CanResizeWithGrip"
+        Background="{DynamicResource BackgroundLightBrush}"
+        Foreground="{DynamicResource ForegroundBrush}">
+    <!-- #5632 Phase A: the Level 1 investigations an agent route hands to the operator's own agent. Requests with their
+         brief, alerts, report and journal (Close with a reason); notes a brief may carry (approve, reject or write one);
+         and the environment profile per fleet, server or tag. Straight to Postgres via ViewerDataService, like the
+         notification routes window it is opened beside. -->
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="ViewerDarkTheme.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="Investigations" FontSize="18" FontWeight="Bold" HorizontalAlignment="Left" Margin="0,0,0,8"/>
+
+        <TabControl Grid.Row="1" x:Name="Tabs">
+            <TabItem Header="_Requests">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="3*"/>
+                        <ColumnDefinition Width="2*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Row="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="State:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <ComboBox x:Name="RequestStateFilter" Width="120" SelectedIndex="0"
+                                  AutomationProperties.Name="Request state filter"
+                                  SelectionChanged="RequestStateFilter_SelectionChanged">
+                            <ComboBoxItem Content="All"/>
+                            <ComboBoxItem Content="open"/>
+                            <ComboBoxItem Content="claimed"/>
+                            <ComboBoxItem Content="reported"/>
+                            <ComboBoxItem Content="closed"/>
+                            <ComboBoxItem Content="expired"/>
+                        </ComboBox>
+                        <Button Content="Re_fresh" Width="80" Height="26" Margin="8,0,0,0" Click="Refresh_Click"/>
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="1" Grid.Column="0" x:Name="RequestsGrid"
+                              Style="{StaticResource DarkGrid}"
+                              CanUserDeleteRows="False"
+                              SelectionMode="Single"
+                              SelectionChanged="RequestsGrid_SelectionChanged">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Opened" Binding="{Binding OpenedDisplay}" Width="120" SortMemberPath="OpenedAtUtc"/>
+                            <DataGridTextColumn Header="Server" Binding="{Binding ServerName}" Width="*"/>
+                            <DataGridTextColumn Header="Family" Binding="{Binding Family}" Width="110"/>
+                            <DataGridTextColumn Header="State" Binding="{Binding State}" Width="70"/>
+                            <DataGridTextColumn Header="Alerts" Binding="{Binding AlertCount}" Width="50"/>
+                            <DataGridTextColumn Header="Claimed by" Binding="{Binding ClaimedBy}" Width="100"/>
+                            <DataGridTextColumn Header="Lease" Binding="{Binding LeaseDisplay}" SortMemberPath="LeaseUntilUtc" Width="50"/>
+                            <DataGridTextColumn Header="Claims" Binding="{Binding ClaimsDisplay}" SortMemberPath="ClaimCount" Width="55"/>
+                            <DataGridTextColumn Header="Expires" Binding="{Binding ExpiresDisplay}" Width="120" SortMemberPath="ExpiresAtUtc"/>
+                            <DataGridTextColumn Header="Verdict" Binding="{Binding Verdict}" Width="90"/>
+                            <DataGridTextColumn Header="Practice" Binding="{Binding PracticeDisplay}" Width="60"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <ScrollViewer Grid.Row="1" Grid.Column="1" Margin="8,0,0,0" VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <TextBlock x:Name="DetailHeader" Text="Select a request to see its brief, alerts, report and journal."
+                                       TextWrapping="Wrap" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                            <TextBlock Text="Brief" Foreground="{DynamicResource ForegroundMutedBrush}"/>
+                            <TextBox x:Name="BriefBox" IsReadOnly="True" TextWrapping="Wrap" Height="110"
+                                     VerticalScrollBarVisibility="Auto" FontFamily="Consolas"
+                                     AutomationProperties.Name="Brief"/>
+                            <TextBlock Text="Alerts" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0"/>
+                            <DataGrid x:Name="AlertsGrid" Style="{StaticResource DarkGrid}" Height="100" IsReadOnly="True">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="Time" Binding="{Binding TimeDisplay}" Width="130" SortMemberPath="AlertTimeUtc"/>
+                                    <DataGridTextColumn Header="Metric" Binding="{Binding MetricName}" Width="*"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                            <TextBlock Text="Report" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0"/>
+                            <TextBox x:Name="ReportBox" IsReadOnly="True" TextWrapping="Wrap" Height="110"
+                                     VerticalScrollBarVisibility="Auto"
+                                     AutomationProperties.Name="Report"/>
+                            <TextBlock x:Name="ReportLinks" TextWrapping="Wrap" Margin="0,4,0,0" Visibility="Collapsed"
+                                       Foreground="{DynamicResource ForegroundBrush}"
+                                       AutomationProperties.Name="Report links"/>
+                            <TextBlock Text="Journal" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0"/>
+                            <DataGrid x:Name="JournalGrid" Style="{StaticResource DarkGrid}" Height="120" IsReadOnly="True">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="Time" Binding="{Binding TimeDisplay}" Width="130" SortMemberPath="EventTimeUtc"/>
+                                    <DataGridTextColumn Header="Event" Binding="{Binding Event}" Width="100"/>
+                                    <DataGridTextColumn Header="Actor" Binding="{Binding Actor}" Width="110"/>
+                                    <DataGridTextColumn Header="Reason" Binding="{Binding Reason}" Width="*"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </StackPanel>
+                    </ScrollViewer>
+
+                    <StackPanel x:Name="CloseRequestPanel" Grid.Row="2" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,8,0,0">
+                        <TextBlock Text="Reason:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBox x:Name="CloseReasonBox" Width="420" MaxLength="500" AutomationProperties.Name="Close reason"/>
+                        <Button Content="_Close Request" Width="110" Height="26" Margin="8,0,0,0" Click="CloseRequest_Click"/>
+                    </StackPanel>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Report Feed_back">
+                <!-- #5913: tell Darling whether a report was right. The false-positive counts per alert family use the
+                     settled verdict (a person's correction wins over the agent's). -->
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="3*"/>
+                        <ColumnDefinition Width="2*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Row="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="Opened in the last:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <ComboBox x:Name="FeedbackWindowBox" Width="100" SelectedIndex="1"
+                                  AutomationProperties.Name="Feedback window"
+                                  SelectionChanged="FeedbackWindowBox_SelectionChanged">
+                            <ComboBoxItem Content="7 days" Tag="7"/>
+                            <ComboBoxItem Content="30 days" Tag="30"/>
+                            <ComboBoxItem Content="90 days" Tag="90"/>
+                        </ComboBox>
+                        <Button Content="Refres_h" Width="80" Height="26" Margin="8,0,0,0" Click="Refresh_Click"/>
+                        <TextBlock x:Name="FeedbackWindowText" VerticalAlignment="Center" Margin="12,0,0,0"
+                                   Foreground="{DynamicResource ForegroundMutedBrush}"/>
+                        <TextBlock x:Name="FeedbackTruncatedText" VerticalAlignment="Center" Margin="12,0,0,0"
+                                   Foreground="{DynamicResource ForegroundMutedBrush}"/>
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="1" Grid.ColumnSpan="2" x:Name="FamilyCountsGrid" Style="{StaticResource DarkGrid}"
+                              MinHeight="70" MaxHeight="160" IsReadOnly="True" Margin="0,0,0,8">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Alert family" Binding="{Binding Family}" Width="*"/>
+                            <DataGridTextColumn Header="Reported" Binding="{Binding Reported}" Width="80"/>
+                            <DataGridTextColumn Header="With feedback" Binding="{Binding WithFeedback}" Width="100"/>
+                            <DataGridTextColumn Header="Marked wrong" Binding="{Binding MarkedWrong}" Width="100"/>
+                            <DataGridTextColumn Header="Agent said false positive" Binding="{Binding AgentFalsePositives}" Width="160"/>
+                            <DataGridTextColumn Header="False positives after feedback" Binding="{Binding FalsePositives}" Width="190"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <DataGrid Grid.Row="2" Grid.Column="0" x:Name="FeedbackReportsGrid" Style="{StaticResource DarkGrid}"
+                              IsReadOnly="True" SelectionMode="Single"
+                              SelectionChanged="FeedbackReportsGrid_SelectionChanged">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Reported" Binding="{Binding ReportedDisplay}" Width="120" SortMemberPath="ReportedAtUtc"/>
+                            <DataGridTextColumn Header="Server" Binding="{Binding Row.ServerName}" Width="*"/>
+                            <DataGridTextColumn Header="Family" Binding="{Binding Row.Family}" Width="100"/>
+                            <DataGridTextColumn Header="Verdict" Binding="{Binding Row.ReportVerdict}" Width="90"/>
+                            <DataGridTextColumn Header="Feedback" Binding="{Binding FeedbackSummary}" Width="110"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <Grid Grid.Row="2" Grid.Column="1" Margin="8,0,0,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="2*" MinHeight="70"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="3*" MinHeight="90"/>
+                        </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" x:Name="FeedbackReportHeader" Text="Select a report to see it and the feedback it has."
+                                       TextWrapping="Wrap" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                            <TextBox Grid.Row="1" x:Name="FeedbackReportBox" IsReadOnly="True" TextWrapping="Wrap"
+                                     VerticalScrollBarVisibility="Auto" AutomationProperties.Name="Reported request"/>
+                            <TextBlock Grid.Row="2" Text="Feedback so far (newest first)" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0"/>
+                            <DataGrid Grid.Row="3" x:Name="FeedbackGivenGrid" Style="{StaticResource DarkGrid}" IsReadOnly="True">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="When" Binding="{Binding WhenDisplay}" Width="120" SortMemberPath="CreatedAtUtc"/>
+                                    <DataGridTextColumn Header="By" Binding="{Binding Row.Author}" Width="100"/>
+                                    <DataGridTextColumn Header="Report was" Binding="{Binding Row.Verdict}" Width="70"/>
+                                    <DataGridTextColumn Header="Should be" Binding="{Binding CorrectedDisplay}" Width="95"/>
+                                    <DataGridTextColumn Header="Missed step" Binding="{Binding Row.MissedStep}" Width="150"/>
+                                    <DataGridTextColumn Header="Comment" Binding="{Binding Row.Comment}" Width="*"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                    </Grid>
+
+                    <Grid x:Name="GiveFeedbackPanel" Grid.Row="3" Grid.ColumnSpan="2" Margin="0,8,0,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <WrapPanel Grid.Row="0" Orientation="Horizontal">
+                            <TextBlock Text="The report was:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                            <ComboBox x:Name="FeedbackVerdictBox" Width="90" SelectedIndex="0" AutomationProperties.Name="Feedback verdict">
+                                <ComboBoxItem Content="right"/>
+                                <ComboBoxItem Content="partly"/>
+                                <ComboBoxItem Content="wrong"/>
+                            </ComboBox>
+                            <TextBlock Text="It should have said:" VerticalAlignment="Center" Margin="12,0,6,0"/>
+                            <ComboBox x:Name="FeedbackCorrectedBox" Width="150" SelectedIndex="0" AutomationProperties.Name="Corrected verdict">
+                                <ComboBoxItem Content="(keep the report's verdict)"/>
+                                <ComboBoxItem Content="real"/>
+                                <ComboBoxItem Content="false_positive"/>
+                                <ComboBoxItem Content="needs_person"/>
+                            </ComboBox>
+                            <TextBlock Text="Step the agent missed:" VerticalAlignment="Center" Margin="12,0,6,0"/>
+                            <TextBox x:Name="FeedbackMissedBox" MinWidth="200" Width="300" MaxLength="4000" AutomationProperties.Name="Missed step"/>
+                        </WrapPanel>
+                        <Grid Grid.Row="1" Margin="0,6,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0" x:Name="FeedbackCommentBox" MinHeight="44" MaxHeight="90" TextWrapping="Wrap" AcceptsReturn="True"
+                                     VerticalScrollBarVisibility="Auto" MaxLength="4000" AutomationProperties.Name="Feedback comment"/>
+                            <Button Grid.Column="1" Content="Save Fee_dback" Width="110" Height="26" Margin="8,0,0,0" VerticalAlignment="Top" Click="SaveFeedback_Click"/>
+                        </Grid>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="_Practice">
+                <!-- #5918: replay a judged case for an agent and score its report against the feedback. -->
+                <local:InvestigationPracticePanel x:Name="PracticePanel"/>
+            </TabItem>
+
+            <TabItem Header="_Notes">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" TextWrapping="Wrap" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,0,0,8"
+                               Text="Only approved notes that have not expired reach a brief. An agent's proposed note waits here until a person approves or rejects it; a note you write is approved as written."/>
+                    <DataGrid Grid.Row="1" x:Name="NotesGrid" Style="{StaticResource DarkGrid}" CanUserDeleteRows="False" SelectionMode="Single">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="State" Binding="{Binding State}" Width="70"/>
+                            <DataGridTextColumn Header="Scope" Binding="{Binding ScopeDisplay}" Width="130"/>
+                            <DataGridTextColumn Header="Metric" Binding="{Binding MetricName}" Width="120"/>
+                            <DataGridTextColumn Header="Note" Binding="{Binding NoteText}" Width="*"/>
+                            <DataGridTextColumn Header="Author" Binding="{Binding Author}" Width="120"/>
+                            <DataGridTextColumn Header="Created" Binding="{Binding CreatedDisplay}" Width="120" SortMemberPath="CreatedAtUtc"/>
+                            <DataGridTextColumn Header="Expires" Binding="{Binding ExpiresDisplay}" Width="90" SortMemberPath="ExpiresAtUtc"/>
+                            <DataGridTextColumn Header="Decided by" Binding="{Binding DecidedBy}" Width="110"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <StackPanel x:Name="DecideNotePanel" Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button Content="_Approve" Width="80" Height="26" Margin="0,0,8,0" Click="ApproveNote_Click"/>
+                        <Button Content="Re_ject" Width="80" Height="26" Click="RejectNote_Click"/>
+                    </StackPanel>
+                    <Grid x:Name="WriteNotePanel" Grid.Row="3" Margin="0,10,0,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <StackPanel Grid.Row="0" Orientation="Horizontal">
+                            <TextBlock Text="Server:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                            <ComboBox x:Name="NoteScopeBox" Width="200" DisplayMemberPath="Label" AutomationProperties.Name="Note server"/>
+                            <TextBlock Text="Metric (optional):" VerticalAlignment="Center" Margin="12,0,6,0"/>
+                            <TextBox x:Name="NoteMetricBox" Width="180" AutomationProperties.Name="Note metric"/>
+                            <TextBlock Text="Keep for days:" VerticalAlignment="Center" Margin="12,0,6,0"/>
+                            <TextBox x:Name="NoteDaysBox" Width="50" Text="90" AutomationProperties.Name="Note lifetime in days"/>
+                        </StackPanel>
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,6,0,0">
+                            <TextBox x:Name="NoteTextBox" Width="760" Height="54" TextWrapping="Wrap" AcceptsReturn="True" MaxLength="2000"
+                                     AutomationProperties.Name="Note text"/>
+                            <Button Content="_Write Note" Width="100" Height="26" Margin="8,0,0,0" VerticalAlignment="Top" Click="WriteNote_Click"/>
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="_Profiles">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" TextWrapping="Wrap" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,0,0,8"
+                               Text="What your agent should know about this environment: the fleet's profile, then the server's or its tag's. The brief states it as written. Darling enforces only the route limits; a profile is guidance, not a limit. Save a blank profile to remove it."/>
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,6">
+                        <TextBlock Text="Scope:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <ComboBox x:Name="ProfileScopeBox" Width="260" DisplayMemberPath="Label"
+                                  AutomationProperties.Name="Profile scope"
+                                  SelectionChanged="ProfileScopeBox_SelectionChanged"/>
+                        <TextBlock x:Name="ProfileModifiedText" VerticalAlignment="Center" Margin="12,0,0,0"
+                                   Foreground="{DynamicResource ForegroundMutedBrush}"/>
+                    </StackPanel>
+                    <TextBox Grid.Row="2" x:Name="ProfileTextBox" TextWrapping="Wrap" AcceptsReturn="True" MaxLength="4000"
+                             VerticalScrollBarVisibility="Auto" AutomationProperties.Name="Profile text"/>
+                    <StackPanel x:Name="SaveProfilePanel" Grid.Row="3" Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button Content="_Save Profile" Width="100" Height="26" Click="SaveProfile_Click"/>
+                    </StackPanel>
+                </Grid>
+            </TabItem>
+            <TabItem Header="_Agent changes">
+                <local:AgentChangesTab x:Name="AgentChangesView"/>
+            </TabItem>
+            <TabItem Header="Server a_ctions">
+                <local:ServerActionsTab x:Name="ServerActionsView"/>
+            </TabItem>
+        </TabControl>
+
+        <TextBlock x:Name="StatusText" Grid.Row="2" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="0,10,100,0"
+                   TextWrapping="Wrap" Foreground="{DynamicResource WarningTextBrush}"/>
+        <Button Grid.Row="2" Content="Cl_ose" Width="80" Height="28" Margin="0,10,0,0"
+                HorizontalAlignment="Right" Click="CloseWindow_Click" IsCancel="True"/>
+    </Grid>
+</Window>

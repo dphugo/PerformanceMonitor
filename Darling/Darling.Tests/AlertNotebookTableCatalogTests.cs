@@ -197,7 +197,7 @@ public sealed class AlertNotebookTableCatalogTests
     public void EveryReadCellEveryNotebookEmits_ResolvesToTheFieldArrayItsVizNeeds()
     {
         var all = EveryReadCell();
-        Assert.True(all.Count >= 150, "expected the authored, prefix and mechanical notebooks to emit well over 150 read cells, found " + all.Count);
+        Assert.NotEmpty(all); // a sweep that found no cells would pass for free; the count itself is not a rule (#5950)
         Assert.Contains(all, c => c.Origin.StartsWith("mechanical: ", StringComparison.Ordinal));
         Assert.Contains(all, c => c.Origin.Contains("(matched row)", StringComparison.Ordinal));
 
@@ -256,12 +256,23 @@ public sealed class AlertNotebookTableCatalogTests
         ["get_ag_health"] = "DarlingAgReader.cs",
     };
 
+    /// <summary>#5904: a read whose payload is built in the shared library rather than in the Mcp folder (the investigation
+    /// tools' core, shared with Lite): the file in <c>PerformanceMonitor.Common/Investigations</c> that builds it.</summary>
+    private static readonly Dictionary<string, string> s_commonPayloadFiles = new(StringComparer.Ordinal)
+    {
+        ["list_investigation_requests"] = "InvestigationToolCore.cs",
+        ["get_investigation_reports"] = "InvestigationToolCore.cs",
+    };
+
     /// <summary>A key the payload code spells through a shared constant rather than a literal: the constant it uses.</summary>
     private static readonly Dictionary<string, string> s_keyConstants = new(StringComparer.Ordinal)
     {
         ["get_database_sizes.size_note"] = "AzureSiblingDatabaseSize.RowNoteKey",
         // #5249: the gated rows are built by the helper the tool calls (anonymous-object member `message`).
         ["get_collection_health.message"] = "DarlingGatedCollectorRows.AppendAsync(",
+        // #6254: read_source is added to the serialized payload by the shared helpers the two tools call (a key written into the JSON, not an object member).
+        ["get_collection_health.read_source"] = "McpHelpers.WithCollectorReadSource(",
+        ["get_collection_log.read_source"] = "WithReadSource(",
     };
 
     /// <summary>The text from <paramref name="start"/> to the next marker (or the end).</summary>
@@ -295,8 +306,44 @@ public sealed class AlertNotebookTableCatalogTests
             source += File.ReadAllText(PathTo(s_serviceDir.Append("Mcp").Append(typeFile).ToArray()));
         }
 
+        if (s_commonPayloadFiles.TryGetValue(read, out var commonFile))
+        {
+            source += File.ReadAllText(PathTo("PerformanceMonitor.Common", "Investigations", commonFile));
+        }
+
         return source;
     }
+
+    /// <summary>The ways a payload's source spells a key it builds: an anonymous-object member (<c>key = ...</c>), a SQL alias, an
+    /// indexer write (<c>row["key"] = ...</c>), a JsonPropertyName, and (#5748) the omit-the-default helper
+    /// <c>AddUnlessDefault(row, "key", ...)</c> a dictionary-built row uses.</summary>
+    private static Regex BuiltKeyPattern(string key) =>
+        new("\\b" + Regex.Escape(key) + "\\s*=(?!=)|\\bAS\\s+" + Regex.Escape(key) + "\\b|\\[\"" + Regex.Escape(key) + "\"\\]|\\bAddUnlessDefault\\(\\s*\\w+\\s*,\\s*\"" + Regex.Escape(key) + "\"|JsonPropertyName\\(\"" + Regex.Escape(key) + "\"\\)");
+
+    [Fact]
+    public void TheBuiltKeyScan_CountsTheDictionaryRowForms_AndStillFlagsAKeyNeverBuilt()
+    {
+        var source = "AddUnlessDefault(row, \"recovered_note\", r.RecoveredNote); row[\"output_finding_truncated\"] = true; plain = 1;";
+        Assert.Matches(BuiltKeyPattern("recovered_note"), source);
+        Assert.Matches(BuiltKeyPattern("output_finding_truncated"), source);
+        Assert.Matches(BuiltKeyPattern("plain"), source);
+        Assert.DoesNotMatch(BuiltKeyPattern("never_built_key"), source);
+        /* A key that is only a prefix of a built one is not built. */
+        Assert.DoesNotMatch(BuiltKeyPattern("recovered"), source);
+    }
+
+    /* #5917: a read whose rows are the shared image record (the tool and the undo journal one type) names its fields in that record,
+       not in the tool file. The record's own JsonPropertyNames are what the wire carries, so they are read by reflection. */
+    private static readonly Dictionary<string, Type> s_imageTypedReads = new(StringComparer.Ordinal)
+    {
+        ["get_mute_rules"] = typeof(PerformanceMonitor.Darling.Storage.MuteRuleImage),
+    };
+
+    private static HashSet<string> ImageWireNames(Type imageType) =>
+        imageType.GetProperties()
+            .Select(p => p.GetCustomAttributes(typeof(System.Text.Json.Serialization.JsonPropertyNameAttribute), true)
+                .Cast<System.Text.Json.Serialization.JsonPropertyNameAttribute>().FirstOrDefault()?.Name)
+            .Where(n => n is not null).Select(n => n!).ToHashSet(StringComparer.Ordinal);
 
     [Fact]
     public void EveryFieldKeyInTheCatalog_IsAFieldTheReadsOwnPayloadBuilds()
@@ -331,9 +378,10 @@ public sealed class AlertNotebookTableCatalogTests
             var source = PayloadSourceFor(read, toolFiles);
             foreach (var key in keys.Distinct())
             {
-                var assignment = new Regex("\\b" + Regex.Escape(key) + "\\s*=(?!=)|\\bAS\\s+" + Regex.Escape(key) + "\\b|\\[\"" + Regex.Escape(key) + "\"\\]|JsonPropertyName\\(\"" + Regex.Escape(key) + "\"\\)");
+                var assignment = BuiltKeyPattern(key);
                 var viaConstant = s_keyConstants.TryGetValue(read + "." + key, out var constant) && source.Contains(constant, StringComparison.Ordinal);
-                if (!assignment.IsMatch(source) && !viaConstant) bad.Add(read + "." + key);
+                var viaImage = s_imageTypedReads.TryGetValue(read, out var imageType) && ImageWireNames(imageType).Contains(key);
+                if (!assignment.IsMatch(source) && !viaConstant && !viaImage) bad.Add(read + "." + key);
             }
         }
 
@@ -390,7 +438,7 @@ public sealed class AlertNotebookTableCatalogTests
     {
         var reads = TemplateTableReads();
 
-        Assert.True(reads.Length >= 24, "expected the template sources to name about 25 distinct reads, found " + reads.Length);
+        Assert.NotEmpty(reads); // not a count of reads: adding or merging a template read is not a defect (#5950)
         Assert.Contains("get_blocking", reads);
         Assert.Contains("get_collection_log", reads);
         Assert.Contains("get_collector_stall_probes", reads);

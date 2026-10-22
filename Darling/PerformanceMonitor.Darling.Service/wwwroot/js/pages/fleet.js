@@ -13,12 +13,13 @@
  * API reports it (band = Warning, status text verbatim) — never the red offline treatment.
  */
 
-import { el, mount, readTool, apiGetFleet, loadingStrip, errorStrip, emptyStrip, localTime, localClock, relTime, fmtInt, fmtNum, fmtPct, fmtMb, fmtMs, bandClass, rollupTextId } from "../util.js";
+import { el, mount, readTool, apiGetFleet, loadingStrip, errorStrip, emptyStrip, localTime, localClock, relTime, fmtInt, fmtNum, fmtPct, fmtMb, fmtMs, bandClass, rollupTextId, tagPill } from "../util.js";
 import { VIZ, navigateServer } from "../panels.js";
 import { favoritesFirst, onChange as onLocalChange } from "../viewer-local.js";
 import { buildTagGroups, cardMatches } from "../fleet-groups.js";
 import { favoriteStar, alertBadge } from "../viewer-local-ui.js";
 import * as api from "../alerts-api.js";
+import { plainText } from "../plain-text.js";
 import { createRule, deleteRule } from "./mute-rules.js";
 
 const BAND_RANK = { Offline: 0, Critical: 1, Warning: 2, Healthy: 3 };
@@ -102,15 +103,7 @@ function tagPills(c) {
   return el(
     "div",
     { class: "tag-pills" },
-    tags.map((t) => {
-      const safeColour = /^#[0-9a-fA-F]{6}$/.test(t.colour || "") ? t.colour : null;
-      return el("span", {
-        class: "tag-pill",
-        text: t.name,
-        title: t.name,
-        style: safeColour ? "background:" + safeColour : null,
-      });
-    })
+    tags.map((t) => tagPill(t.name, t.colour))
   );
 }
 
@@ -142,11 +135,14 @@ export function silenceBody(card) {
    which is also what the card's bell (is_silenced) tests. The reason is NOT part of the test: a rule made over MCP,
    by hand or with an edited reason still silences the whole server, so Unsilence has to remove it too. */
 function noPatterns(rule) {
+  /* #5654: a rule limited to one external source mutes only that source's alerts, so it is not a whole-server silence. */
   return rule.metric_name == null
+    && rule.external_source == null
     && rule.database_pattern == null
     && rule.query_text_pattern == null
     && rule.wait_type_pattern == null
-    && rule.job_name_pattern == null;
+    && rule.job_name_pattern == null
+    && rule.client_app_pattern == null;
 }
 
 /** A whole-server silence keyed on this server's id. Enabled/expiry are not part of the match (as on the desktop). */
@@ -652,7 +648,7 @@ export function rollup(d) {
         "Deadlocks (recent)",
         deadlockClass,
         deadlockSub,
-        coverage ? coverage.note : null,
+        coverage ? plainText(coverage.note) : null,
       ),
     ]),
   ]);
@@ -725,9 +721,20 @@ export function metricBands(c) {
       : c.available_threads != null
       ? fmtInt(c.available_threads) + " free"
       : "ok";
+  /* W19 (#5644): the tile value reads "N free", so the line under it must not repeat N over the total (that read as
+     N in use). It says how many are in use, of the total. */
+  const threadsInUse =
+    c.total_threads != null
+      ? c.available_threads != null
+        ? c.total_threads - c.available_threads
+        : c.current_workers ?? 0
+      : null;
+  /* #6178: an Azure SQL Database (engine_edition 5) has no scheduler data, so its Threads chip is "n/a" for good. Say why under the "n/a". */
   const threadsDetail =
     c.total_threads != null
-      ? fmtInt(c.available_threads ?? c.total_threads - (c.current_workers ?? 0)) + " / " + fmtInt(c.total_threads) + " threads"
+      ? fmtInt(threadsInUse) + " in use / " + fmtInt(c.total_threads) + " threads"
+      : threadsValue === "n/a" && c.engine_edition === 5
+      ? "Azure SQL Database has no thread data"
       : null;
 
   const cpuValue =
@@ -804,7 +811,9 @@ export function metricBands(c) {
   }
 
   return el("div", { class: "metric-bands" }, [
-    chip("CPU", cpuValue, c.cpu_severity, cpuDetail),
+    /* W19 (#5644): total_cpu_percent is the whole box (SQL Server plus other processes); FinOps reads the SQL Server
+       process alone, so this chip says which one it shows. The cpu_percent fallback (a PostgreSQL target) stays "CPU". */
+    chip(c.total_cpu_percent != null ? "Total CPU" : "CPU", cpuValue, c.cpu_severity, cpuDetail),
     chip("Threads", threadsValue, c.threads_severity, threadsDetail),
     chip("Memory", memValue, c.memory_severity, memDetail),
     chip("Blocking", fmtInt(c.blocking_count), c.blocking_severity, blockingDetail),

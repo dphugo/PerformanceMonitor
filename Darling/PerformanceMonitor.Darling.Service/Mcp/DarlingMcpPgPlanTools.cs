@@ -60,10 +60,10 @@ public sealed class DarlingMcpPgPlanTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -104,17 +104,17 @@ public sealed class DarlingMcpPgPlanTools
             if (rows.Count == 0)
             {
                 return await NoPlansStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, wantedQueryId, hours_back, start, now, logger, cancellationToken);
+                    postgres, resolved.ServerId, resolved.ServerName, resolved.DisplayName, wantedQueryId, hours_back, start, now, logger, cancellationToken);
             }
 
             var notice = await DarlingMcpWindowNotice.ReadForToolAsync(
                 postgres, "get_pg_plans", resolved.ServerName, start, now, emptyAnswer: false, logger, cancellationToken);
-            return BuildPlansJson(resolved.ServerName, hours_back, rows, limit, notice);
+            return BuildPlansJson(resolved.DisplayName, hours_back, rows, limit, notice);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             var gated = await DarlingEngineCapability.NotCollectedStatusAsync(
-                postgres, resolved.ServerId, resolved.ServerName, "pg_plan_capture", cancellationToken);
+                postgres, resolved.ServerId, resolved.DisplayName, "pg_plan_capture", cancellationToken);
             if (gated != null)
             {
                 return gated;
@@ -133,10 +133,10 @@ public sealed class DarlingMcpPgPlanTools
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -157,15 +157,15 @@ public sealed class DarlingMcpPgPlanTools
 
             if (rows.Count == 0)
             {
-                return await NoReadinessStatusAsync(postgres, resolved.ServerId, resolved.ServerName, hours_back, cancellationToken);
+                return await NoReadinessStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, hours_back, windowEnd, cancellationToken);
             }
 
-            return BuildReadinessJson(resolved.ServerName, hours_back, rows, limit);
+            return BuildReadinessJson(resolved.DisplayName, hours_back, rows, limit);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             var gated = await DarlingEngineCapability.NotCollectedStatusAsync(
-                postgres, resolved.ServerId, resolved.ServerName, "pg_plan_capture_readiness", cancellationToken);
+                postgres, resolved.ServerId, resolved.DisplayName, "pg_plan_capture_readiness", cancellationToken);
             if (gated != null)
             {
                 return gated;
@@ -184,7 +184,7 @@ public sealed class DarlingMcpPgPlanTools
     /// that order.</para>
     /// </summary>
     private static async Task<string> NoReadinessStatusAsync(
-        NpgsqlDataSource postgres, int serverId, string serverName, int hoursBack,
+        NpgsqlDataSource postgres, int serverId, string serverName, int hoursBack, DateTime windowEnd,
         CancellationToken cancellationToken = default)
     {
         var gated = await DarlingEngineCapability.NotCollectedStatusAsync(
@@ -201,13 +201,13 @@ public sealed class DarlingMcpPgPlanTools
             return precondition;
         }
 
-        return McpHelpers.Status(
+        return await DarlingServerOfflineNote.EmptyAsync(postgres, serverId, serverName, windowEnd, McpHelpers.Status(
             "empty",
             $"No plan-capture readiness state for {serverName} in the last {hoursBack} hour(s). This is NOT "
             + "the healthy case for this read: the collector writes one row per facet on every run whatever "
             + "it finds, so an absence means nothing was collected rather than that nothing was wrong. It "
             + "runs HOURLY, so widen hours_back before concluding anything — a window shorter than the "
-            + "cadence is legitimately empty on a server that is collecting normally.");
+            + "cadence is legitimately empty on a server that is collecting normally."), cancellationToken);
     }
 
     /// <summary>
@@ -283,18 +283,18 @@ public sealed class DarlingMcpPgPlanTools
     /// the threshold" become a true statement rather than a guess.</para>
     /// </summary>
     private static async Task<string> NoPlansStatusAsync(
-        NpgsqlDataSource postgres, int serverId, string serverName, long? wantedQueryId, int hoursBack,
+        NpgsqlDataSource postgres, int serverId, string serverName, string displayName, long? wantedQueryId, int hoursBack,
         DateTime start, DateTime end, ILogger? logger, CancellationToken cancellationToken = default)
     {
         var gated = await DarlingEngineCapability.NotCollectedStatusAsync(
-            postgres, serverId, serverName, "pg_plan_capture", cancellationToken);
+            postgres, serverId, displayName, "pg_plan_capture", cancellationToken);
         if (gated != null)
         {
             return gated;
         }
 
         var precondition = await DarlingRuntimePrecondition.StatusAsync(
-            postgres, serverId, serverName, "pg_plan_capture", cancellationToken);
+            postgres, serverId, displayName, "pg_plan_capture", cancellationToken);
         if (precondition != null)
         {
             return precondition;
@@ -319,7 +319,7 @@ public sealed class DarlingMcpPgPlanTools
         /* #4966: only the empty answer carries the window floor; not_collected and precondition above stay bare. */
         var notice = await DarlingMcpWindowNotice.ReadForToolAsync(
                 postgres, "get_pg_plans", serverName, start, end, emptyAnswer: true, logger, cancellationToken);
-        return McpHelpers.Status("empty", NoPlanCapturedMessage(wantedQueryId, hoursBack), notice.AsHints());
+        return await DarlingServerOfflineNote.EmptyAsync(postgres, serverId, serverName, end, McpHelpers.Status("empty", NoPlanCapturedMessage(wantedQueryId, hoursBack), notice.AsHints()), cancellationToken);
     }
 
     /// <summary>

@@ -93,7 +93,7 @@ public sealed class QueryEventsDatabaseFilterLiveTests
             Assert.Equal("empty", miss.GetProperty("status").GetString());
             Assert.Contains("for the chosen databases", miss.GetProperty("message").GetString(), StringComparison.Ordinal);
             var publicMiss = JsonDocument.Parse(await DarlingMcpLongQueryTools.GetLongQueryCompletions(
-                postgres, ServerName, 1, 100, DateTime.UtcNow.AddDays(-30).ToString("o"), null, null, ct)).RootElement;
+                postgres, ServerName, 1, 100, DateTime.UtcNow.AddDays(-30).ToString("o"), null, null, null, ct)).RootElement;
             Assert.DoesNotContain("for the chosen databases", publicMiss.GetProperty("message").GetString(), StringComparison.Ordinal);
 
             bodySucceeded = true;
@@ -169,7 +169,7 @@ public sealed class QueryEventsDatabaseFilterLiveTests
             var ab = DatabaseFilter.Of([DbA, DbB]);
 
             /* Each per-database arm: only the chosen databases. */
-            var readCost = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, servers, start, end, ab, ct);
+            var readCost = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, servers, start, end, ab, cancellationToken: ct);
             Assert.Equal(new[] { DbA, DbB }, readCost.Select(r => r.DatabaseName).Order().ToArray());
             var readCostAll = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, servers, start, end, cancellationToken: ct);
             Assert.Equal(new[] { DbA, DbB, DbC }, readCostAll.Select(r => r.DatabaseName).Order().ToArray());
@@ -181,11 +181,11 @@ public sealed class QueryEventsDatabaseFilterLiveTests
                 Assert.Equal(whole.OthersSlowestItemMsP50, row.OthersSlowestItemMsP50);
             }
 
-            var churn = await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, servers, start, end, ab, ct);
+            var churn = await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, servers, start, end, ab, cancellationToken: ct);
             Assert.Equal(new[] { DbA, DbB }, churn.Select(r => r.DatabaseName).Order().ToArray());
             Assert.Equal(3, (await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, servers, start, end, cancellationToken: ct)).Count);
 
-            var config = await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, servers, start, end, ab, ct);
+            var config = await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, servers, start, end, ab, cancellationToken: ct);
             Assert.Equal(new[] { DbA, DbB }, config.Select(r => r.DatabaseName).Order().ToArray());
             Assert.Equal(3, (await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, servers, start, end, cancellationToken: ct)).Count);
 

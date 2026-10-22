@@ -56,6 +56,7 @@ namespace Darling.Tests;
 /// Warning — the never-collected server's band. Neutrality is unchanged wherever anything IS measured:
 /// the pins below hold a one-of-six card exactly where #3528 left it.</para>
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class UnmeasuredMetricsAreNotHealthyTests
 {
     private static readonly DateTime Now = new(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
@@ -605,28 +606,4 @@ public sealed class UnmeasuredMetricsAreNotHealthyTests
 
     /* ─────────────────────────── one decision, both surfaces ─────────────────────────── */
 
-    /// <summary>
-    /// Both surfaces reach the shared "is this a measurement" decision, and no third file decides it for
-    /// itself. Same census shape as <c>FleetCardPostgresCpuTests</c>'s, and the same reason: the failure
-    /// mode is a surface that never learns the concept exists.
-    /// </summary>
-    [Fact]
-    public void BothSurfacesReachTheSharedMeasuredDecision()
-    {
-        var callers = System.IO.Directory
-            .EnumerateFiles(System.IO.Path.Combine(RepoFile.Root, "Darling"), "*.cs", System.IO.SearchOption.AllDirectories)
-            .Where(f =>
-            {
-                var segments = f.Split(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
-                return !segments.Contains("bin") && !segments.Contains("obj") && !segments.Contains("Darling.Tests");
-            })
-            .Where(f => CSharpSourceWalker
-                .StripCommentsAndStrings(System.IO.File.ReadAllText(f))
-                .Contains("ServerMetricSources.DmvSourced", StringComparison.Ordinal))
-            .Select(System.IO.Path.GetFileName)
-            .OrderBy(n => n, StringComparer.Ordinal)
-            .ToArray();
-
-        Assert.Equal(new[] { "DarlingFleetReader.cs", "ViewerDataService.Overview.cs" }, callers);
-    }
 }

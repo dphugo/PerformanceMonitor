@@ -177,8 +177,8 @@ END $$;";
     /// rejects it, 25001). The lock this takes is <c>ShareLock</c> (a plain <c>CREATE INDEX</c>, not a
     /// rewrite of an existing index), which blocks writers to the table for the build's duration but not
     /// readers. At the rig's 4M row size the build itself took low single-digit seconds; a field store's
-    /// two tables are kept to 15 and 9 days respectively by the same purge this index speeds up, so neither
-    /// grows unbounded between upgrades.</para>
+    /// two tables are kept to 15 and 10 days respectively (the wide table's 9 until #5809) by the same purge this
+    /// index speeds up, so neither grows unbounded between upgrades.</para>
     ///
     /// <para><b>Why not <see cref="UnorderedRowCappedDeleteSql"/> instead (the alternative measured for #4608).</b>
     /// That builder exists for the two plain (non-hypertable) tables whose V149 migration deliberately
@@ -932,6 +932,1423 @@ END $$;";
     private static readonly string V173Sql = "SET LOCAL lock_timeout = '" + (MigrationCommandTimeoutSeconds - 20) + "s';\n" + QueryStoreComposeStamp.CreateSql;
 
     /// <summary>
+    /// V174 (#5655) — <c>config.service_version</c>: one row per service host with the product version the service reported at
+    /// start, its process start time and the time the row was written. The Manage Servers window reads it to show the SERVICE's
+    /// version once, in place of the viewer's own version on every server row. A separate table keyed by the service host, as
+    /// <c>config.password_key_service</c> is, and not a column of <c>config.config_service</c>, whose self-bump trigger would make
+    /// every service reload on each start. The text is on <see cref="ServiceVersionTable"/>, which the rung embeds. Catalog-only:
+    /// the table is created empty, and no GRANT is needed (the <c>config</c> schema's blanket SELECT and default privileges cover
+    /// it). <b>No Lite twin:</b> Lite has no PostgreSQL store, and there the app is the collector.
+    /// </summary>
+    private static readonly string V174Sql = ServiceVersionTable.CreateSql;
+
+    /// <summary>
+    /// V179 (#5640) - everything the Client Timeouts alert needs in the store, in one rung. (1) <c>collect.attention_events</c>: the
+    /// <c>AttentionCollector</c> table, a <c>count</c> row for each run whose event_counter delta is above zero (event_time NULL; a quiet run writes none) plus one <c>sample</c> row per kept ring-buffer
+    /// event (attention_count 0). A collector table that stays a PLAIN table on every store (<c>ICollectorSchemaInfo.StaysPlainTable</c>): no hypertable, no compression and no
+    /// Timescale retention policy, because the 73rd hypertable is a grid decision (#3035, #3044, #3107) and its rows are low volume. Its 30-day
+    /// retention is the time-sliced DELETE the retention sweep runs on both store kinds. A fresh store already has it from V1's catalog walk, so
+    /// the CREATE is a no-op there and the real create on upgrade.
+    /// Columns are exactly <c>PgSchemaGenerator.CreateTable</c>'s output for the catalog entry. (2)
+    /// <c>config.config_mute_rules.client_app_pattern</c>: the client-application match for mute rules (nullable text, no default,
+    /// like V157's <c>server_id</c>). (3) Three alert settings on <c>config.config_alert_settings</c>, named like V177's:
+    /// <c>client_timeouts_enabled</c> (<c>boolean NOT NULL DEFAULT FALSE</c>: the alert ships OFF until the bars are checked against a
+    /// week of capture on the field stores), <c>client_timeouts_warning_per_minute</c> (default 10) and
+    /// <c>client_timeouts_critical_per_minute</c> (default 60), attentions per minute averaged over three minutes. The defaults are
+    /// a guess from "a healthy app rarely times out", not a measured normal rate. Written as literals because a migration's text is
+    /// frozen at the version it ships in. No CHECK on the bounds, no reload beacon of its own (V17's trigger bumps the version on any
+    /// write to the settings row), no GRANT (the <c>collect</c> and <c>config</c> schemas carry blanket SELECT and table-level
+    /// grants). Catalog-only: every added column is nullable or has a constant default. Every statement is idempotent. <b>Lite twin:</b>
+    /// the DuckDB bump to schema 68. Sequenced after V176-V178 (#5638, #5641, #5684), which are in other open changes.
+    /// </summary>
+    private const string V179Sql = @"
+CREATE TABLE IF NOT EXISTS collect.attention_events (
+    attention_event_id bigint NOT NULL,
+    collection_time timestamp NOT NULL,
+    server_id integer NOT NULL,
+    server_name text NOT NULL,
+    event_time timestamp,
+    event_kind text,
+    attention_count bigint,
+    database_name text,
+    client_app_name text,
+    client_hostname text,
+    session_id integer,
+    request_id integer,
+    interrupt_duration_us bigint,
+    statement_fingerprint text,
+    statement_text text
+);
+
+CREATE INDEX IF NOT EXISTS idx_attention_events_time ON collect.attention_events(server_id, collection_time);
+
+ALTER TABLE config.config_mute_rules ADD COLUMN IF NOT EXISTS client_app_pattern text;
+
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS client_timeouts_enabled boolean NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS client_timeouts_warning_per_minute integer NOT NULL DEFAULT 10,
+    ADD COLUMN IF NOT EXISTS client_timeouts_critical_per_minute integer NOT NULL DEFAULT 60;";
+
+    /// <summary>
+    /// V175 (#5631) — <c>collect.plan_regression_daily.rowcount_sum</c>: the day's sum of <c>avg_rowcount * execution_count</c> for
+    /// the plan, so PLAN_REGRESSION can tell a plan whose cost followed a much bigger output from a real regression on the daily
+    /// path, as it can on the raw and interval-table paths. NULL when any interval of the day had no <c>avg_rowcount</c>, so a
+    /// missing count never reads as a small one. The same step bumps <c>late_seq</c> on every built day: each day then reads as
+    /// stale, so reads take it from the interval table (the same answer as the raw read) until the hourly builder rebuilds it with
+    /// the column filled. Both happen only when the column is added, so a second run of the text changes nothing. Catalog-only: a
+    /// nullable column without a default does not rewrite the table, and the built table is one row per server and day. The lock
+    /// timeout is <see cref="MigrationCommandTimeoutSeconds"/> less 20 s, as V173's, because the new column needs an ACCESS EXCLUSIVE
+    /// lock on the table. The same migration adds <c>collect.query_store_interval_latest.avg_rowcount</c> (<c>bigint</c>, as
+    /// <c>query_store_stats.avg_rowcount</c>) in its own idempotent step: the interval table never had it, and the new rows-per-call
+    /// reads need it. No backfill: interval rows written before the upgrade keep a NULL, so rows per call is NULL for them and the
+    /// output-size rule skips them (a missing count never reads as a small one). On a day-partitioned store the column is added to the
+    /// parent and the partitions inherit it. No GRANT: the <c>collect</c> schema's blanket SELECT covers a column. <b>No Lite twin:</b> Lite has no
+    /// PostgreSQL store.
+    /// </summary>
+    private static readonly string V175Sql = "SET LOCAL lock_timeout = '" + (MigrationCommandTimeoutSeconds - 20) + @"s';
+DO $$
+BEGIN
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'collect'
+        AND   table_name = 'plan_regression_daily'
+        AND   column_name = 'rowcount_sum'
+    )
+    THEN
+        ALTER TABLE collect.plan_regression_daily ADD COLUMN rowcount_sum numeric;
+        UPDATE collect.plan_regression_daily_built SET late_seq = late_seq + 1;
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'collect'
+        AND   table_name = 'query_store_interval_latest'
+        AND   column_name = 'avg_rowcount'
+    )
+    THEN
+        ALTER TABLE collect.query_store_interval_latest ADD COLUMN avg_rowcount bigint;
+    END IF;
+END
+$$;";
+
+    /// <summary>
+    /// V176 (#5638) - <c>collect.procedure_stats_totals</c>: the per-collection totals of <c>collect.procedure_stats</c> that the raw
+    /// procedure duration trend reads instead of every row of every collection (about 560 to 1,060 rows per collection since #5463).
+    /// The collector writes it on the COPY's own transaction (<c>ProcedureStatsTotalsWriter</c>); the grain, the measures, the
+    /// NULL database handling and the retention are on <see cref="ProcedureStatsTotals"/>, which the rung embeds.
+    ///
+    /// <para><b>Empty when created, no backfill</b> (the data-moving census therefore has nothing to declare): a collection written
+    /// before the rung has no totals row and the read keeps reading its rows. A plain table, not a collector, so no catalog, hypertable or
+    /// grant change; the <c>collect</c> schema's blanket SELECT and owner default privileges cover it. No Lite twin: Lite's store is
+    /// DuckDB with its own procedure trend.</para>
+    /// </summary>
+    private const string V176Sql = ProcedureStatsTotals.CreateSql;
+
+    /// <summary>
+    /// V177 (#5641) - the Runnable Queue alert's three settings on <c>config.config_alert_settings</c>:
+    /// <c>runnable_queue_enabled</c> (<c>boolean NOT NULL DEFAULT TRUE</c>, like <c>poison_wait_enabled</c>) and the two bars,
+    /// <c>runnable_queue_warning_per_scheduler</c> (default 8) and <c>runnable_queue_critical_per_scheduler</c> (default 16),
+    /// runnable tasks per visible online scheduler, averaged over the collections of the last 5 minutes when there are at least 3, otherwise over
+    /// the newest 3 if all fall in the last 10 minutes (the rule as shipped; the migration's SQL text says nothing of the window). The defaults are
+    /// <c>RunnableQueueEvaluator.DefaultWarningPerScheduler</c> / <c>DefaultCriticalPerScheduler</c>, written as literals here
+    /// because a migration's text is frozen at the version it ships in; the defaults pin in the rung's test holds them equal.
+    ///
+    /// <para>No CHECK enforcing the bounds, matching V119/V120/V122/V124/V126: the floor (Warning at least 1, Critical never
+    /// below Warning) is the <c>update_alert_settings</c> write bound and <c>DarlingAlertSettings</c>' read-side clamp, the
+    /// raw-in/clamped-out split every knob on this table uses. Catalog-only: a column with a constant default does not rewrite
+    /// the one-row table. No reload beacon of its own: V17's statement-level <c>trg_bump_alert_settings</c> already bumps
+    /// <c>config_service.config_version</c> on any write here. No GRANT: this table carries table-level grants with no column
+    /// carve. <b>No Lite twin:</b> Lite keeps these as settings-file keys. Sequenced after V176 (#5638, procedure_stats_totals).
+    /// </summary>
+    private const string V177Sql = @"
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS runnable_queue_enabled boolean NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS runnable_queue_warning_per_scheduler integer NOT NULL DEFAULT 8,
+    ADD COLUMN IF NOT EXISTS runnable_queue_critical_per_scheduler integer NOT NULL DEFAULT 16;";
+
+    /// <summary>
+    /// V178 (#5684) - <c>collect.query_store_watermarks</c> and <c>collect.query_store_watermarks_coverage</c>: one row per
+    /// (server, database, collection_time) with that key's <c>MAX(last_execution_time)</c>, so the Query Store per-database watermark
+    /// seed read touches about thirty-six rows instead of every <c>query_store_stats</c> row of the pair's last three hours. The
+    /// collector writes it on the COPY's own transaction behind a savepoint (<c>QueryStoreWatermarks.TryUpsertBatchAsync</c>); the grain,
+    /// the types, the only-up upsert, the coverage start and the two-day retention are on <see cref="QueryStoreWatermarks"/>, which the
+    /// rung embeds.
+    ///
+    /// <para><b>Empty when created, no backfill</b> (the data-moving census therefore has nothing to declare), except the one coverage row
+    /// the rung inserts: the store's own clock at the moment the rung ran, kept on a re-run. A reader treats everything before it as raw's.
+    /// A plain table, not a collector, so no catalog, hypertable or grant change. No Lite twin: Lite's store is DuckDB with its own
+    /// watermark read.</para>
+    /// </summary>
+    private const string V178Sql = QueryStoreWatermarks.CreateSql;
+
+    /// <summary>
+    /// V180 (#5654) — the tables for alerts that another service raises through Darling's channels, routes and mute rules:
+    /// <c>config.external_alert_source</c> (the registry that maps a login role to a source name), <c>config.external_alert_pending</c>
+    /// (the queue the provisioned function appends to and the service drains) and <c>config.external_alert_state</c> (which keys are
+    /// firing), plus <c>config.config_mute_rules.external_source</c>, so a mute rule can name a source. The text is on
+    /// <see cref="ExternalAlertTables"/>, which the rung embeds. All three tables are created empty, so nothing is moved, and the
+    /// column is nullable with no default: one catalog-only <c>ADD COLUMN</c>, and every stored rule keeps its effect (NULL names no
+    /// source). No GRANT here: the <c>config</c> schema's blanket SELECT covers the tables, and owner-only writes, and the one EXECUTE
+    /// each source role holds, are provisioning's, re-asserted on every start. <b>No Lite twin:</b> Lite has no PostgreSQL store.
+    /// </summary>
+    private static readonly string V180Sql = ExternalAlertTables.CreateSql;
+
+    /// <summary>
+    /// V181 (#5750) — a notification route can be scoped to one server or to a tag and its whole subtree.
+    /// <c>config.config_notification_routes</c> gains the nullable <c>scope_server_id</c> (a registry server id) and
+    /// <c>scope_tag_id</c> (a <c>config.server_tags</c> id), a CHECK that at most one is set, and a CHECK that the match <c>*</c>
+    /// (the lowest metric level, ruling 4) appears only on a scoped route. A stored row keeps its effect: both columns are NULL on it,
+    /// so it stays fleet-wide.
+    ///
+    /// <para><b>No foreign key and no ON DELETE action, deliberately.</b> A route whose server or tag was removed must stay as it was
+    /// written and show as orphaned; a cascade would delete it, and <c>ON DELETE SET NULL</c> would silently widen it to fleet-wide.
+    /// The service marks it orphaned at load and the router matches it to nothing.</para>
+    ///
+    /// <para><b>The <c>*</c> CHECK is NOT VALID</b>: it is enforced for every insert and update from now on, and it is not checked
+    /// against rows already stored, so a store that holds an unscoped <c>*</c> row (a literal metric name before this rung, which
+    /// matched nothing real) still migrates instead of refusing to start. The router never matches such a row.</para>
+    ///
+    /// <para><b>Reload.</b> The reload beacon (<c>config.config_bump_version</c>) already fires on a write to the routes table and to
+    /// <c>config_monitored_servers</c>, but V32 deliberately gave the two tag tables none. A scoped route's server set depends on both, so
+    /// this rung adds V117's trigger shape to <c>config.server_tags</c> and <c>config.server_tag_map</c>: a tag edit, a mapping change or
+    /// a cascade from a tag delete bumps <c>config_service.config_version</c> and the running service re-reads the routes.</para>
+    ///
+    /// <para>Catalog-only: two nullable columns, two constraints, two triggers. Every statement is idempotent. No GRANT here: the
+    /// viewer and mcp roles' column-level SELECT on the routes table is a provisioning statement (<c>DarlingManagedRoles</c>,
+    /// re-asserted on every managed start after migration, and mirrored in <c>Darling/tools/provision-roles.sql</c>); both new columns are on its
+    /// non-secret list. <b>Lite twin:</b> the DuckDB step at schema 69 (separate store, separate lane).</para>
+    /// </summary>
+    private const string V181Sql = @"
+ALTER TABLE config.config_notification_routes
+    ADD COLUMN IF NOT EXISTS scope_server_id integer,
+    ADD COLUMN IF NOT EXISTS scope_tag_id integer;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_config_notification_routes_one_scope'
+                     AND conrelid = 'config.config_notification_routes'::regclass) THEN
+        ALTER TABLE config.config_notification_routes
+            ADD CONSTRAINT ck_config_notification_routes_one_scope
+            CHECK (scope_server_id IS NULL OR scope_tag_id IS NULL);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_config_notification_routes_wildcard_scoped'
+                     AND conrelid = 'config.config_notification_routes'::regclass) THEN
+        ALTER TABLE config.config_notification_routes
+            ADD CONSTRAINT ck_config_notification_routes_wildcard_scoped
+            CHECK (btrim(metric_match) <> '*' OR scope_server_id IS NOT NULL OR scope_tag_id IS NOT NULL) NOT VALID;
+    END IF;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_bump_server_tags ON config.server_tags;
+CREATE TRIGGER trg_bump_server_tags
+    AFTER INSERT OR UPDATE OR DELETE ON config.server_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION config.config_bump_version();
+
+DROP TRIGGER IF EXISTS trg_bump_server_tag_map ON config.server_tag_map;
+CREATE TRIGGER trg_bump_server_tag_map
+    AFTER INSERT OR UPDATE OR DELETE ON config.server_tag_map
+    FOR EACH STATEMENT EXECUTE FUNCTION config.config_bump_version();";
+
+    /// <summary>
+    /// V182 (#5506) — what a capacity question needs from the read record. <c>collect.read_latency</c> gains
+    /// <c>window_band</c> (the width of the window the read asked for: <c>1h</c>, <c>24h</c>, <c>7d</c>, <c>7d+</c>, or
+    /// <c>none</c> for a read with no window), <c>max_in_flight</c> (the most reads already in progress on the service when a
+    /// read of the key started, in the hour) and <c>wait_total_ms</c> (the time the key's reads waited for a store connection,
+    /// apart from their run time). The band joins the primary key, so a 1-hour read and a 7-day read of one route no longer
+    /// share a histogram. <c>collect.slow_reads</c> gains the nullable <c>in_flight</c> and <c>wait_ms</c> for each slow read.
+    ///
+    /// <para>Rows stored before this rung keep their counts: each gets <c>window_band = 'none'</c>, <c>max_in_flight = 0</c>
+    /// and <c>wait_total_ms = 0</c> from the column defaults, and their old key is still unique under the new one. The primary
+    /// key (V148's <c>read_latency_pkey</c>) is dropped and re-added only while it does not yet name <c>window_band</c>, so a
+    /// second run does nothing. The table
+    /// holds at most 90 days of hourly rows per surface, route and outcome, so the index rebuild is small. <b>No Lite
+    /// twin:</b> Lite records no read latency.</para>
+    /// </summary>
+    private const string V182Sql = @"
+ALTER TABLE collect.read_latency
+    ADD COLUMN IF NOT EXISTS window_band text NOT NULL DEFAULT 'none',
+    ADD COLUMN IF NOT EXISTS max_in_flight integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS wait_total_ms bigint NOT NULL DEFAULT 0;
+
+DO $$
+BEGIN
+    IF NOT EXISTS
+       (
+           SELECT 1
+           FROM pg_constraint AS c
+           JOIN pg_attribute AS a
+             ON a.attrelid = c.conrelid
+            AND a.attnum = ANY (c.conkey)
+           WHERE c.conrelid = 'collect.read_latency'::regclass
+           AND   c.contype = 'p'
+           AND   a.attname = 'window_band'
+       )
+    THEN
+        ALTER TABLE collect.read_latency DROP CONSTRAINT IF EXISTS read_latency_pkey;
+        ALTER TABLE collect.read_latency
+            ADD CONSTRAINT read_latency_pkey PRIMARY KEY (metric_time, surface, route, outcome, window_band);
+    END IF;
+END $$;
+
+ALTER TABLE collect.slow_reads
+    ADD COLUMN IF NOT EXISTS in_flight integer,
+    ADD COLUMN IF NOT EXISTS wait_ms bigint;";
+
+    /// <summary>
+    /// V183 (#5793): who made each read, with no personal data. <c>collect.slow_reads</c> gains the nullable <c>caller</c> (an
+    /// MCP client's own name and version, its User-Agent product token when it sent none, or <c>web:</c> and a salted hash of
+    /// the web session key) and <c>collect.read_latency</c> gains <c>distinct_callers</c> (how many different callers read the
+    /// key in the hour). The caller does not join the hourly key, which would multiply its rows by the number of clients.
+    ///
+    /// <para>Rows stored before this rung get a NULL caller and a count of 0 from the column default. Both ADD COLUMNs are
+    /// IF NOT EXISTS, so a second run does nothing, and neither rewrites the table. <b>No Lite twin:</b> Lite records no read
+    /// latency.</para>
+    /// </summary>
+    private const string V183Sql = @"
+ALTER TABLE collect.slow_reads
+    ADD COLUMN IF NOT EXISTS caller text;
+
+ALTER TABLE collect.read_latency
+    ADD COLUMN IF NOT EXISTS distinct_callers integer NOT NULL DEFAULT 0;";
+
+    /// <summary>
+    /// V184 (#5632 Phase A) — the tables for Level 1 investigations that an alert hands to the operator's own agent, and the
+    /// agent columns on <c>config.config_notification_routes</c>. The text is on <see cref="InvestigationTables"/>, which the
+    /// rung embeds. Every table is created empty, so nothing is moved; each route column is nullable or has a constant default,
+    /// so the <c>ADD COLUMN</c> is catalog-only and every stored route keeps its effect (a NULL agent level names no agent).
+    /// No GRANT here: the <c>config</c> schema's blanket SELECT covers the tables, and the narrow writes are provisioning's
+    /// (<c>DarlingManagedRoles</c>, mirrored in <c>Darling/tools/provision-roles.sql</c>), re-asserted on every start.
+    /// <b>No Lite twin</b> in Phase A: Lite Level 1 is a follow-up.
+    /// </summary>
+    private static readonly string V184Sql = InvestigationTables.CreateSql;
+
+    /// <summary>
+    /// V187 (#5825): alert resolutions can be sent to the channels that got the fire, opt-in per channel.
+    /// <c>config.config_notification</c> gains four fleet flags, <c>slack_send_resolutions</c>, <c>teams_send_resolutions</c>,
+    /// <c>generic_send_resolutions</c> (the generic webhook) and <c>email_send_resolutions</c>, non-null and FALSE by default,
+    /// so a store that does not turn one on keeps sending no resolution anywhere. <c>config.config_notification_routes</c>
+    /// gains the nullable <c>send_resolutions</c>: NULL follows the channel's flag, TRUE or FALSE overrides it for that
+    /// route's destinations. <c>config.config_alert_log</c> gains what a sent resolution records on its own history row:
+    /// <c>resolution_sent_at</c> (UTC, like <c>alert_time</c>), <c>resolution_channels</c> (the channels it went to) and
+    /// <c>resolution_outcome</c> (what the send did). All three are NULL on every row a resolution was not sent for,
+    /// including every row written before this rung.
+    ///
+    /// <para>Catalog-only and idempotent. No GRANT here: the read roles' column-level SELECT on the notification and routes
+    /// tables is provisioning's (<c>DarlingManagedRoles.ViewerRestrictedConfigTables</c>, mirrored in
+    /// <c>Darling/tools/provision-roles.sql</c>), and every new column is on its non-secret list; the alert log keeps its
+    /// table-wide SELECT. <b>No Lite twin</b> (#5825 decision 4: Lite shows a resolution as a tray notification).</para>
+    /// </summary>
+    private const string V187Sql = @"
+ALTER TABLE config.config_notification
+    ADD COLUMN IF NOT EXISTS slack_send_resolutions boolean NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS teams_send_resolutions boolean NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS generic_send_resolutions boolean NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS email_send_resolutions boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE config.config_notification_routes
+    ADD COLUMN IF NOT EXISTS send_resolutions boolean;
+
+ALTER TABLE config.config_alert_log
+    ADD COLUMN IF NOT EXISTS resolution_sent_at timestamp,
+    ADD COLUMN IF NOT EXISTS resolution_channels text,
+    ADD COLUMN IF NOT EXISTS resolution_outcome text;";
+
+    /// <summary>
+    /// V185 (#5812): the open days of <c>collect.plan_regression_daily</c> are built too, as partial days.
+    /// <c>collect.plan_regression_daily_built</c> gains <c>built_through</c>, the <c>first_execution_time</c> the build covered
+    /// (exclusive) by a partial build: a day's totals are its rows (by <c>last_execution_time</c>) whose first execution is
+    /// below it. A partial build is valid while <c>partial_seq = late_seq</c>, the second new column, and leaves
+    /// <c>built_seq</c> NULL; a whole build stamps <c>built_seq</c> and clears both. So code from before this rung, which reads
+    /// a day as built only while <c>built_seq = late_seq</c>, reads a partial day live, and its builder's whole build (which
+    /// leaves <c>built_through</c> as it was) still reads as whole, because <c>built_seq = late_seq</c> means the whole day
+    /// whatever <c>built_through</c> holds. No built day is invalidated. The watermark is on <c>first_execution_time</c> because it is part of an interval row's identity and never
+    /// moves when the row is updated, so a row is on one side of it for its whole life (its <c>last_execution_time</c> moves
+    /// while the interval runs), and because the interval table is partitioned and indexed on it, so the live half of the read
+    /// touches only the rows after the watermark.
+    ///
+    /// <para><b>The trigger now marks the open days.</b> Its upper bound moves from yesterday's midnight to two hours before the
+    /// current hour (<see cref="PlanRegressionDaily.LateTriggerLagHours"/>), so a row written with a first execution below that
+    /// marks its days (the #5631 validity rule: a moved <c>late_seq</c> invalidates a whole or a partial build). The builder's
+    /// watermark is three hours before the current hour by the store's own clock, one hour under the trigger's, so a write whose transaction began up to an hour
+    /// before a build still marks the day it could change. Steady collection does not fire it: the collector writes the
+    /// intervals still running and the one that just ended, whose first executions are at or after the trigger's bound.
+    /// That holds only while the two clocks agree: <c>first_execution_time</c> is the monitored server's clock and
+    /// <c>now()</c> the store's. The bound sits an hour below the start of a 60-minute interval that has just ended, so a store
+    /// clock up to an hour ahead stays quiet; at one hour the margin was zero, and a store a second ahead fired the trigger on
+    /// every steady apply (#5812 review). A bigger skew, or Query Store intervals longer than an hour, fires it on every apply,
+    /// and the open days then read live, as before #5812: slower, never a wrong number.</para>
+    /// </summary>
+    private static readonly string V185Sql = $@"
+ALTER TABLE collect.plan_regression_daily_built
+    ADD COLUMN IF NOT EXISTS built_through timestamp,
+    ADD COLUMN IF NOT EXISTS partial_seq bigint;
+
+DROP TRIGGER IF EXISTS trg_plan_regression_daily_late ON collect.query_store_interval_latest;
+CREATE TRIGGER trg_plan_regression_daily_late
+    AFTER INSERT OR UPDATE ON collect.query_store_interval_latest
+    FOR EACH ROW
+    WHEN (NEW.first_execution_time < date_trunc('hour', now() AT TIME ZONE 'UTC') - interval '{PlanRegressionDaily.LateTriggerLagHours} hour'
+          AND NEW.first_execution_time >= date_trunc('day', now() AT TIME ZONE 'UTC') - interval '17 days')
+    EXECUTE FUNCTION collect.plan_regression_daily_mark_late();";
+
+    /// <summary>
+    /// V186 (#5810): <c>collect.collection_log_hourly</c>, the hourly rollup of <c>collect.collection_log</c> that
+    /// <c>get_collection_health</c> reads for the closed hours of its 7-day window. One row per (server, collector, closed hour)
+    /// with every decomposable aggregate the read's <c>health</c> computes (counts, <c>rows_stored</c>, <c>duration_sum</c> and
+    /// <c>duration_count</c> for the average, the maxima and the newest instants) and <c>duration_histogram</c>, the count of timed
+    /// runs per slot of the shared duration bounds, from which the read takes a bucketed p95. A plain table: about 34 rows per
+    /// server per hour, kept about 7 days by the service's hourly pass, which also fills it (its first pass backfills the window).
+    /// The <c>hour_start</c> index serves that pass's newest-hour lookup and its retention DELETE. Idempotent; it creates
+    /// objects only, so a rewind is a DROP TABLE.
+    /// </summary>
+    private const string V186Sql = @"
+CREATE TABLE IF NOT EXISTS collect.collection_log_hourly
+(
+    server_id integer NOT NULL,
+    collector_name text NOT NULL,
+    hour_start timestamp NOT NULL,
+    total_runs integer NOT NULL,
+    success_count integer NOT NULL,
+    error_count integer NOT NULL,
+    permission_denied_count integer NOT NULL,
+    yield_count integer NOT NULL,
+    abandoned_count integer NOT NULL,
+    extension_missing_count integer NOT NULL,
+    session_missing_count integer NOT NULL,
+    note_count integer NOT NULL,
+    runs_with_rows integer NOT NULL,
+    rows_stored bigint NOT NULL,
+    duration_sum bigint NOT NULL,
+    duration_count integer NOT NULL,
+    max_duration_ms integer,
+    max_slowest_item_ms integer,
+    last_success_time timestamp,
+    last_run_time timestamp NOT NULL,
+    last_error_time timestamp,
+    last_failure_text_time timestamp,
+    last_note_time timestamp,
+    last_denied_time timestamp,
+    last_non_skip_time timestamp,
+    last_productive_time timestamp,
+    last_streak_break_time timestamp,
+    duration_histogram integer[] NOT NULL,
+    CONSTRAINT pk_collection_log_hourly PRIMARY KEY (server_id, collector_name, hour_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collection_log_hourly_hour ON collect.collection_log_hourly (hour_start);";
+
+    /// <summary>
+    /// V188 (#5821): <c>config.investigation_request_alerts</c> gains the five values the brief's alerts section reads from
+    /// the alert's history row: <c>current_value</c>, <c>threshold_value</c>, <c>muted</c>, <c>detail_text</c> and
+    /// <c>context_json</c>. An alert with an agent route now opens or joins its request before its page is sent, so the
+    /// generic webhook can name the request, and its history row is written after the send: an agent that claims while the
+    /// page is in flight would compose a brief with no history row to read. The link rows carry the values instead.
+    ///
+    /// <para>Every column is nullable with no default, so each <c>ADD COLUMN</c> is catalog-only and rewrites nothing; a link
+    /// row written before this rung keeps NULLs and its brief reads the history row as before. IF NOT EXISTS, so a second run
+    /// does nothing. No GRANT: the table's grants are table-level. <b>No Lite twin:</b> Lite has no investigation store.</para>
+    /// </summary>
+    private const string V188Sql = @"
+ALTER TABLE config.investigation_request_alerts
+    ADD COLUMN IF NOT EXISTS current_value double precision,
+    ADD COLUMN IF NOT EXISTS threshold_value double precision,
+    ADD COLUMN IF NOT EXISTS muted boolean,
+    ADD COLUMN IF NOT EXISTS detail_text text,
+    ADD COLUMN IF NOT EXISTS context_json text;";
+
+    /// <summary>
+    /// V190 (#5857): <c>collect.store_metrics.size_estimated</c>. The hourly store self-metrics sweep sizes hypertables
+    /// and continuous aggregates from the compression catalog (a compressed chunk contributes the bytes TimescaleDB
+    /// recorded when it compressed the chunk, not a file-system read), because the exact sizes make a file call per chunk and
+    /// their cost grew with the chunk count. One sweep a day (the first without an exact row in the last 23 hours) writes
+    /// the exact sizes. <c>true</c> marks a row sized by the estimate, <c>false</c> an exact one. NULL on every row
+    /// written before this rung, which were exact; no backfill, so nothing is rewritten.
+    ///
+    /// <para>One nullable column with no default, so the <c>ADD COLUMN</c> is catalog-only; IF NOT EXISTS, so a second run
+    /// does nothing. No GRANT: the table's grants are table-level. <b>No Lite twin:</b> Lite sizes its own DuckDB file,
+    /// not hypertables.</para>
+    /// </summary>
+    private const string V190Sql = @"
+ALTER TABLE collect.store_metrics
+    ADD COLUMN IF NOT EXISTS size_estimated boolean;";
+
+    /// <summary>
+    /// V191 (#5909, Phase B of #5632): the store for Level 2. An agent may change alert settings, so the store needs a place
+    /// to hold what an agent may do and what it has changed. This is the only migration in Phase B; every later slice uses
+    /// these tables and columns.
+    ///
+    /// <para><b>Levels.</b> The route's <c>agent_level</c> allowed NULL, 0 and 1; it now allows 0 to 2. A request's
+    /// <c>autonomy_level</c> allowed 1; it now allows 1 to 2. A level outside the range is still refused. The two CHECKs
+    /// are replaced in place, under their own names, only when the stored definition does not already name level 2, so a
+    /// second run replaces nothing. Widening a CHECK cannot be violated by a stored row.</para>
+    ///
+    /// <para><b>The switch.</b> <c>config.config_service.agent_actions_enabled</c>, default <c>true</c>, so it reads as on on
+    /// a new store and on an upgraded one. It is not a second opt-in: a route set to Level 2 is the opt-in, and this switch
+    /// is the operator's way to turn every agent change off at once. A constant default, so the <c>ADD COLUMN</c> is
+    /// catalog-only.</para>
+    ///
+    /// <para><b>Threshold overrides.</b> <c>config.config_threshold_overrides</c>: one value per server, database and
+    /// threshold key. It is deleted with its server (foreign key, <c>ON DELETE CASCADE</c>). The unique index covers a
+    /// NULL database name through <c>coalesce(database_name, '')</c>. It joins the <c>config_version</c> reload beacon with
+    /// V117's trigger shape (statement level, <c>config.config_bump_version()</c> verbatim), so a change reaches the engine
+    /// the way every other config change does. <c>request_id</c> names the request that asked for the change and has no
+    /// foreign key: the override outlives the request. Overrides are configuration and are never aged. <c>value</c> is <c>double
+    /// precision</c>, the type of the store's own thresholds (<c>config_alert_log.threshold_value</c> and five
+    /// <c>config_alert_settings</c> columns: <c>analysis_notify_severity</c>, the two retention-hold ratios and the two
+    /// deadlock per-hour rates), so a fractional threshold is representable; an integer threshold is exact in it, and
+    /// widening the column later would have been a table rewrite. Which keys Level 2 may touch is the engine registry's
+    /// (#5910), not this table's.</para>
+    ///
+    /// <para><b>Feedback.</b> <c>config.investigation_feedback</c>: a person's verdict on a report (right, partly or wrong),
+    /// the corrected verdict, the step the agent missed, a comment and the author; one row per request per author, compared
+    /// case-insensitively (<c>lower(author)</c>), with the author held to the family's identity shape
+    /// (<c>^[A-Za-z0-9._:-]{1,64}$</c>, as <c>claimed_by</c> and <c>agent_id</c>), the corrected verdict to the report
+    /// verdicts and the free text to 4000 characters, as the report's summary. It is
+    /// deleted with its request (<c>ON DELETE CASCADE</c>), so it ages with the request through retention's DELETE.</para>
+    ///
+    /// <para><b>Practice.</b> <c>config.investigation_requests.practice_of</c>, nullable with no default and <b>no foreign
+    /// key</b>: a practice request survives deletion of the request it replays.</para>
+    ///
+    /// <para>The journal needs no schema change. Grants are provisioning's (managed section 10e and provision-roles.sql step
+    /// 3j); the default privileges give admin the writes and viewer the read on a table made here. <b>No Lite twin:</b> Lite
+    /// has no investigation store.</para>
+    /// </summary>
+    private const string V191Sql = @"
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conname = 'ck_config_notification_routes_agent'
+                 AND conrelid = 'config.config_notification_routes'::regclass
+                 AND pg_get_constraintdef(oid) !~ 'ARRAY\[0, 1, 2\]') THEN
+        ALTER TABLE config.config_notification_routes DROP CONSTRAINT ck_config_notification_routes_agent;
+        ALTER TABLE config.config_notification_routes
+            ADD CONSTRAINT ck_config_notification_routes_agent CHECK (
+                (agent_level IS NULL OR agent_level IN (0, 1, 2))
+                AND agent_max_per_hour BETWEEN 1 AND 60
+                AND agent_max_per_day BETWEEN 1 AND 500
+                AND agent_lease_minutes BETWEEN 5 AND 120
+                AND agent_expiry_minutes BETWEEN 15 AND 1440);
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conname = 'ck_investigation_requests_autonomy'
+                 AND conrelid = 'config.investigation_requests'::regclass
+                 AND pg_get_constraintdef(oid) !~ 'ARRAY\[1, 2\]') THEN
+        ALTER TABLE config.investigation_requests DROP CONSTRAINT ck_investigation_requests_autonomy;
+        ALTER TABLE config.investigation_requests
+            ADD CONSTRAINT ck_investigation_requests_autonomy CHECK (autonomy_level IN (1, 2));
+    END IF;
+END $do$;
+
+ALTER TABLE config.config_service
+    ADD COLUMN IF NOT EXISTS agent_actions_enabled boolean NOT NULL DEFAULT true;
+
+ALTER TABLE config.investigation_requests
+    ADD COLUMN IF NOT EXISTS practice_of uuid;
+
+CREATE TABLE IF NOT EXISTS config.config_threshold_overrides
+(
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    server_id integer NOT NULL,
+    database_name text,
+    threshold_key text NOT NULL,
+    value double precision NOT NULL,
+    set_by text NOT NULL,
+    request_id uuid,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_config_threshold_overrides PRIMARY KEY (id),
+    CONSTRAINT fk_config_threshold_overrides_server FOREIGN KEY (server_id)
+        REFERENCES config.config_monitored_servers (server_id) ON DELETE CASCADE,
+    CONSTRAINT ck_config_threshold_overrides_key CHECK (btrim(threshold_key) <> ''),
+    CONSTRAINT ck_config_threshold_overrides_set_by CHECK (btrim(set_by) <> '')
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_config_threshold_overrides_scope
+    ON config.config_threshold_overrides (server_id, (coalesce(database_name, '')), threshold_key);
+
+DROP TRIGGER IF EXISTS trg_bump_threshold_overrides ON config.config_threshold_overrides;
+CREATE TRIGGER trg_bump_threshold_overrides
+    AFTER INSERT OR UPDATE OR DELETE ON config.config_threshold_overrides
+    FOR EACH STATEMENT EXECUTE FUNCTION config.config_bump_version();
+
+CREATE TABLE IF NOT EXISTS config.investigation_feedback
+(
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    request_id uuid NOT NULL,
+    verdict text NOT NULL,
+    corrected_verdict text,
+    missed_step text,
+    comment text,
+    author text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_investigation_feedback PRIMARY KEY (id),
+    CONSTRAINT fk_investigation_feedback_request FOREIGN KEY (request_id)
+        REFERENCES config.investigation_requests (request_id) ON DELETE CASCADE,
+    CONSTRAINT ck_investigation_feedback_verdict CHECK (verdict IN ('right', 'partly', 'wrong')),
+    CONSTRAINT ck_investigation_feedback_corrected CHECK (corrected_verdict IS NULL OR corrected_verdict IN ('real', 'false_positive', 'needs_person')),
+    CONSTRAINT ck_investigation_feedback_author CHECK (author ~ '^[A-Za-z0-9._:-]{1,64}$'),
+    CONSTRAINT ck_investigation_feedback_missed_step CHECK (missed_step IS NULL OR length(missed_step) <= 4000),
+    CONSTRAINT ck_investigation_feedback_comment CHECK (comment IS NULL OR length(comment) <= 4000)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_investigation_feedback_author
+    ON config.investigation_feedback (request_id, lower(author));";
+
+    /// <summary>
+    /// V192 (#5977, wave 1 of #5971): the store for query tags. The tag set (<c>config.query_tags</c>, the shape of
+    /// <c>config.server_tags</c> and its own table), hand assignments by <c>query_hash</c> or by object, rules, the per-pass
+    /// sightings of query keys and caller fields (<c>collect.query_tag_sightings</c>), the materialised tag map the reads join
+    /// (one tag per key, held by its primary key) and the one-row version state. This is the only migration of #5971.
+    ///
+    /// <para>Deleting a tag deletes its assignments, rules and map rows (cascade); deleting a rule leaves its map rows until the
+    /// next rebuild. A write to tags, assignments or rules bumps <c>config.query_tag_state.rules_version</c> through a
+    /// statement-level trigger. The trigger function is <c>SECURITY DEFINER</c> with a pinned search_path, unlike V117's
+    /// invoker-rights beacon: the mcp role writes the three tables and the viewer role deletes server-scoped rows when a server is
+    /// removed, and neither is granted anything on the state row, so the bump has to run as the owner.</para>
+    ///
+    /// <para>Grants are provisioning's (<c>DarlingManagedRoles</c>, mirrored in <c>Darling/tools/provision-roles.sql</c>). The
+    /// service writes sightings, the map and the state row as the store owner. Every statement is idempotent. All new tables are
+    /// created empty. <b>Lite twin:</b> the DuckDB tables come in #5989.</para>
+    /// </summary>
+    private static readonly string V192Sql = QueryTagSchema.CreateSql;
+
+    /// <summary>
+    /// V193 (#5997, Phase C of #5632): the store for investigation evidence, follow-ups and signed webhooks. This is the only
+    /// migration in Phase C; every later slice uses these tables and columns.
+    ///
+    /// <para><b>Journal.</b> <c>config.investigation_journal.event_id</c>, a <c>uuid</c> per event row, unique, sent as the
+    /// webhook's <c>webhook-id</c> (D6). Existing rows get one each when the column is added; the journal is a plain table.</para>
+    ///
+    /// <para><b>Requests.</b> <c>max_severity</c> (the highest severity any joined alert had, D6), <c>evidence_state</c> (D9),
+    /// and the follow-up trio <c>follow_up_of</c>, <c>follow_up_at</c>, <c>follow_up_condition</c> (D16). <c>follow_up_of</c> has
+    /// <b>no foreign key</b>, like <c>practice_of</c>: a follow-up outlives the request it follows. All nullable, no default,
+    /// so each <c>ADD COLUMN</c> is catalog-only.</para>
+    ///
+    /// <para><b>Evidence.</b> <c>config.investigation_evidence</c> (D10): one row per evidence section of a request, unique on
+    /// (request, section), <c>content</c> held to 32 KB like a report's evidence, plans by hash and never XML. A section not yet
+    /// collected is <c>pending</c>, one never collected is <c>not_collected</c> (D9). Deleted with its request
+    /// (<c>ON DELETE CASCADE</c>) and cleared with the brief at 90 days by retention.</para>
+    ///
+    /// <para><b>Deadlock signatures.</b> <c>config.investigation_signature_days</c> (D13): the daily rollup (server, signature,
+    /// day, count), purged at 30 days. <c>config.investigation_signature_merges</c> (D14): the journaled, undoable merge of one
+    /// signature into another, with its reason; undoing sets <c>undone_at</c> and the row stays as the record. At most one live
+    /// merge per (server, merged signature). Merges are decisions a person can read back and are never aged. Neither table has a
+    /// foreign key to the server, like the investigation tables.</para>
+    ///
+    /// <para><b>Reports.</b> <c>family_of</c> (D17), the first report's request id: a foreign key to the requests, <c>ON DELETE SET
+    /// NULL</c>, so a family id always names a request that existed. <c>queries_run</c> (D17): an array of at most 20 items,
+    /// no string over 2,000 characters.</para>
+    ///
+    /// <para><b>Signing.</b> D2 and D3: <c>signing_key</c> (sealed; #5998 seals it, this rung only stores text), the previous key
+    /// and when it stops being sent, on <b>both</b> the notification settings row and the routes, because D2 gives one key per
+    /// generic channel and per route with its own URL. The keys are secrets and are carved out of the read roles' column grants
+    /// in <c>DarlingManagedRoles.ViewerRestrictedConfigTables</c>. <c>fallback_route_id</c> (D8) on the route: a route to use when
+    /// the agent route cannot deliver. Never the route itself (a CHECK), and <b>no foreign key</b>, like the route's scope
+    /// columns (V181): the reader treats an id that names no route as no fallback.</para>
+    ///
+    /// <para><b>Procedure stats.</b> <c>collect.procedure_stats.module_modify_date</c>, nullable: the module's <c>modify_date</c>
+    /// that D16's deploy condition compares. The collector fills it later (#6009); rows from before keep NULL.</para>
+    ///
+    /// <para>Grants are provisioning's (managed section 10f and provision-roles.sql step 3l). <b>No Lite twin here:</b> Lite's
+    /// schema step is #6010.</para>
+    /// </summary>
+    private const string V193Sql = @"
+ALTER TABLE config.investigation_journal
+    ADD COLUMN IF NOT EXISTS event_id uuid NOT NULL DEFAULT gen_random_uuid();
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_investigation_journal_event_id
+    ON config.investigation_journal (event_id);
+
+ALTER TABLE config.investigation_requests
+    ADD COLUMN IF NOT EXISTS max_severity text,
+    ADD COLUMN IF NOT EXISTS evidence_state text,
+    ADD COLUMN IF NOT EXISTS follow_up_of uuid,
+    ADD COLUMN IF NOT EXISTS follow_up_at timestamptz,
+    ADD COLUMN IF NOT EXISTS follow_up_condition text;
+
+ALTER TABLE config.investigation_reports
+    ADD COLUMN IF NOT EXISTS family_of uuid,
+    ADD COLUMN IF NOT EXISTS queries_run jsonb;
+
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'fk_investigation_reports_family'
+                     AND conrelid = 'config.investigation_reports'::regclass) THEN
+        ALTER TABLE config.investigation_reports
+            ADD CONSTRAINT fk_investigation_reports_family FOREIGN KEY (family_of)
+                REFERENCES config.investigation_requests (request_id) ON DELETE SET NULL;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_investigation_reports_queries_run'
+                     AND conrelid = 'config.investigation_reports'::regclass) THEN
+        ALTER TABLE config.investigation_reports
+            ADD CONSTRAINT ck_investigation_reports_queries_run CHECK (
+                queries_run IS NULL OR (
+                    jsonb_typeof(queries_run) = 'array'
+                    AND jsonb_array_length(queries_run) <= 20
+                    AND NOT jsonb_path_exists(queries_run, 'strict $.** ? (@.type() == ""string"" && @ like_regex ""^(?:.{200}){10}."" flag ""s"")')));
+    END IF;
+END $do$;
+
+CREATE TABLE IF NOT EXISTS config.investigation_evidence
+(
+    evidence_id bigint GENERATED ALWAYS AS IDENTITY,
+    request_id uuid NOT NULL,
+    section text NOT NULL,
+    state text NOT NULL DEFAULT 'pending',
+    content jsonb,
+    captured_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_investigation_evidence PRIMARY KEY (evidence_id),
+    CONSTRAINT uq_investigation_evidence_section UNIQUE (request_id, section),
+    CONSTRAINT fk_investigation_evidence_request FOREIGN KEY (request_id)
+        REFERENCES config.investigation_requests (request_id) ON DELETE CASCADE,
+    CONSTRAINT ck_investigation_evidence_section CHECK (section ~ '^[a-z][a-z0-9_]{1,40}$'),
+    CONSTRAINT ck_investigation_evidence_state CHECK (state IN ('pending', 'ready', 'not_collected')),
+    CONSTRAINT ck_investigation_evidence_content CHECK (content IS NULL OR octet_length(content::text) <= 32768)
+);
+
+CREATE TABLE IF NOT EXISTS config.investigation_signature_days
+(
+    server_id integer NOT NULL,
+    signature text NOT NULL,
+    day date NOT NULL,
+    count integer NOT NULL DEFAULT 0,
+    CONSTRAINT pk_investigation_signature_days PRIMARY KEY (server_id, signature, day),
+    CONSTRAINT ck_investigation_signature_days_signature CHECK (btrim(signature) <> ''),
+    CONSTRAINT ck_investigation_signature_days_count CHECK (count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS ix_investigation_signature_days_day
+    ON config.investigation_signature_days (day);
+
+CREATE TABLE IF NOT EXISTS config.investigation_signature_merges
+(
+    merge_id bigint GENERATED ALWAYS AS IDENTITY,
+    server_id integer NOT NULL,
+    signature text NOT NULL,
+    merged_into text NOT NULL,
+    reason text NOT NULL,
+    merged_by text NOT NULL,
+    merged_at timestamptz NOT NULL DEFAULT now(),
+    undone_at timestamptz,
+    undone_by text,
+    CONSTRAINT pk_investigation_signature_merges PRIMARY KEY (merge_id),
+    CONSTRAINT ck_investigation_signature_merges_signature CHECK (btrim(signature) <> '' AND btrim(merged_into) <> '' AND signature <> merged_into),
+    CONSTRAINT ck_investigation_signature_merges_reason CHECK (btrim(reason) <> '' AND length(reason) <= 2000),
+    CONSTRAINT ck_investigation_signature_merges_merged_by CHECK (merged_by ~ '^[A-Za-z0-9._:-]{1,64}$'),
+    CONSTRAINT ck_investigation_signature_merges_undone CHECK ((undone_at IS NULL) = (undone_by IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_investigation_signature_merges_live
+    ON config.investigation_signature_merges (server_id, signature) WHERE undone_at IS NULL;
+
+ALTER TABLE config.config_notification
+    ADD COLUMN IF NOT EXISTS signing_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS previous_signing_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS previous_signing_key_until timestamptz;
+
+ALTER TABLE config.config_notification_routes
+    ADD COLUMN IF NOT EXISTS signing_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS previous_signing_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS previous_signing_key_until timestamptz,
+    ADD COLUMN IF NOT EXISTS fallback_route_id integer;
+
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_config_notification_routes_fallback'
+                     AND conrelid = 'config.config_notification_routes'::regclass) THEN
+        ALTER TABLE config.config_notification_routes
+            ADD CONSTRAINT ck_config_notification_routes_fallback CHECK (fallback_route_id IS NULL OR fallback_route_id <> route_id);
+    END IF;
+END $do$;
+
+ALTER TABLE collect.procedure_stats
+    ADD COLUMN IF NOT EXISTS module_modify_date timestamp;";
+
+    /// <summary>
+    /// V194 (#5985, part of #5971): <c>database_name</c> joins the identity of a query-tag sighting. V192 made
+    /// <c>collect.query_tag_sightings</c> unique on (server, kind, key, application, login, host), and the writer kept the
+    /// first non-NULL <c>database_name</c>, so one hash seen in two databases by the same caller collapsed into one row and a
+    /// database rule could only ever see the first database. The new unique index adds <c>COALESCE(database_name, '')</c> as
+    /// the fourth caller part, after application, login and host (the same NULL-is-empty fold the other three use), so each database a hash was seen in has its
+    /// own row and the map builder, which resolves a key against every sighting row it has, tests a database rule against
+    /// each. The new index is created first and the old one dropped after it, both guarded, so a re-run is a no-op. Existing
+    /// rows stay: they are unique on the old, coarser key, so they are unique on the finer one. Only an index changes: no
+    /// grant, no column, no data.
+    /// </summary>
+    private const string V194Sql = @"
+CREATE UNIQUE INDEX IF NOT EXISTS ux_query_tag_sightings_key_db
+    ON collect.query_tag_sightings (server_id, key_kind, key, COALESCE(application_name, ''), COALESCE(login_name, ''), COALESCE(host_name, ''), COALESCE(database_name, ''));
+DROP INDEX IF EXISTS collect.ux_query_tag_sightings_key;";
+
+    /// <summary>
+    /// V195 (#5632) - <c>collect.query_store_forced_plans</c>: the plans Query Store has forced, read from <c>sys.query_store_plan</c> by
+    /// <c>QueryStoreForcedPlansCollector</c> every five minutes, one row per forced plan plus ONE all-NULL marker row per captured database
+    /// per pass (so a force that left a captured database reads as REMOVED, not as not captured). A PLAIN table on every store
+    /// (<c>StaysPlainTable</c>: a few rows per database per pass, the grid stays at 72 hypertables), its 30-day retention the time-sliced
+    /// DELETE. Columns and the one index (server_id, collection_time) are exactly <c>PgSchemaGenerator</c>'s output, so a fresh store (V1's catalog walk) and an upgraded one
+    /// agree; the table is small enough that it also serves the per-database newest-capture read. New table, no data moves, no grant (the <c>collect</c> schema carries blanket SELECT). Every statement is idempotent.
+    /// </summary>
+    private const string V195Sql = @"
+CREATE TABLE IF NOT EXISTS collect.query_store_forced_plans (
+    collection_id bigint NOT NULL,
+    collection_time timestamp NOT NULL,
+    server_id integer NOT NULL,
+    server_name text NOT NULL,
+    database_name text,
+    plan_id bigint,
+    query_id bigint,
+    query_plan_hash text,
+    plan_forcing_type text,
+    force_failure_count bigint,
+    last_force_failure_reason text,
+    last_execution_time timestamp,
+    last_compile_start_time timestamp
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_store_forced_plans_time ON collect.query_store_forced_plans(server_id, collection_time);";
+
+    /// <summary>
+    /// V197 (#5632, step 8): the link a plan-force check carries. <c>config.investigation_requests.force_check_of</c> is the
+    /// <c>action_called</c> journal id of the force the check is about, <c>force_check_no</c> its number (1 to 26). Both are null or both
+    /// are set (a CHECK), and the pair is unique where set, so a force has at most one request per check number whatever replays the sweep.
+    /// Not <c>follow_up_of</c>: a request has one follow-up child, and a check must not take the one the agent's own <c>follow_up_at</c> needs.
+    /// <b>No foreign key</b> (the journal id is a plain number, like <c>follow_up_of</c>). Both columns are nullable with no default, so each
+    /// <c>ADD COLUMN</c> is catalog-only and the one unique index is built over a column that is null on every stored row.
+    /// </summary>
+    private const string V197Sql = @"
+ALTER TABLE config.investigation_requests
+    ADD COLUMN IF NOT EXISTS force_check_of bigint,
+    ADD COLUMN IF NOT EXISTS force_check_no smallint;
+
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_investigation_requests_force_check'
+                     AND conrelid = 'config.investigation_requests'::regclass) THEN
+        ALTER TABLE config.investigation_requests
+            ADD CONSTRAINT ck_investigation_requests_force_check CHECK (
+                (force_check_of IS NULL AND force_check_no IS NULL)
+                OR (force_check_of IS NOT NULL AND force_check_no BETWEEN 1 AND 26));
+    END IF;
+END $do$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_investigation_requests_force_check
+    ON config.investigation_requests (force_check_of, force_check_no)
+    WHERE force_check_of IS NOT NULL;";
+
+    /// <summary>
+    /// V198 (#6066): the store's pseudonym key. <c>config.pseudonym_key</c> is a one-row table (<c>id = 1</c>, a CHECK) holding 32 bytes
+    /// that turn a login or host name into the same <c>login#3fa9c2d1</c> text in every <c>metadataOnly</c> MCP answer, brief and webhook
+    /// from this store (<c>PerformanceMonitor.Common.PseudonymKey</c>). The row is seeded here, once, with <c>sha256</c> of two
+    /// <c>gen_random_uuid()</c> values (PostgreSQL's own strong random source, no extension), so every store has its key from the upgrade
+    /// on and no two services race to make one; <c>ON CONFLICT DO NOTHING</c> keeps a second run, and a restored or copied store, on the
+    /// key it has. A fresh install runs this rung too (the generated schema is V1 only), so a fresh and an upgraded store each end with
+    /// exactly one row. The key is never rotated.
+    ///
+    /// <para><b>Only the store owner reads it.</b> The table is revoked from <c>PUBLIC</c> here and from <c>admin</c>, <c>viewer</c> and <c>mcp</c>
+    /// (the roles that exist) in the same transaction, so no default grant outlives the migration; provisioning (<c>provision-roles.sql</c> step
+    /// 2d and 3g, managed section 10a) revokes it again and grants SELECT to nobody. It carries the password key tables' owner-only write
+    /// triggers (<c>config.password_key_owner_only()</c>, V165), <c>ENABLE ALWAYS</c>.</para>
+    /// </summary>
+    private const string V198Sql = @"
+CREATE TABLE IF NOT EXISTS config.pseudonym_key
+(
+    id smallint NOT NULL,
+    key bytea NOT NULL,
+    created_at timestamp NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+    CONSTRAINT pk_pseudonym_key PRIMARY KEY (id),
+    CONSTRAINT ck_pseudonym_key_single_row CHECK (id = 1),
+    CONSTRAINT ck_pseudonym_key_length CHECK (octet_length(key) = 32)
+);
+
+REVOKE ALL ON config.pseudonym_key FROM PUBLIC;
+
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS r WHERE r.rolname = 'admin') THEN
+        REVOKE ALL ON config.pseudonym_key FROM admin;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS r WHERE r.rolname = 'viewer') THEN
+        REVOKE ALL ON config.pseudonym_key FROM viewer;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS r WHERE r.rolname = 'mcp') THEN
+        REVOKE ALL ON config.pseudonym_key FROM mcp;
+    END IF;
+END
+$do$;
+
+DROP TRIGGER IF EXISTS trg_pseudonym_key_owner_only_row ON config.pseudonym_key;
+CREATE TRIGGER trg_pseudonym_key_owner_only_row
+    BEFORE INSERT OR UPDATE OR DELETE ON config.pseudonym_key
+    FOR EACH ROW EXECUTE FUNCTION config.password_key_owner_only();
+DROP TRIGGER IF EXISTS trg_pseudonym_key_owner_only_truncate ON config.pseudonym_key;
+CREATE TRIGGER trg_pseudonym_key_owner_only_truncate
+    BEFORE TRUNCATE ON config.pseudonym_key
+    FOR EACH STATEMENT EXECUTE FUNCTION config.password_key_owner_only();
+ALTER TABLE config.pseudonym_key ENABLE ALWAYS TRIGGER trg_pseudonym_key_owner_only_row;
+ALTER TABLE config.pseudonym_key ENABLE ALWAYS TRIGGER trg_pseudonym_key_owner_only_truncate;
+
+INSERT INTO config.pseudonym_key (id, key)
+VALUES (1, pg_catalog.sha256(pg_catalog.decode(
+    pg_catalog.replace(pg_catalog.gen_random_uuid()::text || pg_catalog.gen_random_uuid()::text, '-', ''), 'hex')))
+ON CONFLICT (id) DO NOTHING;";
+
+    /// <summary>
+    /// V199 (#5632, step 11): what a person needs to judge a head blocker. Four nullable columns on the blocker side of
+    /// <c>collect.dmv_blocking_snapshots</c>, from the blocker's own session: <c>blocking_login_time</c>
+    /// (<c>sys.dm_exec_sessions.login_time</c>), <c>blocking_last_request_end_time</c> (<c>last_request_end_time</c>),
+    /// <c>blocking_open_transaction_count</c> (<c>open_transaction_count</c>) and <c>blocking_tran_log_bytes_used</c> (the SUM of
+    /// <c>database_transaction_log_bytes_used</c> over every transaction of the session, exact bytes, not MB). The two times are the
+    /// monitored server's local clock, stored raw: a later kill step compares <c>login_time</c> with the server's own value, so the
+    /// stored value must be the server's value, unchanged. A reader converts them to UTC with the server's offset.
+    ///
+    /// <para><b>Nullable, no DEFAULT, no backfill</b> (the V155 and V193 shape): a row collected before this rung never asked the
+    /// engine, and nothing can reconstruct the values, so NULL is the honest value. A nullable, default-less <c>ADD COLUMN</c> is
+    /// catalog-only in PostgreSQL and TimescaleDB accepts it on a compressed hypertable.</para>
+    ///
+    /// <para><b>Appended LAST</b>, after <c>blocking_client_app</c>: the writer is a positional binary COPY, so a fresh store (the
+    /// generated V1 table carries the columns from the collector's payload, and these ALTERs no-op there) and an upgraded store share
+    /// one physical column order. The trailing <c>CREATE OR REPLACE VIEW</c> re-expands <c>v_dmv_blocking_snapshots</c>' pinned
+    /// <c>SELECT *</c>, which PostgreSQL freezes at CREATE (unqualified, like V155's, so it resolves through the migrate session's
+    /// <c>search_path</c>).</para>
+    /// </summary>
+    private const string V199Sql = @"
+ALTER TABLE collect.dmv_blocking_snapshots ADD COLUMN IF NOT EXISTS blocking_login_time timestamp;
+ALTER TABLE collect.dmv_blocking_snapshots ADD COLUMN IF NOT EXISTS blocking_last_request_end_time timestamp;
+ALTER TABLE collect.dmv_blocking_snapshots ADD COLUMN IF NOT EXISTS blocking_open_transaction_count integer;
+ALTER TABLE collect.dmv_blocking_snapshots ADD COLUMN IF NOT EXISTS blocking_tran_log_bytes_used bigint;
+CREATE OR REPLACE VIEW v_dmv_blocking_snapshots AS SELECT * FROM dmv_blocking_snapshots;";
+
+    /// <summary>
+    /// V200 (#6098): the Volume Free Space alert's fleet-wide EXCLUDED-VOLUMES list on the singleton
+    /// <c>config_alert_settings</c> row: a <c>text[]</c> of mount points the alert ignores, <c>excluded_databases</c>'s
+    /// shape (V17), <c>text[] NOT NULL DEFAULT '{}'</c>. The default is EMPTY, so a pre-rung row reads as "no volume
+    /// excluded" and the alert behaves exactly as it did.
+    ///
+    /// <para><b>The match rule</b> (whole mount point, case-insensitive, a trailing <c>\</c> or <c>/</c> on either side
+    /// ignored, never a prefix) is spelled once in <c>PerformanceMonitor.Alerting.VolumeExclusions</c> and applied by the
+    /// shared engine to the volumes it reads, BEFORE the breach test. The store holds the normalised list (trimmed,
+    /// blanks dropped, de-duplicated by the comparison form).</para>
+    ///
+    /// <para><b>Readers and writers.</b> <c>StoreConfigProvider</c> seeds it from <c>alerts.excludedVolumes</c> in
+    /// darling.json on first run and reads it back; the Viewer's <c>ViewerDataService.AlertSettings</c> binds it from the
+    /// Settings window; <c>DarlingAlertReader.AlertSettingsSelectSql</c> reads it for <c>get_alert_settings</c>;
+    /// <c>update_alert_settings</c> writes <c>excluded_volumes</c>; the web admin page edits it. No reload beacon of its
+    /// own: V17's statement-level <c>trg_bump_alert_settings</c> already bumps <c>config_service.config_version</c> on any
+    /// write here. No ACL or provisioning change: <c>config_alert_settings</c> carries table-level grants (no column
+    /// carve), the same fact every knob rung on this row has relied on. An older build ignores the column.</para>
+    /// </summary>
+    private const string V200Sql = @"
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS excluded_volumes text[] NOT NULL DEFAULT '{}'::text[];";
+
+    /// <summary>
+    /// V201 (#6160): what the forced-plan collector learned about a force beyond Query Store's own columns, on
+    /// <c>collect.query_store_forced_plans</c> (V195). <c>variant_plan_ids</c> is <c>text</c>: the plan ids of the same query, newer
+    /// than the forced plan, whose stored plan XML carries <c>UsePlan="1"</c> and no <c>PlanGuideName</c> (SQL Server recompiled the
+    /// force under a new plan id), as a comma-separated list in ascending order with no spaces (<c>12,15</c>). The collector writer has no
+    /// array type, so the list is text; NULL when there is none. <c>plan_guide_name</c>, <c>plan_guide_enabled</c> (<c>boolean</c>) and
+    /// <c>plan_guide_scope</c> (OBJECT, SQL or TEMPLATE) describe a plan guide that covers the forced query, all NULL when none was found.
+    ///
+    /// <para><b>Appended LAST</b>, after <c>last_compile_start_time</c>: the writer is a positional binary COPY, so a fresh store (the
+    /// generated V1 table carries the columns from the collector's payload, and these ALTERs no-op there) and an upgraded store share one
+    /// physical column order. All four are nullable with no default, so each <c>ADD COLUMN</c> is catalog-only, and a row stored before
+    /// the rung reads NULL (no variant, no guide). The table stays a plain table (<c>StaysPlainTable</c>); no grant (the <c>collect</c>
+    /// schema carries blanket SELECT). An older build ignores the columns. Every statement is idempotent.</para>
+    /// </summary>
+    private const string V201Sql = @"
+ALTER TABLE collect.query_store_forced_plans ADD COLUMN IF NOT EXISTS variant_plan_ids text;
+ALTER TABLE collect.query_store_forced_plans ADD COLUMN IF NOT EXISTS plan_guide_name text;
+ALTER TABLE collect.query_store_forced_plans ADD COLUMN IF NOT EXISTS plan_guide_enabled boolean;
+ALTER TABLE collect.query_store_forced_plans ADD COLUMN IF NOT EXISTS plan_guide_scope text;";
+
+    /// <summary>
+    /// V202 (#6159): <c>collect.ag_replica_states.primary_replica</c>, the name of the replica that was the primary when the row was
+    /// collected, read from <c>sys.dm_hadr_availability_group_states.primary_replica</c>. A secondary can read that DMV, so the Availability
+    /// Groups card built from a secondary's own view can say "Primary: NODE1" instead of leaving the reader to guess why the replica
+    /// list it was given has no PRIMARY row.
+    ///
+    /// <para><b>Nullable, no DEFAULT, no backfill</b> (the V151 <c>group_id</c> shape): a row collected before this rung never asked
+    /// the engine, so NULL is the honest value, and a reader treats NULL as "primary not known". <b>Appended LAST</b>, after
+    /// <c>group_id</c>: the writer is a positional binary COPY, so a fresh store (the generated V1 table carries the column from the
+    /// collector's payload, and this ALTER no-ops there) and an upgraded store share one physical column order. The table has no
+    /// passthrough view, so the rung is one ALTER. An older build ignores the column.</para>
+    /// </summary>
+    private const string V202Sql = @"
+ALTER TABLE collect.ag_replica_states ADD COLUMN IF NOT EXISTS primary_replica text;";
+
+    /// <summary>
+    /// V205 (#6235): an optional expiry on a custom alert rule, the same column name and meaning as
+    /// <c>config_mute_rules.expires_at_utc</c>. <c>expires_at_utc</c> is a nullable naive-UTC <c>timestamp</c>; NULL means the rule
+    /// never expires, which is every existing row. "Expired" is computed (<c>expires_at_utc &lt;= now</c>), never stored, so no job
+    /// has to flip anything. An expired rule is not evaluated and does not fire; its row stays, and moving or clearing the expiry
+    /// turns it back on. A nullable column with no default is catalog-only. An older build ignores the column and keeps evaluating
+    /// the rule. Idempotent.
+    /// </summary>
+    private const string V205Sql = @"
+ALTER TABLE config.custom_alert_rules ADD COLUMN IF NOT EXISTS expires_at_utc timestamp;";
+
+    /// <summary>
+    /// V203 (#6170): the per-server login the PostgreSQL hypothetical-index check runs under, a pair in the same shape as the
+    /// remediation pair V113 added. <c>hypothetical_index_username</c> is a login name. <c>hypothetical_index_encrypted_password</c>
+    /// holds an <c>env:</c> or <c>file:</c> reference to its password, never the password. Both are nullable with no default and no
+    /// fallback: a server with neither has the check refused, and the check never runs under the monitoring login. A new column
+    /// pair needs no backfill, so each <c>ADD COLUMN</c> is catalog-only. An older build ignores the columns. Idempotent.
+    /// </summary>
+    private const string V203Sql = @"
+ALTER TABLE config.config_monitored_servers ADD COLUMN IF NOT EXISTS hypothetical_index_username text;
+ALTER TABLE config.config_monitored_servers ADD COLUMN IF NOT EXISTS hypothetical_index_encrypted_password text;";
+
+    /// <summary>
+    /// V206 (#6227): <c>config.config_collector_schedules.enabled</c> may be NULL, which reads "inherit": the fleet-wide row's value
+    /// for a server's row, then the collector's shipped default. A row the schedule tools create to set only a frequency or a
+    /// retention then stores no enabled state of its own, so a later fleet-wide disable still reaches that server; before, such a row
+    /// stored <c>enabled</c> explicitly and the fleet-wide value never reached it. Dropping NOT NULL is catalog-only, the DEFAULT TRUE
+    /// stays (a row inserted without the column is explicit, as every row was), and existing rows keep their values. The service
+    /// and the viewer read NULL as "inherit" (<c>ScheduleOverride.Enabled</c> was already nullable and layers with <c>??</c>). An older
+    /// build reads the column as a plain boolean and fails on a NULL, so before rolling back past this rung set every NULL to the value
+    /// it inherits, or delete those rows (the rollback list in the README has the statement).
+    ///
+    /// <para><b>The table takes only what the schedule tools write.</b> The tools store a collector name in the catalog's own spelling
+    /// (lower-case letters, digits and underscores) and values inside <c>CollectorScheduleDefaults.MaxFrequencyMinutes</c> and
+    /// <c>MaxRetentionDays</c>; the unique indexes compare the name exactly, so a differently-cased name was a second row that the
+    /// readers resolved in no fixed order. First the rung tidies what is already stored: where one scope holds the same name in more than
+    /// one case, the lower-case row stays (else the first by name) and the others go; a remaining mixed-case name becomes lower-case; a
+    /// name that is still not a lower-case identifier of at most 64 characters names no collector and goes; a value over the cap is
+    /// set to the cap (a retention is already read as the cap; a frequency over a year was a collector that effectively never runs). Then three CHECK constraints, added <c>NOT VALID</c> so they bind every
+    /// later INSERT and UPDATE whatever the role, and the rung holds no row they would refuse. The viewer's save deletes a scope's rows
+    /// and inserts them again, so a stored row the checks refuse would fail that save: that is why the tidy comes first.</para>
+    ///
+    /// <para><b>No foreign key to the registry.</b> The viewer lists servers from the observed <c>servers</c> table, which keeps a server
+    /// after its definition in <c>config_monitored_servers</c> is removed and is the only list on a store that was never seeded, and the
+    /// schedule tools resolve against the same table, so a schedule row for an id with no definition is a normal write and a foreign key
+    /// would refuse it. Instead a row-level BEFORE INSERT trigger on <c>config_monitored_servers</c> clears the schedule rows held under
+    /// a server id the service has never seen: no definition in <c>config_monitored_servers</c> and no row in the observed
+    /// <c>collect.servers</c>, so a row written ahead of an unknown server being registered never decides how that server is collected.
+    /// It does nothing when the id already has a definition (an upsert, the seed) or an observed row, so a server that was removed and
+    /// is added again keeps the schedule rows the operator set for it (a collector switched off stays off). The trigger
+    /// function is <c>SECURITY DEFINER</c> with a pinned search_path, because the roles that register a server cannot delete schedule
+    /// rows; it deletes by the new row's server id and nothing else.</para>
+    ///
+    /// <para>Idempotent: every step is guarded or is a no-op the second time.</para>
+    /// </summary>
+    private const string V206Sql = @"
+ALTER TABLE config.config_collector_schedules ALTER COLUMN enabled DROP NOT NULL;
+
+DELETE FROM config.config_collector_schedules
+WHERE ctid IN
+(
+    SELECT d.row_id
+    FROM
+    (
+        SELECT
+            s.ctid AS row_id,
+            row_number() OVER (
+                PARTITION BY s.server_id, lower(s.collector_name)
+                ORDER BY (s.collector_name = lower(s.collector_name)) DESC, s.collector_name) AS keep_rank
+        FROM config.config_collector_schedules AS s
+    ) AS d
+    WHERE d.keep_rank > 1
+);
+UPDATE config.config_collector_schedules SET collector_name = lower(collector_name) WHERE collector_name <> lower(collector_name);
+DELETE FROM config.config_collector_schedules WHERE collector_name !~ '^[a-z0-9_]{1,64}$';
+UPDATE config.config_collector_schedules SET frequency_minutes = 525600 WHERE frequency_minutes > 525600;
+UPDATE config.config_collector_schedules SET retention_days = 3650 WHERE retention_days > 3650;
+
+DO $limits$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'config.config_collector_schedules'::regclass AND conname = 'ck_config_collector_schedules_name') THEN
+        ALTER TABLE config.config_collector_schedules
+            ADD CONSTRAINT ck_config_collector_schedules_name CHECK (collector_name ~ '^[a-z0-9_]{1,64}$') NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'config.config_collector_schedules'::regclass AND conname = 'ck_config_collector_schedules_frequency_cap') THEN
+        ALTER TABLE config.config_collector_schedules
+            ADD CONSTRAINT ck_config_collector_schedules_frequency_cap CHECK (frequency_minutes <= 525600) NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'config.config_collector_schedules'::regclass AND conname = 'ck_config_collector_schedules_retention_cap') THEN
+        ALTER TABLE config.config_collector_schedules
+            ADD CONSTRAINT ck_config_collector_schedules_retention_cap CHECK (retention_days <= 3650) NOT VALID;
+    END IF;
+END
+$limits$;
+
+CREATE OR REPLACE FUNCTION config.config_clear_unregistered_schedules() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $clear$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM config.config_monitored_servers AS m WHERE m.server_id = NEW.server_id)
+       AND NOT EXISTS (SELECT 1 FROM collect.servers AS o WHERE o.server_id = NEW.server_id) THEN
+        DELETE FROM config.config_collector_schedules WHERE server_id = NEW.server_id;
+    END IF;
+    RETURN NEW;
+END;
+$clear$;
+REVOKE ALL ON FUNCTION config.config_clear_unregistered_schedules() FROM PUBLIC;
+DROP TRIGGER IF EXISTS trg_clear_unregistered_schedules ON config.config_monitored_servers;
+CREATE TRIGGER trg_clear_unregistered_schedules
+    BEFORE INSERT ON config.config_monitored_servers
+    FOR EACH ROW EXECUTE FUNCTION config.config_clear_unregistered_schedules();";
+
+    /// <summary>
+    /// V204 (#6214): shared folders, personal views and an owner on the saved custom views and notebooks (both are
+    /// <c>config.custom_views</c> rows). Four columns: <c>folder</c> (NULL is the top level; the writers store it trimmed, empty as NULL,
+    /// at most 100 characters, no control characters, and a check holds the same rule), <c>personal</c> (default false, so every existing
+    /// view stays shared) and <c>created_by</c> (NULL for every existing view, which reads as "unknown"; <c>updated_by</c> is NOT copied
+    /// into it, because that is who last saved a view, not who made it) and <c>owner_key</c> (NULL for every existing view and for every view
+    /// the shared token or MCP made). <c>created_by</c> is a name for display only: it is what a person's sign-in called them, it can change,
+    /// and an identity provider can hand the same name to somebody else, so it never decides who may touch a personal view. <c>owner_key</c>
+    /// does: the web host stamps base64url(SHA-256(issuer + newline + sub)) of the validated ID token, which is stable and is not reused. A
+    /// check refuses a personal view with no owner key.
+    ///
+    /// <para><b>Uniqueness moves from the store to the scope.</b> V31's <c>UNIQUE (name)</c> is dropped under whatever name it carries
+    /// (looked up by its column, not assumed). Two partial unique indexes replace it: shared views are unique on
+    /// <c>(COALESCE(folder, ''), name)</c>, personal views on <c>(owner_key, name)</c>. Names still compare exactly (case-sensitive), as
+    /// before. A view's folder does not take part in a personal view's uniqueness.</para>
+    ///
+    /// <para>Every step is guarded, so a second run changes nothing. An older build keeps working against the new shape: it writes top-level
+    /// shared views, which the new indexes treat as before, and ignores the columns. It does not hide a person's personal views from the
+    /// list. Grants need no change: the viewer and mcp roles hold table-level INSERT, UPDATE and DELETE on the table, which cover new columns.</para>
+    /// </summary>
+    private const string V204Sql = @"
+ALTER TABLE config.custom_views ADD COLUMN IF NOT EXISTS folder text;
+ALTER TABLE config.custom_views ADD COLUMN IF NOT EXISTS personal boolean NOT NULL DEFAULT false;
+ALTER TABLE config.custom_views ADD COLUMN IF NOT EXISTS created_by text;
+ALTER TABLE config.custom_views ADD COLUMN IF NOT EXISTS owner_key text;
+
+DO $$
+DECLARE
+    unique_name text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conrelid = 'config.custom_views'::regclass AND conname = 'ck_custom_views_folder')
+    THEN
+        ALTER TABLE config.custom_views ADD CONSTRAINT ck_custom_views_folder CHECK (
+            folder IS NULL
+            OR (folder = btrim(folder) AND folder <> '' AND char_length(folder) <= 100 AND folder !~ '[--]'));
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conrelid = 'config.custom_views'::regclass AND conname = 'ck_custom_views_personal_owner')
+    THEN
+        ALTER TABLE config.custom_views ADD CONSTRAINT ck_custom_views_personal_owner CHECK (NOT personal OR owner_key IS NOT NULL);
+    END IF;
+
+    /* V31's UNIQUE (name), found by the one column it covers so a renamed constraint is dropped too. */
+    FOR unique_name IN
+        SELECT con.conname
+        FROM pg_constraint con
+        WHERE con.conrelid = 'config.custom_views'::regclass
+          AND con.contype = 'u'
+          AND con.conkey = ARRAY[(SELECT a.attnum FROM pg_attribute a
+                                  WHERE a.attrelid = 'config.custom_views'::regclass AND a.attname = 'name')]
+    LOOP
+        EXECUTE format('ALTER TABLE config.custom_views DROP CONSTRAINT %I', unique_name);
+    END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_custom_views_shared_name ON config.custom_views ((COALESCE(folder, '')), name) WHERE NOT personal;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_custom_views_personal_name ON config.custom_views (owner_key, name) WHERE personal;";
+
+    /// <summary>
+    /// V208 (#6231): <c>config.config_mute_rules.starts_at_utc</c>, the moment a mute rule begins to apply. A quiet window for planned
+    /// work is a mute rule with only a server scope (or none, for the fleet) and an end time; what it lacked was a START, so work
+    /// planned for tonight could not be set up this afternoon.
+    ///
+    /// <para><b>NULL means the rule applies from the moment it exists</b>, exactly as every stored rule did, so there is no backfill.
+    /// Nullable, no DEFAULT, one catalog-only <c>ADD COLUMN</c>. Needs no GRANT (the roles' table-level grants cover a new column)
+    /// and no trigger (the V117 reload beacon fires on any change to the table). An older build ignores the column and would apply a
+    /// rule that has not started yet, so a window set ahead of its start mutes early on a rolled-back build.</para>
+    /// </summary>
+    private const string V208Sql = @"
+ALTER TABLE config.config_mute_rules ADD COLUMN IF NOT EXISTS starts_at_utc timestamp;";
+
+    /// <summary>
+    /// V209 (#6211): <c>config.config_service.query_store_fetch_top_n</c>, how many plans per database-hour and metric the Query Store collector
+    /// fetches the text and plan XML of. Default 100 (the measured knee: about 86% of new plans' CPU for about a third of the fetches). 0 or less
+    /// means every new plan, the behaviour before this rung. Read live each cycle, so a change needs no restart. One catalog-only <c>ADD COLUMN</c>
+    /// with a constant default; no backfill, no GRANT (the roles' table-level SELECT covers a new column; the Viewer's settings save writes it as the admin role, whose
+    /// table-level UPDATE on the config schema covers it, while the viewer role holds only <c>UPDATE (config_version, updated_at)</c> on this table) and no trigger (the config_version trigger fires on any row update).
+    /// </summary>
+    private const string V209Sql = @"
+ALTER TABLE config.config_service ADD COLUMN IF NOT EXISTS query_store_fetch_top_n integer NOT NULL DEFAULT 100;";
+
+    /// <summary>
+    /// V213 (#6254): two nullable text columns. <c>config.config_monitored_servers.query_store_replica</c> is the host (or listener
+    /// name) Query Store is read from instead of the server itself; NULL, the default for every existing row, keeps today's behaviour.
+    /// <c>collect.collection_log.read_source</c> says which host a collection read came from; NULL on every existing row. Neither has a
+    /// default and neither needs a backfill, so each <c>ADD COLUMN</c> is catalog-only. An older build ignores both columns and reads
+    /// every row as it did before, so there is no rollback line. Idempotent.
+    /// </summary>
+    private const string V213Sql = @"
+ALTER TABLE config.config_monitored_servers ADD COLUMN IF NOT EXISTS query_store_replica text;
+ALTER TABLE collect.collection_log ADD COLUMN IF NOT EXISTS read_source text;
+
+/* The log lives in the collect schema, and its passthrough view freezes its column list at CREATE (the V80 lesson), so every read
+   of the log (the MCP tools, the web page, the Viewer) would never see read_source without this. Appending is the one alteration
+   CREATE OR REPLACE VIEW permits, which is exactly what an ADD COLUMN produces. */
+CREATE OR REPLACE VIEW collect.v_collection_log AS SELECT * FROM collect.collection_log;";
+
+    /// <summary>
+    /// V210 (#6281, part of #5632): the MCP tag writes may not change which servers an agent route covers. A tag-scoped route covers
+    /// every registered server mapped to its tag or to any descendant of it (<c>NotificationRouteScopeExpander</c>), and
+    /// <c>update_notification_route</c> refuses over MCP to change an agent route's scope, so the tag tools, which write
+    /// <c>config.server_tags</c> and <c>config.server_tag_map</c>, could not be left to change the same set.
+    ///
+    /// <para><b>Which sessions.</b> A session whose login is <c>mcp</c>, or whose session setting <c>darling.surface</c> is
+    /// <c>mcp</c>: the MCP host sets that setting inside each write's own transaction (transaction-local, so it ends with the commit or the rollback and a pooled connection never keeps it), so an MCP that connects as the store's owner (no
+    /// <c>postgres.mcpConnectionString</c>), or as another login, is held to the rule too. The Viewer, the web dashboard and the
+    /// service carry neither and are not held to it. The login test is on <c>session_user</c>, which a non-superuser cannot change,
+    /// because the function is SECURITY DEFINER (it reads the route table, which <c>mcp</c> may not).</para>
+    ///
+    /// <para><b>The rule.</b> A row trigger on each table refuses with SQLSTATE <c>DL403</c>, naming the route, when any tag the
+    /// write could reach is the scope tag of a route whose <c>agent_level</c> is set (0, Off, included: an Off route is how a person
+    /// keeps servers away from a broader agent route, the same test the route rule uses). It does not work out which route wins. For
+    /// an assignment or removal of a server, the tag and every tag above it. For a delete of a tag, or a move of it to another
+    /// parent, the tag, every tag under it, and every tag above its old parent and above its new parent. A server that is not
+    /// registered, or has been removed, counts like any other: its tag rows come back with it when it is added again (the id is a
+    /// hash), so <c>remove_server</c> over MCP is refused for a server mapped under an agent route's tag. A rename, a colour or a
+    /// sort-order change does not touch coverage and is not looked at. No new column, no backfill, no grant.</para>
+    /// </summary>
+    private const string V210Sql = @"
+CREATE OR REPLACE FUNCTION config.agent_route_tag_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $guard$
+DECLARE
+    v_route integer;
+    v_up integer[];
+    v_down integer[];
+BEGIN
+    IF session_user::text IS DISTINCT FROM 'mcp'
+       AND COALESCE(pg_catalog.current_setting('darling.surface', true), '') <> 'mcp' THEN
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END IF;
+
+    v_up := ARRAY[]::integer[];
+    v_down := ARRAY[]::integer[];
+    IF TG_TABLE_NAME = 'server_tag_map' THEN
+        IF TG_OP IN ('INSERT', 'UPDATE') THEN
+            v_up := v_up || NEW.tag_id;
+        END IF;
+        IF TG_OP IN ('DELETE', 'UPDATE') THEN
+            v_up := v_up || OLD.tag_id;
+        END IF;
+    ELSIF TG_OP = 'DELETE' THEN
+        v_down := ARRAY[OLD.id];
+        IF OLD.parent_id IS NOT NULL THEN
+            v_up := ARRAY[OLD.parent_id];
+        END IF;
+    ELSIF NEW.parent_id IS DISTINCT FROM OLD.parent_id THEN
+        v_down := ARRAY[OLD.id];
+        IF OLD.parent_id IS NOT NULL THEN
+            v_up := v_up || OLD.parent_id;
+        END IF;
+        IF NEW.parent_id IS NOT NULL THEN
+            v_up := v_up || NEW.parent_id;
+        END IF;
+    END IF;
+
+    IF cardinality(v_up) + cardinality(v_down) > 0 THEN
+        WITH RECURSIVE above(id, parent_id) AS (
+            SELECT t.id, t.parent_id FROM config.server_tags AS t WHERE t.id = ANY(v_up)
+            UNION
+            SELECT p.id, p.parent_id FROM config.server_tags AS p JOIN above AS a ON p.id = a.parent_id),
+        below(id) AS (
+            SELECT t.id FROM config.server_tags AS t WHERE t.id = ANY(v_down)
+            UNION
+            SELECT c.id FROM config.server_tags AS c JOIN below AS b ON c.parent_id = b.id)
+        SELECT r.route_id INTO v_route
+        FROM config.config_notification_routes AS r
+        WHERE r.agent_level IS NOT NULL
+          AND (r.scope_tag_id IN (SELECT a.id FROM above AS a) OR r.scope_tag_id IN (SELECT b.id FROM below AS b))
+        ORDER BY r.route_id
+        LIMIT 1;
+        IF v_route IS NOT NULL THEN
+            RAISE EXCEPTION 'Route % has an agent setting (Off included) and its tag is this tag, or is above or below it, so changes to which servers it covers are made in the Viewer or on the web dashboard, not over MCP.', v_route
+                USING ERRCODE = 'DL403';
+        END IF;
+    END IF;
+
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$guard$;
+REVOKE ALL ON FUNCTION config.agent_route_tag_guard() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS trg_agent_route_tag_guard ON config.server_tag_map;
+CREATE TRIGGER trg_agent_route_tag_guard
+    BEFORE INSERT OR UPDATE OR DELETE ON config.server_tag_map
+    FOR EACH ROW EXECUTE FUNCTION config.agent_route_tag_guard();
+ALTER TABLE config.server_tag_map ENABLE ALWAYS TRIGGER trg_agent_route_tag_guard;
+
+DROP TRIGGER IF EXISTS trg_agent_route_tag_guard ON config.server_tags;
+CREATE TRIGGER trg_agent_route_tag_guard
+    BEFORE UPDATE OR DELETE ON config.server_tags
+    FOR EACH ROW EXECUTE FUNCTION config.agent_route_tag_guard();
+ALTER TABLE config.server_tags ENABLE ALWAYS TRIGGER trg_agent_route_tag_guard;";
+
+    /// <summary>
+    /// V211 (#5736): the two multiples of the relative Client Timeouts bars, on the singleton <c>config_alert_settings</c> row beside the two
+    /// bars they scale. Warning is max(<c>client_timeouts_warning_per_minute</c>, <c>client_timeouts_warning_multiple</c> x the server's baseline) and
+    /// Critical is the same with the Critical pair, the baseline being the server's own p99.9 of its 3-minute average attention rate over the last 7 days.
+    /// The two existing columns keep their names and become the FLOORS (their defaults, 10 and 60, are unchanged). Two <c>integer NOT NULL</c> columns with
+    /// constant defaults (3 and 10), catalog-only, no backfill, no GRANT (the roles hold table-level privileges on the config schema) and no trigger (the
+    /// statement-level <c>trg_bump_alert_settings</c> already bumps <c>config_version</c> on any write here). The baseline itself needs no storage: the
+    /// service computes it from <c>collection_log</c> and <c>attention_events</c> and keeps it in memory for a day.
+    /// </summary>
+    private const string V211Sql = @"
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS client_timeouts_warning_multiple integer NOT NULL DEFAULT 3,
+    ADD COLUMN IF NOT EXISTS client_timeouts_critical_multiple integer NOT NULL DEFAULT 10;";
+    /// V212 (#6285, #6339): <c>collect.servers.machine_identity</c>, the name the monitored machine gives itself, written on every
+    /// connect. For a SQL Server it is <c>SERVERPROPERTY('ServerName')</c> folded to lower case (NULL on an Azure SQL Database, which
+    /// names no machine of its own); for PostgreSQL it is the cluster's <c>system_identifier</c>, a colon and the server port (NULL
+    /// when the monitoring role may not call <c>pg_control_system()</c>). <c>add_servers</c> and <c>edit_server</c> over MCP compare
+    /// what a new connection reports with this column, so a machine reached under a second name is recognised. It lives on the
+    /// registry, which no retention purge touches and which keeps a removed registration's row, so the identity of a removed
+    /// registration stays. No backfill: a registration fills its own on its next connect, and until then it is matched by its
+    /// text alone. No view refresh: <c>collect.servers</c> is a registry, not a hypertable.
+    /// </summary>
+    private const string V212Sql = @"
+ALTER TABLE collect.servers
+    ADD COLUMN IF NOT EXISTS machine_identity text;";
+    /// <summary>
+    /// V214 (#6334): <c>config.config_known_patterns</c>, the operator's known-pattern entries ("the backup job pushes High CPU every night
+    /// at 02:00"), shown beside the alerts they match. Context only: an entry never mutes, never pages and never changes an alert.
+    ///
+    /// <para>Every scope column is nullable and NULL means any: <c>server_id</c> (every server), <c>metric_name</c> (every metric, the name
+    /// alert history holds), <c>time_of_day</c> (any time). <c>time_of_day</c> is a wall-clock time in <c>time_zone</c> (an IANA id; NULL is
+    /// UTC) and matches within <c>window_minutes</c> either side, wrapping past midnight; the shared
+    /// <c>KnownPatternMatcher</c> in PerformanceMonitor.Common is the one place that rule lives. <c>expires_at_utc</c> is a naive UTC
+    /// <c>timestamp</c> like the mute rules' (NULL never expires). <c>note</c> is operator-written text, held to 1-500 characters by a
+    /// CHECK so a write that skips the store's function still cannot store more. Further CHECKs hold every column to what a reader can
+    /// load, so a direct call to a write function (or the owner's own SQL) cannot store a row that breaks the read of every entry: a
+    /// time of day below 24:00, a finite expiry before year 10000, a time zone that is a bounded IANA-shaped id (the shape only: the
+    /// zone's existence is the matcher's call, because PostgreSQL's names and .NET's differ at the edges), a metric name of at most 128
+    /// characters, an author of at most 256 and a note with some non-blank text. <c>updated_by</c> and <c>updated_at_utc</c> are NULL
+    /// until an edit; only <c>config.update_known_pattern</c> sets them.</para>
+    ///
+    /// <para><b>The table joins the <c>config_version</c> reload beacon</b> with V117's statement-level trigger on V17's shared
+    /// <c>config.config_bump_version()</c> function, so a write from any path (the web editor, the Viewer, hand-written SQL) moves the
+    /// beacon and a service that caches the entries re-reads them. No GRANT here: the readers' schema-wide SELECT covers a new
+    /// <c>config</c> table, and the writes go through owner-rights functions that provisioning grants to the operator roles. Additive;
+    /// an older build never reads the table.</para>
+    /// </summary>
+    private const string V214Sql = @"
+CREATE TABLE IF NOT EXISTS config.config_known_patterns
+(
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    server_id integer,
+    metric_name text,
+    time_of_day time,
+    time_zone text,
+    window_minutes integer NOT NULL DEFAULT 30,
+    note text NOT NULL,
+    created_by text,
+    created_at_utc timestamp NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+    expires_at_utc timestamp,
+    updated_by text,
+    updated_at_utc timestamp,
+    CONSTRAINT ck_known_patterns_note CHECK (char_length(note) BETWEEN 1 AND 500 AND btrim(note, E' 	
+') <> ''),
+    CONSTRAINT ck_known_patterns_window CHECK (window_minutes BETWEEN 0 AND 720),
+    CONSTRAINT ck_known_patterns_time_of_day CHECK (time_of_day < '24:00'),
+    CONSTRAINT ck_known_patterns_expires CHECK (expires_at_utc IS NULL OR (isfinite(expires_at_utc) AND expires_at_utc < '10000-01-01')),
+    CONSTRAINT ck_known_patterns_time_zone CHECK (time_zone IS NULL OR (char_length(time_zone) <= 64 AND time_zone ~ '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$')),
+    CONSTRAINT ck_known_patterns_metric CHECK (char_length(metric_name) <= 128),
+    CONSTRAINT ck_known_patterns_created_by CHECK (char_length(created_by) <= 256),
+    CONSTRAINT ck_known_patterns_updated_by CHECK (char_length(updated_by) <= 256)
+);
+
+DROP TRIGGER IF EXISTS trg_bump_known_patterns ON config.config_known_patterns;
+CREATE TRIGGER trg_bump_known_patterns
+    AFTER INSERT OR UPDATE OR DELETE ON config.config_known_patterns
+    FOR EACH STATEMENT EXECUTE FUNCTION config.config_bump_version();";
+
+    /// <summary>
+    /// V196 (#5632, step 5): Level 3 and the per-server action switches. <b>Nothing here turns an action on.</b>
+    ///
+    /// <para><b>Levels.</b> <c>ck_config_notification_routes_agent</c> now allows <c>agent_level</c> NULL and 0 to 3, and
+    /// <c>ck_investigation_requests_autonomy</c> allows <c>autonomy_level</c> 1 to 3. Each is replaced in place, under its own
+    /// name, only when the stored definition does not already name 3 (V191's guard), so a second run replaces nothing.
+    /// Level 3 means a route's request may, once an action exists, act on the monitored server; it still needs the four
+    /// conditions of <c>ServerActionGate</c>.</para>
+    ///
+    /// <para><b>Switches.</b> <c>config.config_server_actions</c>: one row per server and action (<c>force_plan</c>,
+    /// <c>evict_plan</c>, <c>kill_session</c>), <c>enabled</c> defaulting to <c>false</c>. <b>No row means off, and this
+    /// migration inserts no row.</b> It is deleted with its server (foreign key, <c>ON DELETE CASCADE</c>) and joins the
+    /// <c>config_version</c> reload beacon with V117's trigger shape, as V191's overrides do. It is configuration and is never aged.
+    /// Grants are provisioning's (managed section 10e, provision-roles.sql step 3j): every role reads it and <b>no role but the owner
+    /// writes it</b>, so no MCP tool, web route or <c>darling.json</c> key can turn a switch on. How a person turns one on is a
+    /// later decision. <b>No Lite twin:</b> Lite is advise-only.</para>
+    /// </summary>
+    private const string V196Sql = @"
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conname = 'ck_config_notification_routes_agent'
+                 AND conrelid = 'config.config_notification_routes'::regclass
+                 AND pg_get_constraintdef(oid) !~ 'ARRAY\[0, 1, 2, 3\]') THEN
+        ALTER TABLE config.config_notification_routes DROP CONSTRAINT ck_config_notification_routes_agent;
+        ALTER TABLE config.config_notification_routes
+            ADD CONSTRAINT ck_config_notification_routes_agent CHECK (
+                (agent_level IS NULL OR agent_level IN (0, 1, 2, 3))
+                AND agent_max_per_hour BETWEEN 1 AND 60
+                AND agent_max_per_day BETWEEN 1 AND 500
+                AND agent_lease_minutes BETWEEN 5 AND 120
+                AND agent_expiry_minutes BETWEEN 15 AND 1440);
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conname = 'ck_investigation_requests_autonomy'
+                 AND conrelid = 'config.investigation_requests'::regclass
+                 AND pg_get_constraintdef(oid) !~ 'ARRAY\[1, 2, 3\]') THEN
+        ALTER TABLE config.investigation_requests DROP CONSTRAINT ck_investigation_requests_autonomy;
+        ALTER TABLE config.investigation_requests
+            ADD CONSTRAINT ck_investigation_requests_autonomy CHECK (autonomy_level IN (1, 2, 3));
+    END IF;
+END $do$;
+
+CREATE TABLE IF NOT EXISTS config.config_server_actions
+(
+    server_id integer NOT NULL,
+    action text NOT NULL,
+    enabled boolean NOT NULL DEFAULT false,
+    set_by text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_config_server_actions PRIMARY KEY (server_id, action),
+    CONSTRAINT fk_config_server_actions_server FOREIGN KEY (server_id)
+        REFERENCES config.config_monitored_servers (server_id) ON DELETE CASCADE,
+    CONSTRAINT ck_config_server_actions_action CHECK (action IN ('force_plan', 'evict_plan', 'kill_session')),
+    CONSTRAINT ck_config_server_actions_set_by CHECK (btrim(set_by) <> '')
+);
+
+DROP TRIGGER IF EXISTS trg_bump_server_actions ON config.config_server_actions;
+CREATE TRIGGER trg_bump_server_actions
+    AFTER INSERT OR UPDATE OR DELETE ON config.config_server_actions
+    FOR EACH STATEMENT EXECUTE FUNCTION config.config_bump_version();";
+
+    /// <summary>
     /// The text of V171 and V172 (#5571). Plain literal DDL after token substitution, not dynamic SQL, so the data-moving
     /// census can read the shipped text. Every statement is catalog-only; see <see cref="V171Sql"/>.
     /// </summary>
@@ -1216,7 +2633,58 @@ $rung$;";
         new Migration(171, "query-store-interval-wide-partitioned", V171Sql),
         new Migration(172, "query-store-interval-latest-partitioned", V172Sql),
         new Migration(173, "query-store-compose-stamp", V173Sql),
+        new Migration(174, "service-version", V174Sql),
+        new Migration(175, "plan-regression-daily-rowcount", V175Sql),
+        new Migration(176, "procedure-stats-totals", V176Sql),
+        new Migration(177, "runnable-queue-alert-settings", V177Sql),
+        new Migration(178, "query-store-watermarks", V178Sql),
+        new Migration(179, "client-timeouts-alert", V179Sql),
+        new Migration(180, "external-alerts", V180Sql),
+        new Migration(181, "notification-route-scope", V181Sql),
+        new Migration(182, "read-latency-capacity-fields", V182Sql),
+        new Migration(183, "read-caller", V183Sql),
+        new Migration(184, "agent-investigations", V184Sql),
+        new Migration(185, "plan-regression-partial-days", V185Sql),
+        new Migration(186, "collection-log-hourly", V186Sql),
+        new Migration(187, "alert-resolution-delivery", V187Sql),
+        new Migration(188, "investigation-alert-facts", V188Sql),
+        new Migration(189, "query-store-compose-failures", V189Sql),
+        new Migration(190, "store-metrics-size-estimated", V190Sql),
+        new Migration(191, "agent-level-2-store", V191Sql),
+        new Migration(192, "query-tags-store", V192Sql),
+        new Migration(193, "phase-c-store", V193Sql),
+        new Migration(194, "query-tag-sightings-database", V194Sql),
+        new Migration(195, "query-store-forced-plans", V195Sql),
+        new Migration(196, "level-3-server-action-switches", V196Sql),
+        new Migration(197, "plan-force-checks", V197Sql),
+        new Migration(198, "pseudonym-key", V198Sql),
+        new Migration(199, "blocking-head-evidence", V199Sql),
+        new Migration(200, "excluded-volumes", V200Sql),
+        new Migration(201, "forced-plan-variants-and-guides", V201Sql),
+        new Migration(202, "ag-primary-replica", V202Sql),
+        new Migration(203, "hypothetical-index-login", V203Sql),
+        new Migration(204, "custom-view-folders", V204Sql),
+        new Migration(205, "custom-alert-rule-expiry", V205Sql),
+        new Migration(206, "collector-enabled-inherit", V206Sql),
+        new Migration(207, "change-watches", ChangeWatchStore.V207Sql),
+        new Migration(208, "mute-rule-starts-at", V208Sql),
+        new Migration(209, "query-store-fetch-top-n", V209Sql),
+        new Migration(210, "mcp-agent-route-tag-guard", V210Sql),
+        new Migration(211, "client-timeouts-relative-bars", V211Sql),
+        new Migration(212, "server-machine-identity", V212Sql),
+        new Migration(213, "query-store-replica", V213Sql),
+        new Migration(214, "known-patterns", V214Sql),
     };
+
+    /// <summary>
+    /// V189 (#5867): <c>collect.query_store_compose_stamp_failures</c>, the failure record of the Query Store compose builder: one row
+    /// per hour whose last build threw, with its consecutive failures, last error and next attempt, so a build that cannot finish backs
+    /// off to one attempt a day instead of running every tick, and <c>get_store_metrics</c> and the self-alert can show it
+    /// (<see cref="QueryStoreComposeStamp.FailuresCreateSql"/>). A plain empty table, no GRANT (the <c>collect</c> schema's blanket
+    /// SELECT covers it). <b>No Lite twin:</b> Lite has no PostgreSQL store. A const, so the list above reads it whatever the
+    /// order of the static initializers.
+    /// </summary>
+    private const string V189Sql = QueryStoreComposeStamp.FailuresCreateSql;
 
     /// <summary>
     /// V114 — the statistics ESTIMATE columns on <c>collect.pg_index_bloat</c>, and the retirement of the
@@ -3093,9 +4561,11 @@ CREATE INDEX IF NOT EXISTS idx_raw_chunk_interval_reconcile_runs_time
     /// ruled issuecomment-5836972848): every outcome (Regular, Aborted, Exception), every raw column the three new
     /// reads need except <c>collection_id</c>, <c>server_name</c> and <c>query_plan_text</c> (57 columns). V143's
     /// own table, coverage and pending tables are untouched — this is three MORE tables, the same shape as V143's
-    /// three, engine-plain, with no backfill. Kept 9 days (F1: the 7-day preset plus a day of margin for an
+    /// three, engine-plain, with no backfill. Kept 9 days at V145 (F1: the 7-day preset plus a day of margin for an
     /// interval that can span a day) by the service's retention sweep, on <c>first_execution_time</c>, not this
-    /// migration's concern.
+    /// migration's concern. Since #5809 the horizon is 10 days, so get_query_store_regressions can read the table:
+    /// its 7-day baseline plus a 24-hour window, with the gate's 26-hour purge-edge margin, needs 9 days 2 hours
+    /// held (<c>DarlingRetention.QueryStoreIntervalWideRetentionDays</c>).
     ///
     /// <para><b><c>collect.query_store_interval_wide</c></b>: identity is V143's identity plus
     /// <c>execution_type_desc</c>, because two outcomes can share every other key. <c>first_execution_time</c>
@@ -7957,6 +9427,8 @@ CREATE TABLE IF NOT EXISTS darling_schema_version (
                 "connection; find it with: SELECT a.pid, a.state, a.query_start, a.query FROM pg_locks l " +
                 "JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory';",
                 totalWaited, attempts, storeVersion, StorageVersion.SchemaVersion);
+            /* #5773: this path skips MigrateLockedAsync, so it makes the newer-store check itself. */
+            WarnIfStoreNewerThanBuild(logger, storeVersion, Scripts[^1].Version);
             return false;
         }
 
@@ -8022,6 +9494,42 @@ CREATE TABLE IF NOT EXISTS darling_schema_version (
         return Convert.ToInt32(await read.ExecuteScalarAsync(cancellationToken), System.Globalization.CultureInfo.InvariantCulture);
     }
 
+    /// <summary>
+    /// #5773: the README section the newer-store warning sends the operator to. It lists, rung by rung, what a
+    /// build older than that rung reads differently.
+    /// </summary>
+    internal const string RollbackReadmeSection = "\"Rolling back to an older build\" in Darling/README.md";
+
+    /// <summary>
+    /// #5773: logs ONE warning when the store's stamped version is above the highest rung this build knows, and
+    /// returns whether it did. A newer build migrated this store and this one was started against it, which is the
+    /// documented rollback (upgrade-darling.ps1 restores the install files, not the store). Rungs are additive, so
+    /// this build keeps starting; refusing would break that rollback. But an older build can read some newer data
+    /// differently, and without this line nothing tells the operator. The README section lists each case.
+    /// The seam the startup check goes through: <see cref="MigrateAsync(NpgsqlConnection, ILogger, CancellationToken)"/>
+    /// passes the version it read and <c>Scripts[^1].Version</c>, and tests plant any pair without a store.
+    /// </summary>
+    internal static bool WarnIfStoreNewerThanBuild(ILogger? logger, int storeVersion, int buildVersion)
+    {
+        if (storeVersion <= buildVersion)
+        {
+            return false;
+        }
+
+        var unknownRungs = storeVersion == buildVersion + 1
+            ? "V" + storeVersion.ToString(System.Globalization.CultureInfo.InvariantCulture) + " is"
+            : "V" + (buildVersion + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)
+                + "-V" + storeVersion.ToString(System.Globalization.CultureInfo.InvariantCulture) + " are";
+
+        logger?.LogWarning(
+            "The store is at V{StoreVersion}; this build knows up to V{BuildVersion}, so {UnknownRungs} unknown to it. " +
+            "A newer build migrated this store. This build keeps running against it, because migrations only add, " +
+            "but it can read some of the data those rungs added differently. See {ReadmeSection} for what each rung " +
+            "changes for an older build, and what to do before rolling back.",
+            storeVersion, buildVersion, unknownRungs, RollbackReadmeSection);
+        return true;
+    }
+
     private static async Task<int> MigrateLockedAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken cancellationToken)
     {
         /* Resolve bare names through collect/config for this migrate session. Load-bearing from V8
@@ -8046,6 +9554,10 @@ CREATE TABLE IF NOT EXISTS darling_schema_version (
         {
             currentVersion = Convert.ToInt32(await readVersion.ExecuteScalarAsync(cancellationToken), System.Globalization.CultureInfo.InvariantCulture);
         }
+
+        /* #5773: a store above this build's top rung was migrated by a newer build. Warn and carry on: the loop below
+           applies nothing, since every rung this build has is at or below the stamp. */
+        WarnIfStoreNewerThanBuild(logger, currentVersion, Scripts[^1].Version);
 
         var applied = 0;
         foreach (var migration in Scripts)

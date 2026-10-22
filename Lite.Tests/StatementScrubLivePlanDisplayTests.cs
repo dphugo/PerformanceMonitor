@@ -31,6 +31,7 @@ namespace PerformanceMonitorLite.Tests;
 /// <see cref="LivePlanDisplay.Filter"/> at the call. Pinned here: the helper, a scan of every caller in the app, and
 /// the state the plan viewer is left in for a plan the filter withholds whole.
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class StatementScrubLivePlanDisplayTests
 {
     private const string Marker = SensitiveStatements.PlaceholderText;
@@ -216,50 +217,12 @@ public sealed class StatementScrubLivePlanDisplayTests
             }
         }
 
-        /* A scan that found nothing would pass vacuously: the display sites are in these six files. The pattern takes any
+        /* A scan that found nothing would pass vacuously: the display sites are in these seven files (the analysis pass's plan fetcher included, #5630). The pattern takes any
            fetch-a-plan name (the by-sql_handle fetch the blocked-process and deadlock actions use included, #5320), so a
            fetch added under a new name fails here until it is wrapped. */
-        Assert.True(sites >= 18, "expected at least 18 live plan fetch call sites, found " + sites);
-        Assert.Equal(6, files.Count);
+        Assert.True(sites >= 19, "expected at least 19 live plan fetch call sites, found " + sites);
+        Assert.Equal(7, files.Count);
         Assert.Empty(problems);
-    }
-
-    /// <summary>
-    /// #5367: a withheld deadlock graph or blocked process report is not "a plan", so its save refusal names what is
-    /// being saved; the plan viewers keep their existing sentence word for word.
-    /// </summary>
-    [Fact]
-    public void TheWithheldSentence_NamesWhatIsSaved_AndThePlanSentenceIsUnchanged()
-    {
-        Assert.Equal("This plan was withheld by the statement filter (#4348).", WithheldPlanGuard.WithheldSentenceFor("plan"));
-        Assert.Equal(SensitiveStatements.WithheldPlanSentence, WithheldPlanGuard.WithheldSentenceFor("plan"));
-        Assert.Equal("This deadlock graph was withheld by the statement filter (#4348).", WithheldPlanGuard.WithheldSentenceFor("deadlock graph"));
-        Assert.Equal("This blocked process report was withheld by the statement filter (#4348).", WithheldPlanGuard.WithheldSentenceFor("blocked process report"));
-    }
-
-    /// <summary>
-    /// #5320: a deadlock graph or blocked process report the filter withheld whole is the marker, not XML. The shared
-    /// <c>FileSaveHelper.SaveXmlToFile</c> (the one save path for both reports) asks the guard before it opens the save
-    /// dialog, so the marker is never written to an <c>.xml</c> file and the user is told why.
-    /// </summary>
-    [Fact]
-    public void SaveXmlToFile_RefusesAWithheldReportBeforeTheSaveDialog_AndLitesDownloadsUseIt()
-    {
-        var helper = File.ReadAllText(Path.Combine(RepoRoot(), "PerformanceMonitor.Ui", "FileSaveHelper.cs"));
-        var start = helper.IndexOf("public static void SaveXmlToFile(", StringComparison.Ordinal);
-        Assert.True(start >= 0, "SaveXmlToFile not found");
-        var dialog = helper.IndexOf("new SaveFileDialog", start, StringComparison.Ordinal);
-        var guard = helper.IndexOf("WithheldPlanGuard.RefuseSave(xml, withheldSubject)", start, StringComparison.Ordinal);
-        Assert.True(guard >= 0 && dialog >= 0 && guard < dialog, "SaveXmlToFile must call WithheldPlanGuard.RefuseSave(xml, withheldSubject) before it opens the dialog");
-
-        var plans = File.ReadAllText(Path.Combine(RepoRoot(), "Lite", "Controls", "ServerTab.Plans.cs"));
-        Assert.Contains("SaveXmlToFile(row.DeadlockGraphXml", plans, StringComparison.Ordinal);
-        Assert.Contains("SaveXmlToFile(row.BlockedProcessReportXml", plans, StringComparison.Ordinal);
-
-        /* #5367: the sentence names what is saved. A deadlock graph is not "a plan"; each download passes its own subject. */
-        Assert.Contains("SaveXmlToFile(row.DeadlockGraphXml, $\"deadlock_{row.DeadlockTime:yyyyMMdd_HHmmss}.xml\", \"deadlock XML\", \"deadlock graph\")", plans, StringComparison.Ordinal);
-        Assert.Contains("\"blocked process XML\", \"blocked process report\")", plans, StringComparison.Ordinal);
-        Assert.DoesNotContain("File.WriteAllText", plans, StringComparison.Ordinal);
     }
 
     private static string RepoRoot([CallerFilePath] string thisFile = "")

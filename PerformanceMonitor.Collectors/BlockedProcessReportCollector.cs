@@ -12,6 +12,7 @@ using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
+using PerformanceMonitor.Common.QueryTags;
 
 namespace PerformanceMonitor.Collectors;
 
@@ -67,6 +68,9 @@ public sealed class BlockedProcessReportCollector : CollectorDefinitionBase<Bloc
         public string? BlockingStatus { get; set; }
         public string? BlockingIsolationLevel { get; set; }
         public string? BlockingClientApp { get; set; }
+
+        /// <summary>The blocking process's own currentdbname (#5980). Read for the query-tag caller key only; not stored.</summary>
+        public string? BlockingDatabaseName { get; set; }
         public string? BlockingHostName { get; set; }
         public string? BlockingLoginName { get; set; }
         public string? BlockingSqlText { get; set; }
@@ -114,6 +118,10 @@ public sealed class BlockedProcessReportCollector : CollectorDefinitionBase<Bloc
     /// reason for the fall in the label itself.
     /// </summary>
     public override bool RunsPerDatabase(CollectorTargetInfo target) => target.IsAzureSqlDb;
+
+    /* #6312: the session is database-scoped on Azure SQL Database and master cannot host one, so the fan-out leaves
+       master out instead of counting its "XE session is not running" as a failed database every sweep. */
+    public override bool SkipsMasterDatabase => true;
 
     /// <summary>
     /// Per-database watermark for the per-database sessions (database_name is the blocked
@@ -275,17 +283,28 @@ SET @shred_needed =
 
 IF @shred_needed = 1
 BEGIN
+    {RingBufferXml.DeclareSql}
+
+    SELECT /* PerformanceMonitorLite */
+        @ring_text = CONVERT(nvarchar(max), xet.target_data),
+        @ring_session = xes.name
+    FROM {ringBufferSource}
+    WHERE xes.name = N'{XeSessionName}'
+    AND   xet.target_name = N'ring_buffer'
+    OPTION(RECOMPILE);
+
+    {RingBufferXml.ParseSql}
+
+    {RingBufferXml.TruncationSql}
+
     INSERT
         @PerformanceMonitor_BlockedProcess
     (
         ring_buffer
     )
-    SELECT /* PerformanceMonitorLite */
-        ring_xml = TRY_CAST(xet.target_data AS xml)
-    FROM {ringBufferSource}
-    WHERE xes.name = N'{XeSessionName}'
-    AND   xet.target_name = N'ring_buffer'
-    OPTION(RECOMPILE);
+    SELECT
+        ring_xml = @ring_xml
+    WHERE @ring_xml IS NOT NULL;
 END;
 
 SELECT
@@ -739,7 +758,9 @@ OPTION(RECOMPILE);
    reader is correctly positioned on the probe-failure set below by the time the host reads it. */
 SELECT
     execution_count = @execution_count,
-    gated = CASE WHEN @shred_needed = 1 THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END;
+    gated = CASE WHEN @shred_needed = 1 THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END,
+    /* #6441: whether SQL Server truncated the ring buffer's XML (all NULL when the gate skipped the read). */
+    {RingBufferXml.TruncationColumnsSql};
 
 /* Trailing result set = the payload path's probe-failure contract (#1851/#1865,
    EnumeratedCollectorDriver.ReadPayloadProbeFailuresAsync). Always returned, and empty on both of
@@ -972,6 +993,9 @@ OUTER APPLY
             }
 
             context.Measure(ShredGatedMeasurement, !reader.IsDBNull(1) && reader.GetBoolean(1) ? 1 : 0);
+
+            /* #6441: SQL Server cuts a ring buffer's XML at about 4 MB and keeps the OLDEST events. */
+            RingBufferXml.MeasureTruncation(reader, 2, context);
         }
 
         /* Measure() ACCUMULATES a repeated label, which is what makes this correct on the per-database
@@ -1111,6 +1135,7 @@ OUTER APPLY
                 BlockingStatus = blockingProcess?.Attribute("status")?.Value,
                 BlockingIsolationLevel = blockingProcess?.Attribute("isolationlevel")?.Value,
                 BlockingClientApp = blockingProcess?.Attribute("clientapp")?.Value,
+                BlockingDatabaseName = blockingProcess?.Attribute("currentdbname")?.Value,
                 BlockingHostName = blockingProcess?.Attribute("hostname")?.Value,
                 BlockingLoginName = blockingProcess?.Attribute("loginname")?.Value,
                 BlockingSqlText = blockingProcess?.Element("inputbuf")?.Value?.Trim(),
@@ -1126,4 +1151,13 @@ OUTER APPLY
             return null;
         }
     }
+
+    /// <summary>
+    /// #5980: a caller sighting for the blocked side and one for the blocking side, each with its own
+    /// application, login, host and statement text. A side that names no application, login or host is left out.
+    /// </summary>
+    public override IReadOnlyList<QueryTagSighting>? DescribeQueryTagSightings(Row row)
+        => QueryTagSightings.Collect(
+            QueryTagSightings.Caller(row.DatabaseName, row.BlockedClientApp, row.BlockedLoginName, row.BlockedHostName, row.BlockedSqlText),
+            QueryTagSightings.Caller(row.BlockingDatabaseName, row.BlockingClientApp, row.BlockingLoginName, row.BlockingHostName, row.BlockingSqlText));
 }

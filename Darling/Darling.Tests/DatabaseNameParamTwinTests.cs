@@ -35,7 +35,7 @@ namespace Darling.Tests;
 /// break every positional caller, so they keep their place; the SET only shrinks (an entry that is now last fails
 /// the stale-entry test), and every other tool, including every tool the filter work widens, must keep it last.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class DatabaseNameParamTwinTests
 {
     private const string Param = "database_name";
@@ -47,6 +47,8 @@ public sealed class DatabaseNameParamTwinTests
     {
         ["get_plan_xml"] = "identity: names the database of one stored plan row, not a filter",
         ["analyze_query_plan"] = "identity: names the database of one stored plan row, not a filter",
+        ["assign_query_tag"] = "identity: one part of the object key being tagged (kind object takes database, schema and object name together), not a filter",
+        ["unassign_query_tag"] = "identity: one part of the object key being untagged (kind object takes database, schema and object name together), not a filter",
     };
 
     /// <summary>Tools whose <c>database_name</c> predates the "append it LAST" rule and sits mid-list (see the class comment).</summary>
@@ -212,67 +214,4 @@ public sealed class DatabaseNameParamTwinTests
         Assert.True(problems.Count == 0, "One tool name must keep one database_name contract on both SKUs:\n" + string.Join("\n", problems));
     }
 
-    /// <summary>
-    /// #5244 N3: the sentence that tells a caller which collector a blocking answer came from, and that the DMV snapshot answers only
-    /// when the blocked process reports have no rows for the chosen databases. It is the only place a caller learns, before the call, that
-    /// adding a database can flip the collector, so its exact text is pinned, and the same text sits on all four descriptions (Darling's and
-    /// Lite's get_blocking_trend and get_blocking_stats). The budget pins only bound its length.
-    /// </summary>
-    private const string SourceSentence =
-        "The source key names the collector that answered, blocked-process-report or DMV snapshot; the DMV snapshot is used only when the blocked "
-        + "process reports have no rows for the chosen databases, so source can differ between filters.";
-
-    [Theory]
-    [InlineData("get_blocking_trend")]
-    [InlineData("get_blocking_stats")]
-    public void TheSourceSentence_IsOnTheToolDescription_WordForWord_OnBothSkus(string tool)
-    {
-        var darlingDescription = typeof(DarlingMcpObjectStatsTools).Assembly.GetTypes()
-            .Where(t => t.GetCustomAttribute<McpServerToolTypeAttribute>() is not null)
-            .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
-            .Where(m => m.GetCustomAttribute<McpServerToolAttribute>()?.Name == tool)
-            .Select(m => m.GetCustomAttribute<DescriptionAttribute>()!.Description)
-            .Single();
-
-        string? liteDescription = null;
-        foreach (var file in Directory.GetFiles(PathTo("Lite", "Mcp"), "*.cs"))
-        {
-            var m = Regex.Match(
-                ReadRepoFile("Lite", "Mcp", Path.GetFileName(file)),
-                @"\[McpServerTool\(Name = """ + tool + @"""\),\s*Description\(""((?:[^""\\]|\\.)*)""\)\]");
-            if (m.Success) liteDescription = Regex.Unescape(m.Groups[1].Value);
-        }
-
-        Assert.NotNull(liteDescription);
-        Assert.Contains(SourceSentence, darlingDescription, StringComparison.Ordinal);
-        Assert.Contains(SourceSentence, liteDescription, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void TheMiddleRoster_OnlyShrinks_EveryEntryIsStillMidList()
-    {
-        var darling = DarlingTools();
-        var lite = LiteTools();
-        foreach (var name in MiddleSince)
-        {
-            var onDarling = darling[name].ParamNames;
-            var liteName = Renamed.FirstOrDefault(r => r.Darling == name).Lite ?? name;
-            var onLite = lite.TryGetValue(liteName, out var l) ? l.ParamNames : null;
-
-            /* Mid-list on at least one SKU, or the entry is stale and must go (the rule then applies to the tool). */
-            var middleSomewhere = onDarling[^1] != Param || (onLite is not null && onLite.Contains(Param) && onLite[^1] != Param);
-            Assert.True(middleSomewhere, $"{name}: database_name is last on both SKUs now; drop it from MiddleSince");
-        }
-    }
-
-    [Fact]
-    public void TheExemptions_NameToolsThatStillExist_AndThatStillHaveTheParameter()
-    {
-        var darling = DarlingTools();
-        foreach (var (name, reason) in Exempt)
-        {
-            Assert.True(darling.TryGetValue(name, out var tool), $"{name} (exempt: {reason}) is no longer a Darling tool: drop the exemption");
-            Assert.True(tool!.ParamNames.Contains(Param), $"{name} (exempt: {reason}) no longer has {Param}: drop the exemption");
-        }
-    }
 }

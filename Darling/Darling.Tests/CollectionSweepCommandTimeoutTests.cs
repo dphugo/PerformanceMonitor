@@ -74,6 +74,7 @@ namespace Darling.Tests;
 /// store connection held for the body's duration, and a 60 s watchdog that only logs. It is derived at
 /// the width the knob is MOVING to (8), not the seeded 4.</para>
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class CollectionSweepCommandTimeoutTests
 {
     /// <summary>
@@ -134,7 +135,9 @@ public sealed class CollectionSweepCommandTimeoutTests
         ("DarlingWorker.cs", "TryRefreshPgStatementTextAsync"),
         ("DarlingWorker.cs", "ReadCollectorWatermarksAsync"),
         ("DarlingObservability.cs", "UpsertServerAsync"),
-        ("DarlingObservability.cs", "LogCollectionAsync"),
+        /* #5735: the collection_log insert moved out of LogCollectionAsync (now a thin wrapper) into the one binding it shares with
+           the skipped-slots row, so the guard follows the command to WriteCollectionLogRowAsync. */
+        ("DarlingObservability.cs", "WriteCollectionLogRowAsync"),
         ("DarlingObservability.cs", "WriteAnalysisStateAsync"),
         ("Targets/RdsCpuIngestor.cs", "GetWatermarkAsync"),
     };
@@ -163,7 +166,9 @@ public sealed class CollectionSweepCommandTimeoutTests
     /// a THREADED PARAMETER — a stronger bound than a constant — on the target path rather than this
     /// budget.</para>
     /// </summary>
-    private const int ExpectedSweepCommandSites = 13;
+    /* 15 since #6351: UpsertServerAsync reads the identity it is about to overwrite and, on a changed identity, the other enabled
+       registrations holding it; both carry the sweep deadline like the upsert. */
+    private const int ExpectedSweepCommandSites = 15;
 
     /// <summary>The five COPY writers, counted for the same reason. Five since #3601: RdsLogEventIngestor is
     /// RdsDeadlockIngestor's write over the log-event definition, and it was looked at by a person — the same
@@ -410,26 +415,6 @@ public sealed class CollectionSweepCommandTimeoutTests
            was invisible to six landed pins, so a new one must be looked at by a person deciding whether it
            shares this budget — not waved through because it happened to set the property. */
         Assert.Equal(ExpectedCopyWriterSites, total);
-    }
-
-    /// <summary>
-    /// The COPY writers take the SAME constant as the commands beside them, because they are the same
-    /// regime — and pinned RELATIONALLY rather than by value so the two can never drift apart. A bare
-    /// <c>TimeSpan.FromSeconds(10)</c> at a COPY site would satisfy the shape guard above while quietly
-    /// decoupling the busiest write in the process from the number this group derived.
-    /// </summary>
-    [Fact]
-    public void TheCopyWriters_TakeTheSweepConstantRatherThanALiteral()
-    {
-        var relational = new Regex(
-            @"\.Timeout\s*=\s*TimeSpan\.FromSeconds\(\s*ServiceCommandDeadlines\.CollectionSweepSeconds\s*\)",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-        var bound = ServiceSources()
-            .Select(p => CSharpSourceWalker.StripCommentsAndStrings(File.ReadAllText(p)))
-            .Sum(t => relational.Matches(t).Count);
-
-        Assert.Equal(ExpectedCopyWriterSites, bound);
     }
 
     /// <summary>

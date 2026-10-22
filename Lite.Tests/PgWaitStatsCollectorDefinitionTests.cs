@@ -21,6 +21,7 @@ namespace Lite.Tests;
 /// Pins the first PostgreSQL collector: the Aurora-only gate, the verified function signatures in its
 /// query, the wait-type noise filter, and delta keying on the numeric event id rather than the name.
 /// </summary>
+[Trait("Stage", "Guard")]
 public class PgWaitStatsCollectorDefinitionTests
 {
     private static readonly RecordingCollectorDeltaCalculator s_deltas = new();
@@ -139,7 +140,7 @@ public class PgWaitStatsCollectorDefinitionTests
     {
         var sql = PgWaitStatsCollector.Instance.BuildQuery(MakeContext()).Text;
 
-        var selectList = sql[..sql.IndexOf("FROM aurora_stat_system_waits()", StringComparison.Ordinal)];
+        var selectList = sql[..sql.IndexOf("FROM pg_catalog.aurora_stat_system_waits()", StringComparison.Ordinal)];
         var items = selectList.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
         Assert.Equal(7, items.Length);
         Assert.EndsWith("(SELECT pg_postmaster_start_time()) AS postmaster_start_time", items[6], StringComparison.Ordinal);

@@ -8,6 +8,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
@@ -16,6 +17,7 @@ using PerformanceMonitor.Analysis.Baselines;
 using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Storage;
 using PerformanceMonitor.Notifications;
+using PerformanceMonitor.Ui;
 
 namespace PerformanceMonitor.Darling.Viewer;
 
@@ -66,6 +68,25 @@ public sealed class ViewerAlertRow
 
     public string? ContextJson { get; init; }
 
+    /// <summary>#5825 (V187): when a resolution's send delivered (UTC); null on every other row.</summary>
+    public DateTime? ResolutionSentAt { get; init; }
+
+    /// <summary>#5825: the channels a resolution went to, or would have gone to when muted; null on every other row.</summary>
+    public string? ResolutionChannels { get; init; }
+
+    /// <summary>#5825: <c>sent</c>, <c>failed: ...</c>, <c>muted</c> or <c>route deleted or disabled: ...</c>; null on every
+    /// other row.</summary>
+    public string? ResolutionOutcome { get; init; }
+
+    /// <summary>The resolution's send in one cell (#5825): "sent (Slack,Email)", "muted (Slack)"; blank on any other row.</summary>
+    public string ResolutionDisplay => ResolutionOutcome is null
+        ? ""
+        : string.IsNullOrEmpty(ResolutionChannels) ? ResolutionOutcome : $"{ResolutionOutcome} ({ResolutionChannels})";
+
+    /// <summary>The resolution's send time for the details window, in UTC; blank when nothing delivered.</summary>
+    public string ResolutionSentAtDisplay =>
+        ResolutionSentAt is { } sent ? sent.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) + " UTC" : "";
+
     /// <summary>This row's own server's clock (its time zone where one is known, else its UTC offset; the viewer
     /// machine's offset while none is collected), set by <see cref="ViewerDataService.GetAlertHistoryAsync"/>
     /// from the fleet's clocks, which it reads at most once per <see cref="ViewerDataService.AlertClockLifetime"/>
@@ -80,8 +101,14 @@ public sealed class ViewerAlertRow
     /// Lite's alert row and <see cref="ViewerTimeHelper.FormatForDisplay(DateTime, string)"/> do for the other
     /// grids (#4766).</summary>
     public string TimeLocal => ViewerTimeHelper.FormatForDisplay(
-        AlertTime, ViewerTimeHelper.DisplayZoneFor(ViewerTimeHelper.CurrentDisplayMode, Clock ?? ViewerTimeHelper.ActiveServerClock),
+        AlertTime, ViewerTimeHelper.DisplayZoneFor(
+            MultiServerTime.EffectiveMode(ViewerTimeHelper.CurrentDisplayMode, MixedServers), Clock ?? ViewerTimeHelper.ActiveServerClock),
         "yyyy-MM-dd HH:mm:ss");
+
+    /// <summary>True when the list this row sits in holds rows of several servers (#6137), set by
+    /// <see cref="ViewerDataService.GetAlertHistoryWindowAsync"/>. Server time cannot apply across servers, so the row then
+    /// reads in the viewer's local time like every other row of the list (<see cref="MultiServerTime"/>).</summary>
+    public bool MixedServers { get; set; }
 
     public string CurrentValueDisplay => AlertMetricClassifier.FormatHistoryValue(MetricName, CurrentValue);
 
@@ -110,6 +137,13 @@ public sealed class ViewerAlertRow
 
     public bool IsWarning => AlertHistoryRowSeverity.IsWarning(MetricName, ContextJson);
 
+    /* #5642: how old the newest sample was when the alert FIRED, the Newest Sample column. Read off the persisted context
+       (the carrier the engine stamped), never measured against the clock now; empty on a row without one, as Lite's row. */
+    public AlertNewestSample? NewestSample => AlertContextSerializer.TryReadNewestSample(ContextJson);
+
+    public string NewestSampleDisplay =>
+        AlertDetailText.SampleAgeLine(NewestSample) ?? "";
+
     /// <summary>
     /// This row as the <see cref="AlertMuteContext"/> a <see cref="MuteRule"/> is judged against — the SAME
     /// server name and metric name the row carries (so a rule keyed on them matches this row by construction,
@@ -136,6 +170,8 @@ public sealed class ViewerAlertRow
             ServerId = ServerId != 0 ? ServerId : null,
             ServerName = StoredServerName.Length > 0 ? StoredServerName : ServerName,
             MetricName = MetricName,
+            /* An external alert's source rides its metric name (#5654), so a rule that names a source covers the toast too. */
+            ExternalSource = AlertMuteContext.ExternalSourceOf(MetricName),
         };
         context.PopulateFromDetailText(DetailText, MetricName);
         return context;
@@ -163,7 +199,10 @@ public sealed partial class ViewerDataService
     a.muted,
     a.detail_text,
     a.context_json,
-    a.server_name AS stored_server_name";
+    a.server_name AS stored_server_name,
+    a.resolution_sent_at,
+    a.resolution_channels,
+    a.resolution_outcome";
 
     /// <summary>Per-server read. $1 window start, $2 server_id, $3 limit, $4 window end, exclusive (naive UTC / int / int / naive UTC).
     /// The end (#5562) is what a finished calendar period or a typed range needs; a live window passes a far-future instant.</summary>
@@ -278,10 +317,25 @@ AND    dismissed = FALSE";
                 DetailText = reader.IsDBNull(10) ? null : reader.GetString(10),
                 ContextJson = reader.IsDBNull(11) ? null : reader.GetString(11),
                 StoredServerName = reader.IsDBNull(12) ? "" : reader.GetString(12),
+                /* #5825 (V187): what a resolution row's send did; null on every other row. */
+                ResolutionSentAt = reader.IsDBNull(13) ? null : DateTime.SpecifyKind(reader.GetDateTime(13), DateTimeKind.Utc),
+                ResolutionChannels = reader.IsDBNull(14) ? null : reader.GetString(14),
+                ResolutionOutcome = reader.IsDBNull(15) ? null : reader.GetString(15),
             });
         }
 
+        StampMixedServers(rows);
         return rows;
+    }
+
+    /// <summary>Marks every row of a list that holds several servers (#6137), so each reads on the one clock the header names.</summary>
+    internal static void StampMixedServers(List<ViewerAlertRow> rows)
+    {
+        var mixed = MultiServerTime.IsMixed(rows.Select(r => r.ServerId));
+        foreach (var row in rows)
+        {
+            row.MixedServers = mixed;
+        }
     }
 
     /* ── Dismiss write path (W2a) ──────────────────────────────────────────────────────────────────

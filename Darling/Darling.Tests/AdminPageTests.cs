@@ -8,6 +8,7 @@
 
 using System;
 using System.Linq;
+using PerformanceMonitor.Darling.Viewer;
 using Xunit;
 using static Darling.Tests.RepoFile;
 
@@ -41,8 +42,8 @@ public sealed class AdminPageTests
     }
 
     [Theory]
-    [InlineData("SERVER_COLUMNS", new[] { "display_name", "server_name", "auth", "engine", "version", "status", "freshness", "monthly_cost", "read_only", "added", "last_collected" })]
-    [InlineData("ROUTE_COLUMNS", new[] { "route_id", "enabled", "metric_match", "match_kind", "family", "channels", "smtp_recipients", "modified_at_utc" })]
+    [InlineData("SERVER_COLUMNS", new[] { "display_name", "server_name", "auth", "engine", "version", "status", "freshness", "monthly_cost", "read_only", "added", "last_collected", "same_machine_as" })]
+    [InlineData("ROUTE_COLUMNS", new[] { "route_id", "enabled", "metric_match", "match_kind", "family", "applies_to", "status", "channels", "agent", "resolutions", "smtp_recipients", "modified_at_utc" })]
     [InlineData("SETTING_COLUMNS", new[] { "setting", "value" })]
     public void EachTab_DeclaresItsColumnKeys(string name, string[] keys)
     {
@@ -52,6 +53,25 @@ public sealed class AdminPageTests
         var block = page.Substring(start, page.IndexOf("];", start, StringComparison.Ordinal) - start);
         var found = System.Text.RegularExpressions.Regex.Matches(block, "key: \"([a-z_]+)\"").Select(m => m.Groups[1].Value).ToArray();
         Assert.Equal(keys, found);
+    }
+
+    [Fact]
+    public void TheRoutesTab_UsesTheDesktopViewersScopeAndStatusWords()
+    {
+        var page = Page();
+        foreach (var (name, word) in new[]
+        {
+            ("ROUTE_ALL_SERVERS", ViewerNotificationRouteScope.AllServersLabel),
+            ("ROUTE_STATUS_OK", ViewerNotificationRouteScope.OkStatus),
+            ("ROUTE_STATUS_DISABLED", ViewerNotificationRouteScope.DisabledStatus),
+            ("ROUTE_STATUS_ORPHANED_SERVER", ViewerNotificationRouteScope.OrphanedServerStatus),
+            ("ROUTE_STATUS_ORPHANED_TAG", ViewerNotificationRouteScope.OrphanedTagStatus),
+            ("ROUTE_STATUS_TAG_UNREADABLE", ViewerNotificationRouteScope.TagDataUnreadableStatus),
+            ("ROUTE_STATUS_SCOPE_UNREADABLE", ViewerNotificationRouteScope.ScopeDataUnreadableStatus),
+        })
+        {
+            Assert.Contains("export const " + name + " = \"" + word + "\";", page, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -103,6 +123,31 @@ public sealed class AdminPageTests
         var gblock = page.Substring(gstart, page.IndexOf("\n};", gstart, StringComparison.Ordinal) - gstart);
         foreach (var g in System.Text.RegularExpressions.Regex.Matches(block, "groups: \\[([^\\]]*)\\]").SelectMany(m => System.Text.RegularExpressions.Regex.Matches(m.Groups[1].Value, "\"([a-z_]+)\"")).Select(m => m.Groups[1].Value))
             Assert.Contains("  " + g + ": [", gblock);
+    }
+
+    /// <summary>#5641: the Runnable Queue group is drawn with its three fields (the switch and the two bars) and a
+    /// label, beside Poison wait in the thresholds section. get_alert_settings emits the same three keys
+    /// (<c>RunnableQueue_IsReportedThroughTheClamp_AndWrittenWithTheEnginesValidation</c>).</summary>
+    [Fact]
+    public void ThePage_DrawsTheRunnableQueueGroup_WithItsThreeFields()
+    {
+        var page = Page();
+        Assert.Contains("  runnable_queue: \"Runnable queue\",", page);
+        Assert.Contains("  runnable_queue: [\"enabled\", \"warning_per_scheduler\", \"critical_per_scheduler\"],", page);
+        var sections = page.IndexOf("export const SETTING_SECTIONS = [", StringComparison.Ordinal);
+        Assert.True(page.IndexOf("\"poison_wait\", \"runnable_queue\"", sections, StringComparison.Ordinal) > sections);
+    }
+
+    /// <summary>#5640: the Client Timeouts group is drawn with its three fields (the switch and the two per-minute bars), read-only
+    /// like every group, beside Runnable queue in the thresholds section. get_alert_settings emits the same three keys.</summary>
+    [Fact]
+    public void ThePage_DrawsTheClientTimeoutsGroup_WithItsThreeFields()
+    {
+        var page = Page();
+        Assert.Contains("  client_timeouts: \"Client timeouts\",", page);
+        Assert.Contains("  client_timeouts: [\"enabled\", \"warning_per_minute\", \"critical_per_minute\", \"warning_multiple\", \"critical_multiple\"],", page);
+        var sections = page.IndexOf("export const SETTING_SECTIONS = [", StringComparison.Ordinal);
+        Assert.True(page.IndexOf("\"runnable_queue\", \"client_timeouts\"", sections, StringComparison.Ordinal) > sections);
     }
 
     [Fact]

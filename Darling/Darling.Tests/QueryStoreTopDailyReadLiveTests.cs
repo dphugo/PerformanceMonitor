@@ -52,9 +52,10 @@ public sealed class QueryStoreTopDailyReadLiveTests
     /// deliberately changed both statements: the over-fetch <c>LIMIT $4 + 5</c> became the round's candidate limit and
     /// the tail gained the page / count-row wrapper, and re-taken again for #5420, which deliberately bounded the tail's
     /// inline-text fallback to the read's window (<c>collection_time &gt;= $2</c> and <c>&lt;= $3</c>), and re-taken for #5523, which deliberately added the table read's upper <c>first_execution_time</c> bound (<c>&lt;= $3 + </c>the slack, twelve hours). The split pin is the
-    /// tail-sharing assert below.</summary>
-    private const string RawSqlHash = "836D1C99489C7EC952E327EE1CE1C40D7B94DE3270EC67D9249D32D05634CC33";
-    private const string TableSqlHash = "7B5AF0879E0AF1B75762318E4B41645D370939B2B0FFAEB768FCD9B589B2AB79";
+    /// tail-sharing assert below. Re-taken for #5815, which deliberately sorted the page's candidates before the text lateral
+    /// so <c>LIMIT $4</c> stops the text lookups at a full page (rows and order unchanged). Re-taken for #5984, which deliberately added the query-tag filter's comment token (a no-op until a read names a tag).</summary>
+    private const string RawSqlHash = "DD0DD535EFADA1E258360AE5C8CBFDCD5E6EC0D21F87BCECEAE7BA76411CF827";
+    private const string TableSqlHash = "0CFFEA04CFB2F5FD8C6C9AE9A21E186C1A6349B3772799B909DB39BC9DCE89D3";
 
     private static string Hash(string sql) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sql.ReplaceLineEndings("\n"))));
@@ -71,7 +72,7 @@ public sealed class QueryStoreTopDailyReadLiveTests
     {
         var daily = DarlingDataReader.QueryStoreTopDailyTableSql.ReplaceLineEndings("\n");
         var table = DarlingDataReader.QueryStoreTopTableSql.ReplaceLineEndings("\n");
-        var tail = table[table.IndexOf("SELECT\n    r.database_name,", StringComparison.Ordinal)..];
+        var tail = table[table.IndexOf("SELECT\n    p.database_name,", StringComparison.Ordinal)..];   /* #5815: the page now selects from p */
         Assert.EndsWith(tail, daily, StringComparison.Ordinal);
         Assert.Contains("$7::text IS NULL OR module_name = $7", daily, StringComparison.Ordinal);
         Assert.Contains("LIMIT $10", daily, StringComparison.Ordinal);   /* #5313: the candidate limit, bound after the two dates */
@@ -443,6 +444,51 @@ FROM generate_series(0, 9) AS i", ct);
             Assert.DoesNotContain(9106L, today);
             Assert.Contains(9107L, today);
             Assert.Contains(9108L, today);
+        });
+    }
+
+    /// <summary>
+    /// #5882: the daily statement's two edge reads take the narrowed first_execution_time margin (the trailing edge anchors on
+    /// <c>$9::date</c>, not on <c>$2</c>). With a built run of whole days, a server of 60-minute intervals (a 3-hour margin)
+    /// gets the rows, in the order, the 26-hour statement gets. The edges hold a straddler each (first executed under two hours
+    /// before it was collected, across the window start and across midnight). Non-vacuity: a row that breaks the 60-minute
+    /// invariant, 20 hours before its collection, is read by the 26-hour statement and dropped by the narrowed one at each edge.
+    /// </summary>
+    [Fact]
+    public async Task TheDailyArm_WithANarrowedMargin_ReturnsTheWideMarginsRows_OverABuiltRunOfDays()
+    {
+        await RunLiveAsync(async (connection, source, ct) =>
+        {
+            var readStart = End.AddHours(-72);                                     // 2026-01-11 06:00; days 12 and 13 are built
+            var midnight = new DateTime(2026, 1, 14, 0, 0, 0);
+            await InsertRowAsync(connection, readStart.AddHours(1), 9201, ct, firstExecution: readStart.AddHours(-1));      // leading edge, begun before the window
+            await InsertRowAsync(connection, midnight.AddMinutes(30), 9202, ct, firstExecution: midnight.AddHours(-2));     // trailing edge, begun before midnight
+
+            var margin = QueryStoreIntervalWide.EdgeMarginFor(TimeSpan.FromMinutes(60));
+            Assert.Equal(TimeSpan.FromHours(3), margin);
+            Assert.NotEqual(QueryStoreIntervalWide.PurgeEdgeMargin, margin);
+            var wideDaily = DarlingDataReader.QueryStoreTopDailyTableSql;
+            var narrowDaily = QueryStoreIntervalWide.WithEdgeMargin(wideDaily, QueryStoreIntervalWide.EdgeMarginSqlFor(margin));
+            Assert.NotEqual(wideDaily, narrowDaily);
+
+            var span = (new DateOnly(2026, 1, 12), new DateOnly(2026, 1, 14));
+            var wideRows = Format((await RunSqlAsync(connection, wideDaily, readStart, End, null, null, null, span, ct)).Select(ToRow));
+            var narrowRows = Format((await RunSqlAsync(connection, narrowDaily, readStart, End, null, null, null, span, ct)).Select(ToRow));
+            Assert.Equal(Top, wideRows.Count);
+            Assert.Equal(wideRows, narrowRows);
+            var ids = (await RunSqlAsync(connection, narrowDaily, readStart, End, null, null, null, span, ct)).Select(v => (long)v[1]!).ToHashSet();
+            Assert.Contains(9201L, ids);
+            Assert.Contains(9202L, ids);
+
+            /* Rows that break the 60-minute invariant: only the 26-hour statement reads them. */
+            await InsertRowAsync(connection, readStart.AddHours(1), 9203, ct, firstExecution: readStart.AddHours(-19));
+            await InsertRowAsync(connection, midnight.AddMinutes(30), 9204, ct, firstExecution: midnight.AddHours(-19).AddMinutes(30));
+            var wideIds = (await RunSqlAsync(connection, wideDaily, readStart, End, null, null, null, span, ct)).Select(v => (long)v[1]!).ToHashSet();
+            var narrowIds = (await RunSqlAsync(connection, narrowDaily, readStart, End, null, null, null, span, ct)).Select(v => (long)v[1]!).ToHashSet();
+            Assert.Contains(9203L, wideIds);
+            Assert.Contains(9204L, wideIds);
+            Assert.DoesNotContain(9203L, narrowIds);
+            Assert.DoesNotContain(9204L, narrowIds);
         });
     }
 

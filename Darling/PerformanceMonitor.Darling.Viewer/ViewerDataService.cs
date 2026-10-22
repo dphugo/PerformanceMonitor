@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -88,6 +89,25 @@ public sealed class DarlingServer : INotifyPropertyChanged
     public override string ToString() => DisplayName;
 
     public bool IsEnabled { get; }
+
+    /// <summary>The names of the OTHER enabled registrations that last reported the same machine identity as this one (#6351), empty
+    /// when none or when the store predates the identity column. Worked out when the list is read, never stored. Settable like the
+    /// sidebar overlay state: it is filled by a second read after the registry rows are built.</summary>
+    public IReadOnlyList<string> SameMachineAs { get; set; } = Array.Empty<string>();
+
+    /// <summary>The sidebar's details line (#6351): the version label, then the same-machine flag when there is one. The flag is part of
+    /// the row's text rather than a tooltip alone, so it is on the screen without hovering.</summary>
+    public string SidebarDetail => SameMachineAs.Count == 0
+        ? VersionLabel
+        : (string.IsNullOrEmpty(VersionLabel) ? "" : VersionLabel + " | ") + "same machine as " + string.Join(", ", SameMachineAs);
+
+    /// <summary>What the same-machine flag means, for the tooltip on the row's name; empty when there is no flag.</summary>
+    public string SameMachineTooltip => SameMachineAs.Count == 0
+        ? ""
+        : "This registration last reported the same machine as " + string.Join(", ", SameMachineAs)
+          + ". An address can start reaching another machine (an availability group listener failing over, a DNS change). "
+          + "An agent-scoped notification route on one registration does not cover the other.";
+
     public int? SqlMajorVersion { get; }
     public decimal MonthlyCostUsd { get; }
 
@@ -330,6 +350,9 @@ public sealed class DarlingServer : INotifyPropertyChanged
         ? "99+"
         : _attentionCount.ToString(CultureInfo.InvariantCulture);
 
+    /// <summary>The badge's screen-reader name ("1 unread alert", "3 unread alerts"); the painted count alone is a bare number.</summary>
+    public string AttentionAutomationName => PerformanceMonitor.Ui.UnreadAlertsName.For(_attentionCount);
+
     /// <summary>
     /// Badge severity vocabulary — "Critical" / "Warning" / "None" — so the sidebar row's DataTriggers colour
     /// the badge (ErrorBrush / WarningBrush) the same way Lite maps deadlock→red, else→orange-red.
@@ -361,6 +384,7 @@ public sealed class DarlingServer : INotifyPropertyChanged
         OnPropertyChanged(nameof(AttentionCount));
         OnPropertyChanged(nameof(HasAttention));
         OnPropertyChanged(nameof(AttentionText));
+        OnPropertyChanged(nameof(AttentionAutomationName));
         OnPropertyChanged(nameof(AttentionSeverity));
         OnPropertyChanged(nameof(AttentionTooltip));
     }
@@ -497,6 +521,38 @@ public sealed partial class ViewerDataService : IAsyncDisposable
         StoreIsOnThisMachine = StoreHostIsLoopback(connectionString);
         StoreConnectionIdentity = ViewerPasswordKey.StoreIdentityOf(connectionString);
         _alertClocks = new ServerClockCache(ct => GetServerClocksAsync(serverId: null, ct), AlertClockLifetime);
+    }
+
+    /// <summary>
+    /// Builds the data service, or says why the store connection string cannot be used. The constructor
+    /// throws when Npgsql cannot use the string, and the caller (<c>MainWindow.OnLoaded</c>, an <c>async void</c>
+    /// handler) let that escape into the dispatcher's unhandled-exception log, which writes the exception's message
+    /// and its inner exception. Npgsql's text for that can quote part of the string (a password with an unquoted ';'
+    /// makes the text after it the "keyword", and a password tail that becomes a Host value with a ':' in it makes
+    /// the text after the ':' a bad port), so the string is proved first, with Npgsql's own construction step (the
+    /// guard builds and disposes a data source, and opens nothing), and <paramref name="unusable"/> is
+    /// <see cref="DarlingStoreConnection.DescribeParseFailure"/>'s text, which the caller shows and logs. A string
+    /// the guard rejects never reaches the constructor, so <see cref="ViewerStorePool.Publish"/> (the constructor's
+    /// first step) does not run for it and the pool state does not change. The constructor adds a connect timeout, an
+    /// application name and a session time zone before it creates the data source, and none of those takes part in
+    /// Npgsql's construction checks.
+    /// </summary>
+    internal static bool TryCreate(
+        string connectionString,
+        int? connectionTimeoutSeconds,
+        [NotNullWhen(true)] out ViewerDataService? dataService,
+        out string unusable)
+    {
+        dataService = null;
+        if (DarlingStoreConnection.TryDescribeParseFailure(connectionString) is { } parseFailure)
+        {
+            unusable = "postgres.connectionString could not be used: " + parseFailure;
+            return false;
+        }
+
+        dataService = new ViewerDataService(connectionString, connectionTimeoutSeconds);
+        unusable = string.Empty;
+        return true;
     }
 
     /// <summary>
@@ -1138,7 +1194,144 @@ SELECT
     /* V173 (#5582) adds the exact stamp-grain rollup of the wide Query Store interval table. The hours table is the sentinel, found
        by name in the catalog so the answer does not depend on the connecting role's privileges on it. Named only in this probe line,
        never in prose, per the V71 finding. */
-    EXISTS (SELECT 1 WHERE to_regclass('collect.query_store_compose_stamp_hours') IS NOT NULL)";
+    EXISTS (SELECT 1 WHERE to_regclass('collect.query_store_compose_stamp_hours') IS NOT NULL),
+    /* V174 (#5655) adds the table in which each service host records its product version. That table is the sentinel, found by
+       name in the catalog so the answer does not depend on the connecting role's privileges on it. Named only in this probe line,
+       never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.service_version') IS NOT NULL),
+    /* V175 (#5631) adds the per-day rows-per-call sum to the daily plan regression totals. That column is the sentinel, found by
+       catalog so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose,
+       per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.plan_regression_daily') AND attname = 'rowcount_sum' AND NOT attisdropped),
+    /* V176 (#5638) adds the per-collection procedure totals table. That table is the sentinel, found by name in the catalog so the answer does not
+       depend on the connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('collect.procedure_stats_totals') IS NOT NULL),
+    /* V177 (#5641) adds the Runnable Queue alert's settings to the alert settings row. The enabled column is the sentinel, found by
+       catalog so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose, per
+       the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_alert_settings') AND attname = 'runnable_queue_enabled' AND NOT attisdropped),
+    /* V178 (#5684) adds the per-batch Query Store watermark table. That table is the sentinel, found by name in the catalog so the answer does not
+       depend on the connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('collect.query_store_watermarks') IS NOT NULL),
+    /* V179 (#5640) adds the Client Timeouts alert's settings to the alert settings row. The enabled column is the sentinel, found by
+       catalog so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose, per
+       the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_alert_settings') AND attname = 'client_timeouts_enabled' AND NOT attisdropped),
+    /* V180 (#5654) adds the registry of the services that raise alerts through this store. That table is the sentinel, found by
+       name in the catalog so the answer does not depend on the connecting role's privileges on it. Named only in this probe line,
+       never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.external_alert_source') IS NOT NULL),
+    /* V181 (#5750) adds the route scope columns to the notification routes. The server scope column is the sentinel, found by
+       catalog so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose,
+       per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_notification_routes') AND attname = 'scope_server_id' AND NOT attisdropped),
+    /* V182 (#5506) adds the window band, the in-flight peak and the connection wait to the read-latency table. The window band
+       column is the sentinel, found by catalog so the answer does not depend on the connecting role's privileges. Named only in
+       this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.read_latency') AND attname = 'window_band' AND NOT attisdropped),
+    /* V183 (#5793) adds the read caller to the slow-read table and the distinct caller count to the read-latency table. The
+       distinct caller column is the sentinel, found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.read_latency') AND attname = 'distinct_callers' AND NOT attisdropped),
+    /* V184 (#5632) adds the investigation tables and the agent columns on the notification routes. The request table is the
+       sentinel, found by catalog so the answer does not depend on the connecting role's privileges. Named only in this probe
+       line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.investigation_requests') IS NOT NULL),
+    /* V185 (#5812) adds the partial-day watermark to the plan regression built table. Found by catalog so the answer does not
+       depend on the connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.plan_regression_daily_built') AND attname = 'built_through' AND NOT attisdropped),
+    /* V186 (#5810) adds the hourly rollup of the collection log. The table is the sentinel, found by catalog so the answer
+       does not depend on the connecting role's privileges. Named only in this probe line, never in prose, per the V71
+       finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('collect.collection_log_hourly') IS NOT NULL),
+    /* V187 (#5825) adds the per-channel resolution flags, the route override and the alert log's resolution columns. Found by
+       catalog so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose,
+       per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_alert_log') AND attname = 'resolution_outcome' AND NOT attisdropped),
+    /* V188 (#5821) adds the alert's values to the investigation link rows. Found by catalog so the answer does not depend on
+       the connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.investigation_request_alerts') AND attname = 'context_json' AND NOT attisdropped),
+    /* V189 (#5867) adds the failure record of the Query Store compose builder. That table is the sentinel, found by name in the
+       catalog so the answer does not depend on the connecting role's privileges on it. Named only in this probe line, never in
+       prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('collect.query_store_compose_stamp_failures') IS NOT NULL),
+    /* V190 (#5857) adds the size-estimate marker to the store's own size series. Found by catalog so the answer does not depend on
+       the connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.store_metrics') AND attname = 'size_estimated' AND NOT attisdropped),
+    /* V191 (#5909) adds the Level 2 store. The feedback table is the sentinel, found by name in the catalog so the answer does
+       not depend on the connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.investigation_feedback') IS NOT NULL),
+    /* V192 (#5977) adds the query-tag store. The tag table is the sentinel, found by name in the catalog so the answer does not
+       depend on the connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.query_tags') IS NOT NULL),
+    /* V193 (#5997) adds the Phase C store. The evidence table is the sentinel, found by name in the catalog so the answer does
+       not depend on the connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.investigation_evidence') IS NOT NULL),
+    /* V194 (#5985) rebuilds the query-tag sightings key to include the database. The new unique index is the sentinel, found by
+       name in the catalog so the answer does not depend on the connecting role's privileges on it. Named only in this probe line,
+       never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('collect.ux_query_tag_sightings_key_db') IS NOT NULL),
+    /* V195 (#5632) adds the forced-plans collector table. Found by name in the catalog so the answer does not depend on the
+       connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('collect.query_store_forced_plans') IS NOT NULL),
+    /* V196 (#5632) adds the per-server action switch table. Found by name in the catalog so the answer does not depend on the
+       connecting role's privileges on it. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.config_server_actions') IS NOT NULL),
+    /* V197 (#5632) adds the force-check link to the investigation requests. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.investigation_requests') AND attname = 'force_check_of' AND NOT attisdropped),
+    /* V198 (#6066) adds the pseudonym key table. Found by name in the catalog (the probe never reads the table, which only the store owner
+       can) so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 WHERE to_regclass('config.pseudonym_key') IS NOT NULL),
+    /* V199 (#5632) adds the head-blocker evidence columns to the blocking snapshots. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.dmv_blocking_snapshots') AND attname = 'blocking_tran_log_bytes_used' AND NOT attisdropped),
+    /* V200 (#6098) adds the Volume Free Space alert's excluded-volumes list to the alert settings row. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_alert_settings') AND attname = 'excluded_volumes' AND NOT attisdropped),
+    /* V201 (#6160) adds the plan-guide columns to the forced-plan capture. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.query_store_forced_plans') AND attname = 'plan_guide_scope' AND NOT attisdropped),
+    /* V202 (#6159) adds the primary replica's name to the AG replica states. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.ag_replica_states') AND attname = 'primary_replica' AND NOT attisdropped),
+    /* V203 (#6170) adds the hypothetical-index login pair to the server registry. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_monitored_servers') AND attname = 'hypothetical_index_encrypted_password' AND NOT attisdropped),
+    /* V204 (#6214) adds the folder, personal flag and creator to the saved custom views. Found by catalog so the answer does not depend on
+       the connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.custom_views') AND attname = 'created_by' AND NOT attisdropped),
+    /* V205 (#6235) adds the optional expiry to the custom alert rules. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.custom_alert_rules') AND attname = 'expires_at_utc' AND NOT attisdropped),
+    /* V206 (#6227) lets the collector schedule rows hold a NULL enabled state (inherit). Found by catalog, as a column that no longer
+       carries NOT NULL, so the answer does not depend on the connecting role's privileges. Named only in this probe line, never in prose,
+       per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_collector_schedules') AND attname = 'enabled' AND NOT attnotnull AND NOT attisdropped),
+    /* V207 (#6234) adds the change watch tables. Found by catalog so the answer does not depend on the connecting role's privileges.
+       Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.change_watches') AND attname = 'watch_id' AND NOT attisdropped),
+    /* V208 (#6231) adds the start time to the mute rules. Found by catalog so the answer does not depend on the
+       connecting role's privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_mute_rules') AND attname = 'starts_at_utc' AND NOT attisdropped),
+    /* V209 (#6211) adds the Query Store fetch top-N setting. Found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_service') AND attname = 'query_store_fetch_top_n' AND NOT attisdropped),
+    /* V210 (#6281) adds the guard on the MCP tag writes. Found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('config.server_tag_map') AND tgname = 'trg_agent_route_tag_guard' AND NOT tgisinternal),
+    /* V211 (#5736) adds the relative Client Timeouts bars' multiples. Found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_alert_settings') AND attname = 'client_timeouts_warning_multiple' AND NOT attisdropped),
+    /* V212 (#6285) adds the machine identity to the server registry. Found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('collect.servers') AND attname = 'machine_identity' AND NOT attisdropped),
+    /* V213 (#6254) adds the Query Store replica setting. Found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('config.config_monitored_servers') AND attname = 'query_store_replica' AND NOT attisdropped),
+    /* V214 (#6334) adds the known-pattern entries. Found by catalog so the answer does not depend on the connecting role's
+       privileges. Named only in this probe line, never in prose, per the V71 finding. */
+    to_regclass('config.config_known_patterns') IS NOT NULL";
 
     /// <summary>The store schema version this viewer build requires — the highest migration it knows
     /// (<see cref="StorageVersion.SchemaVersion"/>). The connect-time gate blocks a store below this.</summary>
@@ -1160,7 +1353,7 @@ SELECT
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             if (await reader.ReadAsync(cancellationToken))
             {
-                return MapProbedSchemaVersion(reader.GetBoolean(0), reader.GetBoolean(1), reader.GetBoolean(2), reader.GetBoolean(3), reader.GetBoolean(4), reader.GetBoolean(5), reader.GetBoolean(6), reader.GetBoolean(7), reader.GetBoolean(8), reader.GetBoolean(9), reader.GetBoolean(10), reader.GetBoolean(11), reader.GetBoolean(12), reader.GetBoolean(13), reader.GetBoolean(14), reader.GetBoolean(15), reader.GetBoolean(16), reader.GetBoolean(17), reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21), reader.GetBoolean(22), reader.GetBoolean(23), reader.GetBoolean(24), reader.GetBoolean(25), reader.GetBoolean(26), reader.GetBoolean(27), reader.GetBoolean(28), reader.GetBoolean(29), reader.GetBoolean(30), reader.GetBoolean(31), reader.GetBoolean(32), reader.GetBoolean(33), reader.GetBoolean(34), reader.GetBoolean(35), reader.GetBoolean(36), reader.GetBoolean(37), reader.GetBoolean(38), reader.GetBoolean(39), reader.GetBoolean(40), reader.GetBoolean(41), reader.GetBoolean(42), reader.GetBoolean(43), reader.GetBoolean(44), reader.GetBoolean(45), reader.GetBoolean(46), reader.GetBoolean(47), reader.GetBoolean(48), reader.GetBoolean(49), reader.GetBoolean(50), reader.GetBoolean(51), reader.GetBoolean(52), reader.GetBoolean(53), reader.GetBoolean(54), reader.GetBoolean(55), reader.GetBoolean(56), reader.GetBoolean(57), reader.GetBoolean(58), reader.GetBoolean(59), reader.GetBoolean(60), reader.GetBoolean(61), reader.GetBoolean(62), reader.GetBoolean(63), reader.GetBoolean(64), reader.GetBoolean(65), reader.GetBoolean(66), reader.GetBoolean(67), reader.GetBoolean(68), reader.GetBoolean(69), reader.GetBoolean(70), reader.GetBoolean(71), reader.GetBoolean(72), reader.GetBoolean(73), reader.GetBoolean(74), reader.GetBoolean(75), reader.GetBoolean(76), reader.GetBoolean(77), reader.GetBoolean(78), reader.GetBoolean(79), reader.GetBoolean(80), reader.GetBoolean(81), reader.GetBoolean(82), reader.GetBoolean(83), reader.GetBoolean(84), reader.GetBoolean(85), reader.GetBoolean(86), reader.GetBoolean(87), reader.GetBoolean(88), reader.GetBoolean(89), reader.GetBoolean(90), reader.GetBoolean(91), reader.GetBoolean(92), reader.GetBoolean(93), reader.GetBoolean(94), reader.GetBoolean(95), reader.GetBoolean(96), reader.GetBoolean(97), reader.GetBoolean(98), reader.GetBoolean(99), reader.GetBoolean(100), reader.GetBoolean(101), reader.GetBoolean(102), reader.GetBoolean(103), reader.GetBoolean(104), reader.GetBoolean(105), reader.GetBoolean(106), reader.GetBoolean(107), reader.GetBoolean(108), reader.GetBoolean(109), reader.GetBoolean(110), reader.GetBoolean(111), reader.GetBoolean(112), reader.GetBoolean(113), reader.GetBoolean(114), reader.GetBoolean(115), reader.GetBoolean(116), reader.GetBoolean(117), reader.GetBoolean(118), reader.GetBoolean(119), reader.GetBoolean(120), reader.GetBoolean(121), reader.GetBoolean(122), reader.GetBoolean(123), reader.GetBoolean(124), reader.GetBoolean(125), reader.GetBoolean(126), reader.GetBoolean(127), reader.GetBoolean(128), reader.GetBoolean(129), reader.GetBoolean(130), reader.GetBoolean(131), reader.GetBoolean(132), reader.GetBoolean(133), reader.GetBoolean(134), reader.GetBoolean(135), reader.GetBoolean(136), reader.GetBoolean(137), reader.GetBoolean(138), reader.GetBoolean(139), reader.GetBoolean(140), reader.GetBoolean(141), reader.GetBoolean(142), reader.GetBoolean(143), reader.GetBoolean(144), reader.GetBoolean(145), reader.GetBoolean(146), reader.GetBoolean(147), reader.GetBoolean(148));
+                return MapProbedSchemaVersion(reader.GetBoolean(0), reader.GetBoolean(1), reader.GetBoolean(2), reader.GetBoolean(3), reader.GetBoolean(4), reader.GetBoolean(5), reader.GetBoolean(6), reader.GetBoolean(7), reader.GetBoolean(8), reader.GetBoolean(9), reader.GetBoolean(10), reader.GetBoolean(11), reader.GetBoolean(12), reader.GetBoolean(13), reader.GetBoolean(14), reader.GetBoolean(15), reader.GetBoolean(16), reader.GetBoolean(17), reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21), reader.GetBoolean(22), reader.GetBoolean(23), reader.GetBoolean(24), reader.GetBoolean(25), reader.GetBoolean(26), reader.GetBoolean(27), reader.GetBoolean(28), reader.GetBoolean(29), reader.GetBoolean(30), reader.GetBoolean(31), reader.GetBoolean(32), reader.GetBoolean(33), reader.GetBoolean(34), reader.GetBoolean(35), reader.GetBoolean(36), reader.GetBoolean(37), reader.GetBoolean(38), reader.GetBoolean(39), reader.GetBoolean(40), reader.GetBoolean(41), reader.GetBoolean(42), reader.GetBoolean(43), reader.GetBoolean(44), reader.GetBoolean(45), reader.GetBoolean(46), reader.GetBoolean(47), reader.GetBoolean(48), reader.GetBoolean(49), reader.GetBoolean(50), reader.GetBoolean(51), reader.GetBoolean(52), reader.GetBoolean(53), reader.GetBoolean(54), reader.GetBoolean(55), reader.GetBoolean(56), reader.GetBoolean(57), reader.GetBoolean(58), reader.GetBoolean(59), reader.GetBoolean(60), reader.GetBoolean(61), reader.GetBoolean(62), reader.GetBoolean(63), reader.GetBoolean(64), reader.GetBoolean(65), reader.GetBoolean(66), reader.GetBoolean(67), reader.GetBoolean(68), reader.GetBoolean(69), reader.GetBoolean(70), reader.GetBoolean(71), reader.GetBoolean(72), reader.GetBoolean(73), reader.GetBoolean(74), reader.GetBoolean(75), reader.GetBoolean(76), reader.GetBoolean(77), reader.GetBoolean(78), reader.GetBoolean(79), reader.GetBoolean(80), reader.GetBoolean(81), reader.GetBoolean(82), reader.GetBoolean(83), reader.GetBoolean(84), reader.GetBoolean(85), reader.GetBoolean(86), reader.GetBoolean(87), reader.GetBoolean(88), reader.GetBoolean(89), reader.GetBoolean(90), reader.GetBoolean(91), reader.GetBoolean(92), reader.GetBoolean(93), reader.GetBoolean(94), reader.GetBoolean(95), reader.GetBoolean(96), reader.GetBoolean(97), reader.GetBoolean(98), reader.GetBoolean(99), reader.GetBoolean(100), reader.GetBoolean(101), reader.GetBoolean(102), reader.GetBoolean(103), reader.GetBoolean(104), reader.GetBoolean(105), reader.GetBoolean(106), reader.GetBoolean(107), reader.GetBoolean(108), reader.GetBoolean(109), reader.GetBoolean(110), reader.GetBoolean(111), reader.GetBoolean(112), reader.GetBoolean(113), reader.GetBoolean(114), reader.GetBoolean(115), reader.GetBoolean(116), reader.GetBoolean(117), reader.GetBoolean(118), reader.GetBoolean(119), reader.GetBoolean(120), reader.GetBoolean(121), reader.GetBoolean(122), reader.GetBoolean(123), reader.GetBoolean(124), reader.GetBoolean(125), reader.GetBoolean(126), reader.GetBoolean(127), reader.GetBoolean(128), reader.GetBoolean(129), reader.GetBoolean(130), reader.GetBoolean(131), reader.GetBoolean(132), reader.GetBoolean(133), reader.GetBoolean(134), reader.GetBoolean(135), reader.GetBoolean(136), reader.GetBoolean(137), reader.GetBoolean(138), reader.GetBoolean(139), reader.GetBoolean(140), reader.GetBoolean(141), reader.GetBoolean(142), reader.GetBoolean(143), reader.GetBoolean(144), reader.GetBoolean(145), reader.GetBoolean(146), reader.GetBoolean(147), reader.GetBoolean(148), reader.GetBoolean(149), reader.GetBoolean(150), reader.GetBoolean(151), reader.GetBoolean(152), reader.GetBoolean(153), reader.GetBoolean(154), reader.GetBoolean(155), reader.GetBoolean(156), reader.GetBoolean(157), reader.GetBoolean(158), reader.GetBoolean(159), reader.GetBoolean(160), reader.GetBoolean(161), reader.GetBoolean(162), reader.GetBoolean(163), reader.GetBoolean(164), reader.GetBoolean(165), reader.GetBoolean(166), reader.GetBoolean(167), reader.GetBoolean(168), reader.GetBoolean(169), reader.GetBoolean(170), reader.GetBoolean(171), reader.GetBoolean(172), reader.GetBoolean(173), reader.GetBoolean(174), reader.GetBoolean(175), reader.GetBoolean(176), reader.GetBoolean(177), reader.GetBoolean(178), reader.GetBoolean(179), reader.GetBoolean(180), reader.GetBoolean(181), reader.GetBoolean(182), reader.GetBoolean(183), reader.GetBoolean(184), reader.GetBoolean(185), reader.GetBoolean(186), reader.GetBoolean(187), reader.GetBoolean(188), reader.GetBoolean(189));
             }
 
             return null;
@@ -1185,22 +1378,14 @@ SELECT
     /// is unit-tested without a live store; any schema bump past the newest arm trips the pinning test that keeps
     /// this in step with <see cref="StorageVersion.SchemaVersion"/>.
     /// </summary>
-    internal static int MapProbedSchemaVersion(bool hasConfigControlPlane, bool hasAlertDeliveryOverride, bool hasAnalysisState, bool hasAlertTuningKnobs, bool hasDefaultTraceEvents, bool hasIndexObjectStatsLatestIndex, bool hasCollectionLogHypertableOrPlainPg, bool hasJobHistory, bool hasAgentStatus, bool hasGenericWebhook, bool hasDeadlocksDatabaseName, bool hasQueryStoreReplicaRole, bool hasLongQueryCompletions, bool hasWebDashboardConfig, bool hasCustomViews, bool hasServerTags, bool hasConnectionRefireKnobs = false, bool hasAgCollectors = false, bool hasAgAlertKnobs = false, bool hasAgLatencyColumns = false, bool hasAgDisconnectRefire = false, bool hasPayloadDimensions = false, bool hasDimFloorIndexes = false, bool hasBlockingWaitThreshold = false, bool hasQueryStoreIntervalIdentity = false, bool hasPagerDutyWebhook = false, bool hasPagerDutyProxy = false, bool hasCollectorState = false, bool hasPlanCorrection = false, bool hasPvsStats = false, bool hasPvsPressureKnobs = false, bool hasDatabaseStateAlert = false, bool hasServerTagColour = false, bool hasQueryStatsHostObject = false, bool hasFindingDrillDown = false, bool hasStoreMetrics = false, bool hasPlanDimGzip = false, bool hasSelfAlertKnobs = false, bool hasJobMetricsColumns = false, bool hasJobCadenceKnob = false, bool hasBackfillSwitch = false, bool hasCollectorMemoryKnobs = false, bool hasDatabaseStateEdgeMemory = false, bool hasIncidentOccurrences = false, bool hasPlanXmlCompressionKnob = false, bool hasMonitoredServerEngine = false, bool hasPgBlockingEdges = false, bool hasQueryStorePlanMap = false, bool hasPgStatementText = false, bool hasQueryStoreText = false, bool hasPlanContentRetentionKnob = false, bool hasQueryStoreHealth = false, bool hasQueryStoreTextHash = false, bool hasComposeTimeoutKnob = false, bool hasFileGrowthAlert = false, bool hasCollectionLogFanoutRollup = false, bool hasTempDbMaxSize = false, bool hasServerEngineKind = false, bool hasPgDatabaseStats = false, bool hasPgIndexUsageStats = false, bool hasPgTableBloatStats = false, bool hasPgSessionStates = false, bool hasPgPlanCaptureReadiness = false, bool hasPgWriteStats = false, bool hasPgExtensionAvailability = false, bool hasPgLockStats = false, bool hasPgColumnStats = false, bool hasPgReplicationStats = false, bool hasPgBufferUsage = false, bool hasPgIndexBloat = false, bool hasPgPerDatabaseAttribution = false, bool hasPgWaitSampling = false, bool hasPgKernelStats = false, bool hasPgPredicateStats = false, bool hasPgPlanCapture = false, bool hasPgMajorVersion = false, bool hasPg18IoBytes = false, bool hasPgServerConfig = false, bool hasPgDeadlocks = false, bool hasPgDeadlockIdentity = false, bool hasCollectorCost = false, bool hasPgCpuUtilization = false, bool hasPlanForceActions = false, bool hasCollectionLogPhaseSplit = false, bool hasCollectionLogDrainForensics = false, bool hasCollectionLogFetchPhaseSums = false, bool hasStoreLogSelfMonitoring = false, bool hasCollectorStallProbes = false, bool hasRemediationCredentialAndActor = false, bool hasPgIndexBloatEstimate = false, bool hasPgCpuCapacityHeadroom = false, bool hasCustomAlertCore = false, bool hasMuteRuleReloadBeacon = false, bool hasBuiltinAlertPersistence = false, bool hasRetentionHoldRatioKnobs = false, bool hasDeadlockRateBandKnobs = false, bool hasOversizedPlanBacklog = false, bool hasPgAlertCountKnobs = false, bool hasFleetSweepState = false, bool hasFleetSweepCadenceKnobs = false, bool hasCollectorScheduleDatabases = false, bool hasSelfDiskWarnGbFloor = false, bool hasDeltaFamilyIntervalColumns = false, bool hasDeltaFamilyIntervalCompletion = false, bool hasPgLogEvents = false, bool hasPgLogEventMetrics = false, bool hasNotificationRoutes = false, bool hasPerfmonCounterType = false, bool hasPgNumbackendsAndSampledMs = false, bool hasTimeHonesty = false, bool hasLrqExclusionKnob = false, bool hasPgDatabaseSizeStatsAndHostMemory = false, bool hasQsCaptureModeRouteKnobToast = false, bool hasPgServerConfigDatabaseRoleOverrides = false, bool hasPostmasterStartTime = false, bool hasCheckpointsTimed = false, bool hasCollectionCaveats = false, bool hasIndexObjectStatsServerTimeIndex = false, bool hasQueryStoreIntervalLatest = false, bool hasRawChunkIntervalRungHistory = false, bool hasQueryStoreIntervalWide = false, bool hasManagedConfVerdicts = false, bool hasComposeTimeoutSixty = false, bool hasReadLatency = false, bool hasHotLivenessTouch = false, bool hasCollectionLogWatermarkAndJobHistoryIndexes = false, bool hasAgGroupId = false, bool hasCaggGroupIndexDrop = false, bool hasIntervalFirstExecIndexes = false, bool hasIntervalWideFirstExecIndex = false, bool hasQueryStoreIntervalEnd = false, bool hasCheckpointLongestSync = false, bool hasMuteRuleServerId = false, bool hasInstallId = false, bool hasInstallIdTableOid = false, bool hasCollectorRunAt = false, bool hasQueryStoreTopDaily = false, bool hasSlowReads = false, bool hasStoreStatementHistory = false, bool hasQueryStatsHourLedger = false, bool hasPasswordKey = false, bool hasPagerDutyAutoResolve = false, bool hasLegacyPinCandidates = false, bool hasPlanRegressionDaily = false, bool hasAwsRole = false, bool hasPgIoStatsHourly = false, bool hasQueryStoreIntervalWidePartitioned = false, bool hasQueryStoreIntervalLatestPartitioned = false, bool hasQueryStoreComposeStamp = false)
+    internal static int MapProbedSchemaVersion(bool hasConfigControlPlane, bool hasAlertDeliveryOverride, bool hasAnalysisState, bool hasAlertTuningKnobs, bool hasDefaultTraceEvents, bool hasIndexObjectStatsLatestIndex, bool hasCollectionLogHypertableOrPlainPg, bool hasJobHistory, bool hasAgentStatus, bool hasGenericWebhook, bool hasDeadlocksDatabaseName, bool hasQueryStoreReplicaRole, bool hasLongQueryCompletions, bool hasWebDashboardConfig, bool hasCustomViews, bool hasServerTags, bool hasConnectionRefireKnobs = false, bool hasAgCollectors = false, bool hasAgAlertKnobs = false, bool hasAgLatencyColumns = false, bool hasAgDisconnectRefire = false, bool hasPayloadDimensions = false, bool hasDimFloorIndexes = false, bool hasBlockingWaitThreshold = false, bool hasQueryStoreIntervalIdentity = false, bool hasPagerDutyWebhook = false, bool hasPagerDutyProxy = false, bool hasCollectorState = false, bool hasPlanCorrection = false, bool hasPvsStats = false, bool hasPvsPressureKnobs = false, bool hasDatabaseStateAlert = false, bool hasServerTagColour = false, bool hasQueryStatsHostObject = false, bool hasFindingDrillDown = false, bool hasStoreMetrics = false, bool hasPlanDimGzip = false, bool hasSelfAlertKnobs = false, bool hasJobMetricsColumns = false, bool hasJobCadenceKnob = false, bool hasBackfillSwitch = false, bool hasCollectorMemoryKnobs = false, bool hasDatabaseStateEdgeMemory = false, bool hasIncidentOccurrences = false, bool hasPlanXmlCompressionKnob = false, bool hasMonitoredServerEngine = false, bool hasPgBlockingEdges = false, bool hasQueryStorePlanMap = false, bool hasPgStatementText = false, bool hasQueryStoreText = false, bool hasPlanContentRetentionKnob = false, bool hasQueryStoreHealth = false, bool hasQueryStoreTextHash = false, bool hasComposeTimeoutKnob = false, bool hasFileGrowthAlert = false, bool hasCollectionLogFanoutRollup = false, bool hasTempDbMaxSize = false, bool hasServerEngineKind = false, bool hasPgDatabaseStats = false, bool hasPgIndexUsageStats = false, bool hasPgTableBloatStats = false, bool hasPgSessionStates = false, bool hasPgPlanCaptureReadiness = false, bool hasPgWriteStats = false, bool hasPgExtensionAvailability = false, bool hasPgLockStats = false, bool hasPgColumnStats = false, bool hasPgReplicationStats = false, bool hasPgBufferUsage = false, bool hasPgIndexBloat = false, bool hasPgPerDatabaseAttribution = false, bool hasPgWaitSampling = false, bool hasPgKernelStats = false, bool hasPgPredicateStats = false, bool hasPgPlanCapture = false, bool hasPgMajorVersion = false, bool hasPg18IoBytes = false, bool hasPgServerConfig = false, bool hasPgDeadlocks = false, bool hasPgDeadlockIdentity = false, bool hasCollectorCost = false, bool hasPgCpuUtilization = false, bool hasPlanForceActions = false, bool hasCollectionLogPhaseSplit = false, bool hasCollectionLogDrainForensics = false, bool hasCollectionLogFetchPhaseSums = false, bool hasStoreLogSelfMonitoring = false, bool hasCollectorStallProbes = false, bool hasRemediationCredentialAndActor = false, bool hasPgIndexBloatEstimate = false, bool hasPgCpuCapacityHeadroom = false, bool hasCustomAlertCore = false, bool hasMuteRuleReloadBeacon = false, bool hasBuiltinAlertPersistence = false, bool hasRetentionHoldRatioKnobs = false, bool hasDeadlockRateBandKnobs = false, bool hasOversizedPlanBacklog = false, bool hasPgAlertCountKnobs = false, bool hasFleetSweepState = false, bool hasFleetSweepCadenceKnobs = false, bool hasCollectorScheduleDatabases = false, bool hasSelfDiskWarnGbFloor = false, bool hasDeltaFamilyIntervalColumns = false, bool hasDeltaFamilyIntervalCompletion = false, bool hasPgLogEvents = false, bool hasPgLogEventMetrics = false, bool hasNotificationRoutes = false, bool hasPerfmonCounterType = false, bool hasPgNumbackendsAndSampledMs = false, bool hasTimeHonesty = false, bool hasLrqExclusionKnob = false, bool hasPgDatabaseSizeStatsAndHostMemory = false, bool hasQsCaptureModeRouteKnobToast = false, bool hasPgServerConfigDatabaseRoleOverrides = false, bool hasPostmasterStartTime = false, bool hasCheckpointsTimed = false, bool hasCollectionCaveats = false, bool hasIndexObjectStatsServerTimeIndex = false, bool hasQueryStoreIntervalLatest = false, bool hasRawChunkIntervalRungHistory = false, bool hasQueryStoreIntervalWide = false, bool hasManagedConfVerdicts = false, bool hasComposeTimeoutSixty = false, bool hasReadLatency = false, bool hasHotLivenessTouch = false, bool hasCollectionLogWatermarkAndJobHistoryIndexes = false, bool hasAgGroupId = false, bool hasCaggGroupIndexDrop = false, bool hasIntervalFirstExecIndexes = false, bool hasIntervalWideFirstExecIndex = false, bool hasQueryStoreIntervalEnd = false, bool hasCheckpointLongestSync = false, bool hasMuteRuleServerId = false, bool hasInstallId = false, bool hasInstallIdTableOid = false, bool hasCollectorRunAt = false, bool hasQueryStoreTopDaily = false, bool hasSlowReads = false, bool hasStoreStatementHistory = false, bool hasQueryStatsHourLedger = false, bool hasPasswordKey = false, bool hasPagerDutyAutoResolve = false, bool hasLegacyPinCandidates = false, bool hasPlanRegressionDaily = false, bool hasAwsRole = false, bool hasPgIoStatsHourly = false, bool hasQueryStoreIntervalWidePartitioned = false, bool hasQueryStoreIntervalLatestPartitioned = false, bool hasQueryStoreComposeStamp = false, bool hasServiceVersion = false, bool hasPlanRegressionDailyRowcount = false, bool hasProcedureStatsTotals = false, bool hasRunnableQueueSettings = false, bool hasQueryStoreWatermarks = false, bool hasClientTimeoutSettings = false, bool hasExternalAlerts = false, bool hasNotificationRouteScope = false, bool hasReadLatencyCapacityFields = false, bool hasReadCaller = false, bool hasInvestigations = false, bool hasPlanRegressionPartialDays = false, bool hasCollectionLogHourly = false, bool hasAlertResolutionDelivery = false, bool hasInvestigationAlertFacts = false, bool hasComposeStampFailures = false, bool hasStoreMetricsSizeEstimated = false, bool hasAgentLevel2Store = false, bool hasQueryTagsStore = false, bool hasPhaseCStore = false, bool hasQueryTagSightingsDatabaseKey = false, bool hasQueryStoreForcedPlans = false, bool hasServerActionSwitches = false, bool hasForceChecks = false, bool hasPseudonymKey = false, bool hasBlockingHeadEvidence = false, bool hasExcludedVolumes = false, bool hasForcedPlanVariantsAndGuides = false, bool hasAgPrimaryReplica = false, bool hasHypotheticalIndexLogin = false, bool hasCustomViewFolders = false, bool hasCustomAlertRuleExpiry = false, bool hasInheritableCollectorEnabled = false, bool hasChangeWatches = false, bool hasMuteRuleStartsAt = false, bool hasQueryStoreFetchTopN = false, bool hasAgentRouteTagGuard = false, bool hasClientTimeoutsMultiples = false, bool hasServerMachineIdentity = false, bool hasQueryStoreReplica = false, bool hasKnownPatterns = false)
     {
         /* V71 (the PostgreSQL blocking-edges rung): a table-existence sentinel and now the newest-first arm.
            A collector table would ordinarily get no arm at all — see the V63-V69 note below — but the TOP
            rung always needs one, whatever it happens to be, because RequiredStoreSchemaVersion is
            StorageVersion.SchemaVersion and a fully-migrated store must map to EXACTLY that or the version
            banner reports a mismatch on a store that is current. Being a collector table makes it no less
-           reliable as a sentinel; it simply is not interesting for any other reason.
-
-           Deliberately NOT spelled with its collect.<table> name here, and this is the only place in the
-           file where that matters. ViewerCollectorCoverageTests scans this reader layer for collector table
-           names by plain substring to decide which tables the viewer actually reads; it strips the probe's
-           information_schema lines precisely so a migration sentinel cannot fake coverage, but a PROSE
-           mention has no such line to strip. Naming the table in this comment made the table look read,
-           which silently exempted it from the coverage ratchet — the exact failure that pin exists to
-           catch, reported as a stale allow-list entry. */
+           reliable as a sentinel; it simply is not interesting for any other reason. */
         /* V72 (the Query Store plan map, #2210): table-existence sentinel, and it has to sit ABOVE the V71
            arm because these are evaluated newest-first — a V72 store also has V71's table, so testing V71
            first would report every V72 store as V71 and the viewer would show a spurious upgrade banner
@@ -1382,6 +1567,298 @@ SELECT
            through to 172 and showing a spurious upgrade banner on a store that is current. The WPF viewer runs no compose read, so no
            viewer read names the new tables; this arm exists so the version banner stays truthful. Named only in the probe line, not this
            prose, per the V71 finding. */
+        /* V174 (#5655): the table in which each service host records its product version. TABLE-existence sentinel, newest-first,
+           and the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to
+           173 and showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per
+           the V71 finding. */
+        /* V181 (#5750): the scope columns on the notification routes. Column-existence sentinel, newest-first, and the TOP rung, so a
+           fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 180 and showing a spurious
+           upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        /* V182 (#5506): the window band, in-flight and connection-wait columns on the read-latency table. Column-existence sentinel,
+           newest-first, and the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling
+           through to 181 and showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this
+           prose, per the V71 finding. */
+        /* V214 (#6334): the known-pattern entries. Table-existence sentinel, newest-first, and the TOP rung, so a fully-migrated
+           store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 213 and showing a spurious upgrade banner
+           on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasKnownPatterns)
+        {
+            return 214;
+        }
+        /* V213 (#6254): the Query Store replica setting. Column-existence sentinel, newest-first, and a rung below the top, so a fully-migrated
+           store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 212 and showing a spurious upgrade banner
+           on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasQueryStoreReplica)
+        {
+            return 213;
+        }
+        /* V212 (#6285): the machine identity on the server registry. Column-existence sentinel, newest-first, and a rung below the top, so a fully-migrated
+           store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 211 and showing a spurious upgrade banner
+           on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasServerMachineIdentity)
+        {
+            return 212;
+        }
+        /* V211 (#5736): the relative Client Timeouts bars' multiples. Column-existence sentinel, newest-first, and a rung below the top, so a
+           fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 210 and showing a spurious
+           upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasClientTimeoutsMultiples)
+        {
+            return 211;
+        }
+        /* V210 (#6281): the guard on the MCP tag writes. Trigger-existence sentinel, newest-first, and the TOP rung, so a fully-migrated
+           store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 209 and showing a spurious upgrade banner
+           on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasAgentRouteTagGuard)
+        {
+            return 210;
+        }
+        /* V209 (#6211): the Query Store fetch top-N setting. Column-existence sentinel, newest-first, and the TOP rung, so a fully-migrated
+           store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 208 and showing a spurious upgrade banner
+           on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasQueryStoreFetchTopN)
+        {
+            return 209;
+        }
+        /* V208 (#6231): the start time on the mute rules. Column-existence sentinel, newest-first, and the TOP rung, so a fully-migrated
+           store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 207 and showing a spurious upgrade banner
+           on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasMuteRuleStartsAt)
+        {
+            return 208;
+        }
+        /* V207 (#6234): the change watch tables. Newest-first, and the TOP rung, so a fully-migrated store maps to EXACTLY
+           StorageVersion.SchemaVersion rather than falling through to 204 and showing a spurious upgrade banner on a store that is current.
+           Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasChangeWatches)
+        {
+            return 207;
+        }
+        /* V203 (#6170): the hypothetical-index login columns on the server registry. Column-existence sentinel, newest-first, and the TOP
+           rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 201 and showing a
+           spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        /* V206 (#6227): the collector schedule rows may hold a NULL enabled state. Column-nullability sentinel, newest-first, and the TOP
+           rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 205 and showing a
+           spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasInheritableCollectorEnabled)
+        {
+            return 206;
+        }
+        /* V205 (#6235): the optional expiry on the custom alert rules. Column-existence sentinel, newest-first, and the TOP rung, so a
+           fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 203 and showing a spurious
+           upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasCustomAlertRuleExpiry)
+        {
+            return 205;
+        }
+        /* V204 (#6214): the folder, personal flag and creator on the custom views. Column-existence sentinel, newest-first, and the TOP
+           rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 203 and showing a
+           spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasCustomViewFolders)
+        {
+            return 204;
+        }
+        if (hasHypotheticalIndexLogin)
+        {
+            return 203;
+        }
+        /* V202 (#6159): the primary replica's name on the AG replica states. Column-existence sentinel, newest-first, and the TOP rung,
+           so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 201 and showing a spurious
+           upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasAgPrimaryReplica)
+        {
+            return 202;
+        }
+        /* V201 (#6160): the plan-guide columns on the forced-plan capture. Column-existence sentinel, newest-first, so a store at 201
+           maps to EXACTLY 201 rather than falling through to 200. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasForcedPlanVariantsAndGuides)
+        {
+            return 201;
+        }
+        /* V200 (#6098): the excluded-volumes column on the alert settings row. Column-existence sentinel, newest-first, so a store at 200
+           maps to EXACTLY 200 rather than falling through to 199. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasExcludedVolumes)
+        {
+            return 200;
+        }
+        /* V199 (#5632): the head-blocker evidence columns on the blocking snapshots. Column-existence sentinel, newest-first, and the TOP rung,
+           so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 198 and showing a spurious
+           upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasBlockingHeadEvidence)
+        {
+            return 199;
+        }
+        /* V198 (#6066): the pseudonym key table. Table-existence sentinel, newest-first, and the TOP rung, so a fully-migrated store maps to
+           EXACTLY StorageVersion.SchemaVersion rather than falling through to 197 and showing a spurious upgrade banner on a store that is
+           current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasPseudonymKey)
+        {
+            return 198;
+        }
+        /* V197 (#5632): the force-check link columns. Column-existence sentinel, newest-first, so a store at 197 maps to EXACTLY 197 rather
+           than falling through to 196. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasForceChecks)
+        {
+            return 197;
+        }
+        /* V196 (#5632): the per-server action switch table. Table-existence sentinel, newest-first, so a store at 196 maps to EXACTLY 196
+           rather than falling through to 195. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasServerActionSwitches)
+        {
+            return 196;
+        }
+        /* V195 (#5632): the forced-plans collector table. Table-existence sentinel, newest-first, so a store at 195 maps to EXACTLY 195
+           rather than falling through to 194. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasQueryStoreForcedPlans)
+        {
+            return 195;
+        }
+        /* V194 (#5985): the query-tag sightings key gains the database. Index-existence sentinel, newest-first, so a store at 194 maps to
+           EXACTLY 194 rather than falling through to 193. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasQueryTagSightingsDatabaseKey)
+        {
+            return 194;
+        }
+        /* V193 (#5997): the Phase C store (investigation evidence, follow-ups, signature days, signing keys). Table-existence
+           sentinel, newest-first, so a store at 193 maps to EXACTLY 193 rather than falling through to 192 and showing a
+           spurious upgrade banner. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasPhaseCStore)
+        {
+            return 193;
+        }
+        /* V192 (#5977): the query-tag store. Table-existence sentinel, newest-first, so a store at 192 maps to EXACTLY 192 rather
+           than falling through to 191 and showing a spurious upgrade banner. Named only in the probe line, not this prose, per the
+           V71 finding. */
+        if (hasQueryTagsStore)
+        {
+            return 192;
+        }
+        /* V191 (#5909): the Level 2 store (the feedback table, the threshold overrides, the agent-actions switch). Table-existence
+           sentinel, newest-first, so a fully-migrated store at 191 maps to EXACTLY 191 rather than falling through to 190 and
+           showing a spurious upgrade banner. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasAgentLevel2Store)
+        {
+            return 191;
+        }
+        /* V190 (#5857): the size-estimate marker on the store's own size series. Column-existence sentinel, newest-first, and the
+           TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 188 and
+           showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per the
+           V71 finding. */
+        if (hasStoreMetricsSizeEstimated)
+        {
+            return 190;
+        }
+        /* V189 (#5867): the failure record of the Query Store compose builder. Table-existence sentinel, newest-first, and the TOP
+           rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 188 and
+           showing a spurious upgrade banner, or the connect-time gate refusing a store that is current. Named only in the probe
+           line, not this prose, per the V71 finding. */
+        if (hasComposeStampFailures)
+        {
+            return 189;
+        }
+        /* V188 (#5821): the alert values on the investigation link rows. Column-existence sentinel, newest-first, and the TOP
+           rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 186 and
+           showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per the
+           V71 finding. */
+        if (hasInvestigationAlertFacts)
+        {
+            return 188;
+        }
+        /* V187 (#5825): the alert-resolution delivery columns. Column-existence sentinel, newest-first, and the TOP rung, so a
+           fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 186 and showing a
+           spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71
+           finding. */
+        if (hasAlertResolutionDelivery)
+        {
+            return 187;
+        }
+        /* V186 (#5810): the hourly rollup of the collection log. Table-existence sentinel, newest-first, and the TOP rung, so a
+           fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 185 and showing a
+           spurious upgrade banner, or the connect-time gate refusing a store that is current. Named only in the probe line, not
+           this prose, per the V71 finding. */
+        if (hasCollectionLogHourly)
+        {
+            return 186;
+        }
+        /* V185 (#5812): the partial-day watermark on the plan regression built table. Column-existence sentinel, newest-first,
+           and the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to
+           184 and showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this prose,
+           per the V71 finding. */
+        if (hasPlanRegressionPartialDays)
+        {
+            return 185;
+        }
+        /* V184 (#5632): the investigation tables and the agent route columns. Table-existence sentinel, newest-first, and
+           the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to
+           183 and showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this prose,
+           per the V71 finding. */
+        if (hasInvestigations)
+        {
+            return 184;
+        }
+        /* V183 (#5793): the read caller columns on the slow-read and read-latency tables. Column-existence sentinel,
+           newest-first, and the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than
+           falling through to 182 and showing a spurious upgrade banner on a store that is current. Named only in the probe
+           line, not this prose, per the V71 finding. */
+        if (hasReadCaller)
+        {
+            return 183;
+        }
+        if (hasReadLatencyCapacityFields)
+        {
+            return 182;
+        }
+        if (hasNotificationRouteScope)
+        {
+            return 181;
+        }
+        /* V180 (#5654): the registry of the services that raise alerts through this store. TABLE-existence sentinel, newest-first,
+           and the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to
+           179 and showing a spurious upgrade banner on a store that is current. Named only in the probe line, not this prose, per
+           the V71 finding. */
+        if (hasExternalAlerts)
+        {
+            return 180;
+        }
+        /* V179 (#5640): the Client Timeouts alert's settings columns on the alert settings row. Column-existence sentinel, newest-first,
+           and the TOP rung, so a fully-migrated store maps to EXACTLY StorageVersion.SchemaVersion rather than falling through to 177.
+           (V178, #5684, the watermark table, sits just below this arm; V177, #5641, below that.) Named only in the probe
+           line, not this prose, per the V71 finding. */
+        if (hasClientTimeoutSettings)
+        {
+            return 179;
+        }
+        /* V178 (#5684): the per-batch Query Store watermark table. Table-existence sentinel, newest-first; the V179 arm (#5640)
+           now sits above it as the top rung, and this one is the rung a store at 178 maps to rather than falling through to 177.
+           Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasQueryStoreWatermarks)
+        {
+            return 178;
+        }
+        /* V177 (#5641): the Runnable Queue alert's settings columns on the alert settings row. Column-existence sentinel, newest-first.
+           The V178 arm (#5684) and the V179 arm (#5640) now sit above it, V179 as the top rung; this one is the rung a store at 177 maps to rather than falling
+           through to 176. (V176, #5638, sits just below this arm.) Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasRunnableQueueSettings)
+        {
+            return 177;
+        }
+        /* V176 (#5638): the per-collection procedure totals table. Table-existence sentinel, newest-first; a store
+           at 176 maps here rather than falling through to 175 and showing a spurious
+           upgrade banner on a store that is current. Named only in the probe line, not this prose, per the V71 finding. */
+        if (hasProcedureStatsTotals)
+        {
+            return 176;
+        }
+        /* V175 (#5631): the rows-per-call column of the daily plan regression totals. Column-existence sentinel, newest-first. Named
+           only in the probe line, not this prose, per the V71 finding. */
+        if (hasPlanRegressionDailyRowcount)
+        {
+            return 175;
+        }
+        if (hasServiceVersion)
+        {
+            return 174;
+        }
         if (hasQueryStoreComposeStamp)
         {
             return 173;
@@ -2717,10 +3194,7 @@ SELECT
         }
 
         /* V34 (#991 Availability Group collectors): engine-agnostic table-existence sentinel, newest-first
-           arm. The AG database-grain collector table exists only at V34 or later. (Named only in the probe
-           SQL, deliberately not repeated here: ViewerCollectorCoverageTests scans this layer by substring
-           and strips the probe's information_schema lines, so spelling the table in prose would make it
-           read as "covered" and quietly exempt it from the coverage ratchet.) */
+           arm. The AG database-grain collector table exists only at V34 or later. */
         if (hasAgCollectors)
         {
             return 34;
@@ -2874,6 +3348,7 @@ SELECT
                 reader.IsDBNull(9) ? null : reader.GetDateTime(9)));
         }
 
+        await AttachSameMachineAsync(servers, cancellationToken);
         return servers;
     }
 

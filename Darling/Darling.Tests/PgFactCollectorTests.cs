@@ -39,7 +39,6 @@ namespace Darling.Tests;
 /* Live-fixture tests share one Postgres store; the collection serializes them so
    cross-test row churn (inserts/purges/deletes) cannot race another class's assertions. */
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class PgFactCollectorTests
 {
     /// <summary>Distinctive fake ids — a real server_id is a storage-name hash, never these.</summary>
@@ -312,7 +311,10 @@ public sealed class PgFactCollectorTests
                     views.Contains(target) || tables.Contains(target) || ctes.Contains(target)
                         || target == QueryStoreIntervalLatest.TableName
                         /* #5448: the daily-totals twin reads the per-day table beside it. */
-                        || target == "plan_regression_daily",
+                        || target == "plan_regression_daily"
+                        /* #5630: the PLAN_REGRESSION read joins the statement text dimension for the recompile hint, as
+                           the drill-down does (#2150). */
+                        || target == "query_store_text",
                     $"FROM/JOIN target '{target}' resolves to no V4 view, collector table, or CTE in:\n{sql}");
             }
         }

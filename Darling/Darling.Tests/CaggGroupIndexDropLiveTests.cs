@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -315,9 +315,33 @@ public sealed class CaggGroupIndexDropLiveTests
     /// version-stamp rollback (<c>DELETE FROM darling_schema_version WHERE version >= N + 1</c>) actually
     /// simulates an older store for the schema PROBE too, not just the version row — a later rung's own
     /// sentinel object would otherwise still be on disk and make the probe map past the simulated version.
-    /// A future rung that adds a new probe sentinel must add its artifact's removal here.</summary>
+    /// A future rung that adds a new probe sentinel adds its removal to <see cref="RungRewindArtifacts.Ladder"/>.</summary>
     private static async Task DropArtifactsOfLaterRungsAsync(NpgsqlConnection connection, int simulatedVersion, CancellationToken ct)
     {
+        /* The probe sentinels of the rungs above the simulated one (V177 and up) are the ladder's to remove (#5950). */
+        await RungRewindArtifacts.DropSentinelsAboveAsync(connection, simulatedVersion, ct);
+
+        if (simulatedVersion < ProcedureStatsTotals.RungVersion)
+        {
+            /* V176 (#5638) - the per-collection procedure totals table is the probe's sentinel. */
+            await using var dropTotals = new NpgsqlCommand("DROP TABLE IF EXISTS collect.procedure_stats_totals", connection);
+            await dropTotals.ExecuteNonQueryAsync(ct);
+        }
+
+        if (simulatedVersion < 175)
+        {
+            /* V175 (#5631) - the rows-per-call column of the daily plan regression totals is the probe's sentinel. */
+            await using var dropRowcount = new NpgsqlCommand("ALTER TABLE IF EXISTS collect.plan_regression_daily DROP COLUMN IF EXISTS rowcount_sum", connection);
+            await dropRowcount.ExecuteNonQueryAsync(ct);
+        }
+
+        if (simulatedVersion < ServiceVersionTable.RungVersion)
+        {
+            /* V174 (#5655) - the service host version table is the probe's sentinel. */
+            await using var dropServiceVersion = new NpgsqlCommand("DROP TABLE IF EXISTS config.service_version", connection);
+            await dropServiceVersion.ExecuteNonQueryAsync(ct);
+        }
+
         if (simulatedVersion < QueryStoreComposeStamp.RungVersion)
         {
             /* V173 (#5582) - the stamp-grain rollup of the wide Query Store table, its validity tables and the two late-row triggers on the

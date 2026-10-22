@@ -73,7 +73,7 @@ public sealed class JobHistoryPageTests
     {
         var source = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpJobTools.cs");
         var keys = Regex.Matches(Page(), "\\{ key: \"([a-z_]+)\"").Select(m => m.Groups[1].Value).ToList();
-        Assert.Equal(10, keys.Count);
+        Assert.Equal(9, keys.Count);
         foreach (var key in keys)
             Assert.Matches("(?m)^\\s+" + Regex.Escape(key) + " = ", source.ReplaceLineEndings("\n"));
     }
@@ -149,8 +149,9 @@ public sealed class JobHistoryPageTests
         Assert.Equal("100", q.GetProperty("limit").GetString());
         Assert.False(q.TryGetProperty("server", out _));
         Assert.True(call.GetProperty("signal").GetBoolean());
-        Assert.Equal("Run Time,Server,Job,Category,Step,Status,Duration,Retries,Last Success,Message", string.Join(",", Strings(run.GetProperty("columns"))));
-        Assert.Equal("Run Time,Server,Job,Category,Step,Status,Duration,Retries,Last Success,Message", string.Join(",", Strings(first.GetProperty("headers"))));
+        /* #5644 W21: no Last Success column; it was the job's current last success repeated on every run row. */
+        Assert.Equal("Run Time,Server,Job,Category,Step,Status,Duration,Retries,Message", string.Join(",", Strings(run.GetProperty("columns"))));
+        Assert.Equal("Run Time,Server,Job,Category,Step,Status,Duration,Retries,Message", string.Join(",", Strings(first.GetProperty("headers"))));
         Assert.Equal(2, first.GetProperty("bodyRows").GetInt32());
         Assert.Equal(",srv-a,srv-b", string.Join(",", Strings(first.GetProperty("servers"))));
         Assert.Equal(",Backup,Maintenance", string.Join(",", Strings(first.GetProperty("categories"))));
@@ -217,6 +218,21 @@ public sealed class JobHistoryPageTests
         Assert.Equal("Failed", rebuilt.GetProperty("selects").GetProperty("Status").GetString());
     }
 
+    /// <summary>#6439: the Category choices are the selected server's own. A server that has shown no run (an Azure SQL Database) lists none, a
+    /// server lists the categories its own answers carried, and a pick made on one server is not sent for the next.</summary>
+    [Fact]
+    public void TheCategoryChoices_AreTheSelectedServersOwn()
+    {
+        var c = Run().GetProperty("categoryChoices");
+
+        Assert.Equal(",Backup,Maintenance", string.Join(",", Strings(c.GetProperty("fleet"))));
+        Assert.Equal("", string.Join(",", Strings(c.GetProperty("noRuns"))));
+        Assert.Equal(",Backup", string.Join(",", Strings(c.GetProperty("oneServer"))));
+        Assert.Equal("Backup", c.GetProperty("pickedSent").GetString());
+        Assert.Equal(",Backup,Maintenance", string.Join(",", Strings(c.GetProperty("backToFleet"))));
+        Assert.Equal(JsonValueKind.Null, c.GetProperty("fleetCategorySent").ValueKind);
+    }
+
     [Fact]
     public void AFleetCallNamesNoServerAndAOneServerCallNamesIt()
     {
@@ -237,6 +253,51 @@ public sealed class JobHistoryPageTests
         Assert.Contains("partial window: the store keeps job history from ", text);
         Assert.Contains("Showing the newest 2 runs; more matched.", text);
         Assert.Equal(0, run.GetProperty("quiet").GetProperty("noticeCount").GetInt32());
+    }
+
+    /// <summary>
+    /// #5703: the row-limit note names how far back the list reaches and suggests narrowing. It suggests picking a server only while
+    /// the Server pick is All servers; a list already scoped to one server is not told to pick one. The full text is pinned (the
+    /// time between is the browser's local format, so the test checks what stands either side of it).
+    /// </summary>
+    [Fact]
+    public void TheRowLimitNoteSuggestsPickingAServerOnlyWhenNoServerIsPicked()
+    {
+        const string head = "Showing the newest 2 runs; more matched. They reach back to ";
+        const string fleetTail = ". Raise the row limit, pick a server or narrow the filters to see the rest.";
+        const string serverTail = ". Raise the row limit or narrow the filters to see the rest.";
+
+        var run = Run();
+        var notes = run.GetProperty("limitNotes");
+        var fleet = notes.GetProperty("fleet").GetString()!;
+        var one = notes.GetProperty("oneServer").GetString()!;
+        Assert.StartsWith(head, fleet, StringComparison.Ordinal);
+        Assert.EndsWith(fleetTail, fleet, StringComparison.Ordinal);
+        Assert.StartsWith(head, one, StringComparison.Ordinal);
+        Assert.EndsWith(serverTail, one, StringComparison.Ordinal);
+        Assert.DoesNotContain("pick a server", one, StringComparison.Ordinal);
+        Assert.True(notes.GetProperty("notCut").GetBoolean());
+
+        /* The rendered page hands the note its own Server pick: All servers offers the pick, srv-a does not. */
+        Assert.Contains("pick a server", run.GetProperty("notices").GetProperty("text").GetString(), StringComparison.Ordinal);
+        var rendered = run.GetProperty("noticesOneServer").GetProperty("text").GetString()!;
+        Assert.Contains(serverTail, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("pick a server", rendered, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// #6178: a not_collected answer that names Azure SQL Database reads "Azure SQL Database has no SQL Agent, so it has no job history."
+    /// Any other engine, an empty answer, and no answer at all keep their own sentence (null here).
+    /// </summary>
+    [Fact]
+    public void AnAzureSqlDatabaseNotCollectedAnswer_SaysItHasNoSqlAgent_AndNothingElseDoes()
+    {
+        var lines = Run().GetProperty("noAgentLines");
+        Assert.Equal("Azure SQL Database has no SQL Agent, so it has no job history.", lines.GetProperty("azure").GetString());
+        Assert.Equal(JsonValueKind.Null, lines.GetProperty("otherEngine").ValueKind);
+        Assert.Equal(JsonValueKind.Null, lines.GetProperty("plainEmpty").ValueKind);
+        Assert.Equal(JsonValueKind.Null, lines.GetProperty("azureButEmpty").ValueKind);
+        Assert.Equal(JsonValueKind.Null, lines.GetProperty("none").ValueKind);
     }
 
     [Fact]
@@ -355,7 +416,8 @@ public sealed class JobHistoryPageTests
         Assert.Contains("el(\"div\", { class: \"jh-message\"", tabs, StringComparison.Ordinal);
 
         var css = Wwwroot("css", "app.css");
-        Assert.Matches("\\.jh-message \\{[^}]*min-width: 2[0-9]rem;[^}]*-webkit-line-clamp: 3;", css);
+        Assert.Matches(@"\.jh-message \{[^}]*min-width: 2[0-9]rem;", css);
+        Assert.Matches(@"\.clamp-text \{[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;", css); // one line (#5644 W11), was 3 lines
     }
 
     [Fact]

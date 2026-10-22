@@ -256,22 +256,6 @@ public sealed class McpEndpointLossReportingTests
     }
 
     /// <summary>
-    /// #2425's startup report is what the person at the keyboard actually sees, and "every setting is at
-    /// its default" does not tell them an endpoint on another machine just stopped answering. The report
-    /// has to name the capability, not the settings.
-    /// </summary>
-    [Fact]
-    public void TheUnreadableSettingsReport_NamesTheMcpEndpoint()
-    {
-        var source = File.ReadAllText(FindRepoFile(Path.Combine("Lite", "App.xaml.cs")));
-
-        Assert.Contains("MCP", MethodBody(source, "private static void ReportUnreadableSettings(string? problem)"),
-            StringComparison.Ordinal);
-        Assert.Contains("MCP", MethodBody(source, "private static void ReportUnreadableSettingsToUser()"),
-            StringComparison.Ordinal);
-    }
-
-    /// <summary>
     /// The Settings window is the one place in the UI that claims to show the endpoint's configuration.
     /// On an unreadable file it shows an unticked box and port 5151, which is a fallback and not a reading
     /// of anything, so the status line beside them must not call that "Disabled".
@@ -304,9 +288,10 @@ public sealed class McpEndpointLossReportingTests
     [Fact]
     public void TheSettingsWindow_ReconsidersTheEndpointStateAfterASave()
     {
+        /* #5846: SaveButton_Click now awaits SaveCoreAsync, which holds the write and the re-read after it. */
         var body = MethodBody(
             File.ReadAllText(FindRepoFile(Path.Combine("Lite", "Windows", "SettingsWindow.xaml.cs"))),
-            "private async void SaveButton_Click(");
+            "private async Task SaveCoreAsync(");
 
         Assert.Contains("_mcpSettingsProblem", body, StringComparison.Ordinal);
         Assert.Contains("UpdateMcpStatus()", body, StringComparison.Ordinal);

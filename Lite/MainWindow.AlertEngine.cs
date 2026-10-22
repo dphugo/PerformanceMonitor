@@ -45,6 +45,13 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task SeedKnownEngineEditionsAsync()
     {
+        /* #5703: the Job History tab's Server drop-down offers exactly the servers the job history collector runs on (not a disabled
+           server or an Azure SQL Database), with the edition resolved here the way the alert sweep's is. The tab reads it on each
+           load, so wiring it before the seed lands is safe: an unseeded server has only its live edition, as everywhere else. */
+        JobHistoryContent.OfferedServers = () => LocalDataService.BuildJobHistoryChoiceMap(
+            _serverManager.GetAllServers(),
+            s => _engineEditions.Resolve(KnownEngineEditions.StorageId(s), _serverManager.GetConnectionStatus(s.Id).SqlEngineEdition));
+
         /* Off the dispatcher, because DuckDB.NET is synchronous. It has its own LocalDataService over the initialized
            store, because _dataService is built further down MainWindow_Loaded. */
         await _engineEditions.SeedFromStoreAsync(
@@ -114,6 +121,25 @@ public partial class MainWindow : Window
            and counted its sibling databases' blocking and deadlocks. */
         var liveEdition = connStatus?.SqlEngineEdition ?? PerformanceMonitor.Collectors.CollectorEngineCapability.UnknownEngineEdition;
 
+        /* #5642: when this app's connection to the server began collecting, and the recent CPU samples the shared
+           gate judges one by one. The sweep observes the reading too, so a sweep that runs before the connection
+           tick's first pass still stamps a value (an online server already stamped keeps its value). A server whose
+           status is unknown (or offline) falls back to the app's start, never to null: the engine reads a null as
+           "unknown" and collapses to the single newest sample, and nothing before the app started was watched
+           anyway. */
+        DateTime watchingSinceUtc;
+        if (badgeServer != null && connStatus?.IsOnline != null)
+        {
+            _watchingSince.Observe(badgeServer.Id, connStatus.IsOnline == true, DateTime.UtcNow);
+            watchingSinceUtc = _watchingSince.GetOrAppStart(badgeServer.Id);
+        }
+        else
+        {
+            watchingSinceUtc = badgeServer != null ? _watchingSince.GetOrAppStart(badgeServer.Id) : _watchingSince.AppStartUtc;
+        }
+
+        var recentCpuSamples = await ReadRecentCpuSamplesAsync(summary.ServerId);
+
         var snapshot = new AlertServerSnapshot(
             key,
             summary.DisplayName,
@@ -132,7 +158,14 @@ public partial class MainWindow : Window
             CpuSampleTimeUtc: summary.CpuSampleTimeUtc ?? summary.CpuSampleTime,
             SeparatelyMonitoredDatabases: badgeServer is null
                 ? null
-                : _engineEditions.SeparatelyMonitoredDatabases(badgeServer, liveEdition, _serverManager.GetAllServers()));
+                : _engineEditions.SeparatelyMonitoredDatabases(badgeServer, liveEdition, _serverManager.GetAllServers()))
+        {
+            /* #5642: the TRUE UTC instant of the newest CPU sample (null on a pre-v63 row, which has only the local
+               stamp), the recent samples oldest first, and when the connection began collecting. */
+            CpuSampleUtcOnly = summary.CpuSampleTimeUtc,
+            RecentCpuSamples = recentCpuSamples,
+            WatchingSinceUtc = watchingSinceUtc
+        };
 
         /* #4752: the app-lifetime token (_backgroundCts, cancelled once in MainWindow_Closing), so closing the app
            ends an alert post still in flight instead of leaving it to run out its timeout against an endpoint that
@@ -179,6 +212,28 @@ public partial class MainWindow : Window
             if ((curBadgeLowDisk && !prevBadgeLowDisk) || (curBadgeFailedJob && !prevBadgeFailedJob))
                 _alertStateService.ClearAcknowledgementForNewCondition(badgeServer.Id);
             RefreshServerBadgeExtras(badgeServer.Id);
+        }
+    }
+
+    /// <summary>
+    /// The server's recent CPU samples for the shared gate (#5642), oldest first, off the dispatcher (DuckDB.NET is
+    /// synchronous). A failed read returns null, which the engine reads as "no list": it judges the single latest
+    /// sample as it did before, so a read failure can only make the alert fire later, never stop the sweep.
+    /// </summary>
+    private async Task<IReadOnlyList<AlertCpuSample>?> ReadRecentCpuSamplesAsync(int serverId)
+    {
+        var dataService = _dataService;
+        if (dataService == null) return null;
+
+        try
+        {
+            var now = DateTime.UtcNow;
+            return await Task.Run(() => dataService.GetRecentCpuSamplesAsync(serverId, now));
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn("Alerts", $"Recent CPU samples read failed for server {serverId}: {ex.Message}");
+            return null;
         }
     }
 
@@ -384,10 +439,10 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// The engine's resolution callback: Lite's tray-only "Resolved/Cleared" toasts. The engine
-    /// supplies the pre-forwarding loop's exact title/message strings and already applied the
+    /// The tray half of the engine's resolution callback (wired through <see cref="LiteAlertResolutionRecorder.Callback"/>,
+    /// which writes the resolution history row first, #6010 part 2). The engine supplies the pre-forwarding loop's exact title/message strings and already applied the
     /// old gates (only on an active→inactive transition, never suppressed/disabled); every
-    /// resolution toast was Success severity. No history row is recorded — exactly the old loop.
+    /// resolution toast was Success severity.
     /// </summary>
     private Task ShowAlertResolutionToastAsync(AlertResolution resolution, CancellationToken cancellationToken)
     {

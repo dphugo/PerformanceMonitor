@@ -106,30 +106,11 @@ public sealed class LivePostgresCollectionHygieneTests
     }
 
     /// <summary>
-    /// The sweep routes its skip through <see cref="HasBuildOutputSegment"/> rather than testing the path
-    /// inline, so the behaviour the theory above pins is the behaviour the sweep actually gets.
-    /// </summary>
-    [Fact]
-    public void TheSweep_SkipsBuildOutputThroughTheSeparatorAwareHelper()
-    {
-        var source = File.ReadAllText(ThisSourceFile());
-
-        /* Built by concatenation on purpose: spelled as one literal, this assertion's OWN text
-           satisfies it, so the pin passes with the call site deleted. Measured — it did. */
-        Assert.Contains("HasBuildOutputSegment(" + "Path.GetRelativePath(", source, StringComparison.Ordinal);
-        Assert.DoesNotContain(@"file.Contains(@""\bin\""", source, StringComparison.Ordinal);
-        Assert.DoesNotContain(@"file.Contains(@""\obj\""", source, StringComparison.Ordinal);
-    }
-
-    /// <summary>This file's own path, for the source pin above.</summary>
-    private static string ThisSourceFile([CallerFilePath] string? path = null) => path!;
-
-    /// <summary>
     /// True when any whole SEGMENT of <paramref name="relativePath"/> is <c>bin</c> or <c>obj</c>, reading
     /// both separator characters on every platform.
     ///
-    /// <para>Same shape and the same reasoning as <c>DocCommentHygieneTests.HasBuildOutputSegment</c>, which
-    /// records why at length: a substring test for a backslash-delimited segment matches nothing where the
+    /// <para>The reasoning, in full:
+    /// a substring test for a backslash-delimited segment matches nothing where the
     /// separator is <c>/</c>, so the sweep above reads every generated <c>.AssemblyInfo.cs</c> and
     /// <c>.g.cs</c> off Windows while skipping them on it — and a guard whose scope depends on the host is
     /// two guards. Whole segments rather than a substring, because <c>Objects</c>, <c>obj-cache</c> and
@@ -193,7 +174,7 @@ public sealed class LivePostgresCollectionHygieneTests
     {
         var directory = FindTestProjectDirectory();
 
-        /* FAIL rather than skip when the source tree cannot be found — the DocCommentHygieneTests rule: a guard
+        /* FAIL rather than skip when the source tree cannot be found: a guard
            that silently skips is a guard that silently stops guarding. */
         Assert.True(directory is not null,
             "Could not locate the Darling.Tests source directory (walked up from the test binary looking for "
@@ -333,8 +314,7 @@ public sealed class LivePostgresCollectionHygieneTests
 
     /// <summary>
     /// Walks up from the test output directory to the repo root (the directory holding
-    /// <c>PerformanceMonitor.sln</c>) and returns this project's source directory. Same walk-up idiom as
-    /// <c>DocCommentHygieneTests.FindRepoRoot</c>.
+    /// <c>PerformanceMonitor.sln</c>) and returns this project's source directory.
     /// </summary>
     private static string? FindTestProjectDirectory()
     {

@@ -8,8 +8,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
 using PerformanceMonitor.Darling.Service;
 using PerformanceMonitor.Darling.Storage;
 using Xunit;
@@ -140,7 +144,7 @@ public sealed class DarlingManagedRolesTests
         /* A change to how a row is reached while it holds a remediation login has its own outcome and its own state. */
         Assert.Contains("'remediation_kept'", function, StringComparison.Ordinal);
         Assert.Contains("USING ERRCODE = 'PW003'", rules, StringComparison.Ordinal);
-        Assert.Contains("This server has a remediation login stored. Change how it is reached on the service host, in the configuration file or with --add-server.", rules, StringComparison.Ordinal);
+        Assert.Contains("This server has a remediation or hypothetical-index login stored. Change how it is reached on the service host, in the configuration file or with --add-server.", rules, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -369,7 +373,7 @@ public sealed class DarlingManagedRolesTests
             /* V113 (#2138 phase 1): the remediation credential's blob is the same kind of thing as the
                monitoring one beside it — a DPAPI secret — and it authenticates a WRITE, so if anything on
                this table is secret it is. */
-            ["config_monitored_servers"] = new[] { "encrypted_password", "remediation_encrypted_password", "aws_external_id" },
+            ["config_monitored_servers"] = new[] { "encrypted_password", "remediation_encrypted_password", "aws_external_id", "hypothetical_index_encrypted_password" },
             ["config_command"] = new[] { "args_json" },
             /* generic_url is a bearer secret like the sibling webhook URLs, and generic_headers holds the
                Authorization token itself (#1506 / V26). pagerduty_routing_key is the Events API v2 integration
@@ -377,12 +381,12 @@ public sealed class DarlingManagedRolesTests
             ["config_notification"] = new[]
             {
                 "smtp_encrypted_password", "smtp_username", "teams_url", "slack_url",
-                "generic_url", "generic_headers", "pagerduty_routing_key",
+                "generic_url", "generic_headers", "pagerduty_routing_key", "signing_key", "previous_signing_key",
             },
             /* V131 (#3598): the sparse routes table mirrors the parent's destination columns under the same
                names, so the four webhook-class destinations are the same bearer secrets they are one table
                up; smtp_recipients and the GENERATED configured_channels presence column are not. */
-            ["config_notification_routes"] = new[] { "teams_url", "slack_url", "generic_url", "pagerduty_routing_key" },
+            ["config_notification_routes"] = new[] { "teams_url", "slack_url", "generic_url", "pagerduty_routing_key", "signing_key", "previous_signing_key" },
         };
 
         /* Exactly the four known secret-bearing tables, with the expected secret columns. */
@@ -457,10 +461,10 @@ public sealed class DarlingManagedRolesTests
            pinned separately by BuildProvisioningSql_McpRole_GrantsCustomViewsWrite_LikeViewer; it does not widen
            either schema-wide claim below. */
         Assert.Contains("GRANT INSERT ON collect.analysis_findings TO mcp;", sql, StringComparison.Ordinal);
-        Assert.Contains("GRANT INSERT ON config.analysis_muted TO mcp;", sql, StringComparison.Ordinal);
+        /* analysis_muted: INSERT for mute_analysis_finding and DELETE for unmute_analysis_finding (#6383). */
+        Assert.Contains("GRANT INSERT, DELETE ON config.analysis_muted TO mcp;", sql, StringComparison.Ordinal);
 
-        /* No DELETE on analysis_muted (no MCP unmute tool) and no schema-wide write for mcp. */
-        Assert.DoesNotContain("DELETE ON config.analysis_muted TO mcp", sql, StringComparison.Ordinal);
+        /* No schema-wide write for mcp. */
         Assert.DoesNotContain("INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA config TO mcp", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA collect TO mcp", sql, StringComparison.Ordinal);
 
@@ -479,6 +483,39 @@ public sealed class DarlingManagedRolesTests
             Assert.DoesNotContain("mcp", adpLine, StringComparison.Ordinal);
         }
     }
+
+    /// <summary>
+    /// #5633 item 13, as ruled: <c>collect.analysis_collection_caveats</c> is the SCHEDULED pass's state, written
+    /// only by the worker as the service role. The mcp role holds no write on it: no statement in the managed
+    /// batch or in the BYO <c>provision-roles.sql</c> names the table at all, and no <c>GRANT ALL</c> reaches mcp
+    /// (which would carry INSERT/UPDATE/DELETE/TRIGGER/REFERENCES onto it, and onto every other table the grant
+    /// names). The live census (McpCollectionCaveatGrantLiveTests) proves the same on a real role; this one runs
+    /// without a database.
+    /// </summary>
+    [Fact]
+    public void McpRole_HoldsNoWriteOnTheCaveatTable_InTheManagedBatchOrTheByoScript()
+    {
+        var managed = DarlingManagedRoles.BuildProvisioningSql(ProvisioningTestSecrets.Admin, ProvisioningTestSecrets.Viewer, ProvisioningTestSecrets.Mcp);
+        var byo = RepoFile.ReadRepoFile("Darling", "tools", "provision-roles.sql");
+
+        foreach (var (name, script) in new[] { ("managed", managed), ("byo", byo) })
+        {
+            var code = Regex.Replace(script, @"(?m)--.*$", "");
+            Assert.True(!code.Contains("analysis_collection_caveats", StringComparison.Ordinal), name + ": a statement names the caveat table");
+            Assert.True(!Regex.IsMatch(code, GrantAllToMcp), name + ": GRANT ALL reaches mcp");
+            Assert.True(!Regex.IsMatch(code, McpWriteOnWholeCollectSchema), name + ": a collect-wide non-SELECT grant reaches mcp");
+        }
+
+        /* The patterns catch the shapes the earlier single-keyword regex missed. */
+        Assert.Matches(GrantAllToMcp, "GRANT ALL ON collect.analysis_collection_caveats TO mcp;");
+        Assert.Matches(GrantAllToMcp, "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA collect TO admin, mcp;");
+        Assert.Matches(GrantAllToMcp, "ALTER DEFAULT PRIVILEGES IN SCHEMA collect GRANT ALL ON TABLES TO mcp;");
+        Assert.Matches(McpWriteOnWholeCollectSchema, "GRANT TRIGGER ON ALL TABLES IN SCHEMA collect TO mcp;");
+        Assert.DoesNotMatch(McpWriteOnWholeCollectSchema, "GRANT SELECT ON ALL TABLES IN SCHEMA collect TO mcp;");
+    }
+
+    private const string GrantAllToMcp = @"(?is)\bGRANT\s+ALL\b[^;]*\bTO\b[^;]*\bmcp\b";
+    private const string McpWriteOnWholeCollectSchema = @"(?is)\bGRANT\s+(?!SELECT\s+ON\b)[^;]*\bON\s+ALL\s+TABLES\s+IN\s+SCHEMA\s+collect\b[^;]*\bTO\b[^;]*\bmcp\b";
 
     [Fact]
     public void BuildProvisioningSql_McpRole_GrantsCustomViewsWrite_LikeViewer()
@@ -505,6 +542,48 @@ public sealed class DarlingManagedRolesTests
 
         /* custom_views carries no secret columns, so it is NOT part of the mcp secret-column carve. */
         Assert.DoesNotContain("REVOKE SELECT ON config.custom_views", sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildProvisioningSql_InvestigationTables_RevokeEverything_ThenGrantEachWriterOnlyWhatItWrites()
+    {
+        var sql = DarlingManagedRoles.BuildProvisioningSql(ProvisioningTestSecrets.Admin, ProvisioningTestSecrets.Viewer, ProvisioningTestSecrets.Mcp);
+        var flat = Regex.Replace(sql, @"\s+", " ");
+
+        /* #5632: the blanket config writes gave admin INSERT/UPDATE/DELETE on all six tables. The REVOKE ALL comes after
+           the last blanket grant and before the password key revoke, which stays the last grant-side statement. */
+        const string Six = "config.investigation_requests, config.investigation_request_alerts, config.investigation_reports, config.investigation_journal, config.investigation_notes, config.agent_environment_profiles";
+        var revoke = flat.IndexOf($"REVOKE ALL ON {Six} FROM PUBLIC, admin, viewer, mcp CASCADE;", StringComparison.Ordinal);
+        Assert.True(revoke > flat.LastIndexOf("GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA config TO admin;", StringComparison.Ordinal));
+        Assert.True(revoke < flat.IndexOf("REVOKE ALL ON config.password_key, ", StringComparison.Ordinal));
+        Assert.Contains($"GRANT SELECT ON {Six} TO admin, viewer;", flat, StringComparison.Ordinal);
+        Assert.Contains($"GRANT SELECT ON {Six} TO mcp;", flat, StringComparison.Ordinal);
+
+        /* mcp: the claim and report columns only, and a note without its state, so an agent's note stays pending. */
+        Assert.Contains("GRANT UPDATE (state, claimed_by, claim_id, claimed_at, lease_until, claim_count, brief_format, brief, reported_at) ON config.investigation_requests TO mcp;", flat, StringComparison.Ordinal);
+        /* #6008: follow_up_at (V193) has its own grant, behind a column check, so a store below V193 commits the rest. */
+        Assert.Contains("AND attname = 'follow_up_at' AND NOT attisdropped) THEN EXECUTE $v193u$ GRANT UPDATE (follow_up_at) ON config.investigation_requests TO mcp; $v193u$;", flat, StringComparison.Ordinal);
+        /* #6009: follow_up_condition, the same way. */
+        Assert.Contains("AND attname = 'follow_up_condition' AND NOT attisdropped) THEN EXECUTE $v193c$ GRANT UPDATE (follow_up_condition) ON config.investigation_requests TO mcp; $v193c$;", flat, StringComparison.Ordinal);
+        Assert.Contains("GRANT INSERT ON config.investigation_reports TO mcp;", flat, StringComparison.Ordinal);
+        /* #6003 review round 2: the journal grant names its columns and leaves out journal_id and event_id. */
+        Assert.Contains($"GRANT INSERT ({DarlingManagedRoles.JournalWriterColumns}) ON config.investigation_journal TO mcp;", flat, StringComparison.Ordinal);
+        Assert.Contains($"GRANT INSERT ({DarlingManagedRoles.JournalWriterColumns}) ON config.investigation_journal TO admin;", flat, StringComparison.Ordinal);
+        Assert.DoesNotContain("GRANT INSERT ON config.investigation_journal", flat, StringComparison.Ordinal);
+        Assert.Contains("GRANT INSERT (server_id, story_path_hash, dedup_key, metric_name, note_text, author, source_request_id) ON config.investigation_notes TO mcp;", flat, StringComparison.Ordinal);
+
+        /* admin (the WPF viewer): close a request, write the profiles, write and decide notes, journal it. */
+        Assert.Contains("GRANT UPDATE (state, closed_at, closed_by, closed_reason) ON config.investigation_requests TO admin;", flat, StringComparison.Ordinal);
+        Assert.Contains("GRANT INSERT, DELETE ON config.investigation_notes TO admin;", flat, StringComparison.Ordinal);
+        Assert.Contains("GRANT UPDATE (state, decided_at, decided_by, expires_at) ON config.investigation_notes TO admin;", flat, StringComparison.Ordinal);
+        Assert.Contains("GRANT INSERT, UPDATE, DELETE ON config.agent_environment_profiles TO admin;", flat, StringComparison.Ordinal);
+
+        /* #5918: admin (the Viewer) opens a practice request and copies its case's alert rows; nobody else links alerts but the owner,
+           and viewer writes nothing here. */
+        Assert.Contains("GRANT INSERT ON config.investigation_request_alerts TO admin;", flat, StringComparison.Ordinal);
+        Assert.Contains("ON config.investigation_requests TO admin;", flat, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"GRANT [A-Z ,()a-z_]*(INSERT|UPDATE|DELETE)[^;]* ON config\.investigation_request_alerts TO (?!admin;)", flat);
+        Assert.DoesNotMatch(@"GRANT (INSERT|UPDATE|DELETE)[^;]* ON config\.(investigation|agent_environment)[a-z_]* TO [a-z_, ]*viewer", flat);
     }
 
     [Fact]
@@ -574,9 +653,21 @@ public sealed class DarlingManagedRolesTests
         foreach (var acl in DarlingManagedRoles.ViewerRestrictedConfigTables)
         {
             Assert.Contains($"REVOKE SELECT ON config.{acl.Table} FROM mcp;", sql, StringComparison.Ordinal);
-            Assert.Contains($"GRANT SELECT ({string.Join(", ", acl.NonSecretColumns)}) ON config.{acl.Table} TO mcp;",
+            var columns = DarlingManagedRoles.McpWithheldColumns.TryGetValue(acl.Table, out var withheld)
+                ? acl.NonSecretColumns.Where(c => !withheld.Contains(c, StringComparer.Ordinal))
+                : acl.NonSecretColumns;
+            Assert.Contains($"GRANT SELECT ({string.Join(", ", columns)}) ON config.{acl.Table} TO mcp;",
                 sql, StringComparison.Ordinal);
         }
+
+        /* #6230: no mcp column grant names result_json, the table is revoked from mcp before the re-grant, and the read function is
+           granted to mcp alone. */
+        Assert.DoesNotContain(sql.Split('\n').Where(l => l.Contains("TO mcp", StringComparison.Ordinal) && l.Contains("GRANT SELECT (", StringComparison.Ordinal)),
+            l => l.Contains("result_json", StringComparison.Ordinal));
+        Assert.Contains("GRANT EXECUTE ON FUNCTION config.read_mcp_command_result(bigint) TO mcp;", sql, StringComparison.Ordinal);
+        Assert.Contains("REVOKE ALL ON FUNCTION config.read_mcp_command_result(bigint) FROM PUBLIC;", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("read_mcp_command_result(bigint) TO viewer", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("read_mcp_command_result(bigint) TO admin", sql, StringComparison.Ordinal);
 
         /* No secret column name appears in any GRANT SELECT (...) TO mcp line (belt over the per-table check). */
         var mcpGrantLines = sql.Split('\n')
@@ -724,7 +815,8 @@ public sealed class DarlingManagedRolesTests
             new[] { "GRANT UPDATE (dismissed) ON config.config_alert_log TO viewer;" },
             System.Text.RegularExpressions.Regex.Matches(sql, @"GRANT [^;]*? ON config\.config_alert_log TO [^;]*viewer[^;]*;")
                 .Select(m => m.Value).ToArray());
-        Assert.DoesNotContain("ON config.config_alert_log TO mcp", sql, StringComparison.Ordinal);
+        /* What mcp may do on the history table is proved by behaviour, as the mcp role:
+           McpAlertAdminLiveTests.DismissAndRestore_RunAsTheMcpRole_SetOnlyTheDismissedColumn. */
         Assert.DoesNotContain("ON config_alert_log TO viewer", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("ON config_alert_log TO mcp", sql, StringComparison.Ordinal);
 
@@ -762,15 +854,20 @@ public sealed class DarlingManagedRolesTests
 
         var utilityOff = byo.IndexOf("\nSET pg_stat_statements.track_utility = off;", StringComparison.Ordinal);
         Assert.True(utilityOff >= 0, "provision-roles.sql no longer turns utility tracking off for its own session");
-        Assert.True(utilityOff < byo.IndexOf("CREATE ROLE admin LOGIN NOSUPERUSER PASSWORD", StringComparison.Ordinal),
+        Assert.True(utilityOff < byo.IndexOf("ALTER ROLE admin  LOGIN PASSWORD", StringComparison.Ordinal),
             "provision-roles.sql sends a password before it turns utility tracking off");
-        Assert.True(utilityOff < byo.IndexOf("ALTER ROLE admin  LOGIN NOSUPERUSER PASSWORD", StringComparison.Ordinal),
-            "provision-roles.sql sends a password before it turns utility tracking off");
+
+        /* The role-collision guard creates the roles without a password, so no CREATE ROLE statement carries one: a
+           password rides only on the ALTER ROLE lines, which come after the guard's own utility-tracking check. */
+        Assert.DoesNotContain("CREATE ROLE admin LOGIN NOSUPERUSER PASSWORD", byo, StringComparison.Ordinal);
+        var trackingCheck = byo.IndexOf("current_setting('pg_stat_statements.track_utility', true) = 'on'", StringComparison.Ordinal);
+        Assert.True(trackingCheck > utilityOff && trackingCheck < byo.IndexOf("CREATE ROLE admin LOGIN NOSUPERUSER;", StringComparison.Ordinal),
+            "the guard must test utility tracking before it creates a role");
 
         /* #3914: the script creates mcp too, so its password statements and its slow-statement lines are held to
            the same order and the same settings. */
-        var mcpCreate = byo.IndexOf("CREATE ROLE mcp LOGIN NOSUPERUSER PASSWORD", StringComparison.Ordinal);
-        var mcpAlter = byo.IndexOf("ALTER ROLE mcp    LOGIN NOSUPERUSER PASSWORD", StringComparison.Ordinal);
+        var mcpCreate = byo.IndexOf("CREATE ROLE mcp LOGIN NOSUPERUSER;", StringComparison.Ordinal);
+        var mcpAlter = byo.IndexOf("ALTER ROLE mcp    LOGIN PASSWORD", StringComparison.Ordinal);
         Assert.True(mcpCreate > utilityOff && mcpAlter > utilityOff,
             "provision-roles.sql sends the mcp password before it turns utility tracking off");
         Assert.Contains("ALTER ROLE mcp    SET log_min_duration_statement = '5000ms';", byo, StringComparison.Ordinal);
@@ -781,5 +878,284 @@ public sealed class DarlingManagedRolesTests
            that stores a single library name (#3904's review). */
         Assert.Contains("ALTER SYSTEM SET shared_preload_libraries = 'timescaledb', 'pg_stat_statements';", byo, StringComparison.Ordinal);
         Assert.DoesNotContain("'timescaledb,pg_stat_statements'", byo, StringComparison.Ordinal);
+    }
+
+    /* ---------------------------------------------------------------------------------------------------
+       A role's credential file is written only after the batch that sets its password has committed.
+       --------------------------------------------------------------------------------------------------- */
+
+    /// <summary>A data source with nothing listening behind it: opening a connection fails at once, so provisioning
+    /// fails after the credential files have been read and before any batch could be sent.</summary>
+    private static NpgsqlDataSource UnreachableStore() => NpgsqlDataSource.Create(
+        new NpgsqlConnectionStringBuilder
+        {
+            Host = "127.0.0.1",
+            Port = DarlingManagedPostgresTests.FindFreeTcpPort(),
+            Username = "darling",
+            Database = "darling",
+            Timeout = 3,
+            Pooling = false,
+        }.ConnectionString);
+
+    /// <summary>A provisioning attempt that fails leaves no credential file for a role that had none: a file
+    /// written first would hand the web and MCP hosts a password the store never received.</summary>
+    [Fact]
+    public async Task AFailedAttempt_WritesNoCredentialFile_ForRolesThatHadNone()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "The credential files are DPAPI blobs, which are Windows-only.");
+
+        var root = Directory.CreateTempSubdirectory("darling-role-files-");
+        try
+        {
+            var dataDirectory = Path.Combine(root.FullName, "pg");
+            await using var store = UnreachableStore();
+
+            await Assert.ThrowsAnyAsync<Exception>(() => DarlingManagedRoles.EnsureProvisionedAsync(
+                store, dataDirectory, NullLogger.Instance, TestContext.Current.CancellationToken));
+
+            Assert.Empty(Directory.GetFileSystemEntries(root.FullName));
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>A credential file an untrusted account owns is removed before the batch, so it is gone after a
+    /// batch that fails, and nothing takes its place: the hosts wait for a file rather than read the untrusted one.</summary>
+    [Fact]
+    public async Task AnUntrustedCredentialFile_IsRemovedBeforeTheBatch_AndStaysGoneWhenTheBatchFails()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "The credential files are DPAPI blobs, which are Windows-only.");
+
+        var root = Directory.CreateTempSubdirectory("darling-role-files-");
+        try
+        {
+            var dataDirectory = Path.Combine(root.FullName, "pg");
+            var viewerPath = DarlingManagedPostgres.ViewerCredentialPathFor(dataDirectory);
+            File.WriteAllText(viewerPath, DarlingSecrets.Protect("WrittenByAnotherAccount1"));
+            var log = new CapturingTestLogger();
+            await using var store = UnreachableStore();
+
+            await Assert.ThrowsAnyAsync<Exception>(() => DarlingManagedRoles.ProvisionManagedRolesAsync(
+                store, dataDirectory, log, isTrustedOwner: _ => false, TestContext.Current.CancellationToken));
+
+            Assert.False(File.Exists(viewerPath), "the untrusted credential file survived a failed attempt");
+            Assert.Empty(Directory.GetFileSystemEntries(root.FullName));
+            Assert.Contains("not owned by a trusted principal", log.Joined, StringComparison.Ordinal);
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>A trusted file is what it always was: read for its password and kept, whatever the batch does.</summary>
+    [Fact]
+    public async Task ATrustedCredentialFile_IsUsedAndKept_WhenTheBatchFails()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "The credential files are DPAPI blobs, which are Windows-only.");
+
+        var root = Directory.CreateTempSubdirectory("darling-role-files-");
+        try
+        {
+            var dataDirectory = Path.Combine(root.FullName, "pg");
+            var paths = new[]
+            {
+                DarlingManagedPostgres.AdminCredentialPathFor(dataDirectory),
+                DarlingManagedPostgres.ViewerCredentialPathFor(dataDirectory),
+                DarlingManagedPostgres.McpCredentialPathFor(dataDirectory),
+            };
+            var before = new Dictionary<string, byte[]>();
+            foreach (var path in paths)
+            {
+                File.WriteAllText(path, DarlingSecrets.Protect("Existing-" + Path.GetFileName(path)));
+                before[path] = File.ReadAllBytes(path);
+            }
+
+            var read = DarlingManagedRoles.ReadOrGenerateRoleCredential(
+                paths[1], DarlingManagedPostgres.ViewerRoleName, allowInteractiveRead: true, NullLogger.Instance, _ => true);
+            Assert.False(read.Generated);
+            Assert.Equal("Existing-" + Path.GetFileName(paths[1]), read.Password);
+
+            await using var store = UnreachableStore();
+            await Assert.ThrowsAnyAsync<Exception>(() => DarlingManagedRoles.ProvisionManagedRolesAsync(
+                store, dataDirectory, NullLogger.Instance, isTrustedOwner: _ => true, TestContext.Current.CancellationToken));
+
+            Assert.Equal(paths.Length, Directory.GetFileSystemEntries(root.FullName).Length);
+            foreach (var path in paths)
+            {
+                Assert.Equal(before[path], File.ReadAllBytes(path));
+            }
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>What a batch that succeeded leaves behind: a file for each generated password and for no other,
+    /// created with the hardened ACL (no ordinary user can read it, and the mcp file has no entry beyond SYSTEM,
+    /// Administrators and the service account), decrypting to the password its role now holds, with no temporary
+    /// file left beside it.</summary>
+    [Fact]
+    public void GeneratedCredentials_AreWrittenHardened_AndOnlyTheGeneratedOnes()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "The credential files are DPAPI blobs, which are Windows-only.");
+
+        var root = Directory.CreateTempSubdirectory("darling-role-files-");
+        try
+        {
+            var dataDirectory = Path.Combine(root.FullName, "pg");
+            var admin = new DarlingManagedRoles.RoleCredential(
+                DarlingManagedPostgres.AdminCredentialPathFor(dataDirectory), DarlingManagedPostgres.AdminRoleName,
+                "AdminPassword1", allowInteractiveRead: true, generated: true);
+            var viewer = new DarlingManagedRoles.RoleCredential(
+                DarlingManagedPostgres.ViewerCredentialPathFor(dataDirectory), DarlingManagedPostgres.ViewerRoleName,
+                "ViewerPassword1", allowInteractiveRead: true, generated: false);
+            var mcp = new DarlingManagedRoles.RoleCredential(
+                DarlingManagedPostgres.McpCredentialPathFor(dataDirectory), DarlingManagedPostgres.McpRoleName,
+                "McpPassword1", allowInteractiveRead: false, generated: true);
+
+            DarlingManagedRoles.PersistGeneratedRoleCredentials(new[] { admin, viewer, mcp }, NullLogger.Instance);
+
+            Assert.Equal("AdminPassword1", DarlingSecrets.Unprotect(File.ReadAllText(admin.FilePath).Trim()));
+            Assert.Equal("McpPassword1", DarlingSecrets.Unprotect(File.ReadAllText(mcp.FilePath).Trim()));
+            Assert.False(File.Exists(viewer.FilePath), "a credential read from an existing file was written again");
+            Assert.Equal(
+                new[] { "pg-admin-credential.dpapi", "pg-mcp-credential.dpapi" },
+                Directory.GetFiles(root.FullName).Select(f => Path.GetFileName(f)!).OrderBy(f => f, StringComparer.Ordinal).ToArray());
+            Assert.False(DarlingFileSecurity.IsReadableByOrdinaryUsers(admin.FilePath));
+            Assert.False(DarlingFileSecurity.IsReadableByOrdinaryUsers(mcp.FilePath));
+            Assert.Null(DarlingFileSecurity.AccessBeyondTrusted(mcp.FilePath));
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>One file that cannot be written does not keep the others off the disk, and the caller gets one
+    /// exception that names the role and never a password.</summary>
+    [Fact]
+    public void AGeneratedCredentialThatCannotBeWritten_DoesNotKeepTheOthersOffTheDisk_AndIsReportedOnce()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "The credential files are DPAPI blobs, which are Windows-only.");
+
+        var root = Directory.CreateTempSubdirectory("darling-role-files-");
+        try
+        {
+            var admin = new DarlingManagedRoles.RoleCredential(
+                Path.Combine(root.FullName, "no-such-folder", "pg-admin-credential.dpapi"), DarlingManagedPostgres.AdminRoleName,
+                "AdminPassword1", allowInteractiveRead: true, generated: true);
+            var mcp = new DarlingManagedRoles.RoleCredential(
+                Path.Combine(root.FullName, "pg-mcp-credential.dpapi"), DarlingManagedPostgres.McpRoleName,
+                "McpPassword1", allowInteractiveRead: false, generated: true);
+
+            var thrown = Assert.Throws<IOException>(() =>
+                DarlingManagedRoles.PersistGeneratedRoleCredentials(new[] { admin, mcp }, NullLogger.Instance));
+
+            Assert.Contains("admin", thrown.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("mcp (", thrown.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("AdminPassword1", thrown.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("McpPassword1", thrown.Message, StringComparison.Ordinal);
+            Assert.True(File.Exists(mcp.FilePath), "the credential that could be written was not");
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>The order that makes the rest true: credentials are read (an untrusted file removed) before the
+    /// batch is sent, and written only after it returns, with the result the core handed back returned unchanged.</summary>
+    [Fact]
+    public void ProvisioningReadsBeforeTheBatch_AndWritesOnlyAfterIt()
+    {
+        var code = CSharpSourceWalker.StripCommentsAndStrings(
+            RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "DarlingManagedRoles.cs"));
+
+        var start = code.IndexOf("internal static async Task<int> ProvisionManagedRolesAsync(", StringComparison.Ordinal);
+        Assert.True(start > 0, "the managed provisioning core could not be located, so this pin proves nothing");
+        var body = CSharpSourceWalker.BraceBalanced(code, code.IndexOf('{', code.IndexOf(')', start)));
+
+        var read = body.LastIndexOf("ReadOrGenerateRoleCredential(", StringComparison.Ordinal);
+        var batch = body.IndexOf("await ProvisionRolesAsync(", StringComparison.Ordinal);
+        var write = body.IndexOf("PersistGeneratedRoleCredentials(", StringComparison.Ordinal);
+        Assert.True(read > 0 && batch > read, "a credential must be read (or generated) before the batch is sent");
+        Assert.True(write > batch, "a credential file must be written only after the batch has returned");
+        Assert.Equal(3, CountOf(body, "ReadOrGenerateRoleCredential("));
+        Assert.Equal(1, CountOf(body, "PersistGeneratedRoleCredentials("));
+
+        /* The read step writes nothing: a new file is only ever created by the persist step. */
+        var readStep = code.IndexOf("internal static RoleCredential ReadOrGenerateRoleCredential(", StringComparison.Ordinal);
+        Assert.True(readStep > 0, "the read step could not be located");
+        var readBody = CSharpSourceWalker.BraceBalanced(code, code.IndexOf('{', code.IndexOf(')', readStep)));
+        Assert.DoesNotContain("CreateHardenedFile", readBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("File.WriteAllText", readBody, StringComparison.Ordinal);
+        Assert.Contains("TryDelete(credentialPath, logger)", readBody, StringComparison.Ordinal);
+    }
+
+    /// <summary>The worker remembers a start-path provisioning failure and retries it from the hourly store-maintenance
+    /// tick: outside the TimescaleDB gate (roles do not depend on the extension), as a sibling after the if/else that
+    /// gate opens, and inside the tick's own method, so it runs at most once per tick.</summary>
+    [Fact]
+    public void TheWorker_RetriesAFailedProvisioning_OncePerHourlyTick_OutsideTheTimescaleGate()
+    {
+        var code = CSharpSourceWalker.StripCommentsAndStrings(
+            RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "DarlingWorker.cs"));
+
+        const string retryCall = "await RetryRoleProvisioningAsync(stoppingToken);";
+        const string lastConvergence = "await ConvergeStoreObjectsAsync(stoppingToken, timescaleAvailable: false);";
+        Assert.Equal(1, CountOf(code, retryCall));
+
+        var tick = code.IndexOf("private async Task RunStoreMaintenanceTickAsync(", StringComparison.Ordinal);
+        var convergence = code.IndexOf(lastConvergence, tick, StringComparison.Ordinal);
+        var retry = code.IndexOf(retryCall, StringComparison.Ordinal);
+        Assert.True(tick > 0 && convergence > tick && retry > convergence,
+            "the retry must sit in the tick's own method, after both of its convergence arms");
+        Assert.Equal("}", code[(convergence + lastConvergence.Length)..retry].Trim());
+
+        var startCall = code.IndexOf("await DarlingManagedRoles.EnsureProvisionedAsync(postgres, dataDirectory, _logger, stoppingToken);", StringComparison.Ordinal);
+        var remember = code.IndexOf("_roleProvisioningRetryDirectory = provisioningDirectory;", StringComparison.Ordinal);
+        Assert.True(startCall > 0 && remember > startCall, "the start path must remember a failed provisioning after the attempt");
+        Assert.Equal(1, CountOf(code, "_roleProvisioningRetryDirectory = provisioningDirectory;"));
+    }
+
+    /// <summary>The retry records what the roles were given exactly as the start path does, clears itself only
+    /// after an attempt returned, runs under its own budget, and logs a failed attempt once.</summary>
+    [Fact]
+    public void TheRetry_ClearsOnlyAfterSuccess_RecordsTheAppliedTimeout_AndLogsEachFailureOnce()
+    {
+        var code = CSharpSourceWalker.StripCommentsAndStrings(
+            RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "DarlingWorker.cs"));
+
+        var start = code.IndexOf("private async Task RetryRoleProvisioningAsync(CancellationToken cancellationToken)", StringComparison.Ordinal);
+        Assert.True(start > 0, "the retry could not be located, so this pin proves nothing");
+        var body = CSharpSourceWalker.BraceBalanced(code, code.IndexOf('{', code.IndexOf(')', start)));
+
+        var attempt = body.IndexOf("DarlingManagedRoles.EnsureProvisionedAsync(_postgres, dataDirectory, _logger, budget.Token)", StringComparison.Ordinal);
+        var clear = body.IndexOf("_roleProvisioningRetryDirectory = null;", StringComparison.Ordinal);
+        Assert.True(attempt > 0 && clear > attempt, "the retry must clear itself only after the attempt returned");
+        Assert.Equal(1, CountOf(body, "_roleProvisioningRetryDirectory = null;"));
+        var applied = body.IndexOf("_appliedComposeStatementTimeoutSeconds =", StringComparison.Ordinal);
+        Assert.True(applied > 0 && applied < attempt, "the retry must record what the roles were given, as the start path does");
+        Assert.Contains("budget.CancelAfter(s_roleProvisioningRetryBudget)", body, StringComparison.Ordinal);
+
+        /* One success line and one warning per failing arm (the two arms are exclusive), never an error line. */
+        Assert.Equal(1, CountOf(body, "_logger.LogInformation("));
+        Assert.Equal(2, CountOf(body, "_logger.LogWarning("));
+        Assert.Equal(0, CountOf(body, "_logger.LogError("));
+    }
+
+    private static int CountOf(string text, string needle)
+    {
+        var count = 0;
+        for (var at = text.IndexOf(needle, StringComparison.Ordinal); at >= 0; at = text.IndexOf(needle, at + needle.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
     }
 }

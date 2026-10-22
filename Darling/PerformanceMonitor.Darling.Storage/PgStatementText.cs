@@ -152,7 +152,7 @@ FROM
         s.queryid AS queryid,
         s.query AS query_text,
         s.total_exec_time AS total_exec_time
-    FROM aurora_stat_statements(true) AS s
+    FROM {AURORA_SCHEMA}.aurora_stat_statements(true) AS s
     WHERE s.queryid IS NOT NULL
     AND   s.query IS NOT NULL
     AND   s.toplevel
@@ -192,12 +192,12 @@ FROM
     SELECT DISTINCT ON (s.queryid)
         s.queryid AS queryid,
         s.query AS query_text,
-        s.total_exec_time AS total_exec_time
-    FROM public.pg_stat_statements AS s
+        s.{TOTAL_TIME} AS total_exec_time
+    FROM {STATEMENTS_SCHEMA}.pg_stat_statements AS s
     WHERE s.queryid IS NOT NULL
     AND   s.query IS NOT NULL
     AND   {TOPLEVEL}
-    ORDER BY s.queryid, s.total_exec_time DESC
+    ORDER BY s.queryid, s.{TOTAL_TIME} DESC
 ) AS d
 ORDER BY d.total_exec_time DESC
 LIMIT $1";
@@ -209,14 +209,33 @@ LIMIT $1";
     /// tracking did not exist, so every row IS top level and <c>true</c> is the correct predicate rather
     /// than a fallback — the same guard <c>PgStatementStatsCollector</c> already applies, and without it
     /// the query fails on a 13 target instead of degrading.</para>
+    /// <para>#6143: the view and the Aurora function are named by the schema <paramref name="schemas"/> read on the
+    /// connection that runs the fetch (<see cref="CollectorContext.PgExtensionSchema"/> and
+    /// <see cref="CollectorContext.PgFunctionSchema"/>), never by <c>public</c> or by search_path: a role with CREATE
+    /// on <c>public</c> could put a same-named view or function there, and the fetch runs under the monitoring login.
+    /// A schema the host did not find is <c>pg_catalog</c>, where the read fails as a missing extension.</para>
     /// </summary>
-    public static string FetchSqlFor(bool isAurora, int postgresMajorVersion)
-        => isAurora
-            ? AuroraFetchSql
-            : VanillaFetchSql.Replace(
-                "{TOPLEVEL}",
-                postgresMajorVersion >= 14 ? "s.toplevel" : "true",
-                System.StringComparison.Ordinal);
+    public static string FetchSqlFor(bool isAurora, int postgresMajorVersion, CollectorContext schemas)
+    {
+        System.ArgumentNullException.ThrowIfNull(schemas);
+        /* #6206: the view's columns follow the extension's catalog version (read with the schema lookup), so total_time
+           stands in for total_exec_time below pg_stat_statements 1.8, and the server major only decides when the
+           extension's version is unknown. */
+        var layout = PgVersionSql.StatementsLayout.For(postgresMajorVersion, schemas.PgExtensionVersion("pg_stat_statements"));
+        return isAurora
+            ? AuroraFetchSql.Replace(
+                "{AURORA_SCHEMA}", schemas.PgFunctionSchema("aurora_stat_statements"), System.StringComparison.Ordinal)
+            : VanillaFetchSql
+                .Replace("{STATEMENTS_SCHEMA}", schemas.PgExtensionSchema("pg_stat_statements"), System.StringComparison.Ordinal)
+                .Replace(
+                    "{TOPLEVEL}",
+                    layout.HasToplevel ? "s.toplevel" : "true",
+                    System.StringComparison.Ordinal)
+                .Replace(
+                    "{TOTAL_TIME}",
+                    layout.HasExecTimeNames ? "total_exec_time" : "total_time",
+                    System.StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// Whether this server is due a text fetch — asked of the STORE rather than remembered in the service, so a

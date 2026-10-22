@@ -8,6 +8,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
 using PerformanceMonitor.Alerting;
@@ -38,13 +39,36 @@ public partial class LocalDataService
     /// <c>dismissed_archive_alerts</c> sidecar the v23 schema migration added), so no read through the view can return or count them;
     /// the MCP tool's description says so.</para>
     /// </summary>
-    public async Task<List<AlertHistoryRow>> GetAlertHistoryAsync(int hoursBack = 24, int limit = 500, int? serverId = null, DateTime? asOfUtc = null, bool includeDismissed = false)
+    public async Task<List<AlertHistoryRow>> GetAlertHistoryAsync(int hoursBack = 24, int limit = 500, int? serverId = null, DateTime? asOfUtc = null, bool includeDismissed = false,
+        string? metricName = null, string? family = null)
     {
         /* Both edges, not just the lower one: the row cap is applied by the database, so trimming
            after the read would spend the whole LIMIT on rows newer than an as_of anchor and hand back an
            empty window that looks exactly like a quiet one. */
         var (cutoff, until) = GetTimeRange(hoursBack, null, null, asOfUtc);
-        return await ReadAlertHistoryAsync(cutoff, until, "<=", limit, serverId, includeDismissed);
+        return await ReadAlertHistoryAsync(cutoff, until, "<=", limit, serverId, includeDismissed, metricName, family);
+    }
+
+    /// <summary>The metric and family predicate of an alert history read (#6074), with its parameter appended when one is needed.
+    /// Applied in the SQL so the row cap counts only rows of the filtered population. <paramref name="metricName"/> is an exact,
+    /// case-insensitive match on the stored name; <paramref name="family"/> goes through the census
+    /// (<see cref="AlertFamily.SqlFamilyPredicate"/>). Empty when neither is set. <paramref name="nextParameter"/> is the
+    /// first free positional parameter number.</summary>
+    private static string AlertFilterClause(string? metricName, string? family, int nextParameter, DuckDBCommand command)
+    {
+        var clause = string.Empty;
+        if (!string.IsNullOrWhiteSpace(metricName))
+        {
+            clause += $"\nAND   lower(metric_name) = lower(${nextParameter})";
+            command.Parameters.Add(new DuckDBParameter { Value = metricName.Trim() });
+        }
+
+        if (!string.IsNullOrWhiteSpace(family))
+        {
+            clause += "\nAND   " + AlertFamily.SqlFamilyPredicate("metric_name", family.Trim());
+        }
+
+        return clause;
     }
 
     /// <summary>
@@ -60,7 +84,8 @@ public partial class LocalDataService
             : ReadAlertHistoryAsync(sinceUtc, DateTime.UtcNow, "<=", limit, serverId, includeDismissed: false);
 
     private async Task<List<AlertHistoryRow>> ReadAlertHistoryAsync(
-        DateTime cutoff, DateTime until, string untilOperator, int limit, int? serverId, bool includeDismissed)
+        DateTime cutoff, DateTime until, string untilOperator, int limit, int? serverId, bool includeDismissed,
+        string? metricName = null, string? family = null)
     {
         using var connection = await OpenConnectionAsync();
         using var command = connection.CreateCommand();
@@ -87,7 +112,7 @@ FROM v_config_alert_log
 WHERE alert_time >= $1
 AND   alert_time {untilOperator} $2
 AND   server_id = $3
-AND   (dismissed = FALSE OR $5)
+AND   (dismissed = FALSE OR $5)" + "{FILTER}" + @"
 ORDER BY alert_time DESC
 LIMIT $4";
             command.Parameters.Add(new DuckDBParameter { Value = cutoff });
@@ -95,6 +120,7 @@ LIMIT $4";
             command.Parameters.Add(new DuckDBParameter { Value = serverId.Value });
             command.Parameters.Add(new DuckDBParameter { Value = limit });
             command.Parameters.Add(new DuckDBParameter { Value = includeDismissed });
+            command.CommandText = command.CommandText.Replace("{FILTER}", AlertFilterClause(metricName, family, 6, command), StringComparison.Ordinal);
         }
         else
         {
@@ -117,13 +143,14 @@ SELECT
 FROM v_config_alert_log
 WHERE alert_time >= $1
 AND   alert_time {untilOperator} $2
-AND   (dismissed = FALSE OR $4)
+AND   (dismissed = FALSE OR $4)" + "{FILTER}" + @"
 ORDER BY alert_time DESC
 LIMIT $3";
             command.Parameters.Add(new DuckDBParameter { Value = cutoff });
             command.Parameters.Add(new DuckDBParameter { Value = until });
             command.Parameters.Add(new DuckDBParameter { Value = limit });
             command.Parameters.Add(new DuckDBParameter { Value = includeDismissed });
+            command.CommandText = command.CommandText.Replace("{FILTER}", AlertFilterClause(metricName, family, 5, command), StringComparison.Ordinal);
         }
 
         var items = new List<AlertHistoryRow>();
@@ -151,6 +178,59 @@ LIMIT $3";
 
         ApplyDisplayNames(items);
         return items;
+    }
+
+    /// <summary>
+    /// #6261: the streak of each row of <paramref name="page"/>, aligned with it, from one read of the alert log for the whole
+    /// page (Darling's <c>GetAlertStreaksAsync</c> twin; the rule is <see cref="InvestigationAlertStreak"/>). Muted and dismissed
+    /// rows are in: they fired. The history is read through <c>v_config_alert_log</c>, so rows ordinary archival moved to Parquet
+    /// still count. Null on a resolution row (a recovery is not a fire).
+    /// </summary>
+    public async Task<int?[]> GetAlertStreaksAsync(IReadOnlyList<AlertHistoryRow> page)
+    {
+        var streaks = new int?[page.Count];
+        var firing = page.Where(r => !AlertMetricClassifier.IsResolution(r.MetricName)).ToList();
+        if (firing.Count == 0) return streaks;
+
+        var servers = firing.Select(r => r.ServerId).Distinct().ToList();
+        var metrics = firing.Select(r => r.MetricName).Distinct(StringComparer.Ordinal).ToList();
+        var since = firing.Min(r => r.AlertTime).AddDays(-InvestigationAlertRecurrence.Days);
+        var until = firing.Max(r => r.AlertTime);
+
+        using var connection = await OpenConnectionAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = $@"
+SELECT server_id, metric_name, alert_time
+FROM v_config_alert_log
+WHERE alert_time >= $1
+AND   alert_time <= $2
+AND   server_id IN ({string.Join(", ", servers.Select((_, i) => "$" + (i + 3).ToString(CultureInfo.InvariantCulture)))})
+AND   metric_name IN ({string.Join(", ", metrics.Select((_, i) => "$" + (i + 3 + servers.Count).ToString(CultureInfo.InvariantCulture)))})";
+        command.Parameters.Add(new DuckDBParameter { Value = since });
+        command.Parameters.Add(new DuckDBParameter { Value = until });
+        foreach (var server in servers) command.Parameters.Add(new DuckDBParameter { Value = server });
+        foreach (var metric in metrics) command.Parameters.Add(new DuckDBParameter { Value = metric });
+
+        var fires = new Dictionary<(int, string), List<DateTime>>();
+        using (var reader = await command.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                var key = ((int)ToInt64(reader.GetValue(0)), reader.GetString(1));
+                if (!fires.TryGetValue(key, out var list)) fires[key] = list = new List<DateTime>();
+                list.Add(reader.GetDateTime(2));
+            }
+        }
+
+        for (var i = 0; i < page.Count; i++)
+        {
+            if (AlertMetricClassifier.IsResolution(page[i].MetricName)) continue;
+            streaks[i] = fires.TryGetValue((page[i].ServerId, page[i].MetricName), out var list)
+                ? InvestigationAlertStreak.ForAlert(page[i].AlertTime, list)
+                : 0;
+        }
+
+        return streaks;
     }
 
     /// <summary>
@@ -197,7 +277,7 @@ LIMIT $3";
     /// read, so it counts exactly the rows that read COULD have returned with the filter off — which on this
     /// SKU excludes archived-and-dismissed rows the view has already removed.
     /// </summary>
-    public async Task<long> CountDismissedAlertsAsync(int hoursBack, int? serverId, DateTime? asOfUtc)
+    public async Task<long> CountDismissedAlertsAsync(int hoursBack, int? serverId, DateTime? asOfUtc, string? metricName = null, string? family = null)
     {
         using var connection = await OpenConnectionAsync();
         using var command = connection.CreateCommand();
@@ -218,6 +298,7 @@ AND   dismissed = TRUE";
         command.Parameters.Add(new DuckDBParameter { Value = until });
         if (serverId.HasValue)
             command.Parameters.Add(new DuckDBParameter { Value = serverId.Value });
+        command.CommandText += AlertFilterClause(metricName, family, serverId.HasValue ? 4 : 3, command);
 
         var result = await command.ExecuteScalarAsync();
         return result is null || result is DBNull ? 0L : ToInt64(result);
@@ -239,7 +320,7 @@ AND   dismissed = TRUE";
         if (App.LogAlertDismissals)
             AppLogger.Info("AlertDismiss", $"Action=DismissSelected, Requested={alerts.Count}");
 
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         PreservedTableRestore.ThrowIfRestorePending(_duckDb.ArchivePath, "dismissed_archive_alerts");
         int archivedDismissed = 0;
 
@@ -354,7 +435,7 @@ AND NOT EXISTS (
         if (App.LogAlertDismissals)
             AppLogger.Info("AlertDismiss", $"Action=DismissAll, Since={sinceUtc:O}, Until={(untilUtc.HasValue ? untilUtc.Value.ToString("O") : "now")}, ServerId={serverId?.ToString() ?? "all"}");
 
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         PreservedTableRestore.ThrowIfRestorePending(_duckDb.ArchivePath, "dismissed_archive_alerts");
         using var command = connection.CreateCommand();
 
@@ -628,8 +709,14 @@ public class AlertHistoryRow
     /// for the other grids.
     /// </summary>
     public string TimeLocal => ServerTimeHelper.FormatInstant(
-        AlertTime, ServerTimeHelper.DisplayZoneFor(ServerTimeHelper.CurrentDisplayMode, Clock ?? ServerTimeHelper.ActiveServerClock),
+        AlertTime, ServerTimeHelper.DisplayZoneFor(
+            PerformanceMonitor.Ui.MultiServerTime.EffectiveMode(ServerTimeHelper.CurrentDisplayMode, MixedServers),
+            Clock ?? ServerTimeHelper.ActiveServerClock),
         "yyyy-MM-dd HH:mm:ss");
+
+    /// <summary>True when the list this row sits in holds rows of several servers (#6137), stamped with <see cref="Clock"/>. Server
+    /// time cannot apply across servers, so such a row reads in this machine's time like every other row of the list.</summary>
+    public bool MixedServers { get; set; }
     public string CurrentValueDisplay => AlertMetricClassifier.FormatHistoryValue(MetricName, CurrentValue);
     public string ThresholdValueDisplay => AlertMetricClassifier.FormatHistoryValue(MetricName, ThresholdValue);
 
@@ -651,4 +738,15 @@ public class AlertHistoryRow
     public bool IsCritical => AlertHistoryRowSeverity.IsCritical(MetricName, ContextJson);
     public bool IsWarning => AlertHistoryRowSeverity.IsWarning(MetricName, ContextJson);
 
+    /* #5642: how old the newest sample was when the alert FIRED, read off the context the row persisted. The engine
+       computed the age once at fire time and the history store kept it; this reads it back and never works it out
+       from the clock now, so a row opened a day later still says what the alert knew when it went out. Null on a
+       row written before the carrier existed, or one whose source had no sample time: no line then. */
+    /* Reads the one property (TryReadNewestSample, the way the route field reads TryReadRoute) rather than rehydrating the
+       whole context: a grid row or a 500-row get_alert_history page needs one nullable record, not every detail item and
+       incident roster. Cheap enough per read that the reference-keyed cache it replaces is gone. */
+    public AlertNewestSample? NewestSample => AlertContextSerializer.TryReadNewestSample(ContextJson);
+
+    /// <summary>The one-line sample age the shared formatter prints everywhere else, or empty when the row has none.</summary>
+    public string NewestSampleDisplay => AlertDetailText.SampleAgeLine(NewestSample) ?? "";
 }

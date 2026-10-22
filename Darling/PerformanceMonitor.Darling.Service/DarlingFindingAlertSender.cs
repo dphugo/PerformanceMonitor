@@ -44,13 +44,18 @@ public sealed class DarlingFindingAlertSender : IFindingAlertSender
     private readonly IAlertHistoryStore _historyStore;
     private readonly EmailSendCore _core;
     private readonly ILogger _logger;
+    private readonly InvestigationDispatcher? _investigations;
 
     public DarlingFindingAlertSender(
         IAlertSettings settings,
         IAlertHistoryStore historyStore,
         WebhookAlertService webhookAlertService,
-        ILogger logger)
+        ILogger logger,
+        InvestigationDispatcher? investigationDispatcher = null)
     {
+        /* #5632 Phase A: optional; null dispatches nothing. A single page and each held page the summary names open or
+           join an investigation request after their rows are written; a digest finding never does. */
+        _investigations = investigationDispatcher;
         _historyStore = historyStore ?? throw new ArgumentNullException(nameof(historyStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _core = new EmailSendCore(settings, historyStore, webhookAlertService, DarlingAlertDeliverer.Branding, logger);
@@ -86,13 +91,22 @@ public sealed class DarlingFindingAlertSender : IFindingAlertSender
             var delivery = AlertDelivery.FromFanout(result, muted: false, trayChannelPresent: false);
             foreach (var alert in named)
             {
-                await _historyStore.RecordAlertAsync(new AlertHistoryRecord(
+                var record = new AlertHistoryRecord(
                     alert.ServerId, alert.ServerName, alert.MetricName,
                     alert.CurrentValue, alert.ThresholdValue,
                     alert.Severity, alert.NotifyThreshold,
                     delivery,
                     false, FindingSummary.RowDetailText(alert, named.Count),
-                    alert.Context is not null ? AlertContextSerializer.Serialize(alert.Context) : null));
+                    alert.Context is not null ? AlertContextSerializer.Serialize(alert.Context) : null)
+                {
+                    AlertTimeUtc = AlertHistoryEscalationSeed.TruncateToMicroseconds(DateTime.UtcNow),
+                };
+                await _historyStore.RecordAlertAsync(record);
+                /* #5632 Phase A (ruling R1): each held page the summary names opens or joins a request, after its row. */
+                if (_investigations is not null)
+                {
+                    await _investigations.DispatchAsync(record, alert.Context, alert.StoryPathHash);
+                }
             }
             return delivery;
         }
@@ -125,6 +139,7 @@ public sealed class DarlingFindingAlertSender : IFindingAlertSender
            the history row all carry the filtered values. */
             alert = AlertStatementFilter.Apply(alert);
             var context = alert.Context;
+            var alertTimeUtc = AlertHistoryEscalationSeed.TruncateToMicroseconds(DateTime.UtcNow);
             AlertDelivery delivery;
 
             if (alert.Route == FindingRoute.Digest)
@@ -144,9 +159,21 @@ public sealed class DarlingFindingAlertSender : IFindingAlertSender
                    DeliveredProse, not DetailText: an analysis finding's prose restates the structured
                    context the channels already render, so delivering both prints the Diagnosis facts
                    twice. The persisted value below is unaffected. */
+                /* #5821: a single page opens or joins its investigation request BEFORE the channels post, so the generic
+                   webhook's {{investigation_json}} can carry it, at the instant its row below is stamped with, and its link rows
+                   carry the values that row will store, so a claim made while the page is in flight reads them. */
+                var investigationJson = _investigations is null
+                    ? null
+                    : await _investigations.OpenForWebhookAsync(
+                        alert.ServerId, alert.ServerName, alert.MetricName, muted: false, alertTimeUtc, context,
+                        alert.StoryPathHash,
+                        InvestigationDispatcher.Facts(
+                            alert.CurrentValue, alert.Severity, alert.ThresholdValue, alert.NotifyThreshold, muted: false,
+                            alert.DetailText, context is not null ? AlertContextSerializer.Serialize(context) : null));
                 var result = await _core.TrySendAsync(
                     alert.MetricName, alert.ServerName, alert.CurrentValue, alert.ThresholdValue,
-                    alert.ServerId, alert.Context, attemptChannels: true, detailText: alert.DeliveredProse);
+                    alert.ServerId, alert.Context, attemptChannels: true, detailText: alert.DeliveredProse,
+                    investigationJson: investigationJson);
 
                 /* trayChannelPresent: false — the headless service has no tray; see DarlingAlertDeliverer. */
                 delivery = AlertDelivery.FromFanout(result, muted: false, trayChannelPresent: false);
@@ -170,12 +197,18 @@ public sealed class DarlingFindingAlertSender : IFindingAlertSender
                detail pane render, and what the mute pre-fill parses. */
 
             string? contextJson = context is not null ? AlertContextSerializer.Serialize(context) : null;
-            await _historyStore.RecordAlertAsync(new AlertHistoryRecord(
+            var record = new AlertHistoryRecord(
                 alert.ServerId, alert.ServerName, alert.MetricName,
                 alert.CurrentValue, alert.ThresholdValue,
                 alert.Severity, alert.NotifyThreshold,
                 delivery,
-                false, alert.DetailText, contextJson));
+                false, alert.DetailText, contextJson)
+            {
+                AlertTimeUtc = alertTimeUtc,
+            };
+            await _historyStore.RecordAlertAsync(record);
+            /* #5632 Phase A (ruling R1): a single page opened or joined its investigation request above, before the send
+               (#5821); a digest finding is a batch, not an incident, and never does. */
 
             return delivery;
         }

@@ -12,6 +12,7 @@ using System.Data.Common;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using PerformanceMonitor.Common.QueryTags;
 
 namespace PerformanceMonitor.Collectors;
 
@@ -327,18 +328,32 @@ DECLARE
     ring_buffer xml NOT NULL
 );
 
+{RingBufferXml.DeclareSql}
+
+SELECT /* PerformanceMonitorLite */
+    @ring_text = CONVERT(nvarchar(max), xet.target_data),
+    @ring_session = xes.name
+FROM {ringBufferSource}
+WHERE xes.name = N'{sessionName}'
+AND   xet.target_name = N'ring_buffer'
+OPTION(RECOMPILE);
+
+{RingBufferXml.ParseSql}
+
+{RingBufferXml.TruncationSql}
+
 INSERT
     @PerformanceMonitor_LongQueryCompletions
 (
     ring_buffer
 )
-SELECT /* PerformanceMonitorLite */
-    ring_xml = TRY_CAST(xet.target_data AS xml)
-FROM {ringBufferSource}
-WHERE xes.name = N'{sessionName}'
-AND   xet.target_name = N'ring_buffer'
-OPTION(RECOMPILE);
-{ShredSelect}";
+SELECT
+    ring_xml = @ring_xml
+WHERE @ring_xml IS NOT NULL;
+{ShredSelect}
+
+/* #6441: whether SQL Server truncated the ring buffer's XML, read by ReadAsync after the event rows. */
+{RingBufferXml.TruncationSelectSql}";
 
         /* Use the most recent event_time from the host store as the cutoff, or fall back to
            CollectorContext.EventFallbackWindow on first run (mirrors the blocked-process / deadlock collectors). */
@@ -418,6 +433,10 @@ OPTION(RECOMPILE);
                 SessionId = reader.IsDBNull(19) ? null : reader.GetInt32(19),
             });
         }
+
+        /* #6441: the session's ring buffer is 4096 KB, whose XML can pass SQL Server's 4 MB cut; the cut keeps the
+           OLDEST events, so the counts are what bands the collector WARNING when new completions are out of sight. */
+        await RingBufferXml.MeasureTrailingTruncationAsync(reader, context, cancellationToken);
 
         return rows;
     }
@@ -687,4 +706,13 @@ BEGIN
     DROP EVENT SESSION [{sessionName}] ON SERVER;
 END;";
     }
+
+    /// <summary>
+    /// #5980: one hash sighting for a long-query completion, carrying the client application, server principal,
+    /// database and the module (object_name) it ran. Null when the event has no query_hash.
+    /// </summary>
+    public override IReadOnlyList<QueryTagSighting>? DescribeQueryTagSightings(Row row)
+        => QueryTagSightings.Collect(QueryTagSightings.Hash(
+            row.QueryHash, row.DatabaseName, QueryTagSightings.NamedObject(row.DatabaseName, row.ObjectName),
+            row.ClientAppName, row.ServerPrincipalName, null, row.StatementText));
 }

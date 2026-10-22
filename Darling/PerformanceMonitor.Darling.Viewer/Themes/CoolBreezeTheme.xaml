@@ -571,7 +571,7 @@
                                  HorizontalAlignment="Left" VerticalAlignment="Center"
                                  Margin="6,4,23,4" Focusable="True"
                                  Background="Transparent" Foreground="{StaticResource ForegroundBrush}"
-                                 Visibility="Hidden" IsReadOnly="{TemplateBinding IsReadOnly}"/>
+                                 Visibility="Hidden" BorderThickness="0" IsReadOnly="{TemplateBinding IsReadOnly}"/>
                         <Popup x:Name="Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
                                AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
                             <Grid x:Name="DropDown" SnapsToDevicePixels="True"
@@ -588,6 +588,11 @@
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter Property="Foreground" Value="{StaticResource ForegroundMutedBrush}"/>
+                        </Trigger>
+                        <!-- #6452: an IsEditable combo types into PART_EditableTextBox; it was Hidden for good, so the box read blank. -->
+                        <Trigger Property="IsEditable" Value="True">
+                            <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                            <Setter TargetName="ContentSite" Property="Visibility" Value="Collapsed"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -942,6 +947,14 @@
     <!-- Right-aligned text style for numeric DataGrid columns -->
     <Style x:Key="NumericCell" TargetType="TextBlock" BasedOn="{StaticResource DataGridCellText}">
         <Setter Property="TextAlignment" Value="Right"/>
+    </Style>
+
+    <!-- #6225: a cell that holds free text a server stored with its line breaks (a statement, a log message, a plan). Every other
+         cell of a row is centred in it, so a text that makes the row hundreds of pixels tall pushes the numbers out of view and the
+         row reads as blank. The cap keeps the row to a few lines; the tooltip or the cell's full text is where the rest is read. -->
+    <Style x:Key="FreeTextCell" TargetType="TextBlock" BasedOn="{StaticResource DataGridCellText}">
+        <Setter Property="MaxHeight" Value="90"/>
+        <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
     </Style>
 
     <Style TargetType="DataGridCell">

@@ -73,10 +73,10 @@ public sealed class DarlingMcpPgWaitSamplingTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -102,9 +102,9 @@ public sealed class DarlingMcpPgWaitSamplingTools
                    pg_wait_sampling needs shared_preload_libraries and a server restart, so an operator
                    who has not done that gets told what to do rather than shown a blank. */
                 var bare = await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_wait_sampling", cancellationToken)
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_wait_sampling", cancellationToken)
                     ?? await DarlingRuntimePrecondition.StatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "pg_wait_sampling", cancellationToken);
+                        postgres, resolved.ServerId, resolved.DisplayName, "pg_wait_sampling", cancellationToken);
                 if (bare is not null)
                 {
                     return bare;
@@ -117,18 +117,18 @@ public sealed class DarlingMcpPgWaitSamplingTools
                 var emptyNotice = await DarlingMcpWindowNotice.ReadForToolAsync(
                     postgres, "get_pg_wait_sampling", resolved.ServerName, emptyStart, windowEnd, emptyAnswer: true, logger, cancellationToken);
 
-                return McpHelpers.Status(
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, McpHelpers.Status(
                         "empty",
                         McpHelpers.QuietUnlessCut(
                             emptyNotice.WindowTruncated, emptyNotice.EffectiveStart,
-                            factual: $"No sampled waits for {resolved.ServerName} in the last {hours_back} hour(s). The "
+                            factual: $"No sampled waits for {resolved.DisplayName} in the last {hours_back} hour(s). The "
                                 + "figures here are per-interval deltas, so a single collection has nothing to "
                                 + "difference against and the window fills on the second one",
                             coveredClaim: ". On a genuinely idle "
                                 + "server this is the healthy state: the profiler samples backends, and an idle "
                                 + "server has none to sample.",
                             tail: DescribeInstrumentForEmpty(instrument, windowTruncated: emptyNotice.WindowTruncated)),
-                        emptyNotice.AsHints());
+                        emptyNotice.AsHints()), cancellationToken);
             }
 
             /* #4966: where the store's coverage of the window starts, probed on the web's own source for this read (WebDataStartNote).
@@ -137,7 +137,7 @@ public sealed class DarlingMcpPgWaitSamplingTools
             var windowStart = windowEnd.AddHours(-hours_back);
             var notice = await DarlingMcpWindowNotice.ReadForToolAsync(
                 postgres, "get_pg_wait_sampling", resolved.ServerName, windowStart, windowEnd, emptyAnswer: false, logger, cancellationToken);
-            return BuildWaitSamplingJson(resolved.ServerName, hours_back, page, limit, instrument, notice);
+            return BuildWaitSamplingJson(resolved.DisplayName, hours_back, page, limit, instrument, notice);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

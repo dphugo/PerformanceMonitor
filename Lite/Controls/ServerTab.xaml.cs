@@ -138,6 +138,7 @@ public partial class ServerTab : UserControl
     private DataGridFilterManager<DatabaseConfigChangeRow>? _databaseConfigChangesFilterMgr;
     private DataGridFilterManager<TraceFlagChangeRow>? _traceFlagChangesFilterMgr;
     private CancellationTokenSource? _actualPlanCts;
+    private bool _actualPlanRequestOpen;
 
     /// <summary>
     /// This server's clock: its time zone where one was collected, else the fixed offset the connect probe read
@@ -175,6 +176,8 @@ public partial class ServerTab : UserControl
     public ServerTab(ServerConnection server, DuckDbInitializer duckDb, CredentialResolver credentialResolver, int utcOffsetMinutes = 0, bool hasMsdbAccess = true, int sqlEngineEdition = 0, Func<bool>? isLongQueryTraceEnabled = null, bool isAwsRds = false)
     {
         InitializeComponent();
+        QueryTagFilterCombo.ItemsSource = new[] { PerformanceMonitorLite.Helpers.QueryTagGrid.AllChoice };
+        QueryTagFilterCombo.SelectedIndex = 0;
         SetupBarCellMaxes();
 
         _server = server;
@@ -495,7 +498,7 @@ public partial class ServerTab : UserControl
             try
             {
                 var (ok, xml) = await ClipboardText.TryReadAsync();
-                if (ok && !string.IsNullOrWhiteSpace(xml))
+                if (ok && !string.IsNullOrWhiteSpace(xml) && !CallerPlanXmlPrompt.Refuse(xml))
                 {
                     // Await so the guard spans the off-thread parse, not just the clipboard read (#2870).
                     await OpenPlanTab(xml, "Pasted Plan");
@@ -535,7 +538,7 @@ public partial class ServerTab : UserControl
         // set/cleared around the tab switch in SelectActiveQueriesForDrillDown().
         if (_suppressActiveQueriesAutoRefresh) return;
 
-        var navContext = MainTabControl.SelectedIndex == 2
+        var navContext = MainTabControl.SelectedIndex == QueriesTabIndex
             ? $"TabNav-Queries.sub{QueriesSubTabControl.SelectedIndex}"
             : $"TabNav-tab{MainTabControl.SelectedIndex}";
         using var _navTimer = Helpers.MethodProfiler.StartTiming(navContext);

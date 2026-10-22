@@ -9,12 +9,15 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
 using PerformanceMonitor.Analysis.Baselines;
+using PerformanceMonitor.Collectors;
 using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Storage;
+using PerformanceMonitor.Ui;
 
 namespace PerformanceMonitor.Darling.Viewer;
 
@@ -118,7 +121,13 @@ public sealed class ViewerJobHistoryRow
     public ServerClock? Clock { get; init; }
 
     private DateTime ForRowDisplay(DateTime naiveUtc) =>
-        ViewerTimeHelper.ConvertToDisplay(naiveUtc, ViewerTimeHelper.CurrentDisplayMode, Clock ?? ViewerTimeHelper.ActiveServerClock);
+        ViewerTimeHelper.ConvertToDisplay(
+            naiveUtc, MultiServerTime.EffectiveMode(ViewerTimeHelper.CurrentDisplayMode, MixedServers), Clock ?? ViewerTimeHelper.ActiveServerClock);
+
+    /// <summary>True when the list this row sits in holds runs of several servers (#6137), set by
+    /// <see cref="ViewerDataService.GetJobHistoryAsync"/>: Server time cannot apply across servers, so every row of such a list
+    /// reads in the viewer's local time (<see cref="MultiServerTime"/>).</summary>
+    public bool MixedServers { get; set; }
 
     /// <summary><see cref="LastSuccessfulRunUtc"/> as the plain wall time, for the reason <see cref="RunTimeLocal"/> gives.</summary>
     public string LastSuccessfulRunLocal => LastSuccessfulRunUtc is { } t
@@ -172,13 +181,24 @@ public sealed partial class ViewerDataService
     /// </para>
     /// </summary>
     public async Task<List<ViewerJobHistoryRow>> GetJobHistoryAsync(
-        DateTime sinceUtc, int? serverId = null, int limit = 2000, DateTime? untilUtc = null, CancellationToken cancellationToken = default)
+        DateTime sinceUtc, int? serverId = null, int limit = 2000, DateTime? untilUtc = null, int? runStatus = null, string? category = null,
+        CancellationToken cancellationToken = default)
     {
         /* #5562 R6: a finished range's end goes into the read (the shared reader's UntilUtc), so the SQL bounds the runs before the
            per-server top-N and the row cap count them. A window that ended in the past on a busy fleet keeps every run inside it, not
            the newest N of everything since the start. The reader's end is inclusive; the picker's end is exclusive (a run at the next
-           day's start is not in "yesterday"), so it is taken one microsecond (the store's precision) earlier. */
-        var filter = untilUtc is { } until ? new JobHistoryFilter(UntilUtc: until.AddTicks(-TimeSpan.TicksPerMicrosecond)) : null;
+           day's start is not in "yesterday"), so it is taken one microsecond (the store's precision) earlier.
+           #5703: the tab's Status and Category go into the read the same way. The row cap keeps the newest N runs of the whole fleet,
+           and one busy server (a job every minute) fills it with its latest runs, so a filter applied to the rows afterwards never
+           saw an older failure on a quieter server: the All Servers grid lost runs the single-server grid showed. The reader's
+           filters run inside the per-server top-N, so the cap counts only matching runs. They do not touch the job stats (the long-running
+           flag and the last success come from the job's successful outcomes, whatever status the grid is filtered to). */
+        var filter = untilUtc is null && runStatus is null && string.IsNullOrWhiteSpace(category)
+            ? null
+            : new JobHistoryFilter(
+                RunStatus: runStatus,
+                Category: string.IsNullOrWhiteSpace(category) ? null : category,
+                UntilUtc: untilUtc is { } until ? until.AddTicks(-TimeSpan.TicksPerMicrosecond) : null);
         var dtos = await DarlingJobHistoryReader.GetAsync(
             _dataSource, sinceUtc, serverId, limit, ViewerCommandDeadlines.CurrentInteractiveReadSeconds, filter, cancellationToken);
 
@@ -192,8 +212,85 @@ public sealed partial class ViewerDataService
             rows.Add(ViewerJobHistoryRow.From(dto, ViewerTimeHelper.ClockForServerOrMachine(clocks, dto.ServerId, TimeZoneInfo.Local, nowUtc)));
         }
 
+        StampMixedServers(rows);
+
         return rows;
     }
+
+    /// <summary>Marks every row of a list that holds several servers (#6137), so each reads on the one clock the header names.</summary>
+    internal static void StampMixedServers(List<ViewerJobHistoryRow> rows)
+    {
+        var mixed = MultiServerTime.IsMixed(rows.Select(r => r.ServerId));
+        foreach (var row in rows)
+        {
+            row.MixedServers = mixed;
+        }
+    }
+
+    /// <summary>
+    /// The Job History tab's Server choices that do not depend on the runs it read (#5703): every managed server a job history can be asked
+    /// of (the sidebar's set, <see cref="GetManagedServersAsync"/>, narrowed by <see cref="OffersJobHistory"/>), by the name the grid's Server
+    /// column speaks. A server with runs in the window is still offered, from the rows. The runs alone would leave a quiet server out of the
+    /// drop-down whenever a busier server's newest runs fill the row cap, and a server with no SQL Agent (an Azure SQL Database) out for good.
+    /// </summary>
+    public async Task<List<JobHistoryFilterChoices.ServerChoice>> GetJobHistoryServerChoicesAsync(CancellationToken cancellationToken = default) =>
+        (await GetJobHistoryServersAsync(cancellationToken)).Choices;
+
+    /// <summary>The Job History tab's registered servers: the Server drop-down's choices, and which of them are Azure SQL Databases (no SQL Agent).</summary>
+    public sealed record JobHistoryServers(List<JobHistoryFilterChoices.ServerChoice> Choices, IReadOnlySet<int> AzureSqlDatabaseIds);
+
+    /// <summary>Reads the registered servers the Job History tab offers (<see cref="OffersJobHistory"/>), with the Azure SQL Databases among them marked.</summary>
+    public async Task<JobHistoryServers> GetJobHistoryServersAsync(CancellationToken cancellationToken = default)
+    {
+        var servers = await GetManagedServersAsync(cancellationToken);
+        return ServersOf(servers);
+    }
+
+    /// <summary>
+    /// Whether the Job History Server drop-down offers this registered server (#6391): a server the job history collector runs on
+    /// (<see cref="JobHistoryCollector.CollectsOn"/>: not a disabled server or a PostgreSQL target; Amazon RDS and Azure SQL Managed Instance
+    /// run SQL Agent and stay), and also an enabled Azure SQL Database. It has no SQL Agent and never any rows, but it is a registered server,
+    /// so it must be pickable for the tab to say so in plain words; filtering it out left it unpickable with the sentence never shown.
+    /// </summary>
+    internal static bool OffersJobHistory(DarlingServer server) =>
+        JobHistoryCollector.CollectsOn(server.IsEnabled, server.EngineKind, server.EngineEdition)
+        || IsEnabledAzureSqlDatabase(server);
+
+    private static bool IsEnabledAzureSqlDatabase(DarlingServer server) =>
+        server.EngineEdition == CollectorEngineCapability.AzureSqlDatabaseEngineEdition
+        && JobHistoryCollector.CollectsOn(server.IsEnabled, server.EngineKind, CollectorEngineCapability.UnknownEngineEdition);
+
+    /// <summary>Maps the managed servers to the Job History servers: those <see cref="OffersJobHistory"/>, by display name.</summary>
+    internal static JobHistoryServers ServersOf(IEnumerable<DarlingServer> servers)
+    {
+        var offered = servers.Where(OffersJobHistory).ToList();
+        return new JobHistoryServers(
+            offered
+                .Select(s => new JobHistoryFilterChoices.ServerChoice(s.ServerId, string.IsNullOrEmpty(s.DisplayName) ? s.ServerName : s.DisplayName))
+                .ToList(),
+            offered.Where(IsEnabledAzureSqlDatabase).Select(s => s.ServerId).ToHashSet());
+    }
+
+    /// <summary>Maps the managed servers to Server choices (see <see cref="ServersOf"/>).</summary>
+    internal static List<JobHistoryFilterChoices.ServerChoice> ServerChoicesOf(IEnumerable<DarlingServer> servers) =>
+        ServersOf(servers).Choices;
+
+    /// <summary>
+    /// The Job History tab's Category choices (#5703): every category with a run in the window, from a read of its own that the row cap
+    /// and the tab's Status and Category filters do not touch (<see cref="DarlingJobHistoryReader.GetCategoriesAsync"/>). At All
+    /// Servers the grid's read holds only the newest runs of the whole fleet, so a quieter server's categories would be missing from
+    /// the drop-down until a Status filter surfaced them.
+    /// </summary>
+    /// <param name="sinceUtc">The window's start: the one the grid's read takes.</param>
+    /// <param name="untilUtc">The window's end for a range that ended in the past, else null.</param>
+    /// <param name="serverId">The server picked in the tab's Server drop-down, or null at All Servers: the read is that server's, so a
+    /// category only another server has is not offered (picking it would give an empty grid).</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    public Task<List<string>> GetJobHistoryCategoriesAsync(
+        DateTime sinceUtc, DateTime? untilUtc = null, int? serverId = null, CancellationToken cancellationToken = default) =>
+        DarlingJobHistoryReader.GetCategoriesAsync(
+            _dataSource, sinceUtc, untilUtc is { } until ? until.AddTicks(-TimeSpan.TicksPerMicrosecond) : null,
+            ViewerCommandDeadlines.CurrentInteractiveReadSeconds, serverId, cancellationToken);
 
     /// <summary>
     /// The exact window, after the server-local to UTC conversion: keeps the runs at or after

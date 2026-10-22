@@ -42,7 +42,7 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 [McpServerToolType]
 public sealed class DarlingMcpPgPredicateTools
 {
-    [McpServerTool(Name = "get_pg_predicate_stats"), Description("Gets PostgreSQL predicate selectivity from pg_qualstats: which columns are filtered, with which operator, rows evaluated and rows filtered out. filtered_pct is 100*rows_filtered/rows_evaluated (a percent), NULL when nothing was evaluated, never a false 0%. worst_estimate_error_ratio large means the PLANNER is misjudging this predicate (a stats/correlation problem), not that it needs an index. SAMPLED: counts are raw at sample_rate (often 0.01) and are NEVER scaled up here. queryid is a STRING and joins get_pg_top_queries. <<GUIDE>> Gets PostgreSQL predicate selectivity from the pg_qualstats extension: which columns queries actually filter on, with which operator, how many rows each predicate evaluated and how many it filtered out. This is the evidence behind an index recommendation - a predicate that evaluates many rows and filters nearly all of them away is a column doing work an index could do instead. filtered_pct is that ratio. worst_estimate_error_ratio compares what the planner expected against what it got, so a large value marks a predicate the planner is misjudging, which is a statistics or correlated-column problem rather than an indexing one. IMPORTANT: these are SAMPLED counts - pg_qualstats records only a fraction of executions, given per row as sample_rate (commonly 0.01), and the counts are NOT scaled up here. queryid joins get_pg_top_queries.")]
+    [McpServerTool(Name = "get_pg_predicate_stats"), Description("Gets PostgreSQL predicate selectivity from pg_qualstats: which columns are filtered, with which operator, rows evaluated and rows filtered out. filtered_pct is 100*rows_filtered/rows_evaluated (a percent), NULL when nothing was evaluated, never a false 0%. worst_estimate_error_ratio large means the PLANNER is misjudging this predicate (a stats/correlation problem), not that it needs an index. SAMPLED: counts are raw at sample_rate (often 0.01) and are NEVER scaled up here. queryid is a STRING and joins get_pg_top_queries. <<GUIDE>> Gets PostgreSQL predicate selectivity from the pg_qualstats extension: which columns queries actually filter on, with which operator, how many rows each predicate evaluated and how many it filtered out. This is the evidence behind an index recommendation - a predicate that evaluates many rows and filters nearly all of them away is a column doing work an index could do instead. filtered_pct is that ratio. worst_estimate_error_ratio compares what the planner expected against what it got, so a large value marks a predicate the planner is misjudging, which is a statistics or correlated-column problem rather than an indexing one. These are SAMPLED counts - pg_qualstats records only a fraction of executions, given per row as sample_rate (commonly 0.01), and the counts are NOT scaled up here. queryid joins get_pg_top_queries.")]
     public static async Task<string> GetPgPredicateStats(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -52,10 +52,10 @@ public sealed class DarlingMcpPgPredicateTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -68,9 +68,9 @@ public sealed class DarlingMcpPgPredicateTools
             if (rows.Count == 0)
             {
                 var bare = await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_predicate_stats", cancellationToken)
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_predicate_stats", cancellationToken)
                     ?? await DarlingRuntimePrecondition.StatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "pg_predicate_stats", cancellationToken);
+                        postgres, resolved.ServerId, resolved.DisplayName, "pg_predicate_stats", cancellationToken);
                 if (bare is not null)
                 {
                     return bare;
@@ -83,13 +83,13 @@ public sealed class DarlingMcpPgPredicateTools
                 var emptyNotice = await DarlingMcpWindowNotice.ReadForToolAsync(
                     postgres, "get_pg_predicate_stats", resolved.ServerName, emptyStart, windowEnd, emptyAnswer: true, logger, cancellationToken);
 
-                return McpHelpers.Status(
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, McpHelpers.Status(
                         "empty",
-                        $"No predicate statistics for {resolved.ServerName} in the last {hours_back} "
+                        $"No predicate statistics for {resolved.DisplayName} in the last {hours_back} "
                         + "hour(s). pg_qualstats SAMPLES executions — at the default 1% rate a low-traffic "
                         + "database can genuinely record nothing — and it needs shared_preload_libraries "
                         + "plus a restart to be active at all.",
-                        emptyNotice.AsHints());
+                        emptyNotice.AsHints()), cancellationToken);
             }
 
             /* #4966: where the store's coverage of the window starts, probed on the web's own source for this read (WebDataStartNote).
@@ -124,7 +124,7 @@ public sealed class DarlingMcpPgPredicateTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,

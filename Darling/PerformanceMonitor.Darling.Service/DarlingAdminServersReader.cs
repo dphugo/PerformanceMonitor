@@ -14,6 +14,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
+using PerformanceMonitor.Darling.Storage;
 using PerformanceMonitor.Collectors;
 using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Service.Mcp;
@@ -49,7 +50,7 @@ internal static class DarlingAdminServersReader
     /// test can pin the dialect ungated. The lateral probe is the same per-server ordered descent
     /// <see cref="DarlingDataReader.ServerListSql"/> uses.
     /// </summary>
-    internal const string AdminServersSql = """
+    internal const string AdminServersSql = $"""
         SELECT
             c.server_id,
             c.name,
@@ -69,7 +70,8 @@ internal static class DarlingAdminServersReader
             s.sql_engine_edition,
             s.engine_kind,
             s.created_date,
-            latest.collection_time AS last_collection
+            latest.collection_time AS last_collection,
+            {DarlingDataReader.SameMachineAsColumnSql}
         FROM config.config_monitored_servers c
         LEFT JOIN servers s ON s.server_id = c.server_id
         LEFT JOIN LATERAL
@@ -77,6 +79,7 @@ internal static class DarlingAdminServersReader
             SELECT cl.collection_time
             FROM v_collection_log cl
             WHERE cl.server_id = c.server_id
+            AND   {CollectionCycleRow.NotCycleRowSql}
             ORDER BY cl.collection_time DESC
             LIMIT 1
         ) AS latest ON TRUE
@@ -103,7 +106,8 @@ internal static class DarlingAdminServersReader
         int? SqlEngineEdition,
         string? EngineKind,
         DateTime? RegisteredAt,
-        DateTime? LastCollection);
+        DateTime? LastCollection,
+        IReadOnlyList<string>? SameMachineAs = null);
 
     internal static async Task<List<Row>> ReadAsync(NpgsqlDataSource postgres, CancellationToken cancellationToken)
     {
@@ -132,7 +136,8 @@ internal static class DarlingAdminServersReader
                 reader.IsDBNull(15) ? null : reader.GetInt32(15),
                 reader.IsDBNull(16) ? null : reader.GetString(16),
                 reader.IsDBNull(17) ? null : reader.GetDateTime(17),
-                reader.IsDBNull(18) ? null : reader.GetDateTime(18)));
+                reader.IsDBNull(18) ? null : reader.GetDateTime(18),
+                reader.IsDBNull(19) ? null : reader.GetFieldValue<string[]>(19)));
         }
 
         return rows;
@@ -192,6 +197,7 @@ internal static class DarlingAdminServersReader
             monthly_cost = CostLabel(r.MonthlyCostUsd),
             monthly_cost_usd = r.MonthlyCostUsd,
             added = r.CreatedAt.ToString("o", CultureInfo.InvariantCulture),
+            same_machine_as = r.SameMachineAs is { Count: > 0 } peers ? string.Join(", ", peers) : null,
         };
     }
 
@@ -241,5 +247,9 @@ internal static class DarlingAdminServersReader
         /// <summary>The figure behind <see cref="monthly_cost"/>, for the column's sort only.</summary>
         public decimal monthly_cost_usd { get; init; }
         public string added { get; init; } = "";
+
+        /// <summary>The other enabled registrations that last reported this machine's identity (#6351), joined for the grid; null when
+        /// there are none. Worked out at read, never stored. An agent-scoped notification route on one does not cover the other.</summary>
+        public string? same_machine_as { get; init; }
     }
 }

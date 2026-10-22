@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
@@ -76,6 +78,13 @@ public partial class DuckDbInitializer : IDisposable
     /// it directly instead of inferring "did the cycle run" from a side effect that holds either way.
     /// </summary>
     internal int CompletedTrimCycleCount;
+
+    /* #5650: a busy-skipped trim cycle used to log only at Debug. RecordTrimSkip counts both skip paths and writes
+       one Information line at most an hour, counted from the first skip; the line resets the count and the hour. */
+    private static readonly TimeSpan TrimSkipLogInterval = TimeSpan.FromHours(1);
+    private readonly object _trimSkipGate = new();
+    private int _trimSkipCount;
+    private DateTime? _trimSkipSinceUtc;
 
     /// <summary>
     /// How often the trim timer checks the sentinel's memory usage (#4262 round 1 finding 1). Not const —
@@ -154,9 +163,11 @@ public partial class DuckDbInitializer : IDisposable
     /// <para>It also answers the pair that made the split look like a contradiction.
     /// <c>DuckDbMuteRuleStore.InsertAsync</c> writing <c>config_mute_rules</c> under a write lock and
     /// <c>FindingStore.MuteStoryAsync</c> writing <c>analysis_muted</c> under a read lock are NOT the same
-    /// species: nothing but the analysis pass ever writes <c>analysis_muted</c>, while
+    /// species: <c>analysis_muted</c> only ever gets appends of new rows, while
     /// <c>config_mute_rules</c> is UPDATEd by an operator and DELETEd by a timer-driven expiry purge that
-    /// can be running at the same moment.</para>
+    /// can be running at the same moment. The one DELETE <c>analysis_muted</c> has,
+    /// <c>FindingStore.UnmuteStoryAsync</c>, is the second kind of statement and takes the write lock for
+    /// the same reason the rule store's deletes do.</para>
     ///
     /// <para><b>The WAIT is a separate question from the lock.</b> <c>AcquireWriteLock()</c> with no
     /// timeout waits behind an archival for however long the archival takes. Eleven current callers do
@@ -177,6 +188,10 @@ public partial class DuckDbInitializer : IDisposable
        to know a read has reached the lock wait, instead of sleeping and hoping the pool started it. */
     internal static int WaitingReadCountForTests => s_dbLock.WaitingReadCount;
 
+    /* Test seam (#5691): how many threads are parked waiting for the write lock right now. A test that queues a writer while
+       a read hold is open reads it to know the writer has reached the lock wait before the hold ends. */
+    internal static int WaitingWriteCountForTests => s_dbLock.WaitingWriteCount;
+
     /* Fires in ResetDatabaseCoreAsync after the database and WAL files are deleted and before the schema is
        recreated: a test throws from it to stand in for a process kill with no database file on disk. */
     internal static Action? AfterDatabaseFilesDeletedForTests { get; set; }
@@ -187,7 +202,9 @@ public partial class DuckDbInitializer : IDisposable
     /// If the current thread already owns a read lock (e.g., leaked by an unhandled exception),
     /// returns a no-op disposable to allow the operation to proceed.
     /// </summary>
-    public IDisposable AcquireReadLock() => AcquireReadLock(CancellationToken.None);
+    public IDisposable AcquireReadLock(
+        [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
+        => AcquireReadLock(CancellationToken.None, holderMember, holderFile);
 
     /// <summary>
     /// The same read lock, abandonable (#2443). <see cref="AcquireWriteLock"/> has taken a timeout
@@ -204,7 +221,9 @@ public partial class DuckDbInitializer : IDisposable
     /// <see cref="CancellationToken.None"/> takes the original uninterruptible path, so the fourteen
     /// callers outside the analysis pass are unchanged rather than quietly re-timed.</para>
     /// </summary>
-    public IDisposable AcquireReadLock(CancellationToken cancellationToken)
+    public IDisposable AcquireReadLock(
+        CancellationToken cancellationToken,
+        [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
     {
         try
         {
@@ -229,7 +248,7 @@ public partial class DuckDbInitializer : IDisposable
                proceeds normally. */
             return NoOpDisposable.Instance;
         }
-        return new LockReleaser(s_dbLock, write: false);
+        return new LockReleaser(s_dbLock, write: false, StoreLockHolders.Register(holderMember, holderFile, write: false));
     }
 
     /// <summary>
@@ -255,7 +274,8 @@ public partial class DuckDbInitializer : IDisposable
     /// because this caller genuinely has a number to pick: it is bounded by what a UI thread may spend,
     /// not by a caller's remaining budget.</para>
     /// </summary>
-    public IDisposable? TryAcquireReadLock(TimeSpan timeout)
+    public IDisposable? TryAcquireReadLock(
+        TimeSpan timeout, [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
     {
         try
         {
@@ -271,7 +291,7 @@ public partial class DuckDbInitializer : IDisposable
             return NoOpDisposable.Instance;
         }
 
-        return new LockReleaser(s_dbLock, write: false);
+        return new LockReleaser(s_dbLock, write: false, StoreLockHolders.Register(holderMember, holderFile, write: false));
     }
 
     /// <summary>
@@ -288,20 +308,37 @@ public partial class DuckDbInitializer : IDisposable
     /// When a timeout is specified, throws <see cref="TimeoutException"/> if the lock
     /// cannot be acquired within the given duration (e.g., archival is in progress).
     /// </summary>
-    public IDisposable AcquireWriteLock(TimeSpan? timeout = null)
+    public IDisposable AcquireWriteLock(
+        TimeSpan? timeout = null, [CallerMemberName] string? holderMember = null, [CallerFilePath] string? holderFile = null)
     {
         if (timeout.HasValue)
         {
+            var waitStarted = Stopwatch.GetTimestamp();
             if (!s_dbLock.TryEnterWriteLock(timeout.Value))
-                throw new TimeoutException(
-                    "Could not acquire database write lock — another operation (archival or maintenance) may be in progress. Please try again in a few moments.");
+            {
+                /* #5650: say who holds the lock and for how long, from the registry every acquisition writes
+                   to. The old text named "archival or maintenance" whatever the holder was. */
+                throw new StoreLockTimeoutException(
+                    Stopwatch.GetElapsedTime(waitStarted),
+                    StoreLockHolders.Snapshot(),
+                    StoreLockHolders.Name(holderMember, holderFile));
+            }
         }
         else
         {
             s_dbLock.EnterWriteLock();
         }
-        return new LockReleaser(s_dbLock, write: true);
+        return new LockReleaser(s_dbLock, write: true, StoreLockHolders.Register(holderMember, holderFile, write: true), WriteHoldWarnAfter);
     }
+
+    /// <summary>
+    /// #5731 hold watchdog: a WRITE hold that lasts longer than this logs one warning naming the holder when it
+    /// is released. A waiting writer makes every new reader (every collector's log append) wait, and a writer's
+    /// hold keeps them out, so a long write hold is the number the housekeeping budgets are tuned against. The
+    /// same five seconds as <c>LocalDataService.WriteLockBudget</c>, the longest a writer will wait for the
+    /// lock. An instance value rather than a static so a test can lower it on its own initializer.
+    /// </summary>
+    internal TimeSpan WriteHoldWarnAfter { get; set; } = TimeSpan.FromSeconds(5);
 
     private sealed class NoOpDisposable : IDisposable
     {
@@ -342,18 +379,42 @@ public partial class DuckDbInitializer : IDisposable
     {
         private readonly ReaderWriterLockSlim _lock;
         private readonly bool _write;
+        private readonly long _holdId;
+        private readonly long _acquiredAt = Stopwatch.GetTimestamp();
+        private readonly TimeSpan _warnAfter;
         private bool _disposed;
 
-        public LockReleaser(ReaderWriterLockSlim rwLock, bool write)
+        public LockReleaser(ReaderWriterLockSlim rwLock, bool write, long holdId, TimeSpan warnAfter = default)
         {
             _lock = rwLock;
             _write = write;
+            _holdId = holdId;
+            _warnAfter = warnAfter;
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+            /* #5731: write holds only, so a read pays one timestamp and nothing else. Logged before the release so
+               the registry still names the holder, and guarded because Dispose must never throw past the unlock. */
+            if (_write && _warnAfter > TimeSpan.Zero)
+            {
+                try
+                {
+                    var held = Stopwatch.GetElapsedTime(_acquiredAt);
+                    if (held > _warnAfter)
+                    {
+                        AppLogger.Warn("DuckDb", string.Create(CultureInfo.InvariantCulture,
+                            $"{StoreLockHolders.HolderName(_holdId)} held the local database write lock for {held.TotalSeconds:0.#} s (warns past {_warnAfter.TotalSeconds:0.#} s); collectors were held off for that long (#5731)"));
+                    }
+                }
+                catch (Exception)
+                {
+                    /* The warning is measurement only. */
+                }
+            }
+            StoreLockHolders.Unregister(_holdId);
             if (_write) _lock.ExitWriteLock();
             else _lock.ExitReadLock();
         }
@@ -362,7 +423,7 @@ public partial class DuckDbInitializer : IDisposable
     /// <summary>
     /// Current schema version. Increment this when schema changes require table rebuilds.
     /// </summary>
-    internal const int CurrentSchemaVersion = 67;
+    internal const int CurrentSchemaVersion = 78;
 
     private readonly string _archivePath;
 
@@ -378,7 +439,7 @@ public partial class DuckDbInitializer : IDisposable
     /// </summary>
     internal Func<string, long?> AvailableFreeBytesProvider { get; set; } = DataVolumeSpace.GetAvailableFreeBytes;
 
-    /// <summary>The clock the volume warning's cadence reads; a test replaces it.</summary>
+    /// <summary>The clock the volume warning's cadence and the trim skip log read (#5650); a test replaces it.</summary>
     internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
 
     /// <summary>How long a volume that stays low goes without repeating its warning.</summary>
@@ -505,7 +566,11 @@ public partial class DuckDbInitializer : IDisposable
            lock is busy, skip this cycle and try again in TrimInterval. Released before the write-lock
            attempt below so the trim never holds both locks at once. */
         if (!s_dbLock.TryEnterReadLock(0))
+        {
+            RecordTrimSkip();
             return;
+        }
+        var readHoldId = StoreLockHolders.Register(nameof(RunMemoryTrimCycle), "DuckDbInitializer.cs", write: false);
 
         double? beforeBytes;
         try
@@ -520,6 +585,7 @@ public partial class DuckDbInitializer : IDisposable
         finally
         {
             s_dbLock.ExitReadLock();
+            StoreLockHolders.Unregister(readHoldId);
         }
 
         if (beforeBytes is null || beforeBytes < TrimThresholdBytes)
@@ -529,11 +595,13 @@ public partial class DuckDbInitializer : IDisposable
            lock is busy, skip this cycle; the next one TrimInterval later gets another try. */
         if (!s_dbLock.TryEnterWriteLock(0))
         {
+            RecordTrimSkip();
             _logger?.LogDebug(
-                "Trim cycle: skipped, write lock unavailable ({BeforeMb:F0} MB in use)",
+                "Trim cycle: skipped, write lock unavailable ({BeforeMb:F0} MiB in use)",
                 beforeBytes.Value / (1024.0 * 1024.0));
             return;
         }
+        var writeHoldId = StoreLockHolders.Register(nameof(RunMemoryTrimCycle), "DuckDbInitializer.cs", write: true);
 
         var stopwatch = Stopwatch.StartNew();
         try
@@ -568,7 +636,7 @@ public partial class DuckDbInitializer : IDisposable
             stopwatch.Stop();
             var afterBytes = ReadSentinelMemoryUsageBytes(lockedSentinel);
             _logger?.LogDebug(
-                "Trim cycle: {BeforeMb:F0} MB -> {AfterMb:F0} MB in {ElapsedMs}ms (memory_limit {Target} -> {Configured})",
+                "Trim cycle: {BeforeMb:F0} MiB -> {AfterMb:F0} MiB in {ElapsedMs}ms (memory_limit {Target} -> {Configured})",
                 beforeBytes.Value / (1024.0 * 1024.0),
                 (afterBytes ?? 0) / (1024.0 * 1024.0),
                 stopwatch.ElapsedMilliseconds,
@@ -578,6 +646,30 @@ public partial class DuckDbInitializer : IDisposable
         finally
         {
             s_dbLock.ExitWriteLock();
+            StoreLockHolders.Unregister(writeHoldId);
+        }
+    }
+
+    /// <summary>
+    /// Counts one busy-skipped trim cycle and writes the hourly Information line (#5650). Locked because the
+    /// read-lock skip runs with no lock held, so two callers can reach it at once.
+    /// </summary>
+    private void RecordTrimSkip()
+    {
+        lock (_trimSkipGate)
+        {
+            var now = UtcNow();
+            _trimSkipSinceUtc ??= now;
+            _trimSkipCount++;
+            var span = now - _trimSkipSinceUtc.Value;
+            if (span < TrimSkipLogInterval)
+                return;
+
+            _logger?.LogInformation(
+                "Memory trim skipped {Count} time(s) in the last {Minutes:F0} min because the local database was busy",
+                _trimSkipCount, span.TotalMinutes);
+            _trimSkipCount = 0;
+            _trimSkipSinceUtc = null;
         }
     }
 
@@ -725,6 +817,7 @@ public partial class DuckDbInitializer : IDisposable
                 return;
             }
 
+            /* #5650: not registered with StoreLockHolders, because Dispose runs at shutdown only. */
             if (s_dbLock.TryEnterWriteLock(DisposeWriteLockTimeout))
             {
                 try
@@ -1273,6 +1366,7 @@ public partial class DuckDbInitializer : IDisposable
             /* On a fresh/reset database (v0), skip migrations entirely — they DROP tables
                expecting CREATE TABLE to follow, which is destructive on a blank DB.
                Just create tables with the current schema and stamp the version. */
+            _versionHeldBackAt = null;
             if (existingVersion > 0 && existingVersion < CurrentSchemaVersion)
             {
                 _logger?.LogInformation("Schema upgrade needed: v{Old} -> v{New}", existingVersion, CurrentSchemaVersion);
@@ -1305,7 +1399,7 @@ public partial class DuckDbInitializer : IDisposable
 
             if (existingVersion < CurrentSchemaVersion)
             {
-                await SetSchemaVersionAsync(connection, CurrentSchemaVersion);
+                await SetSchemaVersionAsync(connection, _versionHeldBackAt ?? CurrentSchemaVersion);
             }
 
             /* Exact duplicate deadlock rows an older build stored twice (a master-registered Azure database's own
@@ -2842,7 +2936,179 @@ public partial class DuckDbInitializer : IDisposable
                 _logger?.LogWarning("Migration to v67 on total_size_mb encountered an error (non-fatal): {Error}", ex.Message);
             }
         }
+
+        if (fromVersion < 68)
+        {
+            /* v68 (#5640): the Client Timeouts alert. Two additions, both additive. (1) The attention_events table is a collector
+                    table, generated from the catalog by the table statements that run right after the migrations, so a database
+                    older than v68 gets it there, and nothing in this step names it. (2) config_mute_rules.client_app_pattern,
+                    the client-application match of a mute rule, is a nullable VARCHAR added through the shared added-columns
+                    list, so a failed add is retried on the next start like every other entry. Nothing to backfill: a rule saved
+                    before the upgrade has no client-application match. */
+            _logger?.LogInformation("Running migration to v68: config_mute_rules.client_app_pattern (Client Timeouts alert)");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(68));
+        }
+
+        if (fromVersion < 69)
+        {
+            /* v69 (#5750): notification_routes, the scoped notification routes. A new table with no row to backfill: a
+               database older than v69 has no routes, which is exactly the state before the feature. Non-fatal, matching v58:
+               without the table the route store's load fails, the cache keeps serving no routes, and every alert goes to
+               the app-wide destinations as it did before; the table statements that follow retry the CREATE on the next start. */
+            _logger?.LogInformation("Running migration to v69: adding notification_routes (scoped notification routes)");
+            try
+            {
+                await ExecuteNonQueryAsync(connection, Schema.CreateNotificationRoutesTable);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning("Migration to v69 encountered an error (non-fatal): {Error}", ex.Message);
+            }
+
+            /* #5775: a table that an earlier build of this unreleased step already created has no generation columns; the
+               shared list adds them (a fresh table has them from the CREATE). */
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(69));
+
+            /* #5820, the same unreleased step: the six Level 1 investigation tables. New tables with no row to backfill,
+               so non-fatal the same way: a table that fails here leaves investigations unavailable (the store's reads and
+               writes fail and the alert path goes on without opening a request), and the table statements that follow
+               retry each CREATE on the next start. Each table is its own try, so one failure does not skip the rest. */
+            _logger?.LogInformation("Running migration to v69: adding the investigation tables (Level 1 investigations)");
+            foreach (var statement in Schema.InvestigationTableStatements())
+            {
+                try
+                {
+                    await ExecuteNonQueryAsync(connection, statement);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning("Migration to v69 investigation tables encountered an error (non-fatal): {Error}", ex.Message);
+                }
+            }
+        }
+
+        if (fromVersion < 70)
+        {
+            /* v70 (#5989): the six query-tag tables. New tables with no row to backfill: a database older than v70 has no
+               query tags, which is the state before the feature. Non-fatal, and each table is its own try: a table that
+               fails here leaves query tags unavailable (the store's reads and writes fail, nothing else does), and the
+               table statements that follow retry each CREATE on the next start. */
+            _logger?.LogInformation("Running migration to v70: adding the query-tag tables");
+            foreach (var statement in Schema.QueryTagTableStatements())
+            {
+                try
+                {
+                    await ExecuteNonQueryAsync(connection, statement);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning("Migration to v70 query-tag tables encountered an error (non-fatal): {Error}", ex.Message);
+                }
+            }
+        }
+
+        if (fromVersion < 71)
+        {
+            /* v71 (#5990): query_tag_sightings gains database_name in its primary key (one hash seen in two databases is two
+               rows). DuckDB cannot change a primary key in place, and the table is DERIVED data: the collectors refill it on
+               their next rounds and the map pass rebuilds from it, so the old rows are dropped rather than migrated.
+               Non-fatal, but the version is stamped v71 ONLY when both the DROP and the CREATE succeeded. A failed DROP leaves
+               the old six-part table in place (CREATE TABLE IF NOT EXISTS would then do nothing and every flush would fail
+               on the missing column), so the stamp stays at v70 and this step retries at the next start. */
+            _logger?.LogInformation("Running migration to v71: recreating query_tag_sightings with the database in its key");
+            try
+            {
+                BeforeV71SightingsDropForTests?.Invoke();
+                await ExecuteNonQueryAsync(connection, "DROP TABLE IF EXISTS query_tag_sightings");
+                BeforeV71SightingsCreateForTests?.Invoke();
+                await ExecuteNonQueryAsync(connection, Schema.CreateQueryTagSightingsTable);
+            }
+            catch (Exception ex)
+            {
+                _versionHeldBackAt = 70;
+                _logger?.LogWarning("Migration to v71 query_tag_sightings encountered an error (non-fatal; the version stays at v70 and the step retries at the next start): {Error}", ex.Message);
+            }
+        }
+
+        if (fromVersion < 72)
+        {
+            /* v72 (#6010): investigation_evidence (a new table, nothing to backfill) and investigation_requests.evidence_state
+               (the shared added-columns list). Non-fatal, like v69 and v70: without them the capture finds no evidence to settle
+               and a brief carries no evidence sections; the table statements that follow retry the CREATE on the next start. */
+            _logger?.LogInformation("Running migration to v72: adding investigation_evidence and investigation_requests.evidence_state");
+            try
+            {
+                await ExecuteNonQueryAsync(connection, Schema.CreateInvestigationEvidenceTable);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning("Migration to v72 encountered an error (non-fatal): {Error}", ex.Message);
+            }
+
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(72));
+        }
+
+        if (fromVersion < 73)
+        {
+            /* v73 (#6010): investigation_requests.max_severity, the quiet-join rule's high-water mark (the shared added-columns list). */
+            _logger?.LogInformation("Running migration to v73: adding investigation_requests.max_severity");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(73));
+        }
+
+        if (fromVersion < 74)
+        {
+            /* v74 (#6011): investigation_reports.family_of and queries_run, Darling's V193-era report fields (#6004; the shared added-columns list). */
+            _logger?.LogInformation("Running migration to v74: adding investigation_reports.family_of and queries_run");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(74));
+        }
+
+        if (fromVersion < 75)
+        {
+            /* v75 (#6012): investigation_requests.follow_up_of and follow_up_at, Darling's V193 follow-up columns (#6008), and the route signing-key flag (the shared added-columns list). */
+            _logger?.LogInformation("Running migration to v75: adding investigation_requests.follow_up_of and follow_up_at, notification_routes.generic_signing_set and generic_signing_until");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(75));
+        }
+
+        if (fromVersion < 76)
+        {
+            /* v76 (#5632): the head blocker's sign-in time, last request end time, open transaction count and transaction log bytes on dmv_blocking_snapshots
+               (Darling's V199 columns; the shared added-columns list). The view over the table is rebuilt on every start (CreateArchiveViewsAsync). */
+            _logger?.LogInformation("Running migration to v76: adding the head blocker's evidence columns to dmv_blocking_snapshots");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(76));
+        }
+
+        if (fromVersion < 77)
+        {
+            /* v77 (#6159, twinning Darling's V202): ag_replica_states.primary_replica, the name of the replica that was the primary when the row was
+               collected (sys.dm_hadr_availability_group_states.primary_replica, which a secondary can read; the shared added-columns list). NULL on a
+               row stored before v77. Fresh installs get it from DuckDbSchemaGenerator (the AG tables are generated from the collector catalog). */
+            _logger?.LogInformation("Running migration to v77: adding ag_replica_states.primary_replica");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(77));
+        }
+
+        if (fromVersion < 78)
+        {
+            /* v78 (#6254): collection_log.read_source, which server a run's Query Store rows were read from: the replica's name when the run
+               read the Query Store replica, the primary's otherwise. VARCHAR, nullable, the LAST column (the shared added-columns list). NULL on a
+               row stored before v78 and on every collector that does not choose a source. The archive views union parquet by name, so a parquet
+               file written before v78 reads NULL for it. */
+            _logger?.LogInformation("Running migration to v78: adding collection_log.read_source");
+            await AddMissingColumnsAsync(connection, AddedColumnsForVersion(78));
+        }
     }
+
+    /* #5990: set when a migration step failed in a way that must be retried at the next start; the stamp then stops at this
+       version instead of CurrentSchemaVersion. */
+    private int? _versionHeldBackAt;
+
+    /// <summary>True while the v71 sightings migration is held back: the table still has the old six-part key.</summary>
+    internal bool QueryTagSchemaHeldBack => _versionHeldBackAt is not null;
+
+    /* Test seams: run before the v71 DROP, and between it and the CREATE; a test throws from one to fail that statement. */
+    internal Action? BeforeV71SightingsDropForTests { get; set; }
+
+    /* (second seam) runs between the v71 DROP and its CREATE, so a test can fail the CREATE after a good DROP. */
+    internal Action? BeforeV71SightingsCreateForTests { get; set; }
 
     /// <summary>
     /// #4727: the 16 columns that schema versions 60 to 66 add to existing tables, in ONE list. Each migration
@@ -2870,6 +3136,45 @@ public partial class DuckDbInitializer : IDisposable
         (65, "ag_replica_states", "group_id", "VARCHAR"),
         (65, "ag_database_replica_states", "group_id", "VARCHAR"),
         (66, "query_store_stats", "interval_end_time_utc", "TIMESTAMP"),
+        (68, "config_mute_rules", "client_app_pattern", "VARCHAR"),
+        /* #5775: the generation token of each route channel's Credential Manager key. Version 69 is unreleased, so these ride
+           with its table rather than a new step; a file that already ran the first v69 gets them from this list on its next start. */
+        (69, "notification_routes", "teams_secret_gen", "VARCHAR"),
+        (69, "notification_routes", "slack_secret_gen", "VARCHAR"),
+        (69, "notification_routes", "generic_secret_gen", "VARCHAR"),
+        (69, "notification_routes", "pagerduty_secret_gen", "VARCHAR"),
+        /* #5820: the five agent settings of a route, the Lite twins of Darling's V184 columns. NULL is no agent (the level)
+           or the default (a limit); the route store reads a NULL limit as NotificationRoute's default. v69 is unreleased. */
+        (69, "notification_routes", "agent_level", "INTEGER"),
+        (69, "notification_routes", "agent_max_per_hour", "INTEGER"),
+        (69, "notification_routes", "agent_max_per_day", "INTEGER"),
+        (69, "notification_routes", "agent_lease_minutes", "INTEGER"),
+        (69, "notification_routes", "agent_expiry_minutes", "INTEGER"),
+        /* #6010: the request's evidence state (Darling's V193 evidence_state): NULL until the capture settles a section. */
+        (72, "investigation_requests", "evidence_state", "VARCHAR"),
+        /* #6010: the highest severity any alert joined to the request had (Darling's V193 max_severity); NULL on a request opened before v73. */
+        (73, "investigation_requests", "max_severity", "VARCHAR"),
+        /* #6011: a report's first-of-family request id and the statements it ran (Darling's family_of uuid and queries_run jsonb, #6004);
+           NULL on a report stored before v74. family_of carries no foreign key here: the tool's existence check is the guard. */
+        (74, "investigation_reports", "family_of", "UUID"),
+        (74, "investigation_reports", "queries_run", "VARCHAR"),
+        /* #6012: the request this follow-up was opened for, and the time a reported request asked to be followed up at (Darling's V193
+           follow_up_of and follow_up_at, #6008). NULL on a request stored before v75. follow_up_of carries no foreign key: the purge clears it. */
+        (75, "investigation_requests", "follow_up_of", "UUID"),
+        (75, "investigation_requests", "follow_up_at", "TIMESTAMP"),
+        /* #6012: a route's generic signing key flag and the end of its rotation overlap (non-secret; the keys are in Credential Manager). NULL reads as no key. */
+        (75, "notification_routes", "generic_signing_set", "BOOLEAN"),
+        (75, "notification_routes", "generic_signing_until", "TIMESTAMP"),
+        /* #5632: the head blocker's evidence (Darling's V199 columns). login_time and last_request_end_time are the monitored server's local clock,
+           stored raw; the log bytes are exact bytes, not MB. NULL on a snapshot stored before v76. */
+        (76, "dmv_blocking_snapshots", "blocking_login_time", "TIMESTAMP"),
+        (76, "dmv_blocking_snapshots", "blocking_last_request_end_time", "TIMESTAMP"),
+        (76, "dmv_blocking_snapshots", "blocking_open_transaction_count", "INTEGER"),
+        (76, "dmv_blocking_snapshots", "blocking_tran_log_bytes_used", "BIGINT"),
+        /* #6159: the primary replica's name (Darling's V202 column). NULL on a row stored before v77, which a reader shows as "primary not known". */
+        (77, "ag_replica_states", "primary_replica", "VARCHAR"),
+        /* #6254: which server a collector run read its Query Store rows from (the Query Store replica or the primary). NULL on a row stored before v78. */
+        (78, "collection_log", "read_source", "VARCHAR"),
     };
 
     internal static IEnumerable<(int Version, string Table, string Column, string Type)> AddedColumnsForVersion(int version) =>

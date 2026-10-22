@@ -36,6 +36,7 @@ namespace Darling.Tests;
 /// reply, in loopback mode and in network mode. A second group checks <c>wwwroot/</c> for any construct the policy
 /// would block, so a later change to the page cannot start failing in the browser without a test going red.
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class DarlingWebSecurityHeadersTests
 {
     private const string ListenIp = "192.168.1.205";
@@ -115,11 +116,36 @@ public sealed class DarlingWebSecurityHeadersTests
     public async Task HtmlShell_CarriesTheHeaders(bool networkMode)
     {
         using var server = await BuildServer(networkMode);
-        var ctx = await Get(server, networkMode, "/", token: networkMode ? Token : null);
+        var ctx = await Get(server, networkMode, "/");
 
-        /* Network mode answers a right token with a 302 to the shell; the redirect carries the headers too. */
-        Assert.True(ctx.Response.StatusCode is 200 or 302, $"unexpected status {ctx.Response.StatusCode}");
-        AssertDefaultHeaders(ctx);
+        /* Network mode answers a request with no session with the sign-in page, which sets its own policy. */
+        Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+        AssertDefaultHeaders(ctx, expectDefaultPolicy: !networkMode);
+        Assert.Equal("same-origin", ctx.Response.Headers["Cross-Origin-Opener-Policy"].ToString());
+    }
+
+    /// <summary>The signed-in landing page (written after an SSO sign-in) goes through the same header middleware as every
+    /// other page: no framing, no referrer, and its own browsing-context group (#6286).</summary>
+    [Fact]
+    public async Task SignedInLandingPage_CarriesTheHeaders_IncludingTheOpenerPolicy()
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseTestServer();
+        builder.Logging.ClearProviders();
+        var app = builder.Build();
+        app.UseMiddleware<DarlingWebSecurityHeaders>(false);
+        app.Run(context => DarlingWebHostService.WriteSignedInLandingAsync(context, "/"));
+        await app.StartAsync();
+        using var server = app.GetTestServer();
+
+        var ctx = await server.SendAsync(c => { c.Request.Method = "GET"; c.Request.Path = "/"; });
+
+        Assert.StartsWith("text/html", ctx.Response.ContentType, StringComparison.Ordinal);
+        Assert.Equal("DENY", ctx.Response.Headers.XFrameOptions.ToString());
+        Assert.Contains("frame-ancestors 'none'", ctx.Response.Headers["Content-Security-Policy"].ToString(), StringComparison.Ordinal);
+        Assert.Equal("no-referrer", ctx.Response.Headers["Referrer-Policy"].ToString());
+        Assert.Equal("same-origin", ctx.Response.Headers["Cross-Origin-Opener-Policy"].ToString());
+        await app.StopAsync();
     }
 
     [Fact]
@@ -131,6 +157,7 @@ public sealed class DarlingWebSecurityHeadersTests
         Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
         Assert.StartsWith("text/html", ctx.Response.ContentType, StringComparison.Ordinal);
         AssertDefaultHeaders(ctx);
+        Assert.Equal("same-origin", ctx.Response.Headers["Cross-Origin-Opener-Policy"].ToString());
     }
 
     [Fact]
@@ -141,6 +168,7 @@ public sealed class DarlingWebSecurityHeadersTests
 
         Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
         AssertDefaultHeaders(ctx);
+        Assert.False(ctx.Response.Headers.ContainsKey("Cross-Origin-Opener-Policy"));
     }
 
     [Fact]
@@ -197,9 +225,10 @@ public sealed class DarlingWebSecurityHeadersTests
     {
         using var server = await BuildServer(networkMode: true);
 
-        /* A right token is exchanged for a 302 and a cookie, so the headers are read on that answer; the
-           shell, asset and API replies behind it are the loopback cases above (the same middleware). */
-        var ctx = await Get(server, true, "/api/ping", token: Token);
+        /* A right token posted from the sign-in form is exchanged for a 302 and a cookie, so the headers are read
+           on that answer; the shell, asset and API replies behind it are the loopback cases above (the same
+           middleware). */
+        var ctx = await DarlingWebHostGateLiveTests.PostSignIn(server, ListenIp, InCidrRemote, Token);
         Assert.Equal(StatusCodes.Status302Found, ctx.Response.StatusCode);
         AssertDefaultHeaders(ctx);
     }

@@ -52,7 +52,7 @@ public sealed class DarlingMcpToolsTests
 {
     /* ---------------- ungated: tool-surface pin ---------------- */
 
-    /// <summary>The six-tool analysis surface, ordinal-sorted — the same names Lite's and the
+    /// <summary>The seven-tool analysis surface, ordinal-sorted — the same names Lite's and the
     /// Dashboard's McpAnalysisTools register, so MCP clients see one consistent product.</summary>
     private static readonly string[] SharedAnalysisToolSurface =
     {
@@ -61,11 +61,12 @@ public sealed class DarlingMcpToolsTests
         "compare_analysis",
         "get_analysis_facts",
         "get_analysis_findings",
-        "mute_analysis_finding"
+        "mute_analysis_finding",
+        "unmute_analysis_finding"
     };
 
     [Fact]
-    public void ToolSurface_ExactlyTheSixSharedAnalysisTools()
+    public void ToolSurface_ExactlyTheSevenSharedAnalysisTools()
     {
         var toolMethods = typeof(DarlingMcpTools)
             .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance)
@@ -422,7 +423,8 @@ public sealed class DarlingMcpToolsTests
             using (var doc = JsonDocument.Parse(findingsJson))
             {
                 var root = doc.RootElement;
-                Assert.Equal(TestServerName, root.GetProperty("server").GetString());
+                /* #6179: the answer names the server by its registry display name, not the storage key. */
+                Assert.Equal(TestServerDisplay, root.GetProperty("server").GetString());
                 Assert.Equal(1, root.GetProperty("finding_count").GetInt32());
                 /* #2000: finding_count is DEDUPED groups; total_occurrences is raw rows; a read
                    nowhere near the window-covering cap carries a present-but-null truncation_note. */
@@ -590,14 +592,14 @@ public sealed class DarlingMcpToolsTests
                 analysisService, postgres, "mcp-e2e", 24);
             using (var doc = JsonDocument.Parse(partialJson))
             {
-                Assert.Equal(TestServerName, doc.RootElement.GetProperty("server").GetString());
+                Assert.Equal(TestServerDisplay, doc.RootElement.GetProperty("server").GetString());
             }
 
             var displayJson = await DarlingMcpTools.GetAnalysisFindings(
                 analysisService, postgres, TestServerDisplay, 24);
             using (var doc = JsonDocument.Parse(displayJson))
             {
-                Assert.Equal(TestServerName, doc.RootElement.GetProperty("server").GetString());
+                Assert.Equal(TestServerDisplay, doc.RootElement.GetProperty("server").GetString());
             }
 
             var unknown = await DarlingMcpTools.GetAnalysisFindings(

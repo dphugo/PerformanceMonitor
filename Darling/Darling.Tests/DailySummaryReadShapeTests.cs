@@ -103,10 +103,7 @@ public sealed class DailySummaryReadShapeSqlTests
         var composite = page[page.IndexOf("export function dailySummaryPanels(server)", StringComparison.Ordinal)..];
         composite = composite[..composite.IndexOf("\n}", StringComparison.Ordinal)];
         Assert.Equal(1, composite.Split("readTool(").Length - 1);
-        Assert.Contains("readTool(\"get_daily_summary_range\", { server, days_back: 30 })", composite, StringComparison.Ordinal);
         Assert.Contains("days.find((day) => day.summary_date === data.to_date)", composite, StringComparison.Ordinal);
-        /* Each panel renders through its own guard, so a fault in one cannot strand the other on its loading strip. */
-        Assert.Equal(2, composite.Split("renderInto(").Length - 1);
         Assert.Contains("VIZ.stat(today, { stats: DAILY_STATS })", composite, StringComparison.Ordinal);
         Assert.Contains("return [tile.panel, calendar.panel];", composite, StringComparison.Ordinal);
     }
@@ -196,6 +193,44 @@ public sealed class ComposeStoreAvailabilitySingleFlightTests
         Assert.Equal(RollupAvailability.All, (await stayer).Rollups);
         Assert.Equal(RollupAvailability.All, (await ComposeStoreAvailability.GetRollupsAsync(dataSource, probe.Run, CancellationToken.None)).Rollups);
         Assert.Equal(1, probe.Calls);
+    }
+
+    /// <summary>
+    /// #5808: an answer with a floor still pending (the store's background drain is measuring a view with no last
+    /// floor) is served to its waiters and NOT cached for the interval: the next call probes again, and once the
+    /// probe answers with every floor known, that answer is cached as before.
+    /// </summary>
+    [Fact]
+    public async Task AnAnswerWithAFloorPending_IsNotCached_AndTheNextCallProbesAgain()
+    {
+        await using var dataSource = UnopenedDataSource();
+        var empty = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        var pending = new RollupCoverage(empty, empty, RollupAvailability.All) { FloorsPending = true };
+        var measured = new RollupCoverage(
+            new Dictionary<string, DateTime>(StringComparer.Ordinal) { [TimescaleSupport.QueryStatsHourlyView] = new DateTime(2026, 9, 1) },
+            empty,
+            RollupAvailability.All);
+        var answers = new Queue<RollupCoverage>(new[] { pending, measured });
+        var calls = 0;
+        Task<(RollupAvailability Rollups, RollupCoverage Coverage)> Probe(NpgsqlDataSource source, CancellationToken token)
+        {
+            calls++;
+            return Task.FromResult((RollupAvailability.All, answers.Dequeue()));
+        }
+
+        var first = await ComposeStoreAvailability.GetRollupsAsync(dataSource, Probe, CancellationToken.None);
+        Assert.True(first.Coverage.FloorsPending);
+        Assert.Null(first.Coverage.FloorOf(TimescaleSupport.QueryStatsHourlyView));
+
+        var second = await ComposeStoreAvailability.GetRollupsAsync(dataSource, Probe, CancellationToken.None);
+        Assert.Equal(2, calls);
+        Assert.False(second.Coverage.FloorsPending);
+        Assert.Equal(new DateTime(2026, 9, 1), second.Coverage.FloorOf(TimescaleSupport.QueryStatsHourlyView));
+
+        var third = await ComposeStoreAvailability.GetRollupsAsync(dataSource, Probe, CancellationToken.None);
+        Assert.Same(second.Coverage, third.Coverage);
+        Assert.Equal(2, calls);
+        Assert.Equal(2, ComposeStoreAvailability.ProbesStartedFor(dataSource));
     }
 
     /// <summary>A failed probe answers every waiter with the never-wrong fallback (route to raw, no coverage

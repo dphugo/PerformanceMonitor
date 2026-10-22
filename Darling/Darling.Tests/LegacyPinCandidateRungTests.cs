@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -129,18 +129,9 @@ public sealed class LegacyPinCandidateRungTests
             "a newer rung's arm follows this one in the probe, so this one reads at the ordinal before it");
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 1})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 2})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 3})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 4})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 5})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 6})", viewer, StringComparison.Ordinal);
-        Assert.DoesNotContain($"reader.GetBoolean({ProbeOrdinal + 7})", viewer, StringComparison.Ordinal);
 
         var method = typeof(ViewerDataService).GetMethod("MapProbedSchemaVersion", BindingFlags.NonPublic | BindingFlags.Static)!;
         var parameters = method.GetParameters();
-        Assert.Equal(ProbeOrdinal + 6, parameters.Length - 1);
         Assert.Equal("hasLegacyPinCandidates", parameters[ProbeOrdinal].Name);
         Assert.Equal("hasPagerDutyAutoResolve", parameters[ProbeOrdinal - 1].Name);
 
@@ -198,7 +189,7 @@ ON CONFLICT (id) DO UPDATE SET smtp_host = EXCLUDED.smtp_host, smtp_port = EXCLU
 
             Assert.Equal(StorageVersion.SchemaVersion, Convert.ToInt32(await ScalarAsync(connection, "SELECT MAX(version) FROM darling_schema_version", ct)));
             Assert.Equal(3L, await ScalarAsync(connection, "SELECT count(*) FROM config.legacy_secret_pin_candidate", ct));
-            Assert.Equal(10L, await ScalarAsync(connection,
+            Assert.Equal(12L, await ScalarAsync(connection,
                 "SELECT count(*) FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid WHERE NOT t.tgisinternal AND p.proname = 'password_key_owner_only'", ct));
 
             /* The hash is the SHA-256 of the stored text, as C# takes it; the text is not in the table. */

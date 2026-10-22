@@ -38,12 +38,12 @@ public sealed class McpBlockingTools
             var rows = await dataService.GetRecentDeadlocksAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd, limit: limit + 1);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "deadlocks")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "deadlocks")
                     /* #2546: capability first (permanent), then the runtime precondition (fixable), then the
                        read's own miss. A deadlock capture the collector cannot read returns zero rows
                        forever, which is byte-identical to a server that simply did not deadlock — the one
                        answer nobody should be given without being told. */
-                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.ServerName, "deadlocks")
+                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "deadlocks")
                     /* #4966: an empty answer over a window the store may not reach back to is not a true negative, so
                        the window keys ride on it under hints. not_collected and the precondition stay bare. */
                     ?? McpHelpers.Status("empty", "No deadlocks found in the specified time range.",
@@ -75,7 +75,7 @@ public sealed class McpBlockingTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where the store's data starts, always present (false and null when the store covered the
                    window). The floor is the earlier of the coverage probe and the oldest event this page shows: a
@@ -140,7 +140,7 @@ public sealed class McpBlockingTools
             var withXml = truncated ? candidates.Take(limit).ToList() : candidates;
             if (withXml.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "deadlocks")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "deadlocks")
                     ?? McpHelpers.Status("empty", "No deadlock XML available in the specified time range.",
                         (await McpQueryTools.EventWindowNoticeAsync(
                             () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.Deadlocks, resolved.ServerId, windowEnd.AddHours(-hours_back), windowEnd),
@@ -174,7 +174,7 @@ public sealed class McpBlockingTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where the store's data starts, always present (false and null when the store covered the
                    window). The floor is the earlier of the coverage probe and the oldest event this page shows: a
@@ -205,7 +205,7 @@ public sealed class McpBlockingTools
     /// back to the whole text. Lite has no web viewer mirror to hold the old cap for, unlike Darling's twin.</summary>
     private const int SqlTextPreviewLength = 150;
 
-    [McpServerTool(Name = "get_blocked_process_reports"), Description("Blocked process report XE + DMV fallback events, newest first, window ends at as_of. not_collected wins if the engine can't run blocked_process_report; else empty means none in the window, or none collected in it. limit caps ROWS, not hours_back: truncated true means raise limit or narrow the window, not widen hours_back. wait_time_ms is milliseconds. Timestamps are UTC; last_tran/last_batch stamps are de-skewed for direct comparison to event_time. blocked_sql_text/blocking_sql_text are a preview by default (*_truncated: true) — pass full_text for the whole text. <<GUIDE>> Gets detailed blocked process reports from extended events (parsed via sp_HumanEventsBlockViewer) plus the always-on DMV blocking-snapshot fallback, NEWEST FIRST. Provides detailed blocked/blocking session info: isolation levels, transaction names, full query text for both sessions. Use for deep analysis of prolonged blocking. THE PAGE IS BOUNDED BY limit, NOT BY hours_back: hours_back is the window you ASKED for, reports_returned is how many rows you GOT, truncated says the window held more than limit, and oldest_returned_event_time / newest_returned_event_time bound the page you are looking at. Because the page is a contiguous newest-first slice, oldest_returned_event_time IS how far back this read reached — on a server blocking steadily, a 24-hour request at the default limit is answered by the newest few minutes, and nothing in the rows themselves says so. When truncated is true, raise limit or narrow hours_back (or anchor as_of) before drawing a conclusion about the window; widening hours_back cannot help, because the cap is on rows, not time. Every timestamp here is UTC: event_time already was, and the six blocked_/blocking_ last_tran/last_batch stamps are de-skewed from the monitored server's local clock by this read, so comparing them against event_time to see whether a transaction predates the block is direct.")]
+    [McpServerTool(Name = "get_blocked_process_reports"), Description("Blocked process report XE + DMV fallback events, newest first, window ends at as_of. not_collected wins if the engine can't run blocked_process_report; else empty means none in the window, or none collected in it. limit caps ROWS, not hours_back: truncated true means raise limit or narrow the window, not widen hours_back. wait_time_ms is milliseconds. Timestamps are UTC; last_tran/last_batch stamps are de-skewed for direct comparison to event_time. blocked_sql_text/blocking_sql_text are a preview by default (*_truncated: true) — pass full_text for the whole text. <<GUIDE>> Gets detailed blocked process reports from extended events (parsed via sp_HumanEventsBlockViewer) plus the always-on DMV blocking-snapshot fallback, NEWEST FIRST. Provides detailed blocked/blocking session info: isolation levels, transaction names, full query text for both sessions. Use for deep analysis of prolonged blocking. THE PAGE IS BOUNDED BY limit, NOT BY hours_back: hours_back is the window you ASKED for, reports_returned is how many rows you GOT, truncated says the window held more than limit, and oldest_returned_event_time / newest_returned_event_time bound the page you are looking at. Because the page is a contiguous newest-first slice, oldest_returned_event_time IS how far back this read reached — on a server blocking steadily, a 24-hour request at the default limit is answered by the newest few minutes, and nothing in the rows themselves says so. When truncated is true, raise limit or narrow hours_back (or anchor as_of) before drawing a conclusion about the window; widening hours_back cannot help, because the cap is on rows, not time. Every timestamp here is UTC: event_time already was, and the six blocked_/blocking_ last_tran/last_batch stamps are de-skewed from the monitored server's local clock by this read, so comparing them against event_time to see whether a transaction predates the block is direct. On a DMV-snapshot row (source 'DMV snapshot') the head blocker's evidence is stored too, null on an XE report row: blocking_login_time is when its session signed in (UTC, so a later kill can check it is the same session), blocking_last_request_end_time is when its last request ended (UTC; with blocking_status sleeping it is how long the head has been idle), blocking_open_transaction_count is its open transactions, and blocking_tran_log_bytes_used is the exact transaction log bytes those transactions have used, summed over every database (0 means it has written no log, so a kill rolls back nothing; null means no transaction row).")]
     public static async Task<string> GetBlockedProcessReports(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -248,7 +248,7 @@ public sealed class McpBlockingTools
             var rows = await dataService.GetRecentBlockedProcessReportsAsync(resolved.ServerId, hours_back, databaseNames: database == null ? null : new[] { database }, asOfUtc: windowEnd, limit: limit + 1);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "blocked_process_report")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "blocked_process_report")
                     ?? McpHelpers.Status("empty", $"No blocked process reports found in the specified time range{ForChosenDatabase(database)}.",
                         (await McpQueryTools.EventWindowNoticeAsync(
                             () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.BlockedProcessReports, resolved.ServerId, windowEnd.AddHours(-hours_back), windowEnd),
@@ -304,13 +304,18 @@ public sealed class McpBlockingTools
                 blocking_last_batch_started = UtcOrNull(r.BlockingLastBatchStarted),
                 blocked_last_batch_completed = UtcOrNull(r.BlockedLastBatchCompleted),
                 blocking_last_batch_completed = UtcOrNull(r.BlockingLastBatchCompleted),
+                /* #5632: the head blocker's evidence, from the DMV snapshot only (null on an XE report row). */
+                blocking_login_time = UtcOrNull(r.BlockingLoginTime),
+                blocking_last_request_end_time = UtcOrNull(r.BlockingLastRequestEndTime),
+                blocking_open_transaction_count = r.BlockingOpenTransactionCount,
+                blocking_tran_log_bytes_used = r.BlockingTranLogBytesUsed,
                 blocked_priority = r.BlockedPriority,
                 blocking_priority = r.BlockingPriority
             });
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* The span REQUESTED. Kept under its shipped name, and no longer the only span on the page. */
                 hours_back,
                 /* #4966: where the store's data starts, always present (false and null when the store covered the
@@ -376,10 +381,10 @@ public sealed class McpBlockingTools
             var withXml = truncated ? candidates.Take(limit).ToList() : candidates;
             if (withXml.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "blocked_process_report")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "blocked_process_report")
                     /* #2546: same order and same reason as get_deadlocks — a blocked-process capture the
                        collector cannot read is indistinguishable here from a server that never blocked. */
-                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.ServerName, "blocked_process_report")
+                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "blocked_process_report")
                     ?? McpHelpers.Status("empty", $"No blocked process report XML available in the specified time range{ForChosenDatabase(database)}.",
                         (await McpQueryTools.EventWindowNoticeAsync(
                             () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.BlockedProcessReports, resolved.ServerId, windowEnd.AddHours(-hours_back), windowEnd, includeAlsoCovered: false),
@@ -388,13 +393,30 @@ public sealed class McpBlockingTools
 
             /* #4966: the XML exists only in the XE arm, so the probe is the XE collector's alone (the DMV snapshots are not
                a source of these rows). Where this server's blocked_process_report data starts for the window. An event list, so the floor is the
-               earlier of the coverage probe and the oldest event the page shows. */
+               earlier of the coverage probe and the oldest event the page shows.
+               #6180: "shown" is the reports the page SERVES, and the size target decides how many that is after this point, so the
+               probe is read once and a notice is built for every possible page length; the one for the length that fits is the one
+               published. Built from every report selected, it would claim a reach that only the reports left out have. */
             var requestedStart = windowEnd.AddHours(-hours_back);
-            var notice = await McpQueryTools.EventWindowNoticeAsync(
-                () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.BlockedProcessReports, resolved.ServerId, requestedStart, windowEnd, includeAlsoCovered: false),
-                withXml.Min(r => r.EventTime), requestedStart, windowEnd, "blocked_process_report");
+            var coverageProbe = new Lazy<Task<DateTime?>>(
+                () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.BlockedProcessReports, resolved.ServerId, requestedStart, windowEnd, includeAlsoCovered: false));
+            /* Lite's probe also reads the stored event times, so on its own it names the store's oldest report in the window, which a
+               size cut can have left out (Darling's probe reads the collector's own times, never these events). A page shorter than
+               the selection therefore probes with the reports it can serve as the only event times: the newest served report bounds
+               the event side, the collector's runs and any older row still prove coverage, and the notice's earlier-of with the oldest
+               report served (EventWindowNoticeAsync) then names that report when nothing proves more. */
+            var newestSelected = withXml.Max(r => r.EventTime);
+            var servedProbe = new Lazy<Task<DateTime?>>(
+                () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.BlockedProcessReports, resolved.ServerId, requestedStart, windowEnd, includeAlsoCovered: false, rowsNotBeforeUtc: newestSelected));
+            var noticeByCount = new McpQueryTools.McpWindowNotice[withXml.Count + 1];
+            for (var shown = 1; shown <= withXml.Count; shown++)
+            {
+                var probe = shown < withXml.Count && newestSelected != null ? servedProbe : coverageProbe;
+                noticeByCount[shown] = await McpQueryTools.EventWindowNoticeAsync(
+                    () => probe.Value, withXml.Take(shown).Min(r => r.EventTime), requestedStart, windowEnd, "blocked_process_report");
+            }
 
-            var result = withXml.Select(r => new
+            var allReports = withXml.Select(r => new
             {
                 event_time = r.EventTime?.ToString("o"),
                 database_name = r.DatabaseName,
@@ -402,11 +424,19 @@ public sealed class McpBlockingTools
                 blocking_spid = r.BlockingSpid,
                 wait_time_ms = r.WaitTimeMs,
                 blocked_process_report_xml = r.BlockedProcessReportXml
-            });
+            }).ToList();
 
+            /* #6180: each report is a whole XML document (about 18 KB), so the default limit of 5 passes the shared response
+               target. The page keeps the newest reports that fit WHOLE (always at least one) and lists the ones it left out by
+               their identifying fields, so a report is never cut mid-way and any one of them can be fetched by itself. */
+            return McpResponseBudget.FitPrefix(allReports.Count, fitCount =>
+            {
+            var notice = noticeByCount[fitCount];
+            var page = withXml.Take(fitCount).ToList();
+            var leftOut = allReports.Count - fitCount;
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where the store's data starts, always present (false and null when the store covered the
                    window). The floor is the earlier of the coverage probe and the oldest event this page shows: a
@@ -419,13 +449,24 @@ public sealed class McpBlockingTools
                 database_name = database,
                 /* #3541 A3: the page bounds, on get_blocked_process_reports' names. truncated means "more
                    reports WITH XML in the window than limit". */
-                reports_returned = withXml.Count,
-                truncated,
-                oldest_returned_event_time = McpHelpers.FormatEffectiveStart(withXml.Min(r => r.EventTime)),
-                newest_returned_event_time = McpHelpers.FormatEffectiveStart(withXml.Max(r => r.EventTime)),
+                reports_returned = fitCount,
+                truncated = truncated || leftOut > 0,
+                oldest_returned_event_time = McpHelpers.FormatEffectiveStart(page.Min(r => r.EventTime)),
+                newest_returned_event_time = McpHelpers.FormatEffectiveStart(page.Max(r => r.EventTime)),
                 order = "event_time_desc",
-                reports = result
+                /* #6180: the reports the size target left off, newest first, by the fields that identify each (a report's
+                   event_time with as_of and limit 1 fetches it alone). Capped so a very large limit cannot grow the list. */
+                left_out_count = leftOut,
+                left_out_reports = allReports.Skip(fitCount).Take(20).Select(r => new
+                {
+                    r.event_time, r.database_name, r.blocked_spid, r.blocking_spid, r.wait_time_ms
+                }).ToList(),
+                size_note = leftOut > 0
+                    ? $"{leftOut} of the {allReports.Count} report(s) this page selected were left out so the answer stays within about 32 KB; a report is never cut mid-way, so each one returned is whole. left_out_reports lists the ones left out (first 20). Fetch one by calling again with as_of set to its event_time (hours_back wide enough to reach it) and limit 1, or narrow with database_name."
+                    : null,
+                reports = allReports.Take(fitCount)
             }, McpHelpers.JsonOptions);
+            }).Json;
         }
         catch (Exception ex)
         {
@@ -478,7 +519,7 @@ public sealed class McpBlockingTools
                     collection_log, which records a SUCCESS with zero rows for a collector that ran and saw
                     nothing. Darling's twin makes the same distinction with the same words.
                 */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "blocked_process_report");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "blocked_process_report");
                 if (gated != null)
                 {
                     return gated;
@@ -487,7 +528,7 @@ public sealed class McpBlockingTools
                 var captures = await dataService.GetBlockingCaptureCountsAsync(
                     resolved.ServerId, hours_back, asOfUtc: anchorEnd);
                 return WithNullSource(await EmptyTrend(
-                    "blocking", resolved.ServerName, hours_back, captures,
+                    "blocking", resolved.DisplayName, hours_back, captures,
                     () => dataService.HasAnyBlockingCollectorRunAsync(resolved.ServerId),
                     database));
             }
@@ -496,7 +537,7 @@ public sealed class McpBlockingTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #5244: the database the trend is limited to (null for all), and which collector answered: the blocked-process
                    reports, or the DMV snapshot when those have no rows for the chosen databases. One source per answer. */
@@ -534,7 +575,7 @@ public sealed class McpBlockingTools
             if (points.Count == 0)
             {
                 /* Same two facts as the blocking trend above, same denominator, same reason. */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "deadlocks");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "deadlocks");
                 if (gated != null)
                 {
                     return gated;
@@ -546,7 +587,7 @@ public sealed class McpBlockingTools
                     /* SINGULAR: the subject lands in "No {subject} was recorded", and "no deadlocks
                        was recorded" is not a sentence. It also reads correctly in the other two,
                        where it modifies the collector rather than the event. */
-                    "deadlock", resolved.ServerName, hours_back, captures,
+                    "deadlock", resolved.DisplayName, hours_back, captures,
                     () => dataService.HasAnyDeadlockCollectorRunAsync(resolved.ServerId));
             }
 
@@ -554,7 +595,7 @@ public sealed class McpBlockingTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 trend = result
             }, McpHelpers.JsonOptions);
@@ -605,7 +646,7 @@ public sealed class McpBlockingTools
                     and filtering the probe the same way would call that server uncollected. Darling's twin
                     makes the same distinction with the same words.
                 */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "wait_stats");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "wait_stats");
                 if (gated != null)
                 {
                     return gated;
@@ -614,10 +655,10 @@ public sealed class McpBlockingTools
                 return await dataService.HasAnyWaitStatAsync(resolved.ServerId)
                     ? McpHelpers.Status(
                         "empty",
-                        $"No lock waits recorded for {resolved.ServerName} in the last {hours_back} hour(s). This server HAS collected wait stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
+                        $"No lock waits recorded for {resolved.DisplayName} in the last {hours_back} hour(s). This server HAS collected wait stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
                     : McpHelpers.Status(
                         "unavailable",
-                        $"No wait stats have EVER been recorded for {resolved.ServerName}, so this is NOT a report of a server without lock contention — nothing has been stored for it at all. Delta wait stats need a SECOND collection cycle before the first row exists, so on a newly added server this clears itself; otherwise check that collection is running and that the server is enabled.");
+                        $"No wait stats have EVER been recorded for {resolved.DisplayName}, so this is NOT a report of a server without lock contention — nothing has been stored for it at all. Delta wait stats need a SECOND collection cycle before the first row exists, so on a newly added server this clears itself; otherwise check that collection is running and that the server is enabled.");
             }
 
             /* The family as the series, the members as a legend listing EVERY type that waited, so no member is
@@ -625,7 +666,7 @@ public sealed class McpBlockingTools
             var types = await dataService.GetLockWaitTypesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
 
             return TrendPayloads.LockWaitTrend(
-                resolved.ServerName, hours_back, types, points, bucketMinutes, bucket_minutes is not null, budget.AutoPoints);
+                resolved.DisplayName, hours_back, types, points, bucketMinutes, bucket_minutes is not null, budget.AutoPoints);
         }
         catch (Exception ex)
         {

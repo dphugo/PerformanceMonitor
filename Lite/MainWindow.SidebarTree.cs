@@ -12,6 +12,9 @@ using System.Linq;
 using System.Text.Json.Nodes;
 using System.Windows;
 using System.Windows.Controls;
+using PerformanceMonitor.Common.Tags;
+using PerformanceMonitor.Ui;
+using PerformanceMonitorLite.Database;
 using PerformanceMonitorLite.Models;
 using PerformanceMonitorLite.Services;
 using PerformanceMonitorLite.Windows;
@@ -28,10 +31,6 @@ namespace PerformanceMonitorLite;
 /// </summary>
 public partial class MainWindow
 {
-    /// <summary>Nesting cap shared with the store's own guard; the sidebar refuses a child that would
-    /// exceed it, matching the viewer and the Manage Tags editor.</summary>
-    private const int MaxTagDepth = 4;
-
     /// <summary>The single projection behind the sidebar. Consumers asking "what servers exist?" read
     /// <see cref="ServerManager.GetAllServers"/> (Lite's authoritative fleet), never the bound list.</summary>
     private readonly FleetView _fleet = new();
@@ -82,7 +81,7 @@ public partial class MainWindow
                 .ToList();
             _fleet.SetTags(_tags, assignments);
 
-            ServerListView.ItemsSource = _fleet.Visible;
+            ServerListKeyboard.Rebind(ServerListView, _fleet.Visible);
             ServerListView.SelectedItem = _fleet.ResolveSelection(previousServerId);
         }
         finally
@@ -131,7 +130,7 @@ public partial class MainWindow
         try
         {
             _fleet.ToggleExpanded(header);
-            ServerListView.ItemsSource = _fleet.Visible;
+            ServerListKeyboard.Rebind(ServerListView, _fleet.Visible);
             ServerListView.SelectedItem = _fleet.ResolveSelection(previousServerId);
             PersistCollapseState();
         }
@@ -203,7 +202,7 @@ public partial class MainWindow
             return;
         }
 
-        if (TagDepth(header.Tag.Id) >= MaxTagDepth - 1)
+        if (!CanAddChildTag(_tags, header.Tag.Id))
         {
             StatusText.Text = "Tags can nest at most four levels deep.";
             return;
@@ -230,17 +229,13 @@ public partial class MainWindow
             return;
         }
 
-        try
-        {
-            await _dataService.RenameServerTagAsync(header.Tag.Id, name);
-            await ReloadTagsAndReprojectAsync();
-            StatusText.Text = $"Renamed tag to '{name}'.";
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Error("Tags", $"Rename tag failed: {ex.Message}", ex);
-            StatusText.Text = $"Could not rename the tag: {ex.Message}";
-        }
+        var tagId = header.Tag.Id;
+        await RunTagWriteAsync(
+            doing: "renaming the tag",
+            logAction: "Rename tag",
+            couldNot: "Could not rename the tag",
+            done: $"Renamed tag to '{name}'.",
+            write: () => Task.Run(() => _dataService.RenameServerTagAsync(tagId, name)));
     }
 
     private async void TagHeaderContextMenu_Delete_Click(object sender, RoutedEventArgs e)
@@ -262,17 +257,13 @@ public partial class MainWindow
             return;
         }
 
-        try
-        {
-            await _dataService.DeleteServerTagAsync(header.Tag.Id);
-            await ReloadTagsAndReprojectAsync();
-            StatusText.Text = $"Deleted tag '{header.Tag.Name}'.";
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Error("Tags", $"Delete tag failed: {ex.Message}", ex);
-            StatusText.Text = $"Could not delete the tag: {ex.Message}";
-        }
+        var tagId = header.Tag.Id;
+        await RunTagWriteAsync(
+            doing: "deleting the tag",
+            logAction: "Delete tag",
+            couldNot: "Could not delete the tag",
+            done: $"Deleted tag '{header.Tag.Name}'.",
+            write: () => Task.Run(() => _dataService.DeleteServerTagAsync(tagId)));
     }
 
     private async System.Threading.Tasks.Task CreateTagAndReloadAsync(string name, int? parentId)
@@ -282,29 +273,76 @@ public partial class MainWindow
             return;
         }
 
+        await RunTagWriteAsync(
+            doing: "creating the tag",
+            logAction: "Create tag",
+            couldNot: "Could not create the tag",
+            done: $"Created tag '{name}'.",
+            write: () => Task.Run(() => _dataService.CreateServerTagAsync(name, parentId)));
+    }
+
+    /* #5650: a tag write started from the sidebar can wait up to 30 s for the local database
+       (LocalDataService.OpenUserWriteConnectionAsync) while archival or a collector write holds it. The sidebar's
+       entries are context-menu items, which close on click, so there is no control to grey out: the status bar says
+       the write is waiting, and a second tag write started meanwhile is refused with a line saying so rather than
+       queued behind the first. The flag is read and set on the dispatcher, so it needs no lock; each caller passes its
+       write already wrapped in Task.Run (TabLoadsOffUiThreadTests reads that at the call), so the window stays responsive. A busy store shows StoreBusyReport's wording, which says
+       nothing was changed, and writes one Warning line; any other failure keeps the old Error line and message. */
+    private bool _tagWriteInFlight;
+
+    private async Task RunTagWriteAsync(string doing, string logAction, string couldNot, string? done, Func<Task> write)
+    {
+        if (_tagWriteInFlight)
+        {
+            StatusText.Text = "Another tag change is still being saved. Please wait for it to finish.";
+            return;
+        }
+
+        _tagWriteInFlight = true;
+        StatusText.Text = StoreBusyReport.WaitingText(doing);
         try
         {
-            await _dataService.CreateServerTagAsync(name, parentId);
+            await write();
             await ReloadTagsAndReprojectAsync();
-            StatusText.Text = $"Created tag '{name}'.";
+            if (done is not null)
+            {
+                StatusText.Text = done;
+            }
+            else
+            {
+                StatusText.Text = string.Empty;
+            }
+        }
+        catch (StoreLockTimeoutException ex)
+        {
+            StatusText.Text = StoreBusyReport.Report("Tags", logAction, ex, doing);
         }
         catch (Exception ex)
         {
-            AppLogger.Error("Tags", $"Create tag failed: {ex.Message}", ex);
-            StatusText.Text = $"Could not create the tag: {ex.Message}";
+            AppLogger.Error("Tags", $"{logAction} failed: {ex.Message}", ex);
+            StatusText.Text = $"{couldNot}: {ex.Message}";
+        }
+        finally
+        {
+            _tagWriteInFlight = false;
         }
     }
 
+    /// <summary>Whether the tag may take a child: the shared tag tree rules decide from its depth (#5978), the
+    /// same call the Manage Tags editor makes.</summary>
+    internal static bool CanAddChildTag(IReadOnlyList<ServerTag> tags, int tagId)
+        => TagTreeRules.CanHaveChildren(TagDepth(tags, tagId));
+
     /// <summary>0-based nesting depth of a tag, walking the ParentId chain (guarded against a bad cycle).</summary>
-    private int TagDepth(int tagId)
+    internal static int TagDepth(IReadOnlyList<ServerTag> tags, int tagId)
     {
-        var byId = _tags.ToDictionary(t => t.Id);
+        var byId = tags.ToDictionary(t => t.Id);
         var depth = 0;
         var current = byId.TryGetValue(tagId, out var start) ? start : null;
         var guard = 0;
         while (current?.ParentId is int parentId
                && byId.TryGetValue(parentId, out var parent)
-               && guard++ < MaxTagDepth + 2)
+               && guard++ < TagTreeRules.MaxDepth + 2)
         {
             depth++;
             current = parent;
@@ -432,24 +470,15 @@ public partial class MainWindow
             return;
         }
 
-        try
-        {
-            /* A checkable MenuItem toggles IsChecked before Click fires, so it now holds the desired state. */
-            if (item.IsChecked)
-            {
-                await _dataService.AssignServerTagAsync(new[] { target.ServerId }, target.TagId);
-            }
-            else
-            {
-                await _dataService.UnassignServerTagAsync(new[] { target.ServerId }, target.TagId);
-            }
-
-            await ReloadTagsAndReprojectAsync();
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Error("Tags", $"Assign/unassign failed: {ex.Message}", ex);
-            StatusText.Text = $"Could not change tags: {ex.Message}";
-        }
+        /* A checkable MenuItem toggles IsChecked before Click fires, so it now holds the desired state. */
+        var assign = item.IsChecked;
+        await RunTagWriteAsync(
+            doing: assign ? "assigning the tag" : "removing the tag from the server",
+            logAction: assign ? "Assign tag" : "Unassign tag",
+            couldNot: "Could not change tags",
+            done: null,
+            write: () => assign
+                ? Task.Run(() => _dataService.AssignServerTagAsync(new[] { target.ServerId }, target.TagId))
+                : Task.Run(() => _dataService.UnassignServerTagAsync(new[] { target.ServerId }, target.TagId)));
     }
 }

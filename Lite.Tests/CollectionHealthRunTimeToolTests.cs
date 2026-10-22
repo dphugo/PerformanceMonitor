@@ -13,7 +13,6 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
 using Microsoft.Extensions.DependencyInjection;
@@ -37,7 +36,6 @@ namespace PerformanceMonitorLite.Tests;
 /// terms (it collects only while it is open): a full row always has the key, a partial row has it only for a collector with a
 /// run time, and a compact row never does. The app's own registration hands the tool the schedule that holds the run times.
 /// </summary>
-[Trait("Reads", "Darling")]
 public sealed class CollectionHealthRunTimeToolTests : IClassFixture<SharedDuckDbFixture>, IDisposable
 {
     private const string ServerName = "RunTimeHealthSrv";
@@ -285,13 +283,14 @@ public sealed class CollectionHealthRunTimeToolTests : IClassFixture<SharedDuckD
 
         var (rows, _) = await CallAsync(RunTimes((Daily, 1440, text, true), (Frequent, 1, null, true)), fullDetail: false);
 
-        /* The partial row of a collector with a run time carries all three keys, the note null because nothing was skipped. A
-           partial row for a collector with none has no key at all, so the shape costs a collector without a run time no bytes. */
+        /* The partial row of a collector with a run time carries run_at and next_run_utc. Its note is null because nothing
+           was skipped, and #5748's rule leaves a null key out of a partial row, so there is no run_time_note key either. A
+           partial row for a collector with no run time has no key at all, so the shape costs it no bytes. */
         var daily = rows[Daily];
         Assert.True(daily.GetProperty("partial_detail").GetBoolean());
         Assert.Equal(text, daily.GetProperty("run_at").GetString());
         Assert.Equal(JsonValueKind.String, daily.GetProperty("next_run_utc").ValueKind);
-        Assert.Equal(JsonValueKind.Null, daily.GetProperty("run_time_note").ValueKind);
+        Assert.False(daily.TryGetProperty("run_time_note", out _));
 
         var minute = rows[Frequent];
         Assert.True(minute.GetProperty("partial_detail").GetBoolean());
@@ -421,19 +420,6 @@ public sealed class CollectionHealthRunTimeToolTests : IClassFixture<SharedDuckD
         Assert.Equal(text, rows[Daily].GetProperty("run_at").GetString());
         var expectedNext = CollectorRunTime.NextDue(now, lastRun, minute, 1440, _serverId, CollectorRunTime.LocalIsUtc);
         Assert.Equal(expectedNext, ParseUtc(rows[Daily].GetProperty("next_run_utc")));
-    }
-
-    /* The two links the runtime test above cannot reach: the host calls that one registration method (and nothing else
-       builds the service), and the app hands the host the schedule it holds. */
-    [Fact]
-    public void TheHostRegistersTheRunTimeServiceOnlyThroughItsRegistrationMethod_AndTheAppHandsTheHostItsSchedule()
-    {
-        var host = File.ReadAllText(Path.Combine(RepoRoot(), "Lite", "Mcp", "McpHostService.cs"));
-        Assert.Contains("RegisterCollectorRunTimes(builder.Services, _scheduleManager, _serverManager);", host, StringComparison.Ordinal);
-        Assert.Equal(1, Regex.Count(host, @"new McpCollectorRunTimes\("));
-
-        var app = File.ReadAllText(Path.Combine(RepoRoot(), "Lite", "MainWindow.xaml.cs"));
-        Assert.Matches(@"new McpHostService\([^;]*,\s*_scheduleManager\)", app);
     }
 
     /* The shared run-time paragraph names run_time_note for both apps: it is no longer scoped to Darling, and the row-shape

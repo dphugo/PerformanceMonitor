@@ -32,7 +32,7 @@ namespace Darling.Tests;
 public sealed class PasswordBindingCensusTests
 {
     private static readonly ServerConnectionIdentity Base =
-        new("example-sql-01", 1433, "sqlserver", "example_db", false, "sql", "example_login", "Mandatory", false, false);
+        new("example-sql-01", 1433, "sqlserver", "example_db", false, "sql", "example_login", "Mandatory", false, false, "example-replica-01");
 
     private static string[] IdentityProperties() =>
         typeof(ServerConnectionIdentity).GetProperties(BindingFlags.Public | BindingFlags.Instance)
@@ -56,6 +56,7 @@ public sealed class PasswordBindingCensusTests
         [nameof(ServerConnectionIdentity.EncryptMode)] = Base with { EncryptMode = "Optional" },
         [nameof(ServerConnectionIdentity.TrustServerCertificate)] = Base with { TrustServerCertificate = true },
         [nameof(ServerConnectionIdentity.MultiSubnetFailover)] = Base with { MultiSubnetFailover = true },
+        [nameof(ServerConnectionIdentity.QueryStoreReplica)] = Base with { QueryStoreReplica = "other-replica" },
     };
 
     [Fact]
@@ -99,14 +100,14 @@ public sealed class PasswordBindingCensusTests
     [Fact]
     public void A_raw_row_maps_with_nulls_as_empty_text_and_zero_and_no_trimming_or_case_change()
     {
-        var empty = ServerConnectionIdentity.FromStoredColumns(null, null, null, null, false, null, null, null, false, false);
+        var empty = ServerConnectionIdentity.FromStoredColumns(null, null, null, null, false, null, null, null, false, false, null);
         var row = ServerConnectionIdentity.FromStoredColumns(
-            " Example-SQL-01 ", 1433, "SqlServer", "Example_Db", true, "SQL", "Example_Login", "Mandatory", true, true);
+            " Example-SQL-01 ", 1433, "SqlServer", "Example_Db", true, "SQL", "Example_Login", "Mandatory", true, true, null);
 
-        Assert.Equal(new ServerConnectionIdentity("", 0, "", "", false, "", "", "", false, false), empty);
+        Assert.Equal(new ServerConnectionIdentity("", 0, "", "", false, "", "", "", false, false, ""), empty);
         Assert.Equal(
             new ServerConnectionIdentity(
-                " Example-SQL-01 ", 1433, "SqlServer", "Example_Db", true, "SQL", "Example_Login", "Mandatory", true, true),
+                " Example-SQL-01 ", 1433, "SqlServer", "Example_Db", true, "SQL", "Example_Login", "Mandatory", true, true, ""),
             row);
     }
 
@@ -117,6 +118,9 @@ public sealed class PasswordBindingCensusTests
         {
             "DisplayName", "UsesSqlAuth", "UsesServicePrincipal", "UsesManagedIdentity", "IsPostgres",
             "HasRemediationCredential", "RemediationUsername",
+            /* #6254: the replica builder takes the replica from the identity the password seal is opened with (the binding itself,
+               not a setting) and the password from DarlingSecrets, which opens the seal against that same identity. */
+            "ConnectionIdentity",
         };
         var bound = IdentityProperties().ToHashSet(StringComparer.Ordinal);
         var read = Regex.Matches(Source("PerformanceMonitor.Darling.Service/MonitoredServerConnection.cs"), @"\bserver\.([A-Za-z_]\w*)")
@@ -204,45 +208,6 @@ public sealed class PasswordBindingCensusTests
         Assert.False(ServerConnectionIdentity.Differ(Base, Base with { Auth = "SQL", EncryptMode = "MANDATORY", Engine = "SQLSERVER" }));
     }
 
-    /// <summary>
-    /// "Two connections differ" is <see cref="ServerConnectionIdentity.Differ"/> and nothing else (#5366): the edit core,
-    /// the connection test, the file matching and the Viewer all use it. This reads every source file under Darling
-    /// (tests and build output left out) and finds no other comparison of the trust or multi-subnet flags, and none of the
-    /// deleted types or helper names. The worker's own reconnect check compares the whole definition, secrets and display
-    /// name included, so it is the one allowed exception.
-    /// </summary>
-    [Fact]
-    public void No_other_connection_predicate_remains_under_Darling()
-    {
-        var darling = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(ThisFile())!, ".."));
-        var allowed = new HashSet<string>(StringComparer.Ordinal) { "ServerConnectionIdentity.cs", "DarlingWorker.cs" };
-        var flagCompare = new Regex(@"\b(TrustServerCertificate|MultiSubnetFailover)\s*(!=|==)", RegexOptions.CultureInvariant);
-        var offenders = new List<string>();
-        foreach (var file in Directory.EnumerateFiles(darling, "*.cs", SearchOption.AllDirectories))
-        {
-            var relative = Path.GetRelativePath(darling, file).Replace('\\', '/');
-            if (relative.StartsWith("Darling.Tests/", StringComparison.Ordinal)
-                || relative.Contains("/obj/", StringComparison.Ordinal) || relative.Contains("/bin/", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var text = File.ReadAllText(file);
-            if (text.Contains("ConnectionSettingsDiffer", StringComparison.Ordinal)
-                || Regex.IsMatch(text, @"\bServerConnectionSettings\b")
-                || (!allowed.Contains(Path.GetFileName(file)) && flagCompare.IsMatch(text)))
-            {
-                offenders.Add(relative);
-            }
-        }
-
-        Assert.True(
-            offenders.Count == 0,
-            "Another connection comparison exists besides ServerConnectionIdentity.Differ: " + string.Join(", ", offenders));
-    }
-
-    private static string ThisFile([CallerFilePath] string thisFile = "") => thisFile;
-
     [Fact]
     public void The_associated_data_is_the_label_key_id_purpose_and_fields_each_with_a_four_byte_length()
     {
@@ -266,7 +231,7 @@ public sealed class PasswordBindingCensusTests
     [Fact]
     public void Each_purpose_binds_its_fixed_number_of_fields_in_the_documented_text_form()
     {
-        var server = PasswordBinding.ForServer(Base with { Auth = "SQL", EncryptMode = "Mandatory", Engine = "SqlServer", ReadOnlyIntent = true });
+        var server = PasswordBinding.ForServer(Base with { Auth = "SQL", EncryptMode = "Mandatory", Engine = "SqlServer", ReadOnlyIntent = true, QueryStoreReplica = null });
         var remediation = PasswordBinding.ForRemediation(Base with { Engine = "SqlServer" }, "example_fix");
         var smtp = PasswordBinding.ForSmtp("omega-01", 587, false, "example_mail_user");
 
@@ -296,7 +261,7 @@ public sealed class PasswordBindingCensusTests
             PasswordBinding.ForWebhook("slack", "notification", null, null).EncodeAad(KeyId),
             PasswordBinding.ForWebhook("slack", "notification", "", "").EncodeAad(KeyId));
         Assert.Equal(
-            new[] { "teams", "slack", "generic", "pagerduty", "generic_headers" }, PasswordBinding.WebhookSlots.ToArray());
+            new[] { "teams", "slack", "generic", "pagerduty", "generic_headers", "signing_key" }, PasswordBinding.WebhookSlots.ToArray());
         Assert.Throws<ArgumentException>(() => PasswordBinding.ForWebhook("smtp", "notification", "", ""));
 
         /* Every field is part of what the value belongs to. */

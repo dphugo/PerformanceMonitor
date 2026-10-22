@@ -50,6 +50,7 @@ namespace Darling.Tests;
 /// <c>StatementSpanFrom(..., statements: 2)</c> is satisfiable by a neighbouring timed construction in a
 /// <c>using (...) { …; }</c> block, and two of the six HypoPG sites are written in exactly that shape.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class StragglerCommandTimeoutTests
 {
     /// <summary>Which hop a file's commands address, so the deadline can be checked against the right one.</summary>
@@ -73,7 +74,7 @@ public sealed class StragglerCommandTimeoutTests
     /// </summary>
     private static readonly (string File, Hop Hop, int Sites, string Constant, Regex Assignment)[] s_regimes =
     {
-        ("Targets/HypotheticalIndexExperiment.cs", Hop.Target, 6,
+        ("Targets/HypotheticalIndexExperiment.cs", Hop.Target, 7,   /* 7 since #6143: the hypopg schema read */
             "HypotheticalIndexExperiment.{Forward,Reset}CommandTimeoutSeconds",
             Assigns(@"(?:Forward|Reset)CommandTimeoutSeconds")),
         ("PgPlanForceActionStore.cs", Hop.Store, 4,

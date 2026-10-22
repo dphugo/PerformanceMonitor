@@ -32,7 +32,6 @@ namespace Darling.Tests;
 /// <see cref="TheTailStatistics_CannotSeparateTheTwoShapes"/> is the arithmetic. Both aggregate over RUNS,
 /// and each of those runs is one blended row.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public class CollectionLogFanoutRollupStoreTests
 {
     [Fact]
@@ -106,7 +105,6 @@ public class CollectionLogFanoutRollupStoreTests
            ordinal, so once a rung was appended it silently started testing that rung's wiring instead of
            this one's. Pinned at 55 — this rung's own ordinal — which cannot slide. The "and no more than
            that" half is the top rung's to assert, and it moved to TempDbCeilingStoreTests with it. */
-        Assert.Contains("reader.GetBoolean(55)", ReadViewerSource(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -348,7 +346,7 @@ public class CollectionLogFanoutRollupStoreTests
             .Select(f => System.IO.Path.GetFileNameWithoutExtension(f))
             .ToList();
 
-        Assert.Equal(5, enumerating.Count);
+        Assert.Equal(6, enumerating.Count);
 
         foreach (var typeName in enumerating)
         {

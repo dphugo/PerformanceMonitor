@@ -10,6 +10,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpMemoryTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_memory_stats"), Description("Gets the latest memory statistics snapshot: physical memory, buffer pool size, plan cache size, memory utilization %, and SQL Server memory model. Use this for a quick memory health check; use get_memory_clerks to see detailed breakdown by component. LATEST IS A TIME: this reads one snapshot, not a window, and captured_at is the instant that snapshot was collected - read it before treating any figure as current, because the newest row a store holds can be minutes or days old.")]
     public static async Task<string> GetMemoryStats(
         LocalDataService dataService,
@@ -24,7 +25,7 @@ public sealed class McpMemoryTools
             var stats = await dataService.GetLatestMemoryStatsAsync(resolved.ServerId);
             if (stats == null)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "memory_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "memory_stats")
                     ?? McpHelpers.Status("unavailable", "No memory stats available.");
             }
 
@@ -34,7 +35,7 @@ public sealed class McpMemoryTools
                own gate. The memory read carries no edition of its own. */
             var engineEdition = await McpEngineCapability.EngineEditionAsync(dataService, resolved.ServerId);
 
-            return MemoryStatsPayload(resolved.ServerName, stats, engineEdition);
+            return MemoryStatsPayload(resolved.DisplayName, stats, engineEdition);
         }
         catch (Exception ex)
         {
@@ -117,7 +118,7 @@ public sealed class McpMemoryTools
                     a server the collector has never touched wants somebody to go look at collection, and
                     widening will never fill it. Probed only here, against the SAME source the trend read.
                 */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "memory_stats");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "memory_stats");
                 if (gated != null)
                 {
                     return gated;
@@ -126,10 +127,10 @@ public sealed class McpMemoryTools
                 return await dataService.HasAnyMemoryStatAsync(resolved.ServerId)
                     ? McpHelpers.Status(
                         "empty",
-                        $"No memory samples recorded for {resolved.ServerName} in the last {hours_back} hour(s). This server HAS collected memory stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
+                        $"No memory samples recorded for {resolved.DisplayName} in the last {hours_back} hour(s). This server HAS collected memory stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
                     : McpHelpers.Status(
                         "unavailable",
-                        $"No memory stats have EVER been recorded for {resolved.ServerName}. This is not an empty window — the memory_stats collector has stored nothing at all for this server. Check that collection is running and that the server is enabled; get_memory_stats will be equally empty until it does.");
+                        $"No memory stats have EVER been recorded for {resolved.DisplayName}. This is not an empty window — the memory_stats collector has stored nothing at all for this server. Check that collection is running and that the server is enabled; get_memory_stats will be equally empty until it does.");
             }
 
             /* Joined from the memory-grant series (#3548), SUM(granted_memory_mb) across pools per snapshot — the
@@ -143,7 +144,7 @@ public sealed class McpMemoryTools
             var discontinuities = await dataService.GetBaselineDiscontinuitiesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
 
             return TrendPayloads.MemoryTrend(
-                resolved.ServerName, hours_back, points, grants, bucketMinutes, bucket_minutes is not null,
+                resolved.DisplayName, hours_back, points, grants, bucketMinutes, bucket_minutes is not null,
                 budget.AutoPoints, BaselineDiscontinuities.ToPayload(discontinuities));
         }
         catch (Exception ex)
@@ -152,6 +153,7 @@ public sealed class McpMemoryTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_memory_clerks"), Description("Gets the top memory consumers by memory clerk type — shows which SQL Server components are using the most memory. LATEST IS A TIME: this reads the newest clerk snapshot, not a window, and captured_at is the instant it was collected.")]
     public static async Task<string> GetMemoryClerks(
         LocalDataService dataService,
@@ -174,10 +176,10 @@ public sealed class McpMemoryTools
                     NEVER a quiet period, because on a live SQL Server it cannot be. Same words as Darling's
                     twin.
                 */
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "memory_clerks")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "memory_clerks")
                     ?? McpHelpers.Status(
                         "unavailable",
-                        $"No memory-clerk snapshot is available for {resolved.ServerName}. This read returns the LATEST snapshot rather than a window, so an empty result is never a quiet period — a live SQL Server always has memory clerks. It means nothing the memory_clerks collector stored is still retained, either because it has not run for this server or because its rows have aged out. Check get_collection_health and get_collection_log for the memory_clerks collector.");
+                        $"No memory-clerk snapshot is available for {resolved.DisplayName}. This read returns the LATEST snapshot rather than a window, so an empty result is never a quiet period — a live SQL Server always has memory clerks. It means nothing the memory_clerks collector stored is still retained, either because it has not run for this server or because its rows have aged out. Check get_collection_health and get_collection_log for the memory_clerks collector.");
 
             var result = rows.Select(r => new
             {
@@ -187,7 +189,7 @@ public sealed class McpMemoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* Every row shares this stamp by construction (the read is every clerk at MAX(collection_time)). */
                 captured_at = rows[0].CollectionTime.ToString("o"),
                 clerks = result
@@ -218,7 +220,7 @@ public sealed class McpMemoryTools
             var rows = await dataService.GetMemoryPressureEventsAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "memory_pressure_events")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "memory_pressure_events")
                     ?? McpHelpers.Status("empty", "No memory pressure events found in the requested time range.",
                         (await McpQueryTools.WindowNoticeAsync(
                             () => dataService.GetQueryWindowFloorAsync(QueryWindowRelation.MemoryPressureEvents, resolved.ServerId, windowEnd.AddHours(-hours_back), windowEnd),
@@ -236,7 +238,7 @@ public sealed class McpMemoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: always present (false and null when the store covered the window). No effective_hours_back, as on the other window-floor payloads. */
                 effective_start = notice.EffectiveStart,
@@ -257,7 +259,8 @@ public sealed class McpMemoryTools
         }
     }
 
-    [McpServerTool(Name = "get_resource_semaphore"), Description("Resource semaphore stats: granted/available memory vs target/max-target ceiling, waiters, timeout/forced pressure, window ends at as_of. TWO READS, per semaphore+pool: grants[] is the NEWEST snapshot (moment: captured_at/age_seconds); window[] aggregates EVERY snapshot (peak waiters+when, peak/min memory, summed timeout/forced deltas). Read window[] for 'was there pressure', grants[] for 'is there pressure now'. No rows: unavailable (not_collected first). sample_interval_seconds/interval_known null/false on a restart-marker or pre-column row; its zero deltas aren't 'no timeouts'. <<GUIDE>> Gets resource semaphore statistics showing granted vs available workspace memory against the target/max-target ceiling, waiter counts, and timeout/forced grant pressure indicators. High waiter counts or rising timeout/forced deltas indicate memory grant pressure affecting query performance. TWO READS UNDER ONE WINDOW: grants[] is the NEWEST snapshot in the window (one row per resource semaphore and pool), stamped once as captured_at with age_seconds against the window's end - it is a moment, not the window. window[] aggregates EVERY snapshot in the window per (resource_semaphore_id, pool_id): peak_waiter_count and peak_waiters_at (the most sessions ever seen waiting for a grant and when), peak_granted_memory_mb, min_available_memory_mb, and timeout_errors_in_window / forced_grants_in_window (the SUM of the per-interval deltas across the window). Each grants[] row also carries sample_interval_seconds, the measured seconds its two deltas accrued over; it is null with interval_known false when the row is a restart marker (no delta was knowable, so the zero deltas beside it are not 'no timeouts') or predates the column. interval_seconds is the interval these deltas cover, null when it can't be known - the same name the latch and spinlock tools use; sample_interval_seconds carries the same value and is kept for existing readers. " + McpToolGuideTopics.MemoryGrantWindowReadOrder)]
+    [ReadsLatestSnapshot(LatestSnapshotShape.Windowed)]
+    [McpServerTool(Name = "get_resource_semaphore"), Description("Resource semaphore stats: granted/available memory vs target/max-target ceiling, waiters, timeout/forced pressure, window ends at as_of. TWO READS, per semaphore+pool: grants[] is the NEWEST snapshot (moment: captured_at/age_seconds); window[] aggregates EVERY snapshot (peak waiters+when, peak/min memory, summed timeout/forced deltas). Read window[] for 'was there pressure', grants[] for 'is there pressure now'. No rows: unavailable (not_collected first). sample_interval_seconds/interval_known null/false on a restart-marker or pre-column row; its zero deltas aren't 'no timeouts'. <<GUIDE>> Gets resource semaphore statistics showing granted vs available workspace memory against the target/max-target ceiling, waiter counts, and timeout/forced grant pressure indicators. High waiter counts or rising timeout/forced deltas indicate memory grant pressure affecting query performance. TWO READS UNDER ONE WINDOW: grants[] is the NEWEST snapshot in the window (one row per resource semaphore and pool), stamped once as captured_at with age_seconds against the window's end - it is a moment, not the window. window[] aggregates EVERY snapshot in the window per (resource_semaphore_id, pool_id): peak_waiter_count and peak_waiters_at (the most sessions ever seen waiting for a grant and when), peak_granted_memory_mb and peak_granted_at (the largest granted memory and when - not the time of peak waiters), min_available_memory_mb, and timeout_errors_in_window / forced_grants_in_window (the SUM of the per-interval deltas across the window). Each grants[] row also carries sample_interval_seconds, the measured seconds its two deltas accrued over; it is null with interval_known false when the row is a restart marker (no delta was knowable, so the zero deltas beside it are not 'no timeouts') or predates the column. interval_seconds is the interval these deltas cover, null when it can't be known - the same name the latch and spinlock tools use; sample_interval_seconds carries the same value and is kept for existing readers. " + McpToolGuideTopics.MemoryGrantWindowReadOrder)]
     public static async Task<string> GetResourceSemaphore(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -276,7 +279,7 @@ public sealed class McpMemoryTools
             var rows = await dataService.GetResourceSemaphoreSnapshotAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "memory_grant_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "memory_grant_stats")
                     ?? McpHelpers.Status("unavailable", "No memory grant data available.");
             }
 
@@ -315,14 +318,15 @@ public sealed class McpMemoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 window_start = windowEnd.AddHours(-hours_back).ToString("o"),
                 window_end = windowEnd.ToString("o"),
                 captured_at = rows[0].CollectionTime.ToString("o"),
                 age_seconds = McpLatestSnapshotStamp.AgeSeconds(rows[0].CollectionTime, windowEnd),
                 grants = result,
-                window = window.Select(WindowShape)
+                window = window.Select(WindowShape),
+                window_note = WindowSamplingNote
             }, McpHelpers.JsonOptions);
         }
         catch (Exception ex)
@@ -331,7 +335,8 @@ public sealed class McpMemoryTools
         }
     }
 
-    [McpServerTool(Name = "get_memory_grants"), Description("Gets resource semaphore stats: granted vs available workspace memory per resource pool, waiters, timeout/forced grant deltas, over a window ending at as_of (default 1h). TWO READS: grants[] is the NEWEST snapshot in the window (a moment: captured_at/age_seconds), one row per pool; window[] aggregates EVERY snapshot in it, per pool (peak waiters+when, peak/min memory, summed timeout/forced deltas). Read window[] for 'was there pressure', grants[] for 'is there pressure now'. No rows: unavailable (or not_collected first). <<GUIDE>> Gets resource semaphore statistics showing granted vs available workspace memory per resource pool, waiter counts, and timeout/forced grant deltas. High waiter counts or rising timeout deltas indicate memory grant pressure affecting query performance. TWO READS UNDER ONE WINDOW: grants[] is the NEWEST snapshot in the window (one row per pool, summed across its semaphores), stamped once as captured_at with age_seconds against the window's end - it is a moment, not the window. window[] aggregates EVERY snapshot in the window per pool: peak_waiter_count and peak_waiters_at (the most sessions ever seen waiting on the pool at one instant and when), peak_granted_memory_mb, min_available_memory_mb, and timeout_errors_in_window / forced_grants_in_window (the SUM of the per-interval deltas across the window). " + McpToolGuideTopics.MemoryGrantWindowReadOrder)]
+    [ReadsLatestSnapshot(LatestSnapshotShape.Windowed)]
+    [McpServerTool(Name = "get_memory_grants"), Description("Gets resource semaphore stats: granted vs available workspace memory per resource pool, waiters, timeout/forced grant deltas, over a window ending at as_of (default 1h). TWO READS: grants[] is the NEWEST snapshot in the window (a moment: captured_at/age_seconds), one row per pool; window[] aggregates EVERY snapshot in it, per pool (peak waiters+when, peak/min memory, summed timeout/forced deltas). Read window[] for 'was there pressure', grants[] for 'is there pressure now'. No rows: unavailable (or not_collected first). <<GUIDE>> Gets resource semaphore statistics showing granted vs available workspace memory per resource pool, waiter counts, and timeout/forced grant deltas. High waiter counts or rising timeout deltas indicate memory grant pressure affecting query performance. TWO READS UNDER ONE WINDOW: grants[] is the NEWEST snapshot in the window (one row per pool, summed across its semaphores), stamped once as captured_at with age_seconds against the window's end - it is a moment, not the window. window[] aggregates EVERY snapshot in the window per pool: peak_waiter_count and peak_waiters_at (the most sessions ever seen waiting on the pool at one instant and when), peak_granted_memory_mb and peak_granted_at (the largest granted memory and when - not the time of peak waiters), min_available_memory_mb, and timeout_errors_in_window / forced_grants_in_window (the SUM of the per-interval deltas across the window). " + McpToolGuideTopics.MemoryGrantWindowReadOrder)]
     public static async Task<string> GetMemoryGrants(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -350,7 +355,7 @@ public sealed class McpMemoryTools
             var rows = await dataService.GetMemoryGrantChartDataAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "memory_grant_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "memory_grant_stats")
                     ?? McpHelpers.Status("unavailable", "No memory grant data available.");
             }
 
@@ -374,14 +379,15 @@ public sealed class McpMemoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 window_start = windowEnd.AddHours(-hours_back).ToString("o"),
                 window_end = windowEnd.ToString("o"),
                 captured_at = latestTime.ToString("o"),
                 age_seconds = McpLatestSnapshotStamp.AgeSeconds(latestTime, windowEnd),
                 grants = result,
-                window = window.Select(WindowShape)
+                window = window.Select(WindowShape),
+                window_note = WindowSamplingNote
             }, McpHelpers.JsonOptions);
         }
         catch (Exception ex)
@@ -390,13 +396,19 @@ public sealed class McpMemoryTools
         }
     }
 
+    /// <summary>#6129: the window's peaks are maxima over the snapshots taken every collection interval, so a wait or grant
+    /// shorter than the interval can fall between two snapshots. A peak of 0 is therefore "none sampled", not "no grant
+    /// pressure": RESOURCE_SEMAPHORE waits in get_wait_stats can coexist with peak_waiter_count 0.</summary>
+    internal const string WindowSamplingNote =
+        "window[] peaks are sampled once per collection interval and can miss a wait or grant shorter than it; a peak of 0 does not rule out grant pressure (check RESOURCE_SEMAPHORE in get_wait_stats). A peak of 0 has a null *_at.";
+
     /// <summary>
     /// The window half's payload shape, shared by both lenses so the same key set describes a semaphore's
     /// window and a pool's window (the pool lens carries a null <c>resource_semaphore_id</c>, which
     /// <see cref="McpHelpers.JsonOptions"/> writes rather than drops — the key is present on both so a caller
     /// can read one shape). Twin of Darling's <c>DarlingMcpMemoryGrantTools.WindowShape</c>.
     /// </summary>
-    private static object WindowShape(MemoryGrantWindowRow w) => new
+    internal static object WindowShape(MemoryGrantWindowRow w) => new
     {
         resource_semaphore_id = w.ResourceSemaphoreId,
         pool_id = w.PoolId,
@@ -404,8 +416,9 @@ public sealed class McpMemoryTools
         first_snapshot_at = w.FirstSnapshotAt.ToString("o"),
         last_snapshot_at = w.LastSnapshotAt.ToString("o"),
         peak_waiter_count = w.PeakWaiterCount,
-        peak_waiters_at = w.PeakWaitersAt.ToString("o"),
+        peak_waiters_at = w.PeakWaiterCount > 0 ? w.PeakWaitersAt.ToString("o") : null,
         peak_granted_memory_mb = Math.Round(w.PeakGrantedMemoryMb, 2),
+        peak_granted_at = w.PeakGrantedMemoryMb > 0 ? w.PeakGrantedAt.ToString("o") : null,
         min_available_memory_mb = Math.Round(w.MinAvailableMemoryMb, 2),
         timeout_errors_in_window = w.TimeoutErrorsInWindow,
         forced_grants_in_window = w.ForcedGrantsInWindow

@@ -24,11 +24,6 @@ from it at build time. Do not add any of those four elements to a csproj: `Produ
 fails the build on a second `<Version>` property anywhere in the tree, on a re-added derived property, and
 on a workflow or script that reads a version from any path but `Directory.Build.props`.
 
-This replaced six independently hand-bumped csproj files (#3222). Two of them had been sitting three
-releases behind, `deprecated/Dashboard/Dashboard.csproj` was declaring 3.6.0 while its binary stamped
-3.3.0.0, and the release gate took its judgement from that file — so nothing in CI compared the version it
-gated on against the version the artifacts were named with. Both now read the file above.
-
 Verify no other files contain hardcoded version strings that need updating.
 
 ### 2. CHANGELOG
@@ -40,7 +35,7 @@ Ensure `CHANGELOG.md` has an entry for the new version with:
 - **Fixed** section for bug fixes
 - Reference links at the bottom for all issue numbers
 
-If a week of parallel PRs left duplicate section headers in `[Unreleased]` (two `### Fixed` blocks from keep-both merges), consolidate them at cut time with a content-preserving script that VERIFIES the entry-line multiset is unchanged — never re-sort by hand (a 242-line silent reorder shipped that way once).
+If a week of parallel PRs left duplicate section headers in `[Unreleased]` (two `### Fixed` blocks from keep-both merges), consolidate them at cut time with a content-preserving script that verifies the entry-line multiset is unchanged. Never re-sort by hand: a hand re-sort can silently reorder hundreds of lines.
 
 If the previous version's changelog entry is missing, add that too.
 
@@ -76,7 +71,7 @@ Do NOT add internal/implementation changes — only user-facing features and beh
 Applies ONLY when `install/` or `upgrades/` changed since the last release (the deprecated Dashboard edition remains on bug-fix support, so its schema discipline still holds when it IS touched):
 
 1. All schema changes MUST go through the `upgrades/{from}-to-{to}/` folder — never ad hoc, never baked into base install scripts. View-only changes flow through `CREATE OR ALTER` re-runs and need no upgrade script.
-2. **List all .sql files in the upgrade folder and compare against `upgrade.txt`** — every script must be listed or it won't run (PR #608 shipped a script not listed in `upgrade.txt`).
+2. **List all .sql files in the upgrade folder and compare against `upgrade.txt`.** A script that is not listed does not run.
 3. Verify each script uses `IF NOT EXISTS` checks for idempotency, and that any column additions in `01_install_database.sql` CREATE TABLE blocks have corresponding ALTER TABLE scripts in the upgrade folder.
 
 ### 4. Build Verification
@@ -110,6 +105,7 @@ Spin up temporary instances with the Azure CLI (`az`) and AWS CLI (`aws`):
    - `database_size_stats` / size collectors cover ALL databases, not just master (the #1631 fallback class)
    - server row shows engine edition 5, and no collector that does not apply to Azure SQL DB errors. The SQL Agent collectors (`running_jobs`, `job_history`, `agent_status`) are marked not applicable when the server is added (`add_servers` answers "Agent surface: not applicable") and never run, so they leave no `collection_log` row and no health entry. That is the expected result, not a gap (verified v3.10.0)
    - `collection_log` clean for the cloud server across the cycles
+   - the always-on XE sessions exist in the Azure database: `PerformanceMonitor_Deadlock`, `PerformanceMonitor_BlockedProcess` and `PerformanceMonitor_Attention` (the client-timeout session, #5640; `SELECT name FROM sys.database_event_sessions`), or this install's own `PerformanceMonitor_Darling_<id>_...` / `PerformanceMonitor_Lite_<id>_...` fallback of the same capture. `PerformanceMonitor_Attention` has two actions that no Azure run has proved: `sqlserver.client_hostname` and `sqlserver.sql_text`. If the create is rejected with error 25744 (`The action ... is not available for Azure SQL Database`), put the named action on the closed list, as #3753 did for the long-query trace, in `AlwaysOnXeSessions.AttentionAzureRejectedActions` (a one-line edit: the Azure DDL is generated from it), and re-run
    - the serverless DB's 60s auto-pause + resume (error 40613 transients) does not wedge collection — rows resume after the pause without a service restart
 4. Firewall churn: DELETE the allow rule, wait 3–5 minutes, re-add it. Collection must resume on its own without restarting the service. (CAVEAT, verified v3.2.0: a bare rule-deletion often does NOT sever an actively-collecting client — connection pooling keeps the open connection alive and Azure gates only NEW connections — so treat a no-outage result as inconclusive rather than a pass; the recovery logic's authoritative validation is the unit suites.) To force a real outage (verified v3.10.0): open admin sessions in each user database BEFORE deleting the rule, in case the machine you test from shares the Darling host's egress IP. Delete the rule, wait 6 minutes for it to take effect, then KILL Darling's sessions (`program_name` = `PerformanceMonitorDarling`) from those sessions. KILL is denied in master even for the server admin, so collectors pooled on master keep running. Collectors that open new connections then hit 40615: the `collection_log` message must name the firewall, and those collectors must store rows again after the rule is re-added, with the service's `started_at` unchanged.
 5. Clean up: `az group delete --name rg-release-test --yes --no-wait`
@@ -119,7 +115,7 @@ Spin up temporary instances with the Azure CLI (`az`) and AWS CLI (`aws`):
    ```
    aws rds create-db-instance --db-instance-identifier pm-release-test --db-instance-class db.t3.xlarge --engine sqlserver-ee --master-username admin --master-user-password "$SQL_TEST_PASSWORD" --allocated-storage 20 --region us-east-1
    ```
-2. **Network reachability is NOT automatic** (bit on v3.3.0: the fresh instance answered "server was not found" until fixed). Verify `PubliclyAccessible` is true, and open 1433 on the instance's security group — the account-default SG has no public inbound:
+2. **Network reachability is not automatic:** a fresh instance answers "server was not found" until it is opened up. Verify `PubliclyAccessible` is true, and open 1433 on the instance's security group — the account-default SG has no public inbound:
    ```
    aws rds describe-db-instances --db-instance-identifier pm-release-test --region us-east-1 --query 'DBInstances[0].[PubliclyAccessible,VpcSecurityGroups[0].VpcSecurityGroupId]' --output text
    aws ec2 authorize-security-group-ingress --group-id <sg-id> --protocol tcp --port 1433 --cidr 0.0.0.0/0 --region us-east-1
@@ -148,7 +144,15 @@ Quick click-through of any new features or significant changes listed in the cha
 
 ### 8. Desktop App Upgrade — Velopack Setup.exe + single-instance handoff
 
-Covers the **desktop apps' own** upgrade via Velopack (`*-Setup.exe`) for **Lite** and the **Darling Viewer**. Test the upgrade over a **running** prior version:
+Covers the **desktop apps' own** upgrade via Velopack (`*-Setup.exe`) for **Lite** and the **Darling Viewer**.
+
+This step is a gate. Run it after step 10 opens the release PR and before step 11 tags the release. Run it on every release, even when the upgrade code did not change. Publishing notifies everyone who watches the repo, and the apps offer the new version in Help → About. A check after publishing finds a broken upgrade only after users can install it.
+
+Before the cut, build each new Setup.exe from the release PR's head commit as `build.yml` does. Run `dotnet publish` for the self-contained build, then `vpk download` and `vpk pack` with the same arguments, except `-p`. In `build.yml`, `-p` points at the signed payload (`signed/Lite-Velopack`, `signed/DarlingViewer-Velopack`). Point it at the unsigned publish folder instead (`publish/Lite-velopack`, `publish/DarlingViewer-velopack`). These Setup.exe files are unsigned. Run each one on a clean Windows machine over the prior release's signed Setup.exe.
+
+After publishing, repeat item 2 with the signed Setup.exe to confirm that signing changed nothing. That repeat is not the gate.
+
+Test the upgrade over a **running** prior version:
 
 1. Install the prior release's Setup.exe, launch the app, and **minimize it to the tray** (leave it running).
 2. Run the new release's Setup.exe (and separately test Help → About → download → restart). Confirm the **new** version actually runs afterward — not the stale in-memory one.
@@ -156,7 +160,7 @@ Covers the **desktop apps' own** upgrade via Velopack (`*-Setup.exe`) for **Lite
 4. **Elevated case:** run the old version **as administrator**, launch the new one non-elevated → expect the *"Restart as administrator"* prompt; elevating completes the takeover. A *same-version* elevated instance should just surface (no UAC).
 5. Confirm Lite never closes the Darling Viewer and vice-versa (scoped by exe name).
 
-Local proxy without a release: bump `<Version>`, rebuild, run over the old build → expect the close-and-takeover prompt. The decision logic is unit-tested (`Lite.Tests/SingleInstanceDecisionTests`); this step validates the live Win32/Velopack seam (`SingleInstanceCoordinator` / `ProcessInspector` in `PerformanceMonitor.Ui`). When the seam saw no changes since the prior release, a quick post-publish regression pass is acceptable instead of a pre-cut gate. Design: `plans/single-instance-upgrade-handoff.md`.
+Local proxy without a release: bump `<Version>`, rebuild, run over the old build → expect the close-and-takeover prompt. The decision logic is unit-tested (`Lite.Tests/SingleInstanceDecisionTests`); this step validates the live Win32/Velopack seam (`SingleInstanceCoordinator` / `ProcessInspector` in `PerformanceMonitor.Ui`). Design: `plans/single-instance-upgrade-handoff.md`.
 
 ### 8a. Darling service install and upgrade (every release)
 
@@ -206,16 +210,16 @@ Then run `uninstall-darling.ps1`, with `-PurgeData` on a machine you will reuse,
 
 #### (d) The Linux tarball and the container image
 
-The release also attaches `PerformanceMonitorDarling-linux-x64-<version>.tar.gz` and `SHA256SUMS-linux.txt`. The `darling-linux` job in `build.yml` builds them: a framework-dependent publish of the service, tarred with no wrapper folder. The same job pushes `ghcr.io/erikdarlingdata/performancemonitor-darling`, tagged with the version and `latest`.
+The release also attaches `PerformanceMonitorDarling-linux-x64-<version>.tar.gz`, `PerformanceMonitorDarling-compose-<version>.tar.gz` and `SHA256SUMS-linux.txt` (#6123). The `darling-linux` job in `build.yml` builds them. The tarball is a framework-dependent publish of the service, tarred with no wrapper folder. The compose archive is the `Darling/compose/` folder from git in one wrapper folder, with the `darling` image line changed from `:latest` to `:<version>`. The `darling-linux-publish` job uploads them and pushes `ghcr.io/erikdarlingdata/performancemonitor-darling`, tagged with the version and `latest`. It starts only after the Windows `build` job has passed, signature checks included (#5804), so the Linux assets reach the release some minutes after the Windows ones; a release whose Windows build failed has no Linux assets and no new image. The tarball waits as a workflow artifact for seven days, so a "Re-run failed jobs" within a week publishes it; after that use "Re-run all jobs".
 
-Linux has no install script, no upgrade script and no systemd unit file in the tarball. The supported shapes are in the README's "Run on Linux" section. One is the compose stack in `Darling/compose/`. The other is the tarball extracted to `/opt/darling` under a unit written from the README's example, with your own PostgreSQL. 
+Linux has no install script, no upgrade script and no systemd unit file in the tarball. The supported shapes are in the README's "Run on Linux" section. One is the compose stack, from the compose archive. The other is the tarball extracted to `/opt/darling` under a unit written from the README's example, with your own PostgreSQL. 
 
 There is no scripted Linux upgrade path. An upgrade is the same manual steps as a fresh install, over an existing store. So the release must check this by hand:
 
-- **Artifacts:** the tarball and `SHA256SUMS-linux.txt` are on the release, the checksum matches, and the versioned and `latest` image tags exist.
-- **Fresh install, compose:** bring the stack up from this release's `Darling/compose/` files on a fresh volume. The compose file names `:latest`, which still points at the previous release until this one publishes. So run the check with this release's own image tag (`:<version>`), set in the compose file or by an override file for the check. Pass: `docker compose ps` shows the darling container healthy (not `unhealthy`). The log shows the config load and `Postgres store ready`. `collection_log` fills, as in the Windows checks.
+- **Artifacts:** the tarball, the compose archive and `SHA256SUMS-linux.txt` are on the release, both checksums match, and the versioned and `latest` image tags exist.
+- **Fresh install, compose:** download `PerformanceMonitorDarling-compose-<version>.tar.gz` from the release, extract it, and bring the stack up from the folder it makes, on a fresh volume. Its compose file already names this release's own image tag (`:<version>`), so no edit is needed. Check that the `darling` service's `image:` line ends in `:<version>`, not `:latest`. Pass: `docker compose ps` shows the darling container healthy (not `unhealthy`). The log shows the config load and `Postgres store ready`. `collection_log` fills, as in the Windows checks.
 - **Fresh install, systemd:** extract the tarball to `/opt/darling` and install `libgssapi-krb5-2`. Write the unit from the README. Point `DARLING_CONFIG` at a config for a throwaway PostgreSQL 15+ with TimescaleDB, and start it. Pass: the unit is active and the same store checks hold.
-- **Upgrade:** repeat each shape over a store the previous release created. For compose, keep the volume and recreate the container from this release's compose file and image. For systemd, stop the unit, move `/opt/darling` aside, extract the new tarball, keep the config, and start the unit. Pass: the service starts, the store migrates to the new top rung, and collection continues with the earlier rows still present.
+- **Upgrade:** repeat each shape over a store the previous release created. For compose, keep the volume and recreate the container from this release's compose archive and image. For systemd, stop the unit, move `/opt/darling` aside, extract the new tarball, keep the config, and start the unit. Pass: the service starts, the store migrates to the new top rung, and collection continues with the earlier rows still present.
 - **Oldest supported:** apply the same fixture rule as (b). If that release did not ship a Linux tarball, say so in the record and use the oldest release that did.
 - **Record:** the same fields as (b), plus the image digest or tarball checksum you tested.
 
@@ -236,6 +240,8 @@ Before cutting the release, verify the nightly build has been clean:
 - At release-PR merge time, dev must equal the sha the field validation ran against (or the delta must be explicitly accepted)
 
 ### 11. Tag and Release
+
+Do not tag or publish until step 8 passes on the unsigned Setup.exe files from the release PR's head. Publishing notifies watchers, so every check that can block the release runs before it.
 
 After PR is merged to main:
 ```

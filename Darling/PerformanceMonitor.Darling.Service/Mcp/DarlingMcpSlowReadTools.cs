@@ -43,20 +43,29 @@ public sealed class DarlingMcpSlowReadTools
         "Gets the monitoring tool's OWN slow or failed reads — each with the arguments it was asked with, the source "
         + "that answered, and its slowest statements. Not a monitored SQL Server or PostgreSQL target. Newest first. "
         + "Optional server_name, surface (web/compose/mcp) and route filter. Empty means none was recorded, not a failure. "
+        + "caller names who read it (MCP client name and version, or a salted web-session hash); no personal data. "
         + "<<GUIDE>> "
         + "Gets the reads the monitoring tool itself answered slowly or badly. The service records one row per read on any "
         + "surface (web dashboard, composed panel, MCP tool) when the read took 5 seconds or more, or ended in a timeout, "
         + "error or limit. A cancelled read or a fallback is recorded only when it was also slow; their counts live in "
-        + "get_read_latency. Each row carries surface, route, outcome, total_ms, the server it named (server_name, null for "
+        + "get_read_latency. A read refused busy, a wait for a slot and a read answered from the read cache are never recorded "
+        + "here, however long the caller waited; get_read_latency counts them. Each row carries surface, route, outcome, total_ms, the server it named (server_name, null for "
         + "a store-wide read), the arguments (short scalars only: numbers, booleans and strings of 128 characters or fewer; "
         + "any longer string or JSON-bearing string is shown as [omitted], and a key naming a secret is [redacted] at any "
-        + "depth; the server replaced by its id, a window lifted into window_start and window_end, 4,096 bytes at most), the source that answered (raw, interval_table, hourly_edges) with its reason "
+        + "depth; the server replaced by its id, 4,096 bytes at most), window_start and window_end (the window the read ran with, its default included), the source that answered (raw, interval_table, hourly_edges) with its reason "
         + "where the read noted one, error_class (a type name or SQLSTATE, never message text), and statements: the "
         + "slowest 5 by ms, with statements_omitted saying how many more were left out; full_detail=true returns all stored "
         + "statements in the order they ran (50 at most, statements_truncated says more ran). A statement's ms runs until "
         + "its reader CLOSES, so it includes row streaming and the caller's time between rows, not only server time; a "
         + "statement's rows stays null (the driver reports no returned-row count). The read's own rows is recorded only by "
-        + "reads that count them, as get_query_store_top does, and is null otherwise. A statement label is the product's own SQL "
+        + "reads that count them, as get_query_store_top does, and is null otherwise. in_flight is how many other reads were "
+        + "already running on the service when this read started, and wait_ms is the part of total_ms it spent waiting for a store "
+        + "connection rather than running (a connection wait only: since #5506 a read's total_ms starts once it has its long-read slot, so "
+        + "time spent queued for a slot is in neither figure and shows in get_read_latency's queued and queue_wait_ms instead; a read "
+        + "refused busy is never offered here); both are null on rows stored before schema V182. caller is who made the read: an MCP "
+        + "client's own name and version (ua: and its User-Agent product token when it sent none, unknown when neither), or web: "
+        + "and 12 hex characters of a hash of the web session key under a salt that lives only in the service's memory, so it holds "
+        + "no personal data and cannot be turned back into the key; null on rows stored before schema V183. A statement label is the product's own SQL "
         + "text with a short hash; parameter values are never stored. summary counts reads per (surface, route, outcome) "
         + "over the window and the filters, so it covers more than the page. reads is newest first, then newest id; the "
         + "page is capped at limit rows or the ~32 KB response budget, whichever cuts first, and truncated says either "
@@ -73,7 +82,7 @@ public sealed class DarlingMcpSlowReadTools
         [Description("True returns every stored statement, in run order.")] bool full_detail = false,
         CancellationToken cancellationToken = default)
     {
-        var hoursError = McpHelpers.ValidateHoursBack(hours);
+        var hoursError = DarlingReadWindow.ValidateHoursBack(hours);
         if (hoursError != null)
         {
             return hoursError;
@@ -185,6 +194,9 @@ public sealed class DarlingMcpSlowReadTools
             source_reason = r.SourceReason,
             error_class = r.ErrorClass,
             rows = r.RowCount,
+            in_flight = r.InFlight,
+            wait_ms = r.WaitMs,
+            caller = r.Caller,
             statement_count = r.StatementCount,
             statements_truncated = r.StatementsTruncated,
             statements_omitted = omitted,

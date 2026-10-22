@@ -54,7 +54,7 @@
 -- re-running blindly are the single-table grants in steps 3b-3f: each names a table (or, for the
 -- beacon columns, a trigger dependency) a specific migration creates -- custom_views is V31,
 -- database_state_expected is V49, custom_alert_rules is V116, the mute-rule reload-beacon trigger is
--- V117, config_notification_routes is V131 and config_collector_run_times is V160 and the password key tables (step 3g) are V165 -- so re-run this script after upgrading past each.
+-- V117, the query-tag tables (step 3k, #5977) are V192, config_notification_routes is V131 (its scope_server_id and scope_tag_id columns are V181, #5750: run this script only after the store has migrated to V181, since the route column grants name them; the agent_* route columns are V184, #5632, and are granted only once they exist) and config_collector_run_times is V160 and the password key tables (step 3g) are V165 and the Level 2 tables (step 3j: config_threshold_overrides and investigation_feedback, #5909) are V191 and the Phase C tables (step 3l: investigation_evidence, investigation_signature_days and investigation_signature_merges, #5997) are V193, as are the signing key and fallback route columns the read carve above names -- so re-run this script after upgrading past each.
 --
 -- BEFORE RUNNING:
 --   1. Replace CHANGE_ME_ADMIN_PASSWORD, CHANGE_ME_VIEWER_PASSWORD and CHANGE_ME_MCP_PASSWORD with strong
@@ -62,8 +62,14 @@
 --      SCRAM-SHA-256 verifier, which PostgreSQL stores as-is, or set the passwords afterwards with psql's
 --      \password admin, \password viewer and \password mcp, which compute the verifier locally and send
 --      only that. A password literal is kept verbatim by anything that records statement text:
---      log_statement, a failed statement's STATEMENT line in the server log, auto_explain, and
---      pg_stat_statements with utility tracking on.
+--      log_statement set to ddl, mod or all, log_min_duration_statement set to 0 or more, a failed statement's
+--      STATEMENT line in the server log, auto_explain, pg_stat_statements with utility tracking on, and
+--      pg_stat_monitor with utility tracking on (pg_stat_monitor.pgsm_track_utility, on by default). pgaudit's role
+--      class writes ALTER ROLE statements to the log too, with the statement text while pgaudit.log_statement is on
+--      (its default). Step 0 turns off the first four, the utility tracking of both modules, and
+--      pgaudit.log_statement, for this session when the role running the script is allowed to. Only a superuser can
+--      change a pgaudit setting, so for any other role the pgaudit entries of this run keep their statement text:
+--      keep the passwords out of the statements as above.
 --   2. If your database is not named "darling", change it in the REVOKE/GRANT ... ON DATABASE
 --      lines and in the ALTER DATABASE note at the bottom.
 --   3. If the owner role is not "darling", change it in the ALTER DEFAULT PRIVILEGES FOR ROLE
@@ -72,8 +78,10 @@
 --   Needs psql 10 or later (step 1 says why):
 --   psql -X -h <host> -U <owner> -d darling -f provision-roles.sql
 --
---   -X keeps your own psqlrc out of the run: an \set AUTOCOMMIT off in it would leave every role, grant and
---   setting uncommitted while psql still exits 0, and an ON_ERROR_STOP in it would change where the run stops.
+--   -X keeps your own psqlrc out of the run: an \set AUTOCOMMIT off in it would leave steps 3 to 5 (the write
+--   grants, the default privileges and the public hardening) uncommitted while psql still exits 0, and an
+--   ON_ERROR_STOP in it would change where the run stops. The roles, the passwords, the read grants, the
+--   secret-column carve and the password key table revoke (step 2d) commit at the script's own COMMIT.
 --
 -- NAME-COLLISION SAFETY: the roles are the bare, un-prefixed names "admin", "viewer" and "mcp". If your
 -- cluster ALREADY has a role by any of those names that this script did not create, it will NOT be
@@ -81,19 +89,132 @@
 -- same-named role without that marker makes this script FAIL LOUD (rename or drop the other role first,
 -- or use a dedicated cluster/database for the Darling store). That includes the roles the service
 -- provisions on the compose store, which carry 'darling-compose' instead.
+--
+-- The marker is a public string, so it does not show who made a role. From PostgreSQL 16 a role with CREATEROLE
+-- holds ADMIN OPTION on every role it creates, which lets it reset that role's password and grant it onward. So
+-- a marked role is refused too (the same stop as above) while a role that is not a superuser, not the database
+-- owner and not the role running this script holds ADMIN OPTION on it. To go on, run the script as that login (it
+-- is then the role running it, so the check leaves it out), or, as a superuser, revoke that option (a login that
+-- created the role cannot revoke the option itself) or drop the role. A plain membership (GRANT viewer TO
+-- some_analyst) is not refused.
+--
+-- AN OWNER WHO IS NOT A SUPERUSER can run this script, with these limits:
+--   * It needs CREATEROLE. From PostgreSQL 16 it also needs ADMIN OPTION on each of the three roles to set a
+--     password or take back an attribute, and it holds that option only on a role it created itself. A role a
+--     superuser made needs GRANT <role> TO <owner> WITH ADMIN OPTION from a superuser first. The guard in step 1
+--     checks this before any password is sent, and stops the run when the owner cannot change one of the three
+--     roles that already exist: it has no CREATEROLE, the role is a superuser, from PostgreSQL 16 it lacks ADMIN
+--     OPTION on the role, or before 16 the role has REPLICATION (only a superuser can change such a role). The
+--     stop names the role and the remedy: a superuser runs GRANT <role> TO <owner> WITH ADMIN OPTION, or runs
+--     this script. The guard also stops the run when one of the three roles is a member of a role that would
+--     outrank the grants below (the owner, a superuser or BYPASSRLS role, pg_read_all_data, pg_write_all_data,
+--     pg_read_server_files, pg_write_server_files or pg_execute_server_program) and the owner cannot revoke that
+--     membership: from PostgreSQL 16 revoking needs ADMIN OPTION on the role the membership is in, and no role
+--     holds that option on itself. The stop names each membership. A password line that still fails (a
+--     password-check module can reject a password) is written to the server log with its password, unless step 0
+--     could turn off log_min_error_statement for the session.
+--   * pg_stat_statements: while the module is loaded with utility tracking on, step 0 fails for this owner, and
+--     the guard in step 1 then stops the run before any password is sent. Either GRANT SET ON PARAMETER
+--     pg_stat_statements.track_utility TO <owner> (PostgreSQL 15 and later), so step 0 can turn it off for this
+--     session, or turn it off for the cluster (step 1b).
+--   * The superuser-only lines (temp_file_limit, log_min_duration_statement, log_parameter_max_length) fail, and
+--     psql carries on. SUPERUSER is not switched off, nor is REPLICATION, BYPASSRLS or CREATEDB unless the owner
+--     holds that attribute itself (PostgreSQL 16 and later; before 16 only a superuser can change REPLICATION or
+--     BYPASSRLS), and a role membership the owner is not allowed to revoke stays. Step 1 prints a WARNING for
+--     each of those, so read psql's output.
+--   * Step 0 cannot turn off log_statement, log_min_duration_statement or log_min_error_statement for this session
+--     unless the owner was granted SET on them (PostgreSQL 15 and later). Where log_statement is ddl, mod or all,
+--     log_min_duration_statement is 0 or more, log_transaction_sample_rate is above 0, log_min_duration_sample is 0 or
+--     more with log_statement_sample_rate above 0, or pgaudit.log covers the role class while pgaudit.log_statement is
+--     on, the run's password lines are written to the server log: the script prints a WARNING after step 0 when it
+--     sees any of them, and you should keep the passwords out of the lines, as in BEFORE RUNNING above.
 -- ============================================================================================
 
 -- 0. Keep this script's own role DDL out of pg_stat_statements (#3899). Step 1 sends each password as an
 --    ALTER ROLE ... PASSWORD literal, and while pg_stat_statements is loaded with utility tracking on (the
 --    module's default), it records that statement VERBATIM, password included, where any superuser or
 --    pg_read_all_stats member (a monitoring agent's pg_monitor login, say) can read it. This covers this
---    session only; step 1b says how to turn it off for good. Harmless when the module is not loaded, and
---    superuser-only when it is, like the rest of this script.
+--    session only; step 1b says how to turn it off for good. Harmless when the module is not loaded. When it is
+--    loaded, this SET needs a superuser, or an owner that was granted SET on the parameter (PostgreSQL 15 and
+--    later): for any other owner it fails, and the first statement of the guard in step 1 then stops the run
+--    before a password is sent.
 SET pg_stat_statements.track_utility = off;
+
+--    pg_stat_monitor tracks utility statements through pg_stat_monitor.pgsm_track_utility (on by default), so it gets
+--    the same switch and the same stop in the guard. The setting can be changed by any role.
+SET pg_stat_monitor.pgsm_track_utility = off;
+
+--    The same for the server log. log_statement set to ddl, mod or all writes each ALTER ROLE ... PASSWORD line to
+--    the log as sent, and log_min_duration_statement (or log_min_duration_sample) at 0 or more writes it with its
+--    duration, so these turn that logging off for this session (this run's own role and grant statements are then
+--    not logged either). A statement that fails is written to the log with its text whenever its error is at or
+--    above log_min_error_statement (error by default), so that is raised to panic, which no statement reaches. The
+--    debug_print_parse, debug_print_rewritten and debug_print_plan settings write a statement's tree, literals
+--    included, so they are switched off too, and so is pgaudit.log_statement, which adds the statement text to
+--    pgaudit's entries. Every one of them except the debug_print ones is superuser-only, so an owner that was not granted SET on it
+--    (PostgreSQL 15 and later) is refused, quietly, and the setting stays as it is: the README says what that owner
+--    does then. A setting this server does not have (the two sampling ones need PostgreSQL 13 and 12) is skipped.
+DO $$
+DECLARE
+   log_setting record;
+BEGIN
+   FOR log_setting IN
+      SELECT name, value
+      FROM (VALUES ('log_statement', 'none'), ('log_min_duration_statement', '-1'),
+                   ('log_min_duration_sample', '-1'), ('log_transaction_sample_rate', '0'),
+                   ('log_min_error_statement', 'panic'), ('debug_print_parse', 'off'),
+                   ('debug_print_rewritten', 'off'), ('debug_print_plan', 'off'),
+                   ('pgaudit.log_statement', 'off')) AS log_settings (name, value)
+   LOOP
+      BEGIN
+         PERFORM set_config(log_setting.name, log_setting.value, false);
+      EXCEPTION WHEN insufficient_privilege OR undefined_object THEN
+         NULL;
+      END;
+   END LOOP;
+END $$;
+
+--    What step 0 could not turn off is said here, before any password is sent: the role running the script was not
+--    allowed to change the setting, so the run's password lines are written to the server log. The settings are
+--    log_statement at ddl, mod or all, log_min_duration_statement at 0 or more, log_transaction_sample_rate above 0
+--    (every statement of a sampled transaction is logged), log_min_duration_sample at 0 or more with
+--    log_statement_sample_rate above 0, and pgaudit.log covering the role class (role or all, and not -role) while
+--    pgaudit.log_statement is on. This is a WARNING and the run goes on, because the passwords may already be
+--    SCRAM-SHA-256 verifiers.
+DO $$
+DECLARE
+   logging_on text;
+BEGIN
+   SELECT string_agg(name || ' = ' || setting
+                     || CASE name
+                           WHEN 'log_min_duration_sample' THEN ' with log_statement_sample_rate = '
+                              || (SELECT sample.setting FROM pg_settings AS sample WHERE sample.name = 'log_statement_sample_rate')
+                           WHEN 'pgaudit.log' THEN ' with pgaudit.log_statement = on'
+                           ELSE ''
+                        END, ', ' ORDER BY name) INTO logging_on
+   FROM pg_settings
+   WHERE CASE name
+            WHEN 'log_statement' THEN setting IN ('ddl', 'mod', 'all')
+            WHEN 'log_min_duration_statement' THEN setting::bigint >= 0
+            WHEN 'log_transaction_sample_rate' THEN setting::numeric > 0
+            WHEN 'log_min_duration_sample' THEN setting::bigint >= 0
+               AND (SELECT sample.setting::numeric FROM pg_settings AS sample WHERE sample.name = 'log_statement_sample_rate') > 0
+            WHEN 'pgaudit.log' THEN (SELECT statement.setting FROM pg_settings AS statement WHERE statement.name = 'pgaudit.log_statement') = 'on'
+               AND (string_to_array(replace(lower(setting), ' ', ''), ',') && ARRAY['role', 'all'])
+               AND NOT ('-role' = ANY (string_to_array(replace(lower(setting), ' ', ''), ',')))
+            ELSE false
+         END;
+   IF logging_on IS NOT NULL THEN
+      RAISE WARNING 'The server log records the statements of this run (%). The ALTER ROLE ... PASSWORD lines are written to it with their passwords, because step 0 could not turn that logging off for this role. Put a SCRAM-SHA-256 verifier in each ALTER ROLE line in place of the literal, or set the passwords afterwards with the psql password command, or run this script as a superuser.', logging_on;
+   END IF;
+END $$;
 
 -- 1. Roles (CREATE ROLE has no IF NOT EXISTS -> guard with a DO block). Idempotent: re-running
 --    this script re-asserts the password below, so it doubles as a password rotation. A fresh role
 --    is stamped 'darling-managed'; an unmarked same-named role fails loud (never repurposed).
+--    The guard carries no password. A statement that fails is written to the server log with its whole text,
+--    and the guard is the statement that fails when it stops the run, so it creates each role without one and the
+--    ALTER ROLE lines after it set them.
 -- Stop on an error for this guard alone (#4746): a script-wide stop would end a non-superuser owner before any grant.
 -- The caller's own ON_ERROR_STOP (psql -v ON_ERROR_STOP=1, or psqlrc) is saved first and put back after the guard,
 -- not forced off. From psql 10 an unset ON_ERROR_STOP reads as off, so the saved value is always on or off. In psql 9.6
@@ -102,31 +223,224 @@ SET pg_stat_statements.track_utility = off;
 \set darling_saved_stop :ON_ERROR_STOP
 \set ON_ERROR_STOP on
 DO $$
+DECLARE
+   other_holder record;
+   unchangeable text;
+   remedy text;
 BEGIN
+   -- First, before any role is touched: with utility tracking still on for this session, pg_stat_statements would
+   -- record the password statements below verbatim, so stop. NULL (the module is not loaded) passes.
+   IF current_setting('pg_stat_statements.track_utility', true) = 'on' THEN
+      RAISE EXCEPTION 'pg_stat_statements.track_utility is on for this session. pg_stat_statements records the password statements of this script verbatim, and any pg_read_all_stats member can read them. The script created and changed nothing. Do one of these three things, then run the script again. Run GRANT SET ON PARAMETER pg_stat_statements.track_utility TO <owner> as a superuser (PostgreSQL 15 and later). Then step 0 can turn it off for this session. Or set pg_stat_statements.track_utility = off in postgresql.conf and reload, which turns it off for the whole cluster (step 1b). Or run this script as a superuser.';
+   END IF;
+   -- The same stop for pg_stat_monitor, which tracks utility statements through pgsm_track_utility. Any role can switch it
+   -- off for its session and step 0 does, so this is reached only when that setting is on anyway (a parameter reset, say).
+   IF current_setting('pg_stat_monitor.pgsm_track_utility', true) IN ('on', 'yes', 'true', '1') THEN
+      RAISE EXCEPTION 'pg_stat_monitor.pgsm_track_utility is on for this session. pg_stat_monitor tracks the password statements of this script. The script created and changed nothing. Set pg_stat_monitor.pgsm_track_utility = off in postgresql.conf and reload, which turns it off for the whole cluster, then run the script again.';
+   END IF;
    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'admin') THEN
-      CREATE ROLE admin LOGIN NOSUPERUSER PASSWORD 'CHANGE_ME_ADMIN_PASSWORD';
+      CREATE ROLE admin LOGIN NOSUPERUSER;
       COMMENT ON ROLE admin IS 'darling-managed';
    ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = 'admin'), 'pg_authid') IS DISTINCT FROM 'darling-managed' THEN
       RAISE EXCEPTION 'Role "admin" already exists and was not created by Darling (missing the ''darling-managed'' marker comment). Rename or drop it before provisioning so Darling does not repurpose an unrelated login.';
    END IF;
    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'viewer') THEN
-      CREATE ROLE viewer LOGIN NOSUPERUSER PASSWORD 'CHANGE_ME_VIEWER_PASSWORD';
+      CREATE ROLE viewer LOGIN NOSUPERUSER;
       COMMENT ON ROLE viewer IS 'darling-managed';
    ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = 'viewer'), 'pg_authid') IS DISTINCT FROM 'darling-managed' THEN
       RAISE EXCEPTION 'Role "viewer" already exists and was not created by Darling (missing the ''darling-managed'' marker comment). Rename or drop it before provisioning so Darling does not repurpose an unrelated login.';
    END IF;
    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mcp') THEN
-      CREATE ROLE mcp LOGIN NOSUPERUSER PASSWORD 'CHANGE_ME_MCP_PASSWORD';
+      CREATE ROLE mcp LOGIN NOSUPERUSER;
       COMMENT ON ROLE mcp IS 'darling-managed';
    ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = 'mcp'), 'pg_authid') IS DISTINCT FROM 'darling-managed' THEN
       RAISE EXCEPTION 'Role "mcp" already exists and was not created by Darling (missing the ''darling-managed'' marker comment). Rename or drop it before provisioning so Darling does not repurpose an unrelated login.';
    END IF;
+   -- The marker does not show who made a role, so a marked role is also refused while a role that is not a
+   -- superuser, not the role running this script and not the database owner holds ADMIN OPTION on it: that role
+   -- could reset its password and grant it onward. (A role this run created has no holder but the one running it.)
+   -- Plain memberships do not count, and neither does the owner of a first run that a superuser then rotates.
+   FOR other_holder IN
+      SELECT granted.rolname AS role_name, string_agg(quote_ident(holder.rolname), ', ' ORDER BY holder.rolname) AS holders
+      FROM pg_auth_members AS membership
+      JOIN pg_roles AS granted ON granted.oid = membership.roleid
+      JOIN pg_roles AS holder ON holder.oid = membership.member
+      WHERE granted.rolname IN ('admin', 'viewer', 'mcp')
+        AND membership.admin_option
+        AND NOT holder.rolsuper
+        AND holder.rolname <> current_user
+        AND holder.oid <> (SELECT datdba FROM pg_database WHERE datname = current_database())
+      GROUP BY granted.rolname
+      ORDER BY granted.rolname
+   LOOP
+      RAISE EXCEPTION 'Role "%" carries the ''darling-managed'' marker, but another login holds ADMIN OPTION on it: %. That login is not a superuser, not the database owner and not the role running this script. It can reset the password of the role or grant the role to other roles, and the marker does not show who made the role. To go on, run this script as that login, which this check leaves out. If more than one login is listed, run the script as one of them after the others lose the option. Or, as a superuser, revoke that ADMIN OPTION (a login that created the role cannot revoke it itself), or drop the role.', other_holder.role_name, other_holder.holders;
+   END LOOP;
+   -- A role that is not a superuser must also be able to change the three roles. If it cannot, each ALTER ROLE ... PASSWORD
+   -- below fails, the server writes the failed statement to its log WITH the password, and psql exits 0 unless the caller
+   -- set ON_ERROR_STOP. So a run by such a role stops here, before any password is sent. The ALTER ROLE lines need:
+   -- the CREATEROLE attribute; roles that are not superusers; from PostgreSQL 16, ADMIN OPTION on each role (pg_has_role
+   -- tests the same thing ALTER ROLE does, and a role this run just created passes because its creator holds the option);
+   -- before 16, roles without REPLICATION. Every role exists at this point, and a superuser is never stopped here.
+   IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+      IF NOT (SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user) THEN
+         RAISE EXCEPTION 'The role running this script, %, is not a superuser and does not have CREATEROLE. It cannot change the passwords of the roles admin, viewer and mcp. The script created and changed nothing. It stopped here so that a failed ALTER ROLE line does not write a password to the server log. Run this script again as a superuser, or as a role that has CREATEROLE.', quote_ident(current_user);
+      END IF;
+      SELECT string_agg(quote_ident(rolname), ', ' ORDER BY rolname) INTO unchangeable
+      FROM pg_roles
+      WHERE rolname IN ('admin', 'viewer', 'mcp') AND rolsuper;
+      IF unchangeable IS NOT NULL THEN
+         RAISE EXCEPTION 'These roles are superusers: %. The role running this script, %, is not a superuser, so it cannot change them. The script created and changed nothing. It stopped here so that a failed ALTER ROLE line does not write a password to the server log. Run this script again as a superuser.', unchangeable, quote_ident(current_user);
+      END IF;
+      IF current_setting('server_version_num')::int >= 160000 THEN
+         SELECT string_agg(quote_ident(rolname), ', ' ORDER BY rolname), string_agg(format('GRANT %I TO %I WITH ADMIN OPTION;', rolname, current_user), ' ' ORDER BY rolname)
+         INTO unchangeable, remedy
+         FROM pg_roles
+         WHERE rolname IN ('admin', 'viewer', 'mcp') AND NOT pg_has_role(current_user, oid, 'MEMBER WITH ADMIN OPTION');
+         IF unchangeable IS NOT NULL THEN
+            RAISE EXCEPTION 'The role running this script, %, does not hold ADMIN OPTION on these roles: %. From PostgreSQL 16 a role needs that option to change the password of another role. The script created and changed nothing. It stopped here so that a failed ALTER ROLE line does not write a password to the server log. Run this script as a superuser. Or, as a superuser, run these statements and then run this script again: %', quote_ident(current_user), unchangeable, remedy;
+         END IF;
+      ELSE
+         SELECT string_agg(quote_ident(rolname), ', ' ORDER BY rolname) INTO unchangeable
+         FROM pg_roles
+         WHERE rolname IN ('admin', 'viewer', 'mcp') AND rolreplication;
+         IF unchangeable IS NOT NULL THEN
+            RAISE EXCEPTION 'These roles have the REPLICATION attribute: %. Before PostgreSQL 16 only a superuser can change a role that has it, and the role running this script, %, is not a superuser. The script created and changed nothing. It stopped here so that a failed ALTER ROLE line does not write a password to the server log. Run this script again as a superuser.', unchangeable, quote_ident(current_user);
+         END IF;
+      END IF;
+      -- A membership of one of the three roles that outranks every grant below (a role that is, or is a member of, the
+      -- owner, a superuser or BYPASSRLS role, or a predefined role that reads or writes every table or the server's files
+      -- or programs) is revoked after the passwords, and the block that revokes it can only warn when the role running
+      -- this script lacks the right to. So the run stops here, before a password is sent, as it does when it cannot change
+      -- the roles at all. From PostgreSQL 16 revoking needs ADMIN OPTION on the role the membership is in, and no role
+      -- holds that on itself; it also removes only the row recorded with the grantor it names (the block that revokes
+      -- names the recorded one), so the role running this script must be able to act as that grantor, which it can
+      -- when it is, or inherits the privileges of, that role. Before 16 CREATEROLE is enough, except for a superuser role.
+      SELECT string_agg(format('%I in %I', member.rolname, granted.rolname), ', ' ORDER BY member.rolname, granted.rolname)
+      INTO unchangeable
+      FROM pg_auth_members AS membership
+      JOIN pg_roles AS granted ON granted.oid = membership.roleid
+      JOIN pg_roles AS member ON member.oid = membership.member
+      WHERE member.rolname IN ('admin', 'viewer', 'mcp')
+        AND EXISTS (
+           SELECT 1
+           FROM pg_roles AS voiding
+           WHERE (voiding.rolsuper
+                  OR voiding.rolbypassrls
+                  OR voiding.oid IN ((SELECT oid FROM pg_roles WHERE rolname = current_user), (SELECT datdba FROM pg_database WHERE datname = current_database()))
+                  OR voiding.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program'))
+             AND pg_has_role(granted.oid, voiding.oid, 'MEMBER'))
+        AND NOT CASE WHEN current_setting('server_version_num')::int >= 160000
+                     THEN pg_has_role(current_user, granted.oid, 'MEMBER WITH ADMIN OPTION')
+                          AND pg_has_role(current_user, membership.grantor, 'USAGE')
+                     ELSE NOT granted.rolsuper END;
+      IF unchangeable IS NOT NULL THEN
+         RAISE EXCEPTION 'These roles are members of roles whose privileges outrank the grants below: %. The role running this script, %, cannot revoke those memberships. The script created and changed nothing. It stopped here before a password is sent, so that no role keeps privileges the carve does not hold back. Run this script again as a superuser, or have a superuser revoke those memberships first (from PostgreSQL 16 with GRANTED BY the grantor that recorded each one).', unchangeable, quote_ident(current_user);
+      END IF;
+   END IF;
 END $$;
 \set ON_ERROR_STOP :darling_saved_stop
 
-ALTER ROLE admin  LOGIN NOSUPERUSER PASSWORD 'CHANGE_ME_ADMIN_PASSWORD';
-ALTER ROLE viewer LOGIN NOSUPERUSER PASSWORD 'CHANGE_ME_VIEWER_PASSWORD';
-ALTER ROLE mcp    LOGIN NOSUPERUSER PASSWORD 'CHANGE_ME_MCP_PASSWORD';
+-- The passwords. Each ALTER names LOGIN and the password only: NOSUPERUSER here would fail for an owner that is
+-- not a superuser (it needs one for any change to that attribute), and a run that fails these three lines rotates
+-- nothing while psql still exits 0. The roles were created NOSUPERUSER; the next block takes the attributes back.
+ALTER ROLE admin  LOGIN PASSWORD 'CHANGE_ME_ADMIN_PASSWORD';
+ALTER ROLE viewer LOGIN PASSWORD 'CHANGE_ME_VIEWER_PASSWORD';
+ALTER ROLE mcp    LOGIN PASSWORD 'CHANGE_ME_MCP_PASSWORD';
+
+-- Attributes and memberships (managed mode's step 1b and section 11). A role this script ADOPTS (it already
+-- carries the marker) keeps whatever was granted to it since: CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS on
+-- viewer or mcp would outrank every grant below, and so would a membership (pg_read_all_data undoes the
+-- secret-column carve, and a membership in the owner is every privilege the owner has). So every one is taken
+-- back, every run.
+--   As a superuser these are managed mode's statements exactly: every attribute off by name, and every membership
+--   in which one of the roles is the MEMBER revoked, GRANTED BY the recorded grantor (since PostgreSQL 16 a plain
+--   REVOKE removes only the grants the bootstrap superuser made), with CASCADE (a grant the member itself made
+--   with an ADMIN OPTION depends on the membership).
+--   Otherwise it goes as far as the owner's privileges allow. From PostgreSQL 16, REPLICATION, BYPASSRLS and
+--   CREATEDB need the owner to hold that attribute itself, and a membership can be revoked only with ADMIN OPTION on
+--   the role it is in. Before 16, REPLICATION and BYPASSRLS need a superuser. SUPERUSER always needs a superuser,
+--   and a role that has SUPERUSER, or before 16 REPLICATION, has already stopped the run at the guard. What remains
+--   draws a WARNING, and the run carries on. Any other error (a lock or statement timeout, a concurrent change to a
+--   role) stops the run: the attributes and the memberships are two blocks, so a failure in one never undoes the
+--   other, and the stop is on for both, so psql does not carry on past a role that kept an attribute or a membership.
+\set ON_ERROR_STOP on
+DO $$
+DECLARE
+   as_superuser boolean := (SELECT rolsuper FROM pg_roles WHERE rolname = current_user);
+   item record;
+   attribute text;
+BEGIN
+   FOR item IN
+      SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls
+      FROM pg_roles
+      WHERE rolname IN ('admin', 'viewer', 'mcp')
+      ORDER BY rolname
+   LOOP
+      IF as_superuser THEN
+         EXECUTE format('ALTER ROLE %I NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS', item.rolname);
+      ELSE
+         FOREACH attribute IN ARRAY array_remove(ARRAY[
+               CASE WHEN item.rolsuper THEN 'SUPERUSER' END,
+               CASE WHEN item.rolcreaterole THEN 'CREATEROLE' END,
+               CASE WHEN item.rolcreatedb THEN 'CREATEDB' END,
+               CASE WHEN item.rolreplication THEN 'REPLICATION' END,
+               CASE WHEN item.rolbypassrls THEN 'BYPASSRLS' END], NULL)
+         LOOP
+            BEGIN
+               EXECUTE format('ALTER ROLE %I NO%s', item.rolname, attribute);
+            EXCEPTION WHEN insufficient_privilege THEN
+               RAISE WARNING 'Role "%" still has the % attribute: switching it off needs a superuser, or, from PostgreSQL 16, an owner that holds % itself.', item.rolname, attribute, attribute;
+            END;
+         END LOOP;
+      END IF;
+   END LOOP;
+END $$;
+
+DO $$
+DECLARE
+   as_superuser boolean := (SELECT rolsuper FROM pg_roles WHERE rolname = current_user);
+   item record;
+   remaining text;
+BEGIN
+   FOR item IN
+      SELECT granted.rolname AS granted, member.rolname AS member, grantor.rolname AS grantor
+      FROM pg_auth_members AS membership
+      JOIN pg_roles AS granted ON granted.oid = membership.roleid
+      JOIN pg_roles AS member ON member.oid = membership.member
+      LEFT JOIN pg_roles AS grantor ON grantor.oid = membership.grantor
+      WHERE member.rolname IN ('admin', 'viewer', 'mcp')
+   LOOP
+      BEGIN
+         EXECUTE format('REVOKE %I FROM %I', item.granted, item.member)
+            || CASE WHEN (as_superuser OR current_setting('server_version_num')::int >= 160000) AND item.grantor IS NOT NULL
+                    THEN format(' GRANTED BY %I', item.grantor) ELSE '' END
+            || ' CASCADE';
+      EXCEPTION WHEN insufficient_privilege THEN
+         RAISE WARNING 'Role "%" is still a member of "%": revoking that needs a superuser, or ADMIN OPTION on "%" and the right to act as "%", the role that granted it.', item.member, item.granted, item.granted, item.grantor;
+      END;
+   END LOOP;
+   -- Nothing that outranks the grants below may be left. From PostgreSQL 16 a revoke removes only the row recorded
+   -- with the grantor it names and warns, without an error, when it finds none, so the memberships are read again
+   -- here and a voiding one that is still there stops the run (exit 3 under the stop above) before any grant.
+   SELECT string_agg(format('%I in %I', member.rolname, granted.rolname), ', ' ORDER BY member.rolname, granted.rolname)
+   INTO remaining
+   FROM pg_auth_members AS membership
+   JOIN pg_roles AS granted ON granted.oid = membership.roleid
+   JOIN pg_roles AS member ON member.oid = membership.member
+   WHERE member.rolname IN ('admin', 'viewer', 'mcp')
+     AND EXISTS (
+        SELECT 1
+        FROM pg_roles AS voiding
+        WHERE (voiding.rolsuper
+               OR voiding.rolbypassrls
+               OR voiding.oid IN ((SELECT oid FROM pg_roles WHERE rolname = current_user), (SELECT datdba FROM pg_database WHERE datname = current_database()))
+               OR voiding.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program'))
+          AND pg_has_role(granted.oid, voiding.oid, 'MEMBER'));
+   IF remaining IS NOT NULL THEN
+      RAISE EXCEPTION 'These roles are still members of roles whose privileges outrank the grants below: %. The run revoked every membership it could, and these remain, so it stopped before any grant. The passwords above were already set. Revoke them as a superuser (REVOKE <role> FROM <member> GRANTED BY <grantor>, as recorded in pg_auth_members), then run this script again.', remaining;
+   END IF;
+END $$;
+\set ON_ERROR_STOP :darling_saved_stop
 
 -- 1a. statement_timeout backstop on viewer and mcp (Custom Views v2, #1563): the web dashboard's compose surface
 --     and the MCP custom-view tools run network-reachable aggregations over a raw, no-rollup store, so this caps
@@ -188,6 +502,14 @@ ALTER ROLE mcp    SET log_parameter_max_length = 0;
 --    holds no secrets, so admin+viewer read all of it. config: admin (the writer, and the Settings
 --    window's identity) reads every column; viewer reads all config tables too -- MINUS the secret columns
 --    carved in step 2b. mcp gets viewer's read surface in its own statements, carved the same way.
+--    Steps 2 to 2d are ONE transaction (managed mode sends the same statements as one batch, which is one
+--    implicit transaction): the blanket config grants below give viewer and mcp table-wide SELECT on the secret
+--    columns, and on the password key tables (step 2d), until the carve and the revoke take it back, and committed on
+--    their own they would leave that window open on every run, and for good if a statement in them failed. Now they
+--    commit together or not at all, so an error anywhere in them leaves the read roles with no read access, never a
+--    blanket grant. psql rolls the
+--    transaction back at the COMMIT after an error, with ON_ERROR_STOP off, and at exit with it on.
+BEGIN;
 GRANT USAGE ON SCHEMA collect, config TO admin, viewer;
 GRANT SELECT ON ALL TABLES IN SCHEMA collect TO admin, viewer;
 GRANT SELECT ON ALL TABLES IN SCHEMA config  TO admin, viewer;
@@ -244,10 +566,100 @@ GRANT SELECT (id, smtp_host, smtp_port, smtp_use_ssl, smtp_from_address, smtp_re
 -- same names, so the same carve applies: the webhook URLs and the PagerDuty routing key are bearer secrets and
 -- are deliberately NOT granted. configured_channels is a GENERATED presence column (which channels a route
 -- sets, never their values) that exists so this carve can still answer "what does route 3 configure".
--- Created by V131, so re-run this script AFTER the service has migrated your store to V131.
+-- Created by V131, so re-run this script AFTER the service has migrated your store to V131. On a store below V131
+-- the pair below is skipped (the table does not exist yet), so the rest of the carve still commits; unguarded, its
+-- error would abort the transaction and roll back the grants above with it. It runs as EXECUTE of a dollar-quoted
+-- string, so the statements are sent only when the table exists. If they fail on a store that has the table, the
+-- whole transaction rolls back and the read roles keep no access. The five agent_* route columns are V184 (#5632):
+-- their grant runs only when agent_level exists, so on a V181-V183 store the carve still commits without them.
+DO $$
+BEGIN
+   IF to_regclass('config.config_notification_routes') IS NOT NULL THEN
+      EXECUTE $v131$
 REVOKE SELECT ON config.config_notification_routes FROM viewer;
-GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at)
+GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at, scope_server_id, scope_tag_id)
     ON config.config_notification_routes TO viewer;
+$v131$;
+      IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = 'config.config_notification_routes'::regclass
+                   AND attname = 'agent_level' AND NOT attisdropped) THEN
+         EXECUTE $v184$
+GRANT SELECT (agent_level, agent_max_per_hour, agent_max_per_day, agent_lease_minutes, agent_expiry_minutes)
+    ON config.config_notification_routes TO viewer;
+$v184$;
+      END IF;
+      -- V187 (#5825): a route's override of the channels' "send resolutions" flags. Non-secret. Granted here, inside
+      -- the routes table's guard and on its own column, so a store without the table or below V187 still commits.
+      IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = 'config.config_notification_routes'::regclass
+                   AND attname = 'send_resolutions' AND NOT attisdropped) THEN
+         EXECUTE $v187$
+GRANT SELECT (send_resolutions) ON config.config_notification_routes TO viewer;
+$v187$;
+      END IF;
+   END IF;
+END $$;
+-- V187 (#5825): the four per-channel "send resolutions" flags. Non-secret (behaviour toggles, like
+-- pagerduty_auto_resolve), so they are granted. Guarded on the column, so a store below V187 still commits the rest
+-- of the carve. This block names config_notification only: a grant on the routes table here, outside that table's
+-- guard, failed on a store without it and rolled the whole carve back (#5855 review).
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = 'config.config_notification'::regclass
+                AND attname = 'slack_send_resolutions' AND NOT attisdropped) THEN
+      EXECUTE $v187$
+GRANT SELECT (slack_send_resolutions, teams_send_resolutions, generic_send_resolutions, email_send_resolutions)
+    ON config.config_notification TO viewer;
+$v187$;
+   END IF;
+END $$;
+-- V193 (#5997): when the previous webhook signing key stops being sent, on the settings row, and on a route that and the
+-- fallback route. Non-secret. The signing keys (signing_key, previous_signing_key) are deliberately NOT granted: whoever
+-- holds one can forge a signed send. Guarded on the column, so a store below V193 (or without the routes table) still
+-- commits the rest of the carve.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_notification')
+                AND attname = 'previous_signing_key_until' AND NOT attisdropped) THEN
+      EXECUTE $v193$
+GRANT SELECT (previous_signing_key_until) ON config.config_notification TO viewer;
+$v193$;
+   END IF;
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_notification_routes')
+                AND attname = 'fallback_route_id' AND NOT attisdropped) THEN
+      EXECUTE $v193r$
+GRANT SELECT (fallback_route_id, previous_signing_key_until) ON config.config_notification_routes TO viewer;
+$v193r$;
+   END IF;
+END $$;
+-- V203 (#6170): the hypothetical-index login's NAME, on the registry. Non-secret, like remediation_username; the password
+-- column (hypothetical_index_encrypted_password) is deliberately NOT granted. Guarded on the column, so a store below V203
+-- still commits the rest of the carve instead of failing on a column it does not have yet.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_monitored_servers')
+                AND attname = 'hypothetical_index_username' AND NOT attisdropped) THEN
+      EXECUTE $v203$
+GRANT SELECT (hypothetical_index_username) ON config.config_monitored_servers TO viewer;
+$v203$;
+   END IF;
+END $$;
+-- V213 (#6254): the Query Store replica HOST, on the registry. Non-secret, like host. Guarded on the column, so a store below V213
+-- still commits the rest of the carve instead of failing on a column it does not have yet.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_monitored_servers')
+                AND attname = 'query_store_replica' AND NOT attisdropped) THEN
+      EXECUTE $v211r$
+GRANT SELECT (query_store_replica) ON config.config_monitored_servers TO viewer;
+$v211r$;
+   END IF;
+END $$;
 
 -- 2c. The SAME carve for mcp (#3914): it reads exactly what viewer reads, so it is denied exactly the same
 --     secret columns -- the column lists are identical to 2b's, and the drift test holds both to the C# list.
@@ -261,8 +673,11 @@ GRANT SELECT (server_id, name, host, database, auth, username, encrypt_mode, tru
               aws_role_arn, aws_external_id_set)
     ON config.config_monitored_servers TO mcp;
 REVOKE SELECT ON config.config_command FROM mcp;
+-- (#6230) result_json is withheld from mcp: it holds the result of every command type, including the Viewer-only ones.
+--     mcp reads a command's result through config.read_mcp_command_result (created below), which answers only for the
+--     command types the MCP tools queue. The REVOKE above removes a result_json grant an earlier run made.
 GRANT SELECT (command_id, created_at, requested_by, command_type, target_server_id, status, claimed_at,
-              completed_at, result_status, result_json, service_instance)
+              completed_at, result_status, service_instance)
     ON config.config_command TO mcp;
 REVOKE SELECT ON config.config_notification FROM mcp;
 GRANT SELECT (id, smtp_host, smtp_port, smtp_use_ssl, smtp_from_address, smtp_recipients,
@@ -272,13 +687,133 @@ GRANT SELECT (id, smtp_host, smtp_port, smtp_use_ssl, smtp_from_address, smtp_re
               -- beside it), so it stays granted.
               pagerduty_auto_resolve)
     ON config.config_notification TO mcp;
+-- V131 again, guarded the same way (see 2b).
+DO $$
+BEGIN
+   IF to_regclass('config.config_notification_routes') IS NOT NULL THEN
+      EXECUTE $v131$
 REVOKE SELECT ON config.config_notification_routes FROM mcp;
-GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at)
+GRANT SELECT (route_id, metric_match, smtp_recipients, configured_channels, enabled, modified_at, scope_server_id, scope_tag_id)
     ON config.config_notification_routes TO mcp;
+$v131$;
+      IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = 'config.config_notification_routes'::regclass
+                   AND attname = 'agent_level' AND NOT attisdropped) THEN
+         EXECUTE $v184$
+GRANT SELECT (agent_level, agent_max_per_hour, agent_max_per_day, agent_lease_minutes, agent_expiry_minutes)
+    ON config.config_notification_routes TO mcp;
+$v184$;
+      END IF;
+      -- V187 (#5825): a route's override of the channels' "send resolutions" flags. Non-secret. Granted here, inside
+      -- the routes table's guard and on its own column, so a store without the table or below V187 still commits.
+      IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = 'config.config_notification_routes'::regclass
+                   AND attname = 'send_resolutions' AND NOT attisdropped) THEN
+         EXECUTE $v187$
+GRANT SELECT (send_resolutions) ON config.config_notification_routes TO mcp;
+$v187$;
+      END IF;
+   END IF;
+END $$;
+-- V187 (#5825): the four per-channel "send resolutions" flags. Non-secret (behaviour toggles, like
+-- pagerduty_auto_resolve), so they are granted. Guarded on the column, so a store below V187 still commits the rest
+-- of the carve. This block names config_notification only: a grant on the routes table here, outside that table's
+-- guard, failed on a store without it and rolled the whole carve back (#5855 review).
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = 'config.config_notification'::regclass
+                AND attname = 'slack_send_resolutions' AND NOT attisdropped) THEN
+      EXECUTE $v187$
+GRANT SELECT (slack_send_resolutions, teams_send_resolutions, generic_send_resolutions, email_send_resolutions)
+    ON config.config_notification TO mcp;
+$v187$;
+   END IF;
+END $$;
+-- V193 (#5997): when the previous webhook signing key stops being sent, on the settings row, and on a route that and the
+-- fallback route. Non-secret. The signing keys (signing_key, previous_signing_key) are deliberately NOT granted: whoever
+-- holds one can forge a signed send. Guarded on the column, so a store below V193 (or without the routes table) still
+-- commits the rest of the carve.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_notification')
+                AND attname = 'previous_signing_key_until' AND NOT attisdropped) THEN
+      EXECUTE $v193$
+GRANT SELECT (previous_signing_key_until) ON config.config_notification TO mcp;
+$v193$;
+   END IF;
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_notification_routes')
+                AND attname = 'fallback_route_id' AND NOT attisdropped) THEN
+      EXECUTE $v193r$
+GRANT SELECT (fallback_route_id, previous_signing_key_until) ON config.config_notification_routes TO mcp;
+$v193r$;
+   END IF;
+END $$;
+-- V203 (#6170): the hypothetical-index login's NAME, on the registry. Non-secret, like remediation_username; the password
+-- column (hypothetical_index_encrypted_password) is deliberately NOT granted. Guarded on the column, so a store below V203
+-- still commits the rest of the carve instead of failing on a column it does not have yet.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_monitored_servers')
+                AND attname = 'hypothetical_index_username' AND NOT attisdropped) THEN
+      EXECUTE $v203$
+GRANT SELECT (hypothetical_index_username) ON config.config_monitored_servers TO mcp;
+$v203$;
+   END IF;
+END $$;
+-- V213 (#6254): the Query Store replica HOST, on the registry. Non-secret, like host. Guarded on the column, so a store below V213
+-- still commits the rest of the carve instead of failing on a column it does not have yet.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_monitored_servers')
+                AND attname = 'query_store_replica' AND NOT attisdropped) THEN
+      EXECUTE $v211r$
+GRANT SELECT (query_store_replica) ON config.config_monitored_servers TO mcp;
+$v211r$;
+   END IF;
+END $$;
 -- The collector run times (V160, #4938): get_collection_health reads them as mcp. The blanket config SELECT above
 -- already covers the table when it exists at that point; naming it makes the grant explicit and idempotent, mirroring
 -- how the schedule tables are read, so a store that reaches V160 after an earlier provisioning is covered by the re-run.
+-- Guarded like the V131 pair above: on a store below V160 the table does not exist, and an unguarded GRANT would abort
+-- the transaction and roll back every grant before it.
+DO $$
+BEGIN
+   IF to_regclass('config.config_collector_run_times') IS NOT NULL THEN
+      EXECUTE $v160$
 GRANT SELECT ON config.config_collector_run_times TO mcp;
+$v160$;
+   END IF;
+END $$;
+
+-- 2d. The password key tables (V165 and V167, #5366), still inside the transaction. The blanket config grants above gave
+--     SELECT on them to admin, viewer and mcp, and the COMMIT below makes whatever is granted by then durable, so the
+--     revoke is in effect at the COMMIT: every privilege on each of these tables that exists is taken from PUBLIC and
+--     the three roles, and SELECT on the key and service-state tables goes back to admin alone, the same result as
+--     managed mode's batch. Step 3g repeats it after the grants of step 3, which give admin write access, and also
+--     removes triggers and foreign keys, so a stop anywhere between here and 3g never leaves viewer or mcp able to read
+--     them. The tables are looked up one at a time: a store below V165 has none, a store at V165 or V166 has no
+--     candidate table.
+DO $do$
+DECLARE
+    key_table text;
+BEGIN
+    FOREACH key_table IN ARRAY ARRAY['password_key', 'password_key_service', 'legacy_secret_pin', 'legacy_secret_pin_marker', 'legacy_secret_pin_candidate', 'pseudonym_key']
+    LOOP
+        IF pg_catalog.to_regclass(pg_catalog.format('config.%I', key_table)) IS NOT NULL THEN
+            EXECUTE pg_catalog.format('REVOKE ALL ON config.%I FROM PUBLIC, admin, viewer, mcp CASCADE', key_table);
+            IF key_table IN ('password_key', 'password_key_service') THEN
+                EXECUTE pg_catalog.format('GRANT SELECT ON config.%I TO admin', key_table);
+            END IF;
+        END IF;
+    END LOOP;
+END
+$do$;
+COMMIT;
 
 -- 3. config writes -- admin gets the whole schema.
 GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA config TO admin;
@@ -316,17 +851,48 @@ GRANT INSERT, UPDATE, DELETE ON config.config_mute_rules TO viewer;
 GRANT UPDATE (config_version, updated_at) ON config.config_service TO viewer;
 GRANT INSERT, UPDATE, DELETE ON config.config_mute_rules TO mcp;
 GRANT UPDATE (config_version, updated_at) ON config.config_service TO mcp;
+-- #6230: pause_collection / resume_collection queue a pause or resume command through config.request_mcp_command, so mcp holds no
+--     write on the paused column. An earlier build granted it; this revoke takes it back from an upgraded store.
+REVOKE UPDATE (paused) ON config.config_service FROM mcp;
 -- #5085: the fleet server-tag write tools run as mcp; these two single-table grants are the admin gate. Both
---     tables are non-secret with no beacon trigger, and server_tags.id is an identity column (no sequence grant).
+--     tables are non-secret, and server_tags.id is an identity column (no sequence grant). V181 (#5750) put a
+--     statement-level reload-beacon trigger on each, so a tag write bumps config_service; the config_service column grant above covers it.
 GRANT INSERT, UPDATE, DELETE ON config.server_tags TO mcp;
 GRANT INSERT, UPDATE, DELETE ON config.server_tag_map TO mcp;
+-- #6227: the collector schedule tools (disable_collector, enable_collector, set_collector_frequency, set_collector_run_at,
+--     set_collector_retention) run as mcp and write the two non-secret schedule tables. Both carry a statement-level
+--     reload-beacon trigger that UPDATEs config_service.config_version as the caller; the column grant above covers it.
+--     The run-time table (V160) is skipped, with a warning, on a store the service has not upgraded that far.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.config_collector_schedules') IS NOT NULL THEN
+      REVOKE INSERT, UPDATE, DELETE ON config.config_collector_schedules FROM mcp;
+      GRANT INSERT (server_id, collector_name, enabled, frequency_minutes, retention_days) ON config.config_collector_schedules TO mcp;
+      GRANT UPDATE (enabled, frequency_minutes, retention_days) ON config.config_collector_schedules TO mcp;
+   ELSE
+      RAISE WARNING 'config.config_collector_schedules was not found, so its mcp grant was skipped. Run this script again after the service has upgraded the store.';
+   END IF;
+
+   IF pg_catalog.to_regclass('config.config_collector_run_times') IS NOT NULL THEN
+      REVOKE INSERT, UPDATE, DELETE ON config.config_collector_run_times FROM mcp;
+      GRANT INSERT (server_id, collector_name, run_at_minute) ON config.config_collector_run_times TO mcp;
+      GRANT UPDATE (run_at_minute) ON config.config_collector_run_times TO mcp;
+      GRANT DELETE ON config.config_collector_run_times TO mcp;
+   ELSE
+      RAISE WARNING 'config.config_collector_run_times was not found, so its mcp grant was skipped. Run this script again after the service has upgraded the store.';
+   END IF;
+END $do$;
 
 -- 3d-2. Alert History dismiss (#4843): the web dashboard's POST /api/alert-history/dismiss runs as viewer and
 --     writes `UPDATE config_alert_log SET dismissed = TRUE`. Column-level on exactly that one column, so viewer
 --     can flip the dismissed flag and cannot rewrite what an alert said or reach INSERT/DELETE. config_alert_log
 --     carries no trigger. The WPF read-only probe (has_table_privilege ... 'UPDATE') answers for the table-level
---     privilege only, so it stays false for viewer. mcp gets none: no MCP tool dismisses an alert.
+--     privilege only, so it stays false for viewer. mcp gets the same one-column grant just below (#6231).
 GRANT UPDATE (dismissed) ON config.config_alert_log TO viewer;
+-- #6231: the MCP dismiss_alert_history / restore_alert_history tools run as mcp and set the same one column, so mcp
+--     gets the same column-level grant (revoke first, so no table-level UPDATE lingers). No other column, no INSERT/DELETE.
+REVOKE UPDATE ON config.config_alert_log FROM mcp;
+GRANT UPDATE (dismissed) ON config.config_alert_log TO mcp;
 
 -- #5085: the web dashboard's /api/server-tags endpoints run as viewer, so viewer gets the same two single-table
 --     writes (the seat model decides who may call them; these grants are only the floor). The WPF Viewer's read-only
@@ -370,7 +936,8 @@ CREATE OR REPLACE FUNCTION config.edit_monitored_server(
    p_multi_subnet_failover boolean,
    p_monthly_cost_usd numeric,
    p_aws_role_arn text,
-   p_aws_external_id text)
+   p_aws_external_id text,
+   p_query_store_replica text)
 RETURNS TABLE (outcome text, new_modified_at timestamp)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -387,6 +954,9 @@ DECLARE
    v_old_encrypt_mode text;
    v_old_trust_server_certificate boolean;
    v_old_multi_subnet_failover boolean;
+   v_old_query_store_replica text;
+   v_query_store_replica text;
+   v_has_replica boolean;
    v_host text;
    v_port integer;
    v_auth text;
@@ -410,11 +980,12 @@ BEGIN
    p_columns := COALESCE(p_columns, ARRAY[]::text[]);
 
    SELECT s.modified_at, s.host, s.port, s.auth, s.database, s.read_only_intent, s.username, s.encrypt_mode,
-          s.trust_server_certificate, s.multi_subnet_failover, COALESCE(s.remediation_encrypted_password, '') <> '',
-          s.aws_role_arn, s.aws_external_id
+          s.trust_server_certificate, s.multi_subnet_failover,
+          (COALESCE(s.remediation_encrypted_password, '') <> '' OR COALESCE((to_jsonb(s) ->> 'hypothetical_index_encrypted_password'), '') <> ''),
+          s.aws_role_arn, s.aws_external_id, NULLIF(btrim(to_jsonb(s) ->> 'query_store_replica'), '')
    INTO v_old_modified_at, v_old_host, v_old_port, v_old_auth, v_old_database, v_old_read_only_intent,
         v_old_username, v_old_encrypt_mode, v_old_trust_server_certificate, v_old_multi_subnet_failover,
-        v_remediation_held, v_old_role, v_old_ext
+        v_remediation_held, v_old_role, v_old_ext, v_old_query_store_replica
    FROM config.config_monitored_servers AS s
    WHERE s.server_id = p_server_id
    FOR UPDATE OF s;
@@ -439,6 +1010,9 @@ BEGIN
    v_encrypt_mode := CASE WHEN 'encrypt_mode' = ANY (p_columns) THEN p_encrypt_mode ELSE v_old_encrypt_mode END;
    v_trust_server_certificate := CASE WHEN 'trust_server_certificate' = ANY (p_columns) THEN p_trust_server_certificate ELSE v_old_trust_server_certificate END;
    v_multi_subnet_failover := CASE WHEN 'multi_subnet_failover' = ANY (p_columns) THEN p_multi_subnet_failover ELSE v_old_multi_subnet_failover END;
+   -- The Query Store replica (#6254): trimmed, blank is none. Left out of p_columns, the stored one is kept. It is a host the stored
+   -- password would be sent to, so a change of it is a change of how the row connects, below.
+   v_query_store_replica := CASE WHEN 'query_store_replica' = ANY (p_columns) THEN NULLIF(btrim(p_query_store_replica), '') ELSE v_old_query_store_replica END;
    -- The AWS role (#5452). Left out of p_columns, the stored role and external ID are kept. A role named in p_columns
    -- with a NULL value clears it, and a cleared role takes its external ID with it.
    v_role := CASE WHEN 'aws_role_arn' = ANY (p_columns) THEN p_aws_role_arn ELSE v_old_role END;
@@ -480,7 +1054,7 @@ BEGIN
    END IF;
 
    -- Any change to how the row connects (host, port, database, read-only intent, authentication mode, username,
-   -- encryption, certificate trust, multi-subnet failover) never keeps the stored secret on a row that has one:
+   -- encryption, certificate trust, multi-subnet failover, Query Store replica) never keeps the stored secret on a row that has one:
    -- the same set the route refuses (#5240). The caller's word is not taken: the change is worked out from the row.
    v_connection_changed := v_host IS DISTINCT FROM v_old_host
       OR v_port IS DISTINCT FROM v_old_port
@@ -490,10 +1064,12 @@ BEGIN
       OR v_username IS DISTINCT FROM v_old_username
       OR lower(v_encrypt_mode) IS DISTINCT FROM lower(v_old_encrypt_mode)
       OR v_trust_server_certificate IS DISTINCT FROM v_old_trust_server_certificate
-      OR v_multi_subnet_failover IS DISTINCT FROM v_old_multi_subnet_failover;
+      OR v_multi_subnet_failover IS DISTINCT FROM v_old_multi_subnet_failover
+      OR v_query_store_replica IS DISTINCT FROM v_old_query_store_replica;
 
-   -- A row that holds a remediation secret is not moved from here, whatever else the call sends: that secret is
-   -- set and changed on the service host, and a new main password does not replace it.
+   -- A row that holds a remediation secret, or a hypothetical-index login secret (#6170), is not moved from here,
+   -- whatever else the call sends: that secret is set and changed on the service host, and a new main password
+   -- does not replace it.
    IF v_connection_changed AND v_remediation_held THEN
       RETURN QUERY SELECT 'remediation_kept'::text, NULL::timestamp;
       RETURN;
@@ -516,35 +1092,109 @@ BEGIN
       v_secret := NULL;
    END IF;
 
+   v_has_replica := EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'config.config_monitored_servers'::regclass
+                           AND attname = 'query_store_replica' AND NOT attisdropped);
+
    -- A value the table's own checks refuse (a required column, a format, a duplicate) answers invalid_value too:
    -- the table's error text is not passed on.
    BEGIN
-      UPDATE config.config_monitored_servers AS s
-      SET name = CASE WHEN 'name' = ANY (p_columns) THEN p_name ELSE s.name END,
-          host = v_host,
-          port = v_port,
-          database = v_database,
-          read_only_intent = v_read_only_intent,
-          auth = v_auth,
-          username = v_username,
-          encrypted_password = CASE WHEN v_secret_set THEN v_secret ELSE s.encrypted_password END,
-          encrypt_mode = v_encrypt_mode,
-          trust_server_certificate = v_trust_server_certificate,
-          multi_subnet_failover = v_multi_subnet_failover,
-          monthly_cost_usd = CASE WHEN 'monthly_cost_usd' = ANY (p_columns) THEN p_monthly_cost_usd ELSE s.monthly_cost_usd END,
-          aws_role_arn = v_role,
-          aws_external_id = v_ext,
-          modified_at = (now() AT TIME ZONE 'UTC')
-      WHERE s.server_id = p_server_id
-      RETURNING s.modified_at INTO new_modified_at;
+      -- A store below V213 has no query_store_replica column (a script run before the service migrated it): the write leaves it out there.
+      IF v_has_replica THEN
+         UPDATE config.config_monitored_servers AS s
+         SET name = CASE WHEN 'name' = ANY (p_columns) THEN p_name ELSE s.name END,
+             host = v_host,
+             port = v_port,
+             database = v_database,
+             read_only_intent = v_read_only_intent,
+             auth = v_auth,
+             username = v_username,
+             encrypted_password = CASE WHEN v_secret_set THEN v_secret ELSE s.encrypted_password END,
+             encrypt_mode = v_encrypt_mode,
+             trust_server_certificate = v_trust_server_certificate,
+             multi_subnet_failover = v_multi_subnet_failover,
+             query_store_replica = v_query_store_replica,
+             monthly_cost_usd = CASE WHEN 'monthly_cost_usd' = ANY (p_columns) THEN p_monthly_cost_usd ELSE s.monthly_cost_usd END,
+             aws_role_arn = v_role,
+             aws_external_id = v_ext,
+             modified_at = (now() AT TIME ZONE 'UTC')
+         WHERE s.server_id = p_server_id
+         RETURNING s.modified_at INTO new_modified_at;
+      ELSE
+         UPDATE config.config_monitored_servers AS s
+         SET name = CASE WHEN 'name' = ANY (p_columns) THEN p_name ELSE s.name END,
+             host = v_host,
+             port = v_port,
+             database = v_database,
+             read_only_intent = v_read_only_intent,
+             auth = v_auth,
+             username = v_username,
+             encrypted_password = CASE WHEN v_secret_set THEN v_secret ELSE s.encrypted_password END,
+             encrypt_mode = v_encrypt_mode,
+             trust_server_certificate = v_trust_server_certificate,
+             multi_subnet_failover = v_multi_subnet_failover,
+             monthly_cost_usd = CASE WHEN 'monthly_cost_usd' = ANY (p_columns) THEN p_monthly_cost_usd ELSE s.monthly_cost_usd END,
+             aws_role_arn = v_role,
+             aws_external_id = v_ext,
+             modified_at = (now() AT TIME ZONE 'UTC')
+         WHERE s.server_id = p_server_id
+         RETURNING s.modified_at INTO new_modified_at;
+      END IF;
    EXCEPTION WHEN integrity_constraint_violation THEN
       RETURN QUERY SELECT 'invalid_value'::text, NULL::timestamp;
       RETURN;
    END;
 
+   -- A registration moved to another address no longer vouches for the machine it reached before (#6340 round 2, N2): the machine
+   -- identity the last connect stored (collect.servers.machine_identity, V212) belongs to the old address, so it is cleared here and the
+   -- next connect writes the new one. A store that predates V212 has no such column; the edit is not held up by that.
+   IF v_host IS DISTINCT FROM v_old_host OR v_port IS DISTINCT FROM v_old_port
+      OR v_database IS DISTINCT FROM v_old_database OR v_read_only_intent IS DISTINCT FROM v_old_read_only_intent THEN
+      BEGIN
+         UPDATE collect.servers SET machine_identity = NULL WHERE server_id = p_server_id;
+      EXCEPTION WHEN undefined_column OR undefined_table THEN
+         NULL;
+      END;
+   END IF;
+
    outcome := 'saved';
    RETURN NEXT;
 END;
+$fn$;
+REVOKE ALL ON FUNCTION config.edit_monitored_server(integer, timestamp, text[], text, text, integer, text, boolean, text, text, text, text, boolean, boolean, numeric, text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION config.edit_monitored_server(integer, timestamp, text[], text, text, integer, text, boolean, text, text, text, text, boolean, boolean, numeric, text, text, text) TO viewer, mcp;
+
+-- #6254: the 17-argument edit function stays as a permanent wrapper over the 18-argument one, for a caller built before the Query
+--     Store replica column. It passes NULL for the replica and strips the column name from p_columns, so a caller of the older
+--     signature can neither change nor clear a replica. Same grants, same owner.
+CREATE OR REPLACE FUNCTION config.edit_monitored_server(
+   p_server_id integer,
+   p_expected_modified_at timestamp,
+   p_columns text[],
+   p_name text,
+   p_host text,
+   p_port integer,
+   p_database text,
+   p_read_only_intent boolean,
+   p_auth text,
+   p_username text,
+   p_secret text,
+   p_encrypt_mode text,
+   p_trust_server_certificate boolean,
+   p_multi_subnet_failover boolean,
+   p_monthly_cost_usd numeric,
+   p_aws_role_arn text,
+   p_aws_external_id text)
+RETURNS TABLE (outcome text, new_modified_at timestamp)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+   SELECT e.outcome, e.new_modified_at
+   FROM config.edit_monitored_server(
+      p_server_id, p_expected_modified_at,
+      array_remove(COALESCE(p_columns, ARRAY[]::text[]), 'query_store_replica'),
+      p_name, p_host, p_port, p_database, p_read_only_intent, p_auth, p_username, p_secret, p_encrypt_mode,
+      p_trust_server_certificate, p_multi_subnet_failover, p_monthly_cost_usd, p_aws_role_arn, p_aws_external_id, NULL::text) AS e;
 $fn$;
 REVOKE ALL ON FUNCTION config.edit_monitored_server(integer, timestamp, text[], text, text, integer, text, boolean, text, text, text, text, boolean, boolean, numeric, text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION config.edit_monitored_server(integer, timestamp, text[], text, text, integer, text, boolean, text, text, text, text, boolean, boolean, numeric, text, text) TO viewer, mcp;
@@ -583,6 +1233,514 @@ $fn$;
 REVOKE ALL ON FUNCTION config.edit_monitored_server(integer, timestamp, text[], text, text, integer, text, boolean, text, text, text, text, boolean, boolean, numeric) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION config.edit_monitored_server(integer, timestamp, text[], text, text, integer, text, boolean, text, text, text, text, boolean, boolean, numeric) TO viewer, mcp;
 
+-- #6334: the known-pattern entries' writes. The web editor (viewer) and the Viewer (admin) write config.config_known_patterns only
+--     through these three functions; no role holds a direct INSERT/UPDATE/DELETE on the table, and mcp gets neither the functions nor a write
+--     (no MCP tool writes an entry: they are operator-written context). Same functions, same text, as managed provisioning rebuilds on every
+--     start. The reads need no grant: the schema-wide SELECT covers the table. The table exists from V214, so re-run this script after upgrading. All three bodies are plpgsql (late-bound) so the script also runs on a store that has not reached V214 yet; a LANGUAGE sql body would fail the CREATE there.
+CREATE OR REPLACE FUNCTION config.insert_known_pattern(
+   p_server_id integer,
+   p_metric_name text,
+   p_time_of_day time,
+   p_time_zone text,
+   p_window_minutes integer,
+   p_note text,
+   p_created_by text,
+   p_expires_at_utc timestamp)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_id bigint;
+BEGIN
+   IF p_server_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = p_server_id) THEN
+      RAISE EXCEPTION 'No monitored server with that id.' USING ERRCODE = 'DL404';
+   END IF;
+   INSERT INTO config.config_known_patterns
+      (server_id, metric_name, time_of_day, time_zone, window_minutes, note, created_by, expires_at_utc)
+   VALUES
+      (p_server_id, p_metric_name, p_time_of_day, p_time_zone, p_window_minutes, p_note, p_created_by, p_expires_at_utc)
+   RETURNING id INTO v_id;
+   RETURN v_id;
+END;
+$fn$;
+REVOKE ALL ON FUNCTION config.insert_known_pattern(integer, text, time, text, integer, text, text, timestamp) FROM PUBLIC;
+DROP FUNCTION IF EXISTS config.update_known_pattern(bigint, integer, text, time, text, integer, text, timestamp);
+CREATE OR REPLACE FUNCTION config.update_known_pattern(
+   p_id bigint,
+   p_server_id integer,
+   p_metric_name text,
+   p_time_of_day time,
+   p_time_zone text,
+   p_window_minutes integer,
+   p_note text,
+   p_expires_at_utc timestamp,
+   p_updated_by text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_rows bigint;
+BEGIN
+   IF p_server_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = p_server_id) THEN
+      RAISE EXCEPTION 'No monitored server with that id.' USING ERRCODE = 'DL404';
+   END IF;
+   UPDATE config.config_known_patterns
+      SET server_id = p_server_id, metric_name = p_metric_name, time_of_day = p_time_of_day, time_zone = p_time_zone,
+          window_minutes = p_window_minutes, note = p_note, expires_at_utc = p_expires_at_utc,
+          updated_by = p_updated_by, updated_at_utc = pg_catalog.now() AT TIME ZONE 'UTC'
+    WHERE id = p_id;
+   GET DIAGNOSTICS v_rows = ROW_COUNT;
+   RETURN v_rows > 0;
+END;
+$fn$;
+REVOKE ALL ON FUNCTION config.update_known_pattern(bigint, integer, text, time, text, integer, text, timestamp, text) FROM PUBLIC;
+CREATE OR REPLACE FUNCTION config.delete_known_pattern(p_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_rows bigint;
+BEGIN
+   DELETE FROM config.config_known_patterns WHERE id = p_id;
+   GET DIAGNOSTICS v_rows = ROW_COUNT;
+   RETURN v_rows > 0;
+END;
+$fn$;
+REVOKE ALL ON FUNCTION config.delete_known_pattern(bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION config.insert_known_pattern(integer, text, time, text, integer, text, text, timestamp) TO admin, viewer;
+GRANT EXECUTE ON FUNCTION config.update_known_pattern(bigint, integer, text, time, text, integer, text, timestamp, text) TO admin, viewer;
+GRANT EXECUTE ON FUNCTION config.delete_known_pattern(bigint) TO admin, viewer;
+
+-- #5941: the run-collectors-now request. The web route (viewer) and the MCP run_collectors_now tool (mcp) queue a
+--     snapshot_now command through config.request_snapshot_now, the only way those two roles write a command row.
+--     The command type is fixed in the body; the caller supplies a server id and an optional list of collector names
+--     and nothing else. Same function, same text, as managed provisioning rebuilds on every start.
+CREATE OR REPLACE FUNCTION config.request_snapshot_now(
+   p_server_id integer,
+   p_args_json text,
+   p_requested_by text)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_args jsonb;
+   v_id bigint;
+   v_last_status text;
+   v_last_at timestamp;
+BEGIN
+   IF p_server_id IS NULL OR NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = p_server_id) THEN
+      RAISE EXCEPTION 'No monitored server with that id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF p_args_json IS NOT NULL THEN
+      v_args := p_args_json::jsonb;
+      IF jsonb_typeof(v_args) IS DISTINCT FROM 'object'
+         OR EXISTS (SELECT 1 FROM jsonb_object_keys(v_args) AS k(key) WHERE k.key <> 'collectors')
+         OR jsonb_typeof(v_args -> 'collectors') IS DISTINCT FROM 'array'
+         OR jsonb_array_length(v_args -> 'collectors') > 200
+         OR EXISTS (SELECT 1 FROM jsonb_array_elements(v_args -> 'collectors') AS e(value)
+                    WHERE jsonb_typeof(e.value) <> 'string' OR length(e.value #>> '{}') > 100) THEN
+         RAISE EXCEPTION 'The only argument is a list of collector names.' USING ERRCODE = 'DL400';
+      END IF;
+   END IF;
+   -- The same guard the service applies (#5941 review): one run at a time per server, and not within 60 seconds of the last
+   -- request for it, so a holder of the viewer or mcp login cannot queue rows without limit. One lock per server makes the
+   -- check and the insert one step.
+   -- Never blocks (provisioning rule): a request that holds the lock for this server is a concurrent request, which is the
+   -- same conflict as a pending row, so this refuses with the same DL409 instead of waiting.
+   IF NOT pg_try_advisory_xact_lock(5941, p_server_id) THEN
+      RAISE EXCEPTION 'A collector run for this server is already queued or running.' USING ERRCODE = 'DL409';
+   END IF;
+   SELECT c.status, c.created_at INTO v_last_status, v_last_at
+   FROM config.config_command AS c
+   WHERE c.command_type = 'snapshot_now' AND c.target_server_id = p_server_id
+   ORDER BY c.command_id DESC
+   LIMIT 1;
+   IF v_last_status IN ('pending', 'in_progress') THEN
+      RAISE EXCEPTION 'A collector run for this server is already queued or running.' USING ERRCODE = 'DL409';
+   END IF;
+   IF v_last_at IS NOT NULL AND v_last_at > (now() AT TIME ZONE 'UTC') - interval '60 seconds' THEN
+      RAISE EXCEPTION 'A collector run was requested for this server less than 60 seconds ago.'
+         USING ERRCODE = 'DL429',
+               HINT = to_char(v_last_at + interval '60 seconds', 'YYYY-MM-DD') || 'T' || to_char(v_last_at + interval '60 seconds', 'HH24:MI:SS') || 'Z';
+   END IF;
+   INSERT INTO config.config_command (requested_by, command_type, target_server_id, args_json, status, created_at)
+   VALUES (left(COALESCE(p_requested_by, 'web'), 200), 'snapshot_now', p_server_id, v_args, 'pending', (now() AT TIME ZONE 'UTC'))
+   RETURNING command_id INTO v_id;
+   RETURN v_id;
+END
+$fn$;
+REVOKE ALL ON FUNCTION config.request_snapshot_now(integer, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION config.request_snapshot_now(integer, text, text) TO viewer, mcp;
+-- #6231: the MCP route tools. mcp holds no INSERT on config.config_notification_routes and no SELECT or UPDATE on its
+--     destination columns, and gets none here: create_notification_route and update_notification_route reach the table only
+--     through these functions. create leaves every channel empty and update writes the match, scope, enabled flag, resolution
+--     override and fallback (the match or scope only on a route with no explicit agent setting); neither takes a destination.
+--     set_notification_route_destinations is the one function that sets a route's own destinations: the service seals each
+--     webhook value for the route's own row first and passes it in, and the function stores only an empty value or a sealed one
+--     (the address list is plain text). All three re-read the row FOR UPDATE and refuse an agent route inside the transaction.
+--     Granted to mcp only.
+BEGIN;
+CREATE OR REPLACE FUNCTION config.create_notification_route(
+   p_metric_match text,
+   p_enabled boolean,
+   p_scope_server_id integer,
+   p_scope_tag_id integer,
+   p_send_resolutions boolean,
+   p_fallback_route_id integer)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_match text := btrim(COALESCE(p_metric_match, ''));
+   v_id integer;
+BEGIN
+   IF v_match = '' THEN
+      RAISE EXCEPTION 'Choose a family or enter an exact metric name.' USING ERRCODE = 'DL400';
+   END IF;
+   IF p_scope_server_id IS NOT NULL AND p_scope_tag_id IS NOT NULL THEN
+      RAISE EXCEPTION 'A route is scoped to one server or one tag, not both.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_match = '*' AND p_scope_server_id IS NULL AND p_scope_tag_id IS NULL THEN
+      RAISE EXCEPTION 'Every metric (*) needs a server or a tag scope. Pick one, or choose a family or an exact metric.' USING ERRCODE = 'DL400';
+   END IF;
+   IF p_scope_server_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = p_scope_server_id) THEN
+      RAISE EXCEPTION 'No monitored server has that server_id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF p_scope_tag_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM config.server_tags WHERE id = p_scope_tag_id) THEN
+      RAISE EXCEPTION 'No server tag has that id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF p_fallback_route_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM config.config_notification_routes WHERE route_id = p_fallback_route_id) THEN
+      RAISE EXCEPTION 'The fallback route does not exist.' USING ERRCODE = 'DL404';
+   END IF;
+   -- Every destination column keeps its empty default, so the route has no destinations of its own: each channel
+   -- goes where it went before (the next matching route, else the Settings channels), and no caller of this function can name a URL, a key or an address list.
+   -- The agent columns keep their defaults too: this function never makes an agent route.
+   INSERT INTO config.config_notification_routes
+      (metric_match, enabled, scope_server_id, scope_tag_id, send_resolutions, fallback_route_id, modified_at)
+   VALUES
+      (v_match, COALESCE(p_enabled, true), p_scope_server_id, p_scope_tag_id, p_send_resolutions, p_fallback_route_id,
+       (now() AT TIME ZONE 'UTC'))
+   RETURNING route_id INTO v_id;
+   RETURN v_id;
+END
+$fn$;
+REVOKE ALL ON FUNCTION config.create_notification_route(text, boolean, integer, integer, boolean, integer) FROM PUBLIC;
+CREATE OR REPLACE FUNCTION config.update_notification_route(
+   p_route_id integer,
+   p_columns text[],
+   p_metric_match text,
+   p_enabled boolean,
+   p_scope_server_id integer,
+   p_scope_tag_id integer,
+   p_send_resolutions boolean,
+   p_fallback_route_id integer)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_row config.config_notification_routes%ROWTYPE;
+   v_match text;
+   v_enabled boolean;
+   v_server integer;
+   v_tag integer;
+   v_resolutions boolean;
+   v_fallback integer;
+BEGIN
+   IF p_columns IS NULL OR cardinality(p_columns) = 0
+      OR EXISTS (SELECT 1 FROM unnest(p_columns) AS c(name)
+                 WHERE c.name IS NULL OR c.name NOT IN ('metric_match', 'enabled', 'scope', 'send_resolutions', 'fallback_route_id')) THEN
+      RAISE EXCEPTION 'The columns to change are metric_match, enabled, scope, send_resolutions and fallback_route_id.' USING ERRCODE = 'DL400';
+   END IF;
+   -- The row is read again here, under its lock, so the agent-route refusal and every check below are on what is stored now
+   -- and not on what the caller read a moment ago.
+   SELECT * INTO v_row FROM config.config_notification_routes WHERE route_id = p_route_id FOR UPDATE;
+   IF NOT FOUND THEN
+      RAISE EXCEPTION 'No notification route has that route_id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF v_row.agent_level IS NOT NULL AND v_row.agent_level >= 1 THEN
+      RAISE EXCEPTION 'That route is an agent route: it is changed in the Viewer, not over MCP.' USING ERRCODE = 'DL403';
+   END IF;
+   -- What a route matches and which servers it covers decide which servers an agent route covers, so a route with an
+   -- explicit agent setting (Off included) keeps both in the Viewer. A route's own destinations do not stop a change
+   -- to what it matches: the destinations are set over MCP too. (#6231)
+   IF ('metric_match' = ANY (p_columns) OR 'scope' = ANY (p_columns)) AND v_row.agent_level IS NOT NULL THEN
+      RAISE EXCEPTION 'That route has an agent setting (Off), so what it matches and which servers it covers are changed in the Viewer or on the web dashboard, not over MCP. Turning it on, send_resolutions and fallback_route_id can still be changed here.' USING ERRCODE = 'DL403';
+   END IF;
+   -- An Off route keeps servers away from a broader agent route, so turning it off widens agent coverage: that is done in the Viewer
+   -- or on the web dashboard. Turning it on stays here. (#6281)
+   IF 'enabled' = ANY (p_columns) AND v_row.agent_level IS NOT NULL AND COALESCE(p_enabled, v_row.enabled) = false THEN
+      RAISE EXCEPTION 'That route has an agent setting (Off), so turning it off is done in the Viewer or on the web dashboard, not over MCP. Turning it on can still be done here.' USING ERRCODE = 'DL403';
+   END IF;
+   v_match := CASE WHEN 'metric_match' = ANY (p_columns) THEN btrim(COALESCE(p_metric_match, '')) ELSE v_row.metric_match END;
+   v_enabled := CASE WHEN 'enabled' = ANY (p_columns) THEN COALESCE(p_enabled, v_row.enabled) ELSE v_row.enabled END;
+   v_server := CASE WHEN 'scope' = ANY (p_columns) THEN p_scope_server_id ELSE v_row.scope_server_id END;
+   v_tag := CASE WHEN 'scope' = ANY (p_columns) THEN p_scope_tag_id ELSE v_row.scope_tag_id END;
+   v_resolutions := CASE WHEN 'send_resolutions' = ANY (p_columns) THEN p_send_resolutions ELSE v_row.send_resolutions END;
+   v_fallback := CASE WHEN 'fallback_route_id' = ANY (p_columns) THEN p_fallback_route_id ELSE v_row.fallback_route_id END;
+   IF v_match = '' THEN
+      RAISE EXCEPTION 'Choose a family or enter an exact metric name.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_server IS NOT NULL AND v_tag IS NOT NULL THEN
+      RAISE EXCEPTION 'A route is scoped to one server or one tag, not both.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_match = '*' AND v_server IS NULL AND v_tag IS NULL THEN
+      RAISE EXCEPTION 'Every metric (*) needs a server or a tag scope. Pick one, or choose a family or an exact metric.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_server IS NOT NULL AND v_server IS DISTINCT FROM v_row.scope_server_id
+      AND NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = v_server) THEN
+      RAISE EXCEPTION 'No monitored server has that server_id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF v_tag IS NOT NULL AND v_tag IS DISTINCT FROM v_row.scope_tag_id
+      AND NOT EXISTS (SELECT 1 FROM config.server_tags WHERE id = v_tag) THEN
+      RAISE EXCEPTION 'No server tag has that id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF v_fallback IS NOT NULL AND v_fallback = p_route_id THEN
+      RAISE EXCEPTION 'A route cannot be its own fallback route.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_fallback IS NOT NULL AND v_fallback IS DISTINCT FROM v_row.fallback_route_id
+      AND NOT EXISTS (SELECT 1 FROM config.config_notification_routes WHERE route_id = v_fallback) THEN
+      RAISE EXCEPTION 'The fallback route does not exist.' USING ERRCODE = 'DL404';
+   END IF;
+   -- The one UPDATE names no destination column: the sealed webhook values, the key, the signing keys and the address list
+   -- stay exactly as stored.
+   UPDATE config.config_notification_routes
+      SET metric_match = v_match,
+          enabled = v_enabled,
+          scope_server_id = v_server,
+          scope_tag_id = v_tag,
+          send_resolutions = v_resolutions,
+          fallback_route_id = v_fallback,
+          modified_at = (now() AT TIME ZONE 'UTC')
+    WHERE route_id = p_route_id;
+END
+$fn$;
+REVOKE ALL ON FUNCTION config.update_notification_route(integer, text[], text, boolean, integer, integer, boolean, integer) FROM PUBLIC;
+-- The return type changed (a previous value is now only a flag for whether one was saved), which CREATE OR REPLACE cannot do on its own.
+DROP FUNCTION IF EXISTS config.set_notification_route_destinations(integer, text[], text, text, text, text, text);
+CREATE OR REPLACE FUNCTION config.set_notification_route_destinations(
+   p_route_id integer,
+   p_columns text[],
+   p_teams_url text,
+   p_slack_url text,
+   p_generic_url text,
+   p_pagerduty_routing_key text,
+   p_smtp_recipients text)
+RETURNS TABLE (prev_teams_url_set boolean, prev_slack_url_set boolean, prev_generic_url_set boolean, prev_pagerduty_routing_key_set boolean, prev_smtp_recipients_set boolean)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_row config.config_notification_routes%ROWTYPE;
+   v_teams text;
+   v_slack text;
+   v_generic text;
+   v_key text;
+   v_recipients text;
+BEGIN
+   IF p_columns IS NULL OR cardinality(p_columns) = 0
+      OR EXISTS (SELECT 1 FROM unnest(p_columns) AS c(name)
+                 WHERE c.name IS NULL OR c.name NOT IN ('teams_url', 'slack_url', 'generic_url', 'pagerduty_routing_key', 'smtp_recipients')) THEN
+      RAISE EXCEPTION 'The destinations to change are teams_url, slack_url, generic_url, pagerduty_routing_key and smtp_recipients.' USING ERRCODE = 'DL400';
+   END IF;
+   -- The row is read under its lock, so every check below is on what is stored now. The agent-route rule of
+   -- update_notification_route holds here too: an agent route is changed in the Viewer.
+   SELECT * INTO v_row FROM config.config_notification_routes WHERE route_id = p_route_id FOR UPDATE;
+   IF NOT FOUND THEN
+      RAISE EXCEPTION 'No notification route has that route_id.' USING ERRCODE = 'DL404';
+   END IF;
+   IF v_row.agent_level IS NOT NULL AND v_row.agent_level >= 1 THEN
+      RAISE EXCEPTION 'That route is an agent route: it is changed in the Viewer, not over MCP.' USING ERRCODE = 'DL403';
+   END IF;
+   v_teams := CASE WHEN 'teams_url' = ANY (p_columns) THEN COALESCE(p_teams_url, '') ELSE v_row.teams_url END;
+   v_slack := CASE WHEN 'slack_url' = ANY (p_columns) THEN COALESCE(p_slack_url, '') ELSE v_row.slack_url END;
+   v_generic := CASE WHEN 'generic_url' = ANY (p_columns) THEN COALESCE(p_generic_url, '') ELSE v_row.generic_url END;
+   v_key := CASE WHEN 'pagerduty_routing_key' = ANY (p_columns) THEN COALESCE(p_pagerduty_routing_key, '') ELSE v_row.pagerduty_routing_key END;
+   v_recipients := CASE WHEN 'smtp_recipients' = ANY (p_columns) THEN btrim(COALESCE(p_smtp_recipients, '')) ELSE v_row.smtp_recipients END;
+   -- A webhook value is sealed by the Darling service before it gets here, for this route's own row. This function stores
+   -- only an empty value or a sealed one, so no caller of it can store a destination as text. A changed value must be exactly
+   -- the sealed shape (sealed:v1:, the 16 character key id, base64) and no longer than 16384 characters: a half-formed value
+   -- turns the channel off for the route, and an oversized one is loaded on every configuration reload.
+   IF EXISTS (SELECT 1
+                FROM (VALUES (v_teams, v_row.teams_url), (v_slack, v_row.slack_url), (v_generic, v_row.generic_url), (v_key, v_row.pagerduty_routing_key))
+                     AS w(new_value, old_value)
+               WHERE w.new_value <> w.old_value AND w.new_value <> ''
+                 AND (length(w.new_value) > 16384
+                      OR w.new_value !~ '^sealed:v1:[0-9a-f]+:[A-Za-z0-9+/]+=?=?$'
+                      OR length(split_part(w.new_value, ':', 3)) <> 16)) THEN
+      RAISE EXCEPTION 'A webhook value is stored sealed by the Darling service, never as text.' USING ERRCODE = 'DL400';
+   END IF;
+   IF length(v_recipients) > 4000 THEN
+      RAISE EXCEPTION 'The email recipients are longer than can be stored.' USING ERRCODE = 'DL400';
+   END IF;
+   -- A changed recipient list is a comma separated list of at most 50 plain addresses: no control character, angle bracket or
+   -- double quote (so no display name or group), the rule the Viewer and the MCP tools apply before they get here.
+   IF v_recipients <> v_row.smtp_recipients
+      AND (v_recipients ~ '[[:cntrl:]<>]' OR position(chr(34) IN v_recipients) > 0
+           OR (SELECT count(*) FROM unnest(string_to_array(v_recipients, ',')) AS e(item) WHERE btrim(e.item) <> '') > 50) THEN
+      RAISE EXCEPTION 'The email recipients are a comma separated list of at most 50 plain addresses such as name@example.com.' USING ERRCODE = 'DL400';
+   END IF;
+   -- A signing key is sealed for the route's stored generic URL text (#5998): a change to that text needs the key removed first.
+   IF v_row.signing_key <> '' AND v_generic IS DISTINCT FROM v_row.generic_url THEN
+      RAISE EXCEPTION 'A signing key is saved for this route''s generic webhook, and it is tied to the generic webhook URL. Remove the key in the Viewer first, then change the URL.' USING ERRCODE = 'DL403';
+   END IF;
+   UPDATE config.config_notification_routes
+      SET teams_url = v_teams,
+          slack_url = v_slack,
+          generic_url = v_generic,
+          pagerduty_routing_key = v_key,
+          smtp_recipients = v_recipients,
+          modified_at = (now() AT TIME ZONE 'UTC')
+    WHERE route_id = p_route_id;
+   -- What was stored before comes back only as a flag for whether one was saved, and only for the columns this call names: the function runs
+   -- with the owner's rights, so it never hands a stored value (sealed text, or a value saved before sealing) to its caller.
+   RETURN QUERY SELECT
+      CASE WHEN 'teams_url' = ANY (p_columns) THEN v_row.teams_url <> '' END,
+      CASE WHEN 'slack_url' = ANY (p_columns) THEN v_row.slack_url <> '' END,
+      CASE WHEN 'generic_url' = ANY (p_columns) THEN v_row.generic_url <> '' END,
+      CASE WHEN 'pagerduty_routing_key' = ANY (p_columns) THEN v_row.pagerduty_routing_key <> '' END,
+      CASE WHEN 'smtp_recipients' = ANY (p_columns) THEN v_row.smtp_recipients <> '' END;
+END
+$fn$;
+REVOKE ALL ON FUNCTION config.set_notification_route_destinations(integer, text[], text, text, text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION config.create_notification_route(text, boolean, integer, integer, boolean, integer) TO mcp;
+GRANT EXECUTE ON FUNCTION config.update_notification_route(integer, text[], text, boolean, integer, integer, boolean, integer) TO mcp;
+GRANT EXECUTE ON FUNCTION config.set_notification_route_destinations(integer, text[], text, text, text, text, text) TO mcp;
+COMMIT;
+
+-- #6230: the MCP incident tools queue analyze_now, purge_now, test_connect, pause and resume through this function, the only way the
+--     mcp role writes a command row. Same function, same text, as managed provisioning rebuilds on every start.
+CREATE OR REPLACE FUNCTION config.request_mcp_command(
+   p_command_type text,
+   p_server_id integer,
+   p_retention_days integer,
+   p_requested_by text)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_type text := lower(btrim(COALESCE(p_command_type, '')));
+   v_args jsonb;
+   v_id bigint;
+   v_last_status text;
+   v_last_at timestamp;
+BEGIN
+   -- The only command types the mcp role may queue (#6230): the two the Viewer's pause and resume buttons queue, plus analyze_now,
+   -- purge_now and test_connect. Everything else the command plane runs (disable_server, reload, the plan and execute commands) stays
+   -- out of this function on purpose: it is the one way mcp writes a command row.
+   IF v_type NOT IN ('pause', 'resume', 'analyze_now', 'purge_now', 'test_connect') THEN
+      RAISE EXCEPTION 'That command type cannot be queued through this function.' USING ERRCODE = 'DL400';
+   END IF;
+   -- The one-request-at-a-time rule below reads the newest row of its kind with a fresh snapshot per statement. A transaction that
+   -- keeps one snapshot (REPEATABLE READ and up) could miss a row another session just queued, so it is refused.
+   IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'This request must run at the READ COMMITTED isolation level.' USING ERRCODE = 'DL400';
+   END IF;
+   IF p_retention_days IS NOT NULL AND (v_type <> 'purge_now' OR p_retention_days < 1 OR p_retention_days > 3650) THEN
+      RAISE EXCEPTION 'retention_days is only for purge_now and must be 1 to 3650.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_type IN ('purge_now', 'pause', 'resume') THEN
+      IF p_server_id IS NOT NULL THEN
+         RAISE EXCEPTION 'This command takes no server.' USING ERRCODE = 'DL400';
+      END IF;
+   ELSIF p_server_id IS NULL OR NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = p_server_id) THEN
+      RAISE EXCEPTION 'No monitored server with that id.' USING ERRCODE = 'DL404';
+   END IF;
+   -- A connection test dials the server with its stored credentials, so it runs only against a server the service is monitoring.
+   IF v_type = 'test_connect' AND NOT EXISTS (SELECT 1 FROM config.config_monitored_servers WHERE server_id = p_server_id AND is_enabled) THEN
+      RAISE EXCEPTION 'A connection test runs only against an enabled server.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_type = 'purge_now' AND p_retention_days IS NOT NULL THEN
+      v_args := jsonb_build_object('retention_days', p_retention_days);
+   END IF;
+   -- A connection test is built HERE from the stored row. The caller supplies a server id and nothing else, so there is no
+   -- argument that carries a credential, a host or a connection string, and the password is the stored one (the service
+   -- tests it only against the server that holds it).
+   IF v_type = 'test_connect' THEN
+      SELECT jsonb_strip_nulls(jsonb_build_object(
+                'name', s.name, 'engine', s.engine, 'host', s.host, 'port', s.port, 'database', s.database,
+                'auth', s.auth, 'username', s.username, 'encryptedPassword', s.encrypted_password,
+                'readOnlyIntent', s.read_only_intent, 'trustServerCertificate', s.trust_server_certificate,
+                'encryptMode', s.encrypt_mode, 'multiSubnetFailover', s.multi_subnet_failover,
+                'queryStoreReplica', NULLIF(btrim(to_jsonb(s) ->> 'query_store_replica'), '')))
+        INTO v_args
+      FROM config.config_monitored_servers AS s
+      WHERE s.server_id = p_server_id;
+   END IF;
+   -- One request of a kind (per server where it has one) at a time, and not within 15 seconds of the last, so a holder of the
+   -- mcp login cannot fill the queue. The lock is a try-lock: a request that cannot take it at once answers busy and never waits.
+   IF NOT pg_try_advisory_xact_lock(6230, hashtext(v_type || ':' || COALESCE(p_server_id::text, ''))) THEN
+      RAISE EXCEPTION 'Another request of this kind is being queued right now (busy); try again shortly.' USING ERRCODE = 'DL423';
+   END IF;
+   SELECT c.status, c.created_at INTO v_last_status, v_last_at
+   FROM config.config_command AS c
+   WHERE c.command_type = v_type AND c.target_server_id IS NOT DISTINCT FROM p_server_id
+   ORDER BY c.command_id DESC
+   LIMIT 1;
+   IF v_last_status IN ('pending', 'in_progress') THEN
+      RAISE EXCEPTION 'The same request is already queued or running.' USING ERRCODE = 'DL409';
+   END IF;
+   IF v_last_at IS NOT NULL AND v_last_at > (now() AT TIME ZONE 'UTC') - interval '15 seconds' THEN
+      RAISE EXCEPTION 'The same request was made less than 15 seconds ago.' USING ERRCODE = 'DL429';
+   END IF;
+   -- The caller's p_requested_by is ignored (the parameter stays so an older caller still binds): every row this function queues is
+   -- stamped 'mcp', so a row cannot carry another actor's name.
+   INSERT INTO config.config_command (requested_by, command_type, target_server_id, args_json, status, created_at)
+   VALUES ('mcp', v_type, p_server_id, v_args, 'pending', (now() AT TIME ZONE 'UTC'))
+   RETURNING command_id INTO v_id;
+   RETURN v_id;
+END
+$fn$;
+REVOKE ALL ON FUNCTION config.request_mcp_command(text, integer, integer, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION config.request_mcp_command(text, integer, integer, text) FROM mcp;
+GRANT EXECUTE ON FUNCTION config.request_mcp_command(text, integer, integer, text) TO mcp;
+
+-- #6230: mcp holds no SELECT on config_command.result_json; it reads a command's status and result through
+--     config.read_mcp_command_result, which answers only for the command types the MCP tools queue. Owned by the store
+--     owner, pinned search_path, no dynamic SQL, granted to mcp only. NOT a versioned migration.
+CREATE OR REPLACE FUNCTION config.read_mcp_command_result(p_command_id bigint)
+RETURNS TABLE (
+   command_type text,
+   target_server_id integer,
+   status text,
+   requested_by text,
+   created_at timestamp,
+   claimed_at timestamp,
+   completed_at timestamp,
+   result_status text,
+   result_json jsonb)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+   SELECT c.command_type, c.target_server_id, c.status, c.requested_by, c.created_at, c.claimed_at, c.completed_at,
+          c.result_status, c.result_json
+   FROM config.config_command AS c
+   WHERE c.command_id = p_command_id
+     AND c.command_type IN ('analyze_now', 'purge_now', 'test_connect', 'pause', 'resume', 'snapshot_now');
+$fn$;
+REVOKE ALL ON FUNCTION config.read_mcp_command_result(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION config.read_mcp_command_result(bigint) FROM mcp;
+GRANT EXECUTE ON FUNCTION config.read_mcp_command_result(bigint) TO mcp;
+
 -- The store's own password rules for every role but the owner: a BEFORE INSERT OR UPDATE trigger on
 --     config_monitored_servers. A new or changed password that starts with env: or file: (a reference) is refused:
 --     references are set in the configuration file, or by --add-server on the service host, as the owner. An update
@@ -601,6 +1759,7 @@ AS $rules$
 DECLARE
    v_reference_main boolean;
    v_reference_remediation boolean;
+   v_reference_hypothetical boolean;
    v_held boolean;
    v_moved boolean;
 BEGIN
@@ -613,12 +1772,16 @@ BEGIN
 
    v_reference_main := COALESCE(left(NEW.encrypted_password, 4) = 'env:' OR left(NEW.encrypted_password, 5) = 'file:', false);
    v_reference_remediation := COALESCE(left(NEW.remediation_encrypted_password, 4) = 'env:' OR left(NEW.remediation_encrypted_password, 5) = 'file:', false);
+   -- #6170: the hypothetical-index login's password column is held to the same rule as the remediation one.
+   -- It is read through to_jsonb, not by name, so this function also runs on a store below V203 that does not have the columns
+   -- yet (a script run before the service migrated it): the value is then NULL and these checks do nothing.
+   v_reference_hypothetical := COALESCE(left((to_jsonb(NEW) ->> 'hypothetical_index_encrypted_password'), 4) = 'env:' OR left((to_jsonb(NEW) ->> 'hypothetical_index_encrypted_password'), 5) = 'file:', false);
 
    IF TG_OP = 'INSERT' THEN
       -- A new row never holds a reference. The one pass: an upsert's proposed row for a server whose stored value is
       -- already that exact reference (the row is locked, so it cannot go away before the write), which then meets the
       -- UPDATE rules below. A role that cannot read or lock the row (viewer, mcp) gets the refusal.
-      IF v_reference_main OR v_reference_remediation THEN
+      IF v_reference_main OR v_reference_remediation OR v_reference_hypothetical THEN
          v_held := false;
          BEGIN
             PERFORM 1
@@ -626,6 +1789,7 @@ BEGIN
             WHERE s.server_id = NEW.server_id
               AND (NOT v_reference_main OR s.encrypted_password = NEW.encrypted_password)
               AND (NOT v_reference_remediation OR s.remediation_encrypted_password = NEW.remediation_encrypted_password)
+              AND (NOT v_reference_hypothetical OR (to_jsonb(s) ->> 'hypothetical_index_encrypted_password') = (to_jsonb(NEW) ->> 'hypothetical_index_encrypted_password'))
             FOR UPDATE OF s;
             v_held := FOUND;
          EXCEPTION WHEN insufficient_privilege THEN
@@ -642,7 +1806,8 @@ BEGIN
 
    -- An update never sets a reference.
    IF (v_reference_main AND NEW.encrypted_password IS DISTINCT FROM OLD.encrypted_password)
-      OR (v_reference_remediation AND NEW.remediation_encrypted_password IS DISTINCT FROM OLD.remediation_encrypted_password) THEN
+      OR (v_reference_remediation AND NEW.remediation_encrypted_password IS DISTINCT FROM OLD.remediation_encrypted_password)
+      OR (v_reference_hypothetical AND (to_jsonb(NEW) ->> 'hypothetical_index_encrypted_password') IS DISTINCT FROM (to_jsonb(OLD) ->> 'hypothetical_index_encrypted_password')) THEN
       RAISE EXCEPTION '%', 'Enter the password itself. References (env: or file:) can only be set in the configuration file.' USING ERRCODE = 'PW001';
    END IF;
 
@@ -658,14 +1823,21 @@ BEGIN
       OR NEW.username IS DISTINCT FROM OLD.username
       OR lower(NEW.encrypt_mode) IS DISTINCT FROM lower(OLD.encrypt_mode)
       OR NEW.trust_server_certificate IS DISTINCT FROM OLD.trust_server_certificate
-      OR NEW.multi_subnet_failover IS DISTINCT FROM OLD.multi_subnet_failover;
+      OR NEW.multi_subnet_failover IS DISTINCT FROM OLD.multi_subnet_failover
+      -- The Query Store replica (#6254) is a host the stored password would be sent to. Read through to_jsonb, blank as none, so this
+      -- function also runs on a store below V213 that does not have the column yet.
+      OR COALESCE(NULLIF(btrim(to_jsonb(NEW) ->> 'query_store_replica'), ''), '') IS DISTINCT FROM COALESCE(NULLIF(btrim(to_jsonb(OLD) ->> 'query_store_replica'), ''), '');
 
    -- A remediation secret that is kept goes with the login name it was stored for: that name is as much a part of how
    -- the row is reached as the host is, so it is not changed here either. Not part of v_moved, so it never raises PW002.
-   IF COALESCE(OLD.remediation_encrypted_password, '') <> ''
-      AND NEW.remediation_encrypted_password IS NOT DISTINCT FROM OLD.remediation_encrypted_password
-      AND (v_moved OR NEW.remediation_username IS DISTINCT FROM OLD.remediation_username) THEN
-      RAISE EXCEPTION '%', 'This server has a remediation login stored. Change how it is reached on the service host, in the configuration file or with --add-server.' USING ERRCODE = 'PW003';
+   -- The hypothetical-index login's secret (#6170) goes with its login name in the same way.
+   IF (COALESCE(OLD.remediation_encrypted_password, '') <> ''
+       AND NEW.remediation_encrypted_password IS NOT DISTINCT FROM OLD.remediation_encrypted_password
+       AND (v_moved OR NEW.remediation_username IS DISTINCT FROM OLD.remediation_username))
+      OR (COALESCE((to_jsonb(OLD) ->> 'hypothetical_index_encrypted_password'), '') <> ''
+       AND (to_jsonb(NEW) ->> 'hypothetical_index_encrypted_password') IS NOT DISTINCT FROM (to_jsonb(OLD) ->> 'hypothetical_index_encrypted_password')
+       AND (v_moved OR (to_jsonb(NEW) ->> 'hypothetical_index_username') IS DISTINCT FROM (to_jsonb(OLD) ->> 'hypothetical_index_username'))) THEN
+      RAISE EXCEPTION '%', 'This server has a remediation or hypothetical-index login stored. Change how it is reached on the service host, in the configuration file or with --add-server.' USING ERRCODE = 'PW003';
    END IF;
 
    IF v_moved
@@ -698,25 +1870,800 @@ GRANT INSERT, UPDATE, DELETE ON config.custom_alert_rules TO viewer;
 GRANT INSERT, UPDATE, DELETE ON config.custom_alert_rules TO mcp;
 
 -- 3f. The rest of the MCP tools' writes, mirroring managed provisioning's grants exactly:
---     analyze_server persists its findings and mute_analysis_finding records a mute (INSERT only: there is no
---     MCP unmute); update_alert_settings writes the singleton alert-settings row and the ONE non-secret
+--     analyze_server persists its findings and mute_analysis_finding records a mute (INSERT, and DELETE for
+--     unmute_analysis_finding, #6383); update_alert_settings writes the singleton alert-settings row and the ONE non-secret
 --     column of config_notification it spans, email_cooldown_minutes (COLUMN-level: the row holds the SMTP
 --     password and the webhook URLs, which mcp can neither read nor write); set_notification_route_enabled
 --     and delete_notification_route take a route out of force or remove it (never INSERT, never a
 --     destination column: a route IS a destination); add_servers / remove_server edit the monitored-server
 --     registry (whose credential column stays carved, so mcp can WRITE a password blob and never READ one).
 GRANT INSERT ON collect.analysis_findings TO mcp;
-GRANT INSERT ON config.analysis_muted TO mcp;
+GRANT INSERT, DELETE ON config.analysis_muted TO mcp;
 GRANT UPDATE ON config.config_alert_settings TO mcp;
 GRANT UPDATE (email_cooldown_minutes) ON config.config_notification TO mcp;
+-- #5825 (V187): update_alert_settings writes delivery.send_resolutions, the four per-channel resolution flags.
+-- Guarded on the column, so a store below V187 still commits the rest.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = 'config.config_notification'::regclass
+                AND attname = 'slack_send_resolutions' AND NOT attisdropped) THEN
+      EXECUTE $v187$
+GRANT UPDATE (slack_send_resolutions, teams_send_resolutions, generic_send_resolutions, email_send_resolutions)
+    ON config.config_notification TO mcp;
+$v187$;
+   END IF;
+END $$;
 GRANT UPDATE (enabled, modified_at), DELETE ON config.config_notification_routes TO mcp;
+-- #6036 (V193): set_notification_route_fallback writes the fallback route id, a pointer to another route (never a
+-- destination). Guarded on the column, so a store below V193 still commits the rest.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = pg_catalog.to_regclass('config.config_notification_routes')
+                AND attname = 'fallback_route_id' AND NOT attisdropped) THEN
+      EXECUTE $v193f$
+GRANT UPDATE (fallback_route_id) ON config.config_notification_routes TO mcp;
+$v193f$;
+   END IF;
+END $$;
 GRANT INSERT, DELETE ON config.config_monitored_servers TO mcp;
 REVOKE UPDATE ON config.config_monitored_servers FROM mcp;
 -- The role and external ID of a server are set only through the edit function (and an INSERT): mcp's UPDATE
 -- names every other column of the table and leaves out aws_role_arn, aws_external_id and the generated
--- aws_external_id_set. A column added to the table later is added to this list.
+-- aws_external_id_set, and query_store_replica (#6254), a host the service connects to with its own credentials:
+-- it changes only through the edit function, never add it here. A column added to the table later is added to this list
+-- unless it is one of those.
 GRANT UPDATE (server_id, name, host, database, auth, username, encrypted_password, encrypt_mode, trust_server_certificate, read_only_intent, multi_subnet_failover, excluded_databases, monthly_cost_usd, capture_plans, is_enabled, created_at, modified_at, alert_delivery_mode_override, engine, port, plan_force_bot_enabled, remediation_username, remediation_encrypted_password)
    ON config.config_monitored_servers TO mcp;
+
+-- 3h. External alert submit (#5654): another service raises an alert through Darling's channels, routes and mute rules by
+--     calling config.submit_external_alert as its OWN login (one login per source). This is the same function managed
+--     provisioning rebuilds on every start (DarlingManagedRoles section 10b), the same text, and the same grants (section
+--     10c). It looks the caller up by session_user in config.external_alert_source, so no argument names the source and
+--     no source can record an alert under another source's name. EXECUTE goes to the registered source logins only.
+--     The three tables (V180) are written only by the owner and by this function: the REVOKE below takes the
+--     INSERT/UPDATE/DELETE that step 3 and the default privileges gave admin. A source login is touched only when the registry names it
+--     and it carries the 'darling-alert-source' marker comment; each gets LOGIN, every widening attribute off, NOINHERIT,
+--     no role membership but darling_alert_sources (WITH INHERIT FALSE, SET FALSE from PostgreSQL 16), CONNECT on this
+--     database, USAGE on config and EXECUTE on the function, and nothing else. darling_alert_sources is a NOLOGIN group
+--     marked 'darling-alert-source-group' that holds nothing; it exists so the managed pg_hba line for
+--     postgres.network.role "sources" names one role. An unmarked role of that name stops the script (the step 1 rule), and
+--     every member that is not a registered, marked source login is revoked from it. On a
+--     store below V180 the block warns and skips the tables and the logins (the function itself is created either way);
+--     re-run the script once the service has migrated the store to V180, and again after each add-alert-source.
+CREATE OR REPLACE FUNCTION config.submit_external_alert(
+   p_kind text,
+   p_alert_key text,
+   p_severity text,
+   p_title text,
+   p_detail text,
+   p_server_name text,
+   p_value double precision)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+   v_source_id integer;
+   v_max_per_minute integer;
+   v_max_pending integer;
+   v_severity text;
+   v_pending_id bigint;
+BEGIN
+   SELECT s.source_id, s.max_per_minute, s.max_pending
+   INTO v_source_id, v_max_per_minute, v_max_pending
+   FROM config.external_alert_source AS s
+   WHERE s.role_name = session_user::text
+     AND s.enabled
+   FOR NO KEY UPDATE OF s;
+
+   IF NOT FOUND THEN
+      RAISE EXCEPTION 'This login is not a registered external alert source.' USING ERRCODE = 'DL403';
+   END IF;
+
+   IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'submit_external_alert needs the READ COMMITTED isolation level.' USING ERRCODE = 'DL400',
+         HINT = 'Run the call outside a REPEATABLE READ or SERIALIZABLE transaction.';
+   END IF;
+
+   v_severity := CASE WHEN p_severity IS NULL AND p_kind = 'clear' THEN 'warning' ELSE p_severity END;
+
+   IF p_kind IS NULL OR p_kind NOT IN ('fire', 'clear') THEN
+      RAISE EXCEPTION 'kind must be fire or clear.' USING ERRCODE = 'DL400';
+   END IF;
+   IF v_severity IS NULL OR v_severity NOT IN ('warning', 'critical') THEN
+      RAISE EXCEPTION 'severity must be warning or critical.' USING ERRCODE = 'DL400';
+   END IF;
+   IF p_alert_key IS NULL OR char_length(p_alert_key) NOT BETWEEN 1 AND 128 OR p_alert_key !~ '^[A-Za-z0-9._:-]+$' THEN
+      RAISE EXCEPTION 'alert_key must be 1 to 128 characters from A-Z a-z 0-9 . _ : -.' USING ERRCODE = 'DL400';
+   END IF;
+   IF char_length(p_title) > 200 THEN
+      RAISE EXCEPTION 'title is longer than 200 characters.' USING ERRCODE = 'DL400';
+   END IF;
+   IF char_length(p_detail) > 2000 THEN
+      RAISE EXCEPTION 'detail is longer than 2000 characters.' USING ERRCODE = 'DL400';
+   END IF;
+   IF char_length(p_server_name) > 128 THEN
+      RAISE EXCEPTION 'server_name is longer than 128 characters.' USING ERRCODE = 'DL400';
+   END IF;
+   IF p_value IN ('NaN'::double precision, 'Infinity'::double precision, '-Infinity'::double precision) THEN
+      RAISE EXCEPTION 'value must be a finite number.' USING ERRCODE = 'DL400';
+   END IF;
+
+   IF (SELECT count(*) FROM config.external_alert_pending AS p
+       WHERE p.source_id = v_source_id AND p.submitted_at > clock_timestamp() - interval '1 minute') >= v_max_per_minute THEN
+      RAISE EXCEPTION 'This source has reached its limit of % alerts per minute.', v_max_per_minute
+         USING ERRCODE = 'DL429', HINT = 'Send fewer alerts, or ask the Darling operator to raise max_per_minute for this source.';
+   END IF;
+   IF (SELECT count(*) FROM config.external_alert_pending AS p
+       WHERE p.source_id = v_source_id AND p.status IN ('pending', 'claimed')) >= v_max_pending THEN
+      RAISE EXCEPTION 'This source already has % alerts waiting for delivery.', v_max_pending
+         USING ERRCODE = 'DL429', HINT = 'Darling has not delivered the earlier alerts yet. Retry later.';
+   END IF;
+
+   INSERT INTO config.external_alert_pending
+      (source_id, kind, alert_key, severity, title, detail, server_name, value, submitted_at, expires_at)
+   VALUES
+      (v_source_id, p_kind, p_alert_key, v_severity,
+       regexp_replace(p_title, '[\r\n]+', ' ', 'g'),
+       regexp_replace(p_detail, '[\r\n]+', ' ', 'g'),
+       regexp_replace(p_server_name, '[\r\n]+', ' ', 'g'),
+       p_value, clock_timestamp(), clock_timestamp() + interval '15 minutes')
+   RETURNING pending_id INTO v_pending_id;
+
+   RETURN v_pending_id;
+END;
+$fn$;
+REVOKE ALL ON FUNCTION config.submit_external_alert(text, text, text, text, text, text, double precision) FROM PUBLIC;
+REVOKE ALL ON FUNCTION config.submit_external_alert(text, text, text, text, text, text, double precision) FROM admin, viewer, mcp;
+-- The two trigger functions need no EXECUTE to fire, so PUBLIC (and with it a source login) gets none.
+REVOKE EXECUTE ON FUNCTION config.config_bump_version(), config.config_service_bump() FROM PUBLIC;
+-- pg_stat_statements gives PUBLIC its views and functions; Darling reads them through its own SECURITY DEFINER functions.
+-- pg_read_all_stats (part of pg_monitor) keeps them, so a monitoring login that watches this database as a PostgreSQL target
+-- still reads them, and so does each store owner that is not a superuser (the owner of config.config_monitored_servers and
+-- of the reader functions), which those functions run as. Only the owner of the extension or a superuser may revoke them:
+-- for any other role this block changes nothing. When PUBLIC still holds them afterwards (the extension belongs to a
+-- superuser and this script runs as the store owner), it raises a WARNING naming the owner of the extension and the
+-- statements that owner runs; the service logs the same text.
+DO $do$
+DECLARE
+   v_pass integer;
+   v_may_change boolean;
+   v_statements text;
+   v_warning text;
+BEGIN
+   -- The first pass revokes when this role may; the second reads the grants as they are now.
+   FOR v_pass IN 1..2 LOOP
+      SELECT q.may_change, q.sql_text, q.warning INTO v_may_change, v_statements, v_warning
+      FROM (
+      WITH ext AS
+      (
+          SELECT
+              n.nspname,
+              e.extowner,
+              e.extnamespace,
+              (
+                  SELECT c.oid
+                  FROM pg_catalog.pg_class AS c
+                  WHERE c.relnamespace = e.extnamespace
+                  AND   c.relname OPERATOR(pg_catalog.=) 'pg_stat_statements'
+              ) AS view_oid,
+              (
+                  SELECT c.oid
+                  FROM pg_catalog.pg_class AS c
+                  WHERE c.relnamespace = e.extnamespace
+                  AND   c.relname OPERATOR(pg_catalog.=) 'pg_stat_statements_info'
+              ) AS info_oid
+          FROM pg_catalog.pg_extension AS e
+          JOIN pg_catalog.pg_namespace AS n
+            ON n.oid = e.extnamespace
+          WHERE e.extname = 'pg_stat_statements'
+      ),
+      facts AS
+      (
+          SELECT
+              ext.*,
+              (SELECT c.relowner FROM pg_catalog.pg_class AS c WHERE c.oid = ext.view_oid) AS view_owner,
+              (
+                  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(r.rolname), ', ' ORDER BY r.rolname)
+                  FROM pg_catalog.pg_roles AS r
+                  WHERE NOT r.rolsuper
+                  AND   r.oid IS DISTINCT FROM (SELECT c.relowner FROM pg_catalog.pg_class AS c WHERE c.oid = ext.view_oid)
+                  AND   r.oid IN
+                        (
+                            SELECT c.relowner
+                            FROM pg_catalog.pg_class AS c
+                            JOIN pg_catalog.pg_namespace AS cn
+                              ON cn.oid = c.relnamespace
+                            WHERE cn.nspname OPERATOR(pg_catalog.=) 'config'
+                            AND   c.relname OPERATOR(pg_catalog.=) 'config_monitored_servers'
+                            UNION ALL
+                            SELECT p.proowner
+                            FROM pg_catalog.pg_proc AS p
+                            JOIN pg_catalog.pg_namespace AS pn
+                              ON pn.oid = p.pronamespace
+                            WHERE pn.nspname OPERATOR(pg_catalog.=) 'config'
+                            AND   p.proname IN ('store_statement_stats', 'store_statement_stats_info')
+                        )
+              ) AS owners,
+              (
+                  EXISTS
+                  (
+                      SELECT 1
+                      FROM pg_catalog.pg_class AS c
+                      CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))) AS a
+                      WHERE c.oid IN (ext.view_oid, ext.info_oid)
+                      AND   a.grantee = 0
+                      AND   a.privilege_type = 'SELECT'
+                  )
+                  OR EXISTS
+                  (
+                      SELECT 1
+                      FROM pg_catalog.pg_proc AS p
+                      CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) AS a
+                      WHERE p.pronamespace = ext.extnamespace
+                      AND   p.proname IN ('pg_stat_statements', 'pg_stat_statements_info')
+                      AND   a.grantee = 0
+                      AND   a.privilege_type = 'EXECUTE'
+                  )
+              ) AS public_reads
+          FROM ext
+      ),
+      built AS
+      (
+          SELECT
+              f.*,
+              'pg_read_all_stats' || COALESCE(', ' || f.owners, '') AS grantees
+          FROM facts AS f
+      ),
+      statements AS
+      (
+          SELECT
+              b.*,
+              pg_catalog.format('REVOKE SELECT ON %1$I.pg_stat_statements FROM PUBLIC; REVOKE EXECUTE ON FUNCTION %1$I.pg_stat_statements(boolean) FROM PUBLIC; GRANT SELECT ON %1$I.pg_stat_statements TO %2$s; GRANT EXECUTE ON FUNCTION %1$I.pg_stat_statements(boolean) TO %2$s;', b.nspname, b.grantees)
+              || CASE
+                     WHEN b.info_oid IS NULL THEN ''
+                     ELSE pg_catalog.format(' REVOKE SELECT ON %1$I.pg_stat_statements_info FROM PUBLIC; REVOKE EXECUTE ON FUNCTION %1$I.pg_stat_statements_info() FROM PUBLIC; GRANT SELECT ON %1$I.pg_stat_statements_info TO %2$s; GRANT EXECUTE ON FUNCTION %1$I.pg_stat_statements_info() TO %2$s;', b.nspname, b.grantees)
+                 END AS sql_text
+          FROM built AS b
+      )
+      SELECT
+          COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles AS r WHERE r.rolname OPERATOR(pg_catalog.=) current_user), false)
+              OR (s.view_owner IS NOT NULL AND pg_catalog.pg_has_role(current_user, s.view_owner, 'USAGE')) AS may_change,
+          s.sql_text,
+          CASE
+              WHEN s.public_reads THEN pg_catalog.format(
+                  'Statement statistics: PUBLIC can still read %s.pg_stat_statements, so every login that may connect to this database reads the statement statistics of every role, the external alert source logins included. Only the owner of the extension, %s, or a superuser can revoke that. Have %s run, in this database: %s',
+                  pg_catalog.quote_ident(s.nspname),
+                  pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(s.extowner)),
+                  pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(s.extowner)),
+                  s.sql_text)
+          END AS warning
+      FROM statements AS s
+      WHERE s.view_oid IS NOT NULL
+      ) AS q;
+      IF v_pass = 1 AND v_may_change AND v_statements IS NOT NULL THEN
+         EXECUTE v_statements;
+      END IF;
+   END LOOP;
+   IF v_warning IS NOT NULL THEN
+      RAISE WARNING '%', v_warning;
+   END IF;
+END $do$;
+
+DO $do$
+DECLARE
+   as_superuser boolean := (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user);
+   source_login record;
+   membership record;
+   attribute text;
+   group_oid oid;
+   reset_failed boolean;
+BEGIN
+   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'darling_alert_sources') THEN
+      CREATE ROLE darling_alert_sources NOLOGIN NOINHERIT;
+      COMMENT ON ROLE darling_alert_sources IS 'darling-alert-source-group';
+   ELSIF pg_catalog.shobj_description((SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'darling_alert_sources'), 'pg_authid') IS DISTINCT FROM 'darling-alert-source-group' THEN
+      RAISE EXCEPTION 'The group role "darling_alert_sources" already exists and was not created by Darling (missing the ''darling-alert-source-group'' marker comment). Rename or drop it before provisioning so Darling does not repurpose an unrelated role.';
+   END IF;
+
+   SELECT oid INTO group_oid FROM pg_catalog.pg_roles WHERE rolname = 'darling_alert_sources';
+   -- NOLOGIN and NOINHERIT alone, then only the attributes that are on: a role without SUPERUSER may not name SUPERUSER,
+   -- REPLICATION or BYPASSRLS in ALTER ROLE even to switch them off, so naming them all would always fail for it.
+   BEGIN
+      ALTER ROLE darling_alert_sources NOLOGIN NOINHERIT;
+   EXCEPTION WHEN insufficient_privilege THEN
+      RAISE WARNING 'Role "darling_alert_sources" could not be set to NOLOGIN NOINHERIT: this needs a superuser, or CREATEROLE and, from PostgreSQL 16, ADMIN OPTION on the role.';
+   END;
+   FOREACH attribute IN ARRAY (
+         SELECT pg_catalog.array_remove(ARRAY[
+            CASE WHEN r.rolsuper THEN 'SUPERUSER' END,
+            CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
+            CASE WHEN r.rolcreatedb THEN 'CREATEDB' END,
+            CASE WHEN r.rolreplication THEN 'REPLICATION' END,
+            CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END], NULL)
+         FROM pg_catalog.pg_roles AS r WHERE r.oid = group_oid)
+   LOOP
+      BEGIN
+         EXECUTE pg_catalog.format('ALTER ROLE darling_alert_sources NO%s', attribute);
+      EXCEPTION WHEN insufficient_privilege THEN
+         RAISE WARNING 'Role "darling_alert_sources" still has the % attribute: switching it off needs a superuser, or, from PostgreSQL 16, an owner that holds % itself.', attribute, attribute;
+      END;
+   END LOOP;
+   IF (SELECT r.rolcanlogin FROM pg_catalog.pg_roles AS r WHERE r.oid = group_oid) THEN
+      RAISE WARNING 'Role "darling_alert_sources" can still log in, and a pg_hba line for +darling_alert_sources admits it. Have a superuser run: ALTER ROLE darling_alert_sources NOLOGIN;';
+   END IF;
+
+   FOR membership IN
+      SELECT g.rolname AS granted, b.rolname AS grantor
+      FROM pg_catalog.pg_auth_members AS a
+      JOIN pg_catalog.pg_roles AS g ON g.oid = a.roleid
+      LEFT JOIN pg_catalog.pg_roles AS b ON b.oid = a.grantor
+      WHERE a.member = group_oid
+   LOOP
+      BEGIN
+         EXECUTE pg_catalog.format('REVOKE %I FROM darling_alert_sources', membership.granted)
+            || CASE WHEN (as_superuser OR pg_catalog.current_setting('server_version_num')::int >= 160000) AND membership.grantor IS NOT NULL
+                    THEN pg_catalog.format(' GRANTED BY %I', membership.grantor) ELSE '' END
+            || ' CASCADE';
+      EXCEPTION WHEN insufficient_privilege THEN
+         RAISE WARNING 'Role "darling_alert_sources" is still a member of "%": revoking that needs a superuser, or ADMIN OPTION on it.', membership.granted;
+      END;
+   END LOOP;
+
+   EXECUTE pg_catalog.format('REVOKE ALL ON DATABASE %I FROM darling_alert_sources', pg_catalog.current_database());
+   REVOKE ALL ON SCHEMA config, collect FROM darling_alert_sources;
+   REVOKE ALL ON ALL TABLES IN SCHEMA config, collect FROM darling_alert_sources;
+   REVOKE ALL ON ALL SEQUENCES IN SCHEMA config, collect FROM darling_alert_sources;
+   REVOKE ALL ON FUNCTION config.submit_external_alert(text, text, text, text, text, text, double precision) FROM darling_alert_sources;
+
+   IF pg_catalog.to_regclass('config.external_alert_source') IS NULL
+      OR pg_catalog.to_regclass('config.external_alert_pending') IS NULL
+      OR pg_catalog.to_regclass('config.external_alert_state') IS NULL THEN
+      RAISE WARNING 'The external alert tables were not found, so their grants and the source logins were skipped. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   REVOKE ALL ON config.external_alert_source, config.external_alert_pending, config.external_alert_state
+      FROM PUBLIC, admin, viewer, mcp CASCADE;
+   GRANT SELECT ON config.external_alert_source, config.external_alert_pending, config.external_alert_state
+      TO admin, viewer;
+   GRANT SELECT ON config.external_alert_source, config.external_alert_pending, config.external_alert_state
+      TO mcp;
+
+   -- Every grant of the group to a role that is not a registered, marked source login, and every grant of a source login to
+   -- any role, found by walking down from the group through the source logins: pg_hba's +darling_alert_sources matches a
+   -- member at any depth, whatever its INHERIT and SET options. A grant this role may not revoke (from PostgreSQL 16, a role
+   -- that is not a superuser is recorded as a member of each role it creates, granted by the bootstrap superuser) is named
+   -- in a WARNING here, and again at the end of this block with the pg_hba line that keeps it out.
+   FOR membership IN
+      WITH RECURSIVE valid AS (
+         SELECT r.oid
+         FROM config.external_alert_source AS s
+         JOIN pg_catalog.pg_roles AS r ON r.rolname = s.role_name
+         WHERE pg_catalog.shobj_description(r.oid, 'pg_authid') IS NOT DISTINCT FROM 'darling-alert-source'
+           AND r.rolname NOT IN ('admin', 'viewer', 'mcp')
+           AND r.rolname <> current_user
+           AND NOT r.rolsuper
+           AND r.oid <> (SELECT d.datdba FROM pg_catalog.pg_database AS d WHERE d.datname = pg_catalog.current_database())
+      ), walk (roleid, member) AS (
+         SELECT a.roleid, a.member FROM pg_catalog.pg_auth_members AS a WHERE a.roleid = group_oid
+         UNION
+         SELECT a.roleid, a.member
+         FROM pg_catalog.pg_auth_members AS a
+         JOIN walk AS w ON a.roleid = w.member
+         WHERE w.member IN (SELECT v.oid FROM valid AS v)
+      )
+      SELECT DISTINCT g.rolname AS granted, m.rolname AS member_name, b.rolname AS grantor
+      FROM walk AS w
+      JOIN pg_catalog.pg_auth_members AS a ON a.roleid = w.roleid AND a.member = w.member
+      JOIN pg_catalog.pg_roles AS g ON g.oid = a.roleid
+      JOIN pg_catalog.pg_roles AS m ON m.oid = a.member
+      LEFT JOIN pg_catalog.pg_roles AS b ON b.oid = a.grantor
+      WHERE (w.roleid = group_oid AND w.member NOT IN (SELECT v.oid FROM valid AS v))
+         OR w.roleid IN (SELECT v.oid FROM valid AS v)
+   LOOP
+      BEGIN
+         EXECUTE pg_catalog.format('REVOKE %I FROM %I', membership.granted, membership.member_name)
+            || CASE WHEN (as_superuser OR pg_catalog.current_setting('server_version_num')::int >= 160000) AND membership.grantor IS NOT NULL
+                    THEN pg_catalog.format(' GRANTED BY %I', membership.grantor) ELSE '' END
+            || ' CASCADE';
+      EXCEPTION WHEN insufficient_privilege THEN
+         RAISE WARNING 'Role "%" is still a member of "%": revoking that needs a superuser, or ADMIN OPTION on it and the rights of the role that granted it.', membership.member_name, membership.granted;
+      END;
+   END LOOP;
+
+   FOR source_login IN
+      SELECT s.role_name, r.oid AS role_oid, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
+             (pg_catalog.shobj_description(r.oid, 'pg_authid') IS NOT DISTINCT FROM 'darling-alert-source') AS marked,
+             (r.rolname IN ('admin', 'viewer', 'mcp')
+              OR r.rolname = current_user
+              OR r.rolsuper
+              OR r.oid = (SELECT d.datdba FROM pg_catalog.pg_database AS d WHERE d.datname = pg_catalog.current_database())) AS reserved
+      FROM config.external_alert_source AS s
+      LEFT JOIN pg_catalog.pg_roles AS r ON r.rolname = s.role_name
+   LOOP
+      IF source_login.reserved IS TRUE THEN
+         RAISE WARNING 'External alert source login "%" was skipped: it is one of Darling''s own roles, the role running this step, a superuser or the database owner, and its limit, inheritance and memberships are left as they are.', source_login.role_name;
+         CONTINUE;
+      END IF;
+
+      IF source_login.role_oid IS NULL OR NOT source_login.marked THEN
+         RAISE WARNING 'External alert source login "%" was skipped: it does not exist or does not carry the ''darling-alert-source'' marker comment.', source_login.role_name;
+         IF source_login.role_oid IS NOT NULL THEN
+            EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION config.submit_external_alert(%s) FROM %I',
+               'text, text, text, text, text, text, double precision', source_login.role_name);
+         END IF;
+         CONTINUE;
+      END IF;
+
+      -- A login whose reset below does not complete (an attribute or a membership this role may not take back) gets no
+      -- grant and no membership in the group, as the service's add verb does: it is not admitted until a superuser runs
+      -- this script, or the add verb's statements, for it.
+      reset_failed := false;
+      BEGIN
+         EXECUTE pg_catalog.format('ALTER ROLE %I LOGIN NOINHERIT CONNECTION LIMIT 5', source_login.role_name);
+      EXCEPTION WHEN insufficient_privilege THEN
+         reset_failed := true;
+         RAISE WARNING 'Login "%" could not be set to LOGIN NOINHERIT CONNECTION LIMIT 5: this needs CREATEROLE, and from PostgreSQL 16 ADMIN OPTION on the role.', source_login.role_name;
+      END;
+      FOREACH attribute IN ARRAY pg_catalog.array_remove(ARRAY[
+            CASE WHEN source_login.rolsuper THEN 'SUPERUSER' END,
+            CASE WHEN source_login.rolcreaterole THEN 'CREATEROLE' END,
+            CASE WHEN source_login.rolcreatedb THEN 'CREATEDB' END,
+            CASE WHEN source_login.rolreplication THEN 'REPLICATION' END,
+            CASE WHEN source_login.rolbypassrls THEN 'BYPASSRLS' END], NULL)
+      LOOP
+         BEGIN
+            EXECUTE pg_catalog.format('ALTER ROLE %I NO%s', source_login.role_name, attribute);
+         EXCEPTION WHEN insufficient_privilege THEN
+            reset_failed := true;
+            RAISE WARNING 'Login "%" still has the % attribute: switching it off needs a superuser, or, from PostgreSQL 16, an owner that holds % itself.', source_login.role_name, attribute, attribute;
+         END;
+      END LOOP;
+
+      FOR membership IN
+         SELECT g.rolname AS granted, b.rolname AS grantor
+         FROM pg_catalog.pg_auth_members AS a
+         JOIN pg_catalog.pg_roles AS g ON g.oid = a.roleid
+         LEFT JOIN pg_catalog.pg_roles AS b ON b.oid = a.grantor
+         WHERE a.member = source_login.role_oid
+      LOOP
+         BEGIN
+            EXECUTE pg_catalog.format('REVOKE %I FROM %I', membership.granted, source_login.role_name)
+               || CASE WHEN (as_superuser OR pg_catalog.current_setting('server_version_num')::int >= 160000) AND membership.grantor IS NOT NULL
+                       THEN pg_catalog.format(' GRANTED BY %I', membership.grantor) ELSE '' END
+               || ' CASCADE';
+         EXCEPTION WHEN insufficient_privilege THEN
+            reset_failed := true;
+            RAISE WARNING 'Login "%" is still a member of "%": revoking that needs a superuser, or ADMIN OPTION on it.', source_login.role_name, membership.granted;
+         END;
+      END LOOP;
+
+      EXECUTE pg_catalog.format('REVOKE ALL ON ALL TABLES IN SCHEMA config, collect FROM %I', source_login.role_name);
+      EXECUTE pg_catalog.format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA config, collect FROM %I', source_login.role_name);
+      IF reset_failed THEN
+         EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION config.submit_external_alert(%s) FROM %I',
+            'text, text, text, text, text, text, double precision', source_login.role_name);
+         BEGIN
+            EXECUTE pg_catalog.format('REVOKE darling_alert_sources FROM %I', source_login.role_name);
+         EXCEPTION WHEN insufficient_privilege THEN
+            NULL;
+         END;
+         RAISE WARNING 'External alert source login "%" is not admitted: this script could not finish its reset (see the warnings above), so it gets no grant and no membership in "darling_alert_sources". A superuser runs this script again, or the add verb''s statements, to admit it.', source_login.role_name;
+         CONTINUE;
+      END IF;
+      EXECUTE pg_catalog.format('GRANT CONNECT ON DATABASE %I TO %I', pg_catalog.current_database(), source_login.role_name);
+      EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA config TO %I', source_login.role_name);
+      EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION config.submit_external_alert(%s) TO %I',
+         'text, text, text, text, text, text, double precision', source_login.role_name);
+      BEGIN
+         IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+            EXECUTE pg_catalog.format('GRANT darling_alert_sources TO %I WITH INHERIT FALSE, SET FALSE', source_login.role_name);
+         ELSE
+            EXECUTE pg_catalog.format('GRANT darling_alert_sources TO %I', source_login.role_name);
+         END IF;
+      EXCEPTION WHEN insufficient_privilege THEN
+         RAISE WARNING 'Login "%" could not be made a member of "darling_alert_sources": this needs a superuser, or ADMIN OPTION on the group.', source_login.role_name;
+      END;
+   END LOOP;
+
+   -- What a pg_hba line for +darling_alert_sources admits besides the source logins: every member of the group at any depth
+   -- (through any role) that is not a registered, marked source login, after the revokes above. The role running this script
+   -- is one of them when it is not a superuser and created the group or a source login on PostgreSQL 16 or later.
+   FOR membership IN
+      WITH RECURSIVE closure (oid) AS (
+         SELECT a.member FROM pg_catalog.pg_auth_members AS a WHERE a.roleid = group_oid
+         UNION
+         SELECT a.member FROM pg_catalog.pg_auth_members AS a JOIN closure AS c ON a.roleid = c.oid
+      )
+      SELECT r.rolname AS member_name
+      FROM closure AS c
+      JOIN pg_catalog.pg_roles AS r ON r.oid = c.oid
+      WHERE NOT (EXISTS (SELECT 1 FROM config.external_alert_source AS s WHERE s.role_name = r.rolname)
+                 AND pg_catalog.shobj_description(r.oid, 'pg_authid') IS NOT DISTINCT FROM 'darling-alert-source'
+                 AND r.rolname NOT IN ('admin', 'viewer', 'mcp')
+                 AND NOT r.rolsuper
+                 AND r.oid <> (SELECT d.datdba FROM pg_catalog.pg_database AS d WHERE d.datname = pg_catalog.current_database()))
+      ORDER BY r.rolname
+   LOOP
+      RAISE WARNING 'Role "%" is a member of "darling_alert_sources" (directly or through a source login)%, so a pg_hba line for +darling_alert_sources admits it too. Put this line ABOVE that one: hostssl % % <range> reject',
+         membership.member_name,
+         CASE WHEN membership.member_name = current_user THEN ', and it is the role running this script' ELSE '' END,
+         -- pg_hba quoting: a name is bare only when it is plain lower-case letters, digits and underscores and not a
+         -- pg_hba keyword, so a role named all is that one role and never every role (the service quotes the same way).
+         CASE WHEN pg_catalog.current_database() ~ '^[a-z0-9_]+$'
+                   AND pg_catalog.current_database() NOT IN ('all', 'sameuser', 'samerole', 'samegroup', 'replication')
+              THEN pg_catalog.current_database()::text
+              ELSE '"' || pg_catalog.replace(pg_catalog.current_database(), '"', '""') || '"' END,
+         CASE WHEN membership.member_name ~ '^[a-z0-9_]+$'
+                   AND membership.member_name NOT IN ('all', 'sameuser', 'samerole', 'samegroup', 'replication')
+              THEN membership.member_name::text
+              ELSE '"' || pg_catalog.replace(membership.member_name, '"', '""') || '"' END;
+   END LOOP;
+END $do$;
+
+-- 3i. Investigation tables (V184, #5632), mirroring managed provisioning's section 10d grant for grant. Step 3 and the
+--     default privileges gave admin INSERT/UPDATE/DELETE on all six, so REVOKE ALL ... CASCADE takes every privilege
+--     from PUBLIC and the three roles, and SELECT goes back to all three. mcp (the claim and submit tools) updates only
+--     the claim and report columns of a request, inserts a report and a journal row, and proposes a note without its
+--     state column, so an agent's note stays pending until a person decides it. admin (the desktop Viewer) closes a
+--     request, writes the environment profiles, writes, decides or deletes a note, and journals what it did. The
+--     service writes the rest as the owner. On a store below V184 the block warns and skips, as the agent route column
+--     grants in steps 2b and 2c do, so the whole script runs clean on a V181-V183 store; re-run it once the service has
+--     migrated the store to V184.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.investigation_requests') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_request_alerts') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_reports') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_journal') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_notes') IS NULL
+      OR pg_catalog.to_regclass('config.agent_environment_profiles') IS NULL THEN
+      RAISE WARNING 'The investigation tables were not found, so their grants were skipped. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   REVOKE ALL ON config.investigation_requests, config.investigation_request_alerts, config.investigation_reports,
+      config.investigation_journal, config.investigation_notes, config.agent_environment_profiles
+      FROM PUBLIC, admin, viewer, mcp CASCADE;
+   GRANT SELECT ON config.investigation_requests, config.investigation_request_alerts, config.investigation_reports,
+      config.investigation_journal, config.investigation_notes, config.agent_environment_profiles
+      TO admin, viewer;
+   GRANT SELECT ON config.investigation_requests, config.investigation_request_alerts, config.investigation_reports,
+      config.investigation_journal, config.investigation_notes, config.agent_environment_profiles
+      TO mcp;
+   GRANT UPDATE (state, claimed_by, claim_id, claimed_at, lease_until, claim_count, brief_format, brief, reported_at)
+      ON config.investigation_requests TO mcp;
+   -- #6008 (V193): submit_investigation_report writes follow_up_at onto the report's own request. Guarded on the column, so a
+   -- store at V184 to V192 still takes the rest of this block; re-run the script once the service has migrated it to V193.
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = 'config.investigation_requests'::regclass
+                AND attname = 'follow_up_at' AND NOT attisdropped) THEN
+      EXECUTE $v193u$
+GRANT UPDATE (follow_up_at) ON config.investigation_requests TO mcp;
+$v193u$;
+   END IF;
+   -- #6009 (V193): the deploy condition beside it, guarded the same way.
+   IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+              WHERE attrelid = 'config.investigation_requests'::regclass
+                AND attname = 'follow_up_condition' AND NOT attisdropped) THEN
+      EXECUTE $v193c$
+GRANT UPDATE (follow_up_condition) ON config.investigation_requests TO mcp;
+$v193c$;
+   END IF;
+   GRANT INSERT ON config.investigation_reports TO mcp;
+   GRANT INSERT (event_time, request_id, route_id, server_id, event, actor, reason, detail, once_key)
+      ON config.investigation_journal TO mcp;
+   GRANT INSERT (server_id, story_path_hash, dedup_key, metric_name, note_text, author, source_request_id)
+      ON config.investigation_notes TO mcp;
+   GRANT UPDATE (state, closed_at, closed_by, closed_reason) ON config.investigation_requests TO admin;
+   GRANT INSERT (event_time, request_id, route_id, server_id, event, actor, reason, detail, once_key)
+      ON config.investigation_journal TO admin;
+   GRANT INSERT, DELETE ON config.investigation_notes TO admin;
+   GRANT UPDATE (state, decided_at, decided_by, expires_at) ON config.investigation_notes TO admin;
+   GRANT INSERT, UPDATE, DELETE ON config.agent_environment_profiles TO admin;
+END $do$;
+
+-- 3i (continued). #6003 review: the journal is the request event log the service signs and delivers, and mcp and admin
+--     hold INSERT on it (the nine columns above: not journal_id, the identity, and not event_id, the webhook id, so a role
+--     cannot fill the next million values and make every service insert fail), so this trigger (managed provisioning's
+--     BuildJournalEventRulesSql, text for text) refuses a row from any role but the owner that is an event or a delivery
+--     or fallback mark (but for a practice request's one opened row, which the Viewer writes with the reason "practice of
+--     <case id>"), or that carries a once key other than the prefixes the tools and the Viewer write. A practice opened
+--     row gets the once key practice_opened:<request id> from the trigger, so a second one fails on the unique index. A row
+--     dated ahead of the store's clock is clamped to it. The alert links get the twin rule (BuildRequestAlertLinkRulesSql):
+--     only a practice request takes a link from a role but the owner. Both read V191's practice_of, so on a store below
+--     V191 the block warns and skips; re-run the script once the service has migrated the store.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.investigation_journal') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_request_alerts') IS NULL
+      OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                     WHERE attrelid = pg_catalog.to_regclass('config.investigation_requests')
+                       AND attname = 'practice_of' AND NOT attisdropped) THEN
+      RAISE WARNING 'The investigation journal rules were skipped: the store is below V191. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   EXECUTE $ddl$
+CREATE OR REPLACE FUNCTION config.investigation_journal_owner_rows()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $rules$
+DECLARE
+   v_practice boolean := false;
+BEGIN
+   IF pg_has_role(current_user, (SELECT c.relowner FROM pg_catalog.pg_class AS c WHERE c.oid = TG_RELID), 'USAGE') THEN
+      RETURN NEW;
+   END IF;
+
+   IF NEW.event IN ('opened', 'joined', 'resolved', 'expired', 'claims_exhausted', 'evidence_ready', 'follow_up', 'deadlock_digest', 'event_delivered', 'fallback_sent', 'server_action_switched') THEN
+      IF NEW.event = 'opened'
+         AND EXISTS (SELECT 1 FROM config.investigation_requests AS r
+                     WHERE r.request_id = NEW.request_id AND r.practice_of IS NOT NULL
+                       AND NEW.reason = 'practice of ' || r.practice_of::text)
+         AND NOT EXISTS (SELECT 1 FROM config.investigation_journal AS j
+                         WHERE j.request_id = NEW.request_id AND j.event = 'opened') THEN
+         v_practice := true;
+      ELSE
+         RAISE EXCEPTION 'Only the Darling service journals the request event %.', NEW.event USING ERRCODE = '42501';
+      END IF;
+   END IF;
+
+   IF NEW.once_key IS NOT NULL AND split_part(NEW.once_key, ':', 1) NOT IN ('claimed', 'refused', 'agent_refused', 'journal_capped', 'link') THEN
+      RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'Only the Darling service writes the once keys of request events and their delivery marks.';
+   END IF;
+
+   IF v_practice THEN
+      NEW.once_key := 'practice_opened:' || NEW.request_id::text;
+   END IF;
+
+   IF NEW.event_time > now() THEN
+      NEW.event_time := now();
+   END IF;
+
+   RETURN NEW;
+END;
+$rules$
+$ddl$;
+   REVOKE ALL ON FUNCTION config.investigation_journal_owner_rows() FROM PUBLIC;
+   CREATE OR REPLACE TRIGGER trg_investigation_journal_owner_rows
+      BEFORE INSERT ON config.investigation_journal
+      FOR EACH ROW EXECUTE FUNCTION config.investigation_journal_owner_rows();
+
+   EXECUTE $ddl$
+CREATE OR REPLACE FUNCTION config.investigation_request_alerts_owner_rows()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $rules$
+BEGIN
+   IF pg_has_role(current_user, (SELECT c.relowner FROM pg_catalog.pg_class AS c WHERE c.oid = TG_RELID), 'USAGE') THEN
+      RETURN NEW;
+   END IF;
+
+   IF NOT EXISTS (SELECT 1 FROM config.investigation_requests AS r
+                  WHERE r.request_id = NEW.request_id AND r.practice_of IS NOT NULL) THEN
+      RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'Only the Darling service links an alert to a request, and only a practice request takes a link from anyone else.';
+   END IF;
+
+   RETURN NEW;
+END;
+$rules$
+$ddl$;
+   REVOKE ALL ON FUNCTION config.investigation_request_alerts_owner_rows() FROM PUBLIC;
+   CREATE OR REPLACE TRIGGER trg_investigation_request_alerts_owner_rows
+      BEFORE INSERT ON config.investigation_request_alerts
+      FOR EACH ROW EXECUTE FUNCTION config.investigation_request_alerts_owner_rows();
+END $do$;
+
+-- 3j. Level 2 tables (V191, #5909), mirroring managed provisioning's section 10e grant for grant. The default privileges
+--     give admin INSERT/UPDATE/DELETE and viewer SELECT on a table made after them, but REVOKE ALL ... CASCADE (which also
+--     takes TRIGGER and REFERENCES) and the explicit grants below make the result independent of when the table was made.
+--     admin (the desktop Viewer) writes the threshold overrides and the report feedback. viewer reads both and writes
+--     neither. mcp (the agent's change tools) writes the overrides only and reads the feedback; the overrides' reload
+--     beacon trigger UPDATEs config_service.config_version as the caller, which mcp's two-column grant in step 3d covers.
+--     The mcp write grant on the overrides is table-level on purpose (an override IS the agent's action, and the table has
+--     no authority column to protect, unlike the notes' state column); see managed section 10e.
+--     The two tables are created by V191: on a store below it the block warns and skips, so the rest of the script still
+--     runs; re-run the script once the service has migrated the store to V191.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.config_threshold_overrides') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_feedback') IS NULL THEN
+      RAISE WARNING 'The Level 2 tables were not found, so their grants were skipped. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   REVOKE ALL ON config.config_threshold_overrides, config.investigation_feedback FROM PUBLIC, admin, viewer, mcp CASCADE;
+   GRANT SELECT ON config.config_threshold_overrides, config.investigation_feedback TO admin, viewer;
+   GRANT SELECT ON config.config_threshold_overrides, config.investigation_feedback TO mcp;
+   GRANT INSERT, UPDATE, DELETE ON config.config_threshold_overrides TO admin;
+   GRANT INSERT, UPDATE, DELETE ON config.investigation_feedback TO admin;
+   GRANT INSERT, UPDATE, DELETE ON config.config_threshold_overrides TO mcp;
+   -- #5918 (V191's practice_of column, so here and not in 3i): the Viewer opens a practice request (a replay of a judged case) and copies the case's alert rows.
+   GRANT INSERT (request_id, route_id, server_id, server_name, family, first_metric, story_path_hash, first_alert_at, last_alert_at,
+      window_until, opened_at, expires_at, lease_minutes, autonomy_level, alert_count, practice_of) ON config.investigation_requests TO admin;
+   GRANT INSERT ON config.investigation_request_alerts TO admin;
+END $do$;
+
+-- 3j2. The per-server action switches (V196, #5632 step 5), mirroring managed provisioning's section 10e2. Every role reads them and
+--     NO role but the store owner (the service) writes them: REVOKE ALL ... CASCADE takes every privilege (the default privileges
+--     would give admin INSERT/UPDATE/DELETE on a table made after them), and SELECT goes back to all three. No MCP tool, web route or
+--     darling.json key can turn a switch on. The table is created by V196: on a store below it the block warns and skips, so the
+--     rest of the script still runs; re-run the script once the service has migrated the store to V196.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.config_server_actions') IS NULL THEN
+      RAISE WARNING 'The per-server action switch table was not found, so its grants were skipped. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   REVOKE ALL ON config.config_server_actions FROM PUBLIC, admin, viewer, mcp CASCADE;
+   GRANT SELECT ON config.config_server_actions TO admin, viewer;
+   GRANT SELECT ON config.config_server_actions TO mcp;
+END $do$;
+
+-- 3k. Query-tag tables (V192, #5977), mirroring managed provisioning's grants for them. mcp writes the three tables a person
+--     edits: the tags, the hand assignments and the rules. The map and the sightings are the service's (the owner writes
+--     them), so mcp holds only DELETE on the map, which remove_server runs to clear a removed server's map rows (a server_id is
+--     a hash, so orphaned rows would come back when the server is re-added). viewer gets the same three writes (#5986: the web page that manages
+--     query tags runs the MCP cores as viewer; the read-only seat gate decides who may call it) and DELETE on the map for server
+--     removal, and nothing else on the query-tag tables. admin (the desktop Viewer's default identity) already holds the config writes
+--     through the blanket grant of step 3. No role holds a write on the sightings in collect: like every other collect table,
+--     a removed server's sightings are left to the owner's retention pass. The identity
+--     columns need no sequence grant, and the rules_version bump on a write is a SECURITY DEFINER trigger function, so no
+--     role is granted anything on config.query_tag_state. The tables are created by V192: on a store below it the block warns
+--     and skips, so the rest of the script still runs; re-run the script once the service has migrated the store to V192.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.query_tags') IS NULL
+      OR pg_catalog.to_regclass('config.query_tag_assignments') IS NULL
+      OR pg_catalog.to_regclass('config.query_tag_rules') IS NULL
+      OR pg_catalog.to_regclass('config.query_tag_map') IS NULL
+      OR pg_catalog.to_regclass('collect.query_tag_sightings') IS NULL THEN
+      RAISE WARNING 'The query-tag tables were not found, so their grants were skipped. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   GRANT INSERT, UPDATE, DELETE ON config.query_tags TO mcp;
+   GRANT INSERT, UPDATE, DELETE ON config.query_tag_assignments TO mcp;
+   GRANT INSERT, UPDATE, DELETE ON config.query_tag_rules TO mcp;
+   GRANT DELETE ON config.query_tag_map TO mcp;
+   GRANT INSERT, UPDATE, DELETE ON config.query_tags TO viewer;
+   GRANT INSERT, UPDATE, DELETE ON config.query_tag_assignments TO viewer;
+   GRANT INSERT, UPDATE, DELETE ON config.query_tag_rules TO viewer;
+   GRANT DELETE ON config.query_tag_map TO viewer;
+END $do$;
+
+-- 3l. Phase C tables (V193, #5997), mirroring managed provisioning's section 10f grant for grant. Only the store owner (the
+--     service) writes them. REVOKE ALL ... CASCADE (which also takes TRIGGER and REFERENCES) takes every privilege from PUBLIC
+--     and the three roles, and SELECT goes back to all three: the web dashboard and the MCP tools read them. The merge table's two
+--     grants (#6006) are the first such writes. A later slice that lets a role write one adds that single grant here and in
+--     managed section 10f.
+--     The three tables are created by V193: on a store below it the block warns and skips, so the rest of the script still
+--     runs; re-run the script once the service has migrated the store to V193.
+DO $do$
+BEGIN
+   IF pg_catalog.to_regclass('config.investigation_evidence') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_signature_days') IS NULL
+      OR pg_catalog.to_regclass('config.investigation_signature_merges') IS NULL THEN
+      RAISE WARNING 'The Phase C tables were not found, so their grants were skipped. Run this script again after the service has upgraded the store.';
+      RETURN;
+   END IF;
+
+   REVOKE ALL ON config.investigation_evidence, config.investigation_signature_days, config.investigation_signature_merges FROM PUBLIC, admin, viewer, mcp CASCADE;
+   GRANT SELECT ON config.investigation_evidence, config.investigation_signature_days, config.investigation_signature_merges TO admin, viewer;
+   GRANT SELECT ON config.investigation_evidence, config.investigation_signature_days, config.investigation_signature_merges TO mcp;
+   -- #6006: the one write a role gets here. The gated merge tool runs as mcp and adds a merge row, naming only the columns an
+   -- agent supplies (merge_id and merged_at are the table's own); a person's undo runs as admin and stamps undone_at and undone_by.
+   GRANT INSERT (server_id, signature, merged_into, reason, merged_by) ON config.investigation_signature_merges TO mcp;
+   GRANT UPDATE (undone_at, undone_by) ON config.investigation_signature_merges TO admin;
+END $do$;
 
 -- 3g. The password key tables (V165, #5366): written only by the store owner (the service, its command line and the
 --     migration runner); a trigger on each table refuses every other writer. This is the grant side of the same rule,
@@ -729,6 +2676,7 @@ GRANT UPDATE (server_id, name, host, database, auth, username, encrypted_passwor
 --     legacy pin candidate table by V167: on a store below V165 the block warns and skips, so the rest of the script
 --     (the PUBLIC revoke below included) still runs; re-run the script once the service has migrated the store to V167.
 --     A store at V165 or V166 gets the four-table revoke now, and the candidate table's own revoke once V167 has made it.
+--     Step 2d has already taken the read grants away before the COMMIT; what follows is the part that has to come last.
 DO $do$
 DECLARE
     stray record;
@@ -743,13 +2691,17 @@ BEGIN
         IF pg_catalog.to_regclass('config.legacy_secret_pin_candidate') IS NOT NULL THEN
             REVOKE ALL ON config.legacy_secret_pin_candidate FROM PUBLIC, admin, viewer, mcp CASCADE;
         END IF;
+        -- V198 (#6066): the pseudonym key table. No role but the store owner reads it, so nothing is granted back.
+        IF pg_catalog.to_regclass('config.pseudonym_key') IS NOT NULL THEN
+            REVOKE ALL ON config.pseudonym_key FROM PUBLIC, admin, viewer, mcp CASCADE;
+        END IF;
 
         FOR stray IN
            SELECT t.tgname, t.tgrelid::pg_catalog.regclass::pg_catalog.text AS tablename
            FROM pg_catalog.pg_trigger AS t
            WHERE NOT t.tgisinternal
-             AND t.tgrelid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service'), pg_catalog.to_regclass('config.legacy_secret_pin'), pg_catalog.to_regclass('config.legacy_secret_pin_marker'), pg_catalog.to_regclass('config.legacy_secret_pin_candidate'))
-             AND t.tgname NOT IN ('trg_password_key_owner_only_row', 'trg_password_key_owner_only_truncate', 'trg_password_key_service_owner_only_row', 'trg_password_key_service_owner_only_truncate', 'trg_legacy_secret_pin_owner_only_row', 'trg_legacy_secret_pin_owner_only_truncate', 'trg_legacy_secret_pin_marker_owner_only_row', 'trg_legacy_secret_pin_marker_owner_only_truncate', 'trg_legacy_secret_pin_candidate_owner_only_row', 'trg_legacy_secret_pin_candidate_owner_only_truncate')
+             AND t.tgrelid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service'), pg_catalog.to_regclass('config.legacy_secret_pin'), pg_catalog.to_regclass('config.legacy_secret_pin_marker'), pg_catalog.to_regclass('config.legacy_secret_pin_candidate'), pg_catalog.to_regclass('config.pseudonym_key'))
+             AND t.tgname NOT IN ('trg_password_key_owner_only_row', 'trg_password_key_owner_only_truncate', 'trg_password_key_service_owner_only_row', 'trg_password_key_service_owner_only_truncate', 'trg_legacy_secret_pin_owner_only_row', 'trg_legacy_secret_pin_owner_only_truncate', 'trg_legacy_secret_pin_marker_owner_only_row', 'trg_legacy_secret_pin_marker_owner_only_truncate', 'trg_legacy_secret_pin_candidate_owner_only_row', 'trg_legacy_secret_pin_candidate_owner_only_truncate', 'trg_pseudonym_key_owner_only_row', 'trg_pseudonym_key_owner_only_truncate')
         LOOP
            RAISE WARNING 'Dropped trigger % from % because only the store owner may write the password key tables.', stray.tgname, stray.tablename;
            EXECUTE pg_catalog.format('DROP TRIGGER %I ON %s', stray.tgname, stray.tablename);
@@ -759,7 +2711,7 @@ BEGIN
            SELECT k.conname, k.conrelid::pg_catalog.regclass::pg_catalog.text AS tablename
            FROM pg_catalog.pg_constraint AS k
            WHERE k.contype = 'f'
-             AND k.confrelid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service'), pg_catalog.to_regclass('config.legacy_secret_pin'), pg_catalog.to_regclass('config.legacy_secret_pin_marker'), pg_catalog.to_regclass('config.legacy_secret_pin_candidate'))
+             AND k.confrelid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service'), pg_catalog.to_regclass('config.legacy_secret_pin'), pg_catalog.to_regclass('config.legacy_secret_pin_marker'), pg_catalog.to_regclass('config.legacy_secret_pin_candidate'), pg_catalog.to_regclass('config.pseudonym_key'))
         LOOP
            RAISE WARNING 'Dropped foreign key % on % because it references a password key table.', stray.conname, stray.tablename;
            EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', stray.tablename, stray.conname);
@@ -770,7 +2722,7 @@ BEGIN
            FROM pg_catalog.pg_class AS c
            CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS a
            LEFT JOIN pg_catalog.pg_roles AS r ON r.oid = a.grantee
-           WHERE c.oid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service'), pg_catalog.to_regclass('config.legacy_secret_pin'), pg_catalog.to_regclass('config.legacy_secret_pin_marker'), pg_catalog.to_regclass('config.legacy_secret_pin_candidate'))
+           WHERE c.oid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service'), pg_catalog.to_regclass('config.legacy_secret_pin'), pg_catalog.to_regclass('config.legacy_secret_pin_marker'), pg_catalog.to_regclass('config.legacy_secret_pin_candidate'), pg_catalog.to_regclass('config.pseudonym_key'))
              AND (a.grantee = 0 OR r.rolname IN ('admin', 'viewer', 'mcp'))
              AND NOT (COALESCE(r.rolname = 'admin', false) AND a.privilege_type = 'SELECT'
                       AND c.oid IN (pg_catalog.to_regclass('config.password_key'), pg_catalog.to_regclass('config.password_key_service')))

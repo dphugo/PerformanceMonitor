@@ -38,10 +38,13 @@ namespace PerformanceMonitor.Darling.Service;
 /// that route only when the verdict equals <see cref="ComposeSourceRouter.HourlyRawEdgesCandidate"/> for this run;
 /// null (the default) leaves every compile on its existing route.
 /// <see cref="ModuleMapThrough"/> is the module map's watermark (naive UTC, <see cref="DateTimeKind.Unspecified"/>): the
-/// largest procedure_stats <c>collection_time</c> the last map refresh read. The runner supplies it only for a panel that
-/// joins modules and takes the hourly-raw-edges route; with it, that route resolves names from the map plus a recent
-/// overlay of procedure_stats instead of ranking the whole window. Null (the default, and every other route) keeps the
-/// window-wide ranking CTE.
+/// largest procedure_stats <c>collection_time</c> the last map refresh read. The runner supplies it for every panel that
+/// joins modules (#5811, ruling C); on a raw or hourly-raw-edges route the module CTE then reads procedure_stats only from
+/// the watermark less the refresh slack (or each server's last collection, when that is older) and takes every older handle
+/// from the map. Null (the default), or a watermark older than the window start, reads the whole window's procedure_stats.
+/// <see cref="ModuleMapMissing"/> (#5811) is the runner's finding that <c>collect.module_map</c> does not exist in this store (its
+/// startup ensure failed). Then a raw-route module join ranks the whole window of procedure_stats, as it did before #5811, because
+/// the map-first CTE would fail on the missing relation. False (the default) compiles the map-first CTE.
 /// <see cref="UnregisteredServers"/> (#5525) is the part of <see cref="Servers"/> that names no <c>collect.servers</c> row, found by
 /// the runner (<see cref="ComposeServerScope.FindUnregisteredAsync"/>) before it compiles. The compiler scopes a read by
 /// <c>server_id</c>, resolved from the registry by name; a name with no registry row resolves to no id, so those names alone are
@@ -57,6 +60,10 @@ namespace PerformanceMonitor.Darling.Service;
 /// (naive UTC, <see cref="DateTimeKind.Unspecified"/>); the runner sets it from the rollup's build state. When it is later than the wide read's
 /// start, and every partial the panel needs has a rollup column, the compile reads the rollup for <c>[start, StampThrough)</c> and the
 /// wide table from <c>StampThrough</c>; otherwise (null, the default, or earlier) it compiles the wide-table text unchanged.
+/// <see cref="QueryStoreRawServerIds"/> (#6115) is the split: the <c>server_id</c>s the runner's gate refused, which a Query Store
+/// panel on the wide route reads from raw <c>collect.query_store_stats</c> while every other server in scope reads the interval table.
+/// Each server reads from exactly one source. Null or empty (the default, and every run whose servers all passed) compiles the
+/// all-wide text unchanged, with no new parameter.
 public sealed record ComposeRunContext(
     IReadOnlyList<string>? Servers,
     DateTime StartUtc,
@@ -71,7 +78,9 @@ public sealed record ComposeRunContext(
     DateTime? ModuleMapThrough = null,
     IReadOnlyList<string>? UnregisteredServers = null,
     long? QueryStoreGroupMembers = null,
-    DateTime? QueryStoreStampThrough = null)
+    DateTime? QueryStoreStampThrough = null,
+    bool ModuleMapMissing = false,
+    IReadOnlyList<int>? QueryStoreRawServerIds = null)
 {
     public static readonly IReadOnlyDictionary<string, string?> NoVariables =
         new Dictionary<string, string?>(StringComparer.Ordinal);
@@ -122,6 +131,10 @@ public static class ComposeCompiler
 
     /// <summary>The one source table whose RAW rows need a per-interval dedup before aggregation (#1841).</summary>
     private const string QueryStoreTable = "query_store_stats";
+    private const string DefaultTraceTable = "default_trace_events";
+
+    /// <summary>The source table whose raw rows are combined to one row per (server, collection_time) before aggregation (#5710).</summary>
+    internal const string CpuSchedulerTable = "cpu_scheduler_stats";
 
     /// <summary>The residual series label a <see cref="PanelMode.RankedTimeSeries"/> panel emits when the
     /// spec sets <c>includeOther</c> (#2734). Parenthesized-lowercase matches the product's sentinel family
@@ -212,7 +225,7 @@ public static class ComposeCompiler
         string sourceTable, ComposeRoute route, string timeColumn, string startParam, string endParam, ComposeRunContext context, string? wideStartParam = null,
         IReadOnlyList<string>? dimensionFilters = null, string? serverScopeSql = null, bool restrictDedupe = false,
         string? edgeStartParam = null, string? edgeEndParam = null, ComposeAggregate aggregate = ComposeAggregate.Sum,
-        StampRelation? stamp = null)
+        StampRelation? stamp = null, string? splitRawParam = null)
     {
         if (route.Tier == ComposeSourceTier.HourlyRawEdges)
         {
@@ -251,6 +264,39 @@ public static class ComposeCompiler
             return route.CaggFromClause ?? $"{PgSchemaGenerator.CollectSchema}.{route.CaggRelation!}";
         }
 
+        /* #5710: a cpu_scheduler_stats collection written before the collector fix is split across several rows that share a
+           collection_time, each covering some of the schedulers (runnable tasks 83 + 18 for one 101-task reading). The panel's time
+           aggregate must run over COLLECTIONS, so the relation is the shared per-collection combine (CpuSchedulerCollectionSql: sums
+           for the counts, MAX for the repeated columns), grouped per server too because a panel can span servers. The window is
+           the panel's own (the outer WHERE repeats it on the combined rows, with the server scope and any filters); every row of
+           one collection shares its collection_time, so the window never cuts a collection in half. */
+        if (string.Equals(sourceTable, CpuSchedulerTable, StringComparison.Ordinal))
+        {
+            return $"(SELECT server_id, server_name, {PerformanceMonitor.Common.CpuSchedulerCollectionSql.CombinedColumns} "
+                + $"FROM {PgSchemaGenerator.CollectSchema}.{CpuSchedulerTable} "
+                + $"WHERE {timeColumn} >= {startParam} AND {timeColumn} <= {endParam} "
+                + "GROUP BY server_id, server_name, collection_time)";
+        }
+
+        /* #5738: the Default Trace readers (MCP get_default_trace_events, the viewer, Lite) collapse stored copies of one event by
+           s_defaultTracePartitionKey, so a measure over default_trace_events counts a copy once too. Same shape as the Query Store raw
+           dedupe below: one ROW_NUMBER per key inside the window, EARLIEST collection first (first wins, #5742): the same rule as the stored-copy
+           dedupe in Lite (StoredEventCopies keeps the first batch that stored each identity), and the survivor's collection_time is
+           the x position every time-bucketed panel gives the event, so the earliest copy, the one closest to the event's real
+           time, keeps it in its own bucket rather than moving it to the hour a state reset re-stored it. The id breaks a tie
+           between copies stored in one batch. (The Query Store dedupe below ranks DESC because its rows are cumulative snapshots.) Every key column is a partition column, so
+           the outer server scope and dimension filters (event_name, database_name, object_name, login_name, server) push into this
+           subquery, below the WindowAgg, and no partition restriction is needed. */
+        if (string.Equals(sourceTable, DefaultTraceTable, StringComparison.Ordinal))
+        {
+            return "(SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY "
+                + string.Join(", ", s_defaultTracePartitionKey)
+                + $" ORDER BY {timeColumn} ASC, default_trace_event_id ASC) AS dte_rn "
+                + $"FROM {PgSchemaGenerator.CollectSchema}.{DefaultTraceTable} "
+                + $"WHERE {timeColumn} >= {startParam} AND {timeColumn} <= {endParam}"
+                + ") AS dte_ranked WHERE dte_rn = 1)";
+        }
+
         if (!string.Equals(sourceTable, QueryStoreTable, StringComparison.Ordinal))
         {
             return $"{PgSchemaGenerator.CollectSchema}.{sourceTable}";
@@ -259,7 +305,7 @@ public static class ComposeCompiler
         /* #4605: query_store_interval_wide (V145) already holds the latest snapshot per
            interval, every outcome — exactly what the raw ROW_NUMBER dedupe below computes — so an eligible
            run reads it directly instead of re-sorting every raw snapshot in the window. Eligibility
-           (QueryStoreIntervalWide.UseTable plus clause 6, per server in scope) is decided by the runner
+           (QueryStoreIntervalWide.UseTable, per server in scope; clause 6's legacy-row probe is not asked for, the table holds the same newest-snapshot-per-interval rows) is decided by the runner
            BEFORE compiling (ComposeRunContext.QueryStoreWideEligible), never here: the compiler stays pure
            and never opens a connection. The table has no server_name column, so the relation joins the
            registry (collect.servers, server_id PRIMARY KEY / server_name NOT NULL — 1:1) to restore it,
@@ -271,6 +317,28 @@ public static class ComposeCompiler
            windows of 12 h or more rely on that index and that setting; without them this read scans the table. */
         if (context.QueryStoreWideEligible)
         {
+            /* #6115: the split. The servers the gate refused (splitRawParam, a bound int[] of server_id) read raw, deduped as the all-raw
+               text dedupes, and every other server in scope reads the interval table, so each server is read from exactly one source and
+               no row is counted twice. Null (every server passed) emits the all-wide text below, unchanged. */
+            if (splitRawParam is not null)
+            {
+                var rawRelation = QueryStoreRawDedupe(timeColumn, startParam, endParam, dimensionFilters, serverScopeSql, restrictDedupe, splitRawParam);
+                if (stamp is not null)
+                {
+                    return BuildStampRelation(stamp, wideStartParam ?? startParam, endParam, dimensionFilters, rawRelation, startParam, serverScopeSql);
+                }
+
+                /* One column list for both arms: every column any Query Store measure or dimension reads. A UNION ALL needs the same
+                   columns in the same order, and the wide table and raw hold different sets (wide has no server_name, raw has the
+                   dedupe's own qs_rn). The registry's name rides the wide arm, as it does in the all-wide text. */
+                var wideColumns = string.Join(", ", s_splitColumns.Select(c => c == "server_name" ? "s.server_name" : "w." + c));
+                var rawColumns = string.Join(", ", s_splitColumns);
+                return $"(SELECT {wideColumns} FROM {PgSchemaGenerator.CollectSchema}.query_store_interval_wide AS w "
+                    + $"JOIN {PgSchemaGenerator.CollectSchema}.servers AS s ON s.server_id = w.server_id "
+                    + $"WHERE w.{timeColumn} >= {wideStartParam ?? startParam} AND w.{timeColumn} <= {endParam} AND w.server_id <> ALL({splitRawParam}) "
+                    + $"UNION ALL SELECT {rawColumns} FROM {rawRelation} AS qs_raw_half)";
+            }
+
             if (stamp is not null)
             {
                 return BuildStampRelation(stamp, wideStartParam ?? startParam, endParam, dimensionFilters);
@@ -281,14 +349,52 @@ public static class ComposeCompiler
                 + $"WHERE w.{timeColumn} >= {wideStartParam ?? startParam} AND w.{timeColumn} <= {endParam})";
         }
 
-        return "(SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY "
+        return QueryStoreRawDedupe(timeColumn, startParam, endParam, dimensionFilters, serverScopeSql, restrictDedupe, null);
+    }
+
+    /// <summary>
+    /// The Query Store raw dedupe (one row per interval identity, the newest snapshot): the all-raw relation, and (#6115) the raw half
+    /// of a split panel. With <paramref name="rawServersParam"/> it reads only those servers, by a <c>server_id = ANY(..)</c> predicate
+    /// inside the window (and inside the partition restriction), so the index on (server_id, collection_time) bounds the read to the
+    /// refused servers and its cost follows them alone. Null is the text every all-raw panel compiled before #6115, byte for byte.
+    /// </summary>
+    private static string QueryStoreRawDedupe(
+        string timeColumn, string startParam, string endParam, IReadOnlyList<string>? dimensionFilters, string? serverScopeSql, bool restrictDedupe,
+        string? rawServersParam) =>
+        "(SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY "
             + $"server_id, server_name, database_name, query_id, plan_id, runtime_stats_interval_id, first_execution_time, execution_type_desc, replica_role "
             + $"ORDER BY {timeColumn} DESC, execution_count DESC) AS qs_rn "
             + $"FROM {PgSchemaGenerator.CollectSchema}.{QueryStoreTable} "
             + $"WHERE {timeColumn} >= {startParam} AND {timeColumn} <= {endParam}"
-            + QueryStorePartitionRestriction(timeColumn, startParam, endParam, dimensionFilters, serverScopeSql, restrictDedupe)
+            + (rawServersParam is null ? string.Empty : $" AND server_id = ANY({rawServersParam})")
+            + QueryStorePartitionRestriction(timeColumn, startParam, endParam, dimensionFilters, serverScopeSql, restrictDedupe, rawServersParam)
             + ") AS qs_ranked WHERE qs_rn = 1)";
-    }
+
+    /// <summary>#6115: the columns both halves of a split Query Store panel select, in one order: every column a Query Store measure
+    /// (its value, weighted-value, weight and delta columns) or dimension reads, plus the key and the time. Taken from the catalog, so a
+    /// measure added later is covered without a second list.</summary>
+    private static readonly string[] s_splitColumns = MeasureCatalog.Measures
+        .Where(m => string.Equals(m.SourceTable, QueryStoreTable, StringComparison.Ordinal))
+        .SelectMany(m => new[] { m.Column, m.WeightedValueColumn, m.WeightColumn, m.DeltaColumn })
+        .Concat(MeasureCatalog.Dimensions
+            .Where(d => string.Equals(d.SourceTable, QueryStoreTable, StringComparison.Ordinal) && !d.ViaModuleJoin)
+            .Select(d => d.Column))
+        .Concat(new[] { "server_id", "server_name", "collection_time" })
+        .Where(c => c is not null)
+        .Select(c => c!)
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+
+    /* #5738: the key a stored copy of one Default Trace event shares: the server, then the readers' 16 columns (the 15 fields of
+       DarlingDefaultTraceReader.DefaultTraceEventRow plus event_sequence). A row stored before event_sequence existed has a NULL one
+       and PARTITION BY groups NULLs together, so it keeps the column-only key, as the readers do. server_name rides with server_id
+       as in the Query Store key, so a server_name scope filter pushes below the window function. A census test pins this list equal
+       to the MCP reader's key. */
+    internal static readonly string[] s_defaultTracePartitionKey =
+    {
+        "server_id", "server_name", "event_time", "event_name", "event_class", "spid", "database_name", "login_name", "host_name",
+        "application_name", "object_name", "filename", "text_data", "error_number", "severity", "duration_us", "integer_data", "event_sequence",
+    };
 
     /* The partition key the restriction joins on. The dedupe's PARTITION BY text above spells the same list as a literal (the tie-break
        source guard reads it there); a test pins the two equal. */
@@ -321,7 +427,8 @@ public static class ComposeCompiler
     /// empty and the dedupe is unchanged. When it is added, the inner WHERE still carries every pushable filter.</para>
     /// </summary>
     private static string QueryStorePartitionRestriction(
-        string timeColumn, string startParam, string endParam, IReadOnlyList<string>? dimensionFilters, string? serverScopeSql, bool restrictDedupe)
+        string timeColumn, string startParam, string endParam, IReadOnlyList<string>? dimensionFilters, string? serverScopeSql, bool restrictDedupe,
+        string? rawServersParam = null)
     {
         if (!restrictDedupe || dimensionFilters is not { Count: > 0 })
         {
@@ -331,6 +438,7 @@ public static class ComposeCompiler
         var table = $"{PgSchemaGenerator.CollectSchema}.{QueryStoreTable}";
         var window = $"{FactAlias}.{timeColumn} >= {startParam} AND {FactAlias}.{timeColumn} <= {endParam}"
             + (serverScopeSql is null ? string.Empty : " AND " + serverScopeSql)
+            + (rawServersParam is null ? string.Empty : $" AND {FactAlias}.server_id = ANY({rawServersParam})")
             + string.Concat(dimensionFilters.Select(c => " AND " + c));
         var keys = s_queryStorePartitionKey;
         string Sentinel(string c) => c switch
@@ -464,16 +572,16 @@ public static class ComposeCompiler
             edgeEndParam = p.AddTimestamp(route.EdgeEndUtc!.Value);
         }
 
-        /* The recent-overlay floor of the hourly-raw-edges module join: the later of the window start and the map's
-           watermark less the refresh slack. Bound only when the module join is emitted below from the map, so no other
-           compile gains a parameter. A watermark later than the run's now (written ahead of the clock by an older
-           build) counts as no watermark, so that compile ranks the whole window as before. */
+        /* The overlay floor of the #5811 module CTE (ruling C), on every raw route that joins modules (raw and hourly-raw-edges): the later
+           of the window start and the map's watermark less the refresh slack. Bound only when that is later than the start, so a compile
+           with no watermark (or a stale one, older than the window) binds nothing new and compiles the window ranking (see the module
+           CTE below). A watermark later than the run's now (written ahead of the clock by an older build) counts as no watermark. */
         string? moduleOverlayFloorParam = null;
-        if (route.Tier == ComposeSourceTier.HourlyRawEdges && plan.UsesModuleJoin
-            && context.ModuleMapThrough is DateTime moduleMapThrough && moduleMapThrough <= context.NowUtc)
+        if (!route.IsCagg && plan.UsesModuleJoin && !context.ModuleMapMissing
+            && context.ModuleMapThrough is DateTime moduleMapThrough && moduleMapThrough <= context.NowUtc
+            && moduleMapThrough - DarlingModuleMap.WatermarkSlack > context.StartUtc)
         {
-            var overlayFloor = moduleMapThrough - DarlingModuleMap.WatermarkSlack;
-            moduleOverlayFloorParam = p.AddTimestamp(overlayFloor > context.StartUtc ? overlayFloor : context.StartUtc);
+            moduleOverlayFloorParam = p.AddTimestamp(moduleMapThrough - DarlingModuleMap.WatermarkSlack);
         }
 
         /* #4689: below raw's floor the interval table is exact only from the runner's common start
@@ -490,6 +598,13 @@ public static class ComposeCompiler
            wide start in every mode; null (the default) compiles the wide-table text above byte for byte. */
         var stampPlan = TryPlanStamp(plan, route, context, stampColumns ?? StampColumnFor);
         var stampThroughParam = stampPlan is null ? null : p.AddTimestamp(context.QueryStoreStampThrough!.Value);
+
+        /* #6115: the servers the gate refused, bound once (after every earlier parameter, so an all-pass compile binds nothing new). */
+        var splitRawParam = context.QueryStoreWideEligible
+            && context.QueryStoreRawServerIds is { Count: > 0 } splitRawServers
+            && string.Equals(plan.Measure.SourceTable, QueryStoreTable, StringComparison.Ordinal)
+                ? p.AddIntArray(splitRawServers)
+                : null;
 
         /* Filter predicates are built — and their values BOUND — once, in filter order, so the parameter
            order is identical for every mode (window, scope, filters, then topN). RankedTimeSeries (#2734)
@@ -533,8 +648,9 @@ public static class ComposeCompiler
            three arms share (`s.`), because the rollup rows and the wide rows both carry server_id and the registry row carries the name. */
         var stampRelation = stampPlan is null
             ? null
-            : new StampRelation(stampPlan.Partials, stampThroughParam!, hasServerScope ? ServerScope("s.", serverScopeParam!, unregisteredParam) : null,
-                hasServerScope ? ServerScope("b.", serverScopeParam!, null) : null);
+            : new StampRelation(stampPlan.Partials, stampThroughParam!,
+                AndScope(hasServerScope ? ServerScope("s.", serverScopeParam!, unregisteredParam) : null, splitRawParam is null ? null : $"s.server_id <> ALL({splitRawParam})"),
+                AndScope(hasServerScope ? ServerScope("b.", serverScopeParam!, null) : null, splitRawParam is null ? null : $"b.server_id <> ALL({splitRawParam})"));
 
         /* In stamp mode every value is the combine form over the relation's partial columns (single scan: over rank_base's). */
         string PrimaryValue() => singleScan
@@ -549,7 +665,7 @@ public static class ComposeCompiler
            inside the CTE without changing the outer query's byte-for-byte shape. */
         void AppendFactBody(string indent)
         {
-            sql.Append(indent).Append("FROM ").Append(BuildFactRelation(plan.Measure.SourceTable, route, timeColumn, startParam, endParam, context, wideStartParam, pushableFilterClauses, hasServerScope ? FactScope() : null, restrictDedupe, edgeStartParam, edgeEndParam, plan.Aggregate, stampRelation));
+            sql.Append(indent).Append("FROM ").Append(BuildFactRelation(plan.Measure.SourceTable, route, timeColumn, startParam, endParam, context, wideStartParam, pushableFilterClauses, hasServerScope ? FactScope() : null, restrictDedupe, edgeStartParam, edgeEndParam, plan.Aggregate, stampRelation, splitRawParam));
 
             /* #3653 A6: a CAGG route's FROM-clause item (route.CaggFromClause) is already a complete, aliased
                relation — "collect.<x> AS f" or a stitched "(... UNION ALL ...) AS f" — so it must NOT get a
@@ -603,56 +719,51 @@ public static class ComposeCompiler
            retained module_map instead (procedure_stats raw is dropped at 4d, so the CTE can't cover old windows). */
         if (plan.UsesModuleJoin && !route.IsCagg)
         {
-            /* The hourly-raw-edges route with a map watermark ranks only the recent overlay [floor, end] and takes every
-               older handle from collect.module_map. Without a watermark (or on any other route) the CTE ranks the whole
-               window, exactly as before.
+            /* #5811, ruling C: one module CTE on both raw routes (raw, hourly-raw-edges). Each server's overlay is its procedure_stats rows
+               from min(its last collection in the window, the overlay floor) to the window end, one row per (server_name, sql_handle), and
+               collect.module_map covers every other handle (AppendMapFirstModuleCte). With a fresh map the overlay is about the last
+               refresh's slack.
+               A store without the map (ModuleMapMissing) ranks the whole window with ROW_NUMBER, as every raw route did before #5811,
+               because the map CTE would fail on the missing relation.
 
-               Each (server_name, sql_handle) appears once in m: the overlay keeps rn = 1 per pair, the map's primary key
-               is that pair, and the NOT EXISTS drops a map row the overlay already carries, so the outer LEFT JOIN and
-               the group references are unchanged. A map row with last_seen before the window start is skipped, so a handle
-               with no procedure_stats row in the window still reads '(ad hoc)'. The map is forward-only, so a handle
-               renamed before the floor reads its newest name from the map and one renamed after it reads the overlay's.
-               A rename inside the last minute (the gap between the window end and now) can show the newer name, and so can a handle whose only procedure_stats row is in that
-               minute (it can show a name where the raw route shows (ad hoc)). */
-            var fromMap = moduleOverlayFloorParam is not null;
-            sql.Append("WITH ").Append(fromMap ? "m_recent" : ModuleAlias).Append(" AS (\n");
-            sql.Append("    SELECT server_name, sql_handle, object_name, schema_name, database_name\n");
-            sql.Append("    FROM (\n");
-            sql.Append("        SELECT server_name, sql_handle, object_name, schema_name, database_name,\n");
-            sql.Append("               ROW_NUMBER() OVER (PARTITION BY server_name, sql_handle ORDER BY collection_time DESC) AS rn\n");
-            sql.Append("        FROM ").Append(PgSchemaGenerator.CollectSchema).Append(".procedure_stats\n");
-            sql.Append("        WHERE collection_time >= ").Append(fromMap ? moduleOverlayFloorParam : startParam).Append('\n');
-            sql.Append("          AND collection_time <= ").Append(endParam).Append('\n');
-            if (hasServerScope)
+               Each (server_name, sql_handle) appears once in m: the overlay keeps one row per pair, the map's primary key is that pair,
+               and the NOT EXISTS drops a map row the overlay already carries, so the outer LEFT JOIN and the group references are
+               unchanged. A map row with last_seen before the window start is skipped, so a handle with no procedure_stats row in the
+               window still reads '(ad hoc)'. The map is forward-only, so a handle renamed before the floor reads its newest name from the
+               map and one renamed after it reads the overlay's. A rename inside the last minute (the gap between the window end and now)
+               can show the newer name, and so can a handle whose only procedure_stats row is in that minute (it can show a name where
+               the window-wide ranking shows (ad hoc)).
+
+               With no floor bound (a stale, missing or future watermark) the overlay would be the whole window, and the map-first
+               shape reads it through a per-server LATERAL that the planner sorts serially for the DISTINCT ON: on the plant (10
+               servers, 2.88 million rows) that was 12 to 16 s against the window ranking's 5 to 14 s, which sorts in parallel. So that
+               case compiles the window ranking itself, the same text a store without the map compiles, and costs what it cost before
+               #5811. */
+            if (!context.ModuleMapMissing && moduleOverlayFloorParam is not null)
             {
-                sql.Append("          AND ").Append(ServerScope(string.Empty, serverScopeParam!, unregisteredParam)).Append('\n');
+                AppendMapFirstModuleCte(sql, startParam, endParam, moduleOverlayFloorParam, hasServerScope ? serverScopeParam : null, unregisteredParam);
             }
-
-            sql.Append("          AND sql_handle IS NOT NULL\n");
-            sql.Append("          AND sql_handle <> ''\n");
-            sql.Append("    ) ranked_modules\n");
-            sql.Append("    WHERE rn = 1\n");
-            if (fromMap)
+            else
             {
-                sql.Append("),\n");
-                sql.Append(ModuleAlias).Append(" AS (\n");
-                sql.Append("    SELECT server_name, sql_handle, object_name, schema_name, database_name FROM m_recent\n");
-                sql.Append("    UNION ALL\n");
-                sql.Append("    SELECT mm.server_name, mm.sql_handle, mm.object_name, mm.schema_name, mm.database_name\n");
-                sql.Append("    FROM ").Append(PgSchemaGenerator.CollectSchema).Append(".module_map AS mm\n");
-                sql.Append("    WHERE mm.last_seen >= ").Append(startParam).Append('\n');
+                sql.Append("WITH ").Append(ModuleAlias).Append(" AS (\n");
+                sql.Append("    SELECT server_name, sql_handle, object_name, schema_name, database_name\n");
+                sql.Append("    FROM (\n");
+                sql.Append("        SELECT server_name, sql_handle, object_name, schema_name, database_name,\n");
+                sql.Append("               ROW_NUMBER() OVER (PARTITION BY server_name, sql_handle ORDER BY collection_time DESC) AS rn\n");
+                sql.Append("        FROM ").Append(PgSchemaGenerator.CollectSchema).Append(".procedure_stats\n");
+                sql.Append("        WHERE collection_time >= ").Append(startParam).Append('\n');
+                sql.Append("          AND collection_time <= ").Append(endParam).Append('\n');
                 if (hasServerScope)
                 {
-                    /* module_map is a small table keyed (server_name, sql_handle) with no server_id column, so it stays scoped by the
-                       scoped names (#5525). The fact rows are scoped by id, so a renamed server's pre-rename handles resolve through
-                       m_recent when the overlay covers them and read '(ad hoc)' when only this map would. */
-                    sql.Append("      AND mm.server_name = ANY(").Append(serverScopeParam).Append(")\n");
+                    sql.Append("          AND ").Append(ServerScope(string.Empty, serverScopeParam!, unregisteredParam)).Append('\n');
                 }
 
-                sql.Append("      AND NOT EXISTS (SELECT 1 FROM m_recent AS r WHERE r.server_name = mm.server_name AND r.sql_handle = mm.sql_handle)\n");
+                sql.Append("          AND sql_handle IS NOT NULL\n");
+                sql.Append("          AND sql_handle <> ''\n");
+                sql.Append("    ) ranked_modules\n");
+                sql.Append("    WHERE rn = 1\n");
+                sql.Append(")\n");
             }
-
-            sql.Append(")\n");
         }
 
         /* The #2734 rank pass: RankedTimeSeries prepends a CTE that IS the Ranked query minus the time
@@ -877,6 +988,123 @@ public static class ComposeCompiler
     /// server-local annotation source, which needs no clock read.</summary>
     public static readonly IReadOnlyDictionary<string, ServerClock> NoServerClocks =
         new Dictionary<string, ServerClock>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The #5811 module CTE of a raw-route <c>object_name</c> join (the raw and hourly-raw-edges routes, ruling C): an overlay of each
+    /// server's procedure_stats rows from <c>LEAST(its last collection in the window, the overlay floor)</c> to the window end, and
+    /// <c>collect.module_map</c> for every other handle. The floor is the later of the window start and the map's watermark less
+    /// <see cref="DarlingModuleMap.WatermarkSlack"/>; with no usable watermark the caller compiles the window ranking instead. Before #5811 the CTE ranked
+    /// every procedure_stats row of the window per (server, handle) with <c>ROW_NUMBER</c>, a sort of the whole wide table before the
+    /// fact scan started (on a 10-server plant of 2.88 million rows: an external merge of about 120 MB, 2.5 to 5.6 s of a 6.8 to 15.5 s
+    /// panel).
+    ///
+    /// <para>With a fresh map the overlay is the rows since the map's last refresh, less the slack (about an hour of rows at most), or
+    /// the server's last collection when that is older, so a server that stopped collecting still reads the names it last had.
+    /// The overlay is deduplicated per (server_name, sql_handle), newest row first, the map's primary key is that pair, and the NOT
+    /// EXISTS drops a map row the overlay already carries, so each pair appears once and the outer LEFT JOIN and the group references are
+    /// unchanged. A map row with <c>last_seen</c> before the window start is skipped, so a handle with no procedure_stats row in the window
+    /// still reads '(ad hoc)'.</para>
+    ///
+    /// <para>What can read differently from the window-wide ranking with a fresh map: a handle older than the overlay reads the map's
+    /// name, its newest, which can be newer than the window's end (a rename the map has seen). The overlay is read per registered server,
+    /// by id. A removed or disabled server keeps its registry row (removal flips <c>is_enabled</c> and never deletes the row, see
+    /// <c>DarlingObservability.DisableOrphanedServersSql</c>), so its history reads the overlay like any other server's. A scoped name
+    /// with no registry row (a renamed server's old name, or a name never registered) reads <c>m_unreg</c>: its stored rows over the
+    /// whole window by name, as before #5811, because the map (never purged) still lacks whatever arrived after its last refresh. A
+    /// scope over a renamed server's current name reads its old-name handles from the overlay, but from the map only when the map row
+    /// carries a scoped name.</para>
+    /// </summary>
+    private static void AppendMapFirstModuleCte(StringBuilder sql, string startParam, string endParam, string overlayFloorParam, string? serverScopeParam,
+        string? unregisteredParam)
+    {
+        var schema = PgSchemaGenerator.CollectSchema;
+
+        /* m_last holds each server's overlay: one short backward index scan per server finds its last collection in the window, and a
+           LATERAL range read by (server_id, collection_time) from LEAST(that collection, the floor) takes the rows. The OFFSET 0 keeps
+           that read a LATERAL subquery the planner cannot flatten into a join, and MATERIALIZED keeps the anti-join on the map over
+           m_last's rows only. Measured on the plant (10 servers, 2.88 million rows): flattened, the planner hash-joined a seq scan of the
+           window's whole procedure_stats (0.9 s for 2.88 million rows when collect.servers had no statistics), and with the anti-join
+           inlined it estimated that at one row and seq-scanned the window before joining (0.52 to 0.70 s). The window-start bound is
+           repeated beside the LEAST so the planner can exclude chunks before the window when it plans the read. */
+        sql.Append("WITH m_last AS MATERIALIZED (\n");
+        sql.Append("    SELECT DISTINCT ON (rows_ps.server_name, rows_ps.sql_handle)\n");
+        sql.Append("           rows_ps.server_name, rows_ps.sql_handle, rows_ps.object_name, rows_ps.schema_name, rows_ps.database_name\n");
+        sql.Append("    FROM ").Append(schema).Append(".servers AS srv\n");
+        sql.Append("    CROSS JOIN LATERAL (\n");
+        sql.Append("        SELECT p.collection_time\n");
+        sql.Append("        FROM ").Append(schema).Append(".procedure_stats AS p\n");
+        sql.Append("        WHERE p.server_id = srv.server_id\n");
+        sql.Append("          AND p.collection_time >= ").Append(startParam).Append('\n');
+        sql.Append("          AND p.collection_time <= ").Append(endParam).Append('\n');
+        sql.Append("        ORDER BY p.collection_time DESC\n");
+        sql.Append("        LIMIT 1\n");
+        sql.Append("    ) AS last_ps\n");
+        sql.Append("    CROSS JOIN LATERAL (\n");
+        sql.Append("        SELECT ps.server_name, ps.sql_handle, ps.object_name, ps.schema_name, ps.database_name, ps.collection_time\n");
+        sql.Append("        FROM ").Append(schema).Append(".procedure_stats AS ps\n");
+        sql.Append("        WHERE ps.server_id = srv.server_id\n");
+        sql.Append("          AND ps.collection_time >= LEAST(last_ps.collection_time, ").Append(overlayFloorParam).Append(")\n");
+        sql.Append("          AND ps.collection_time >= ").Append(startParam).Append('\n');
+        sql.Append("          AND ps.collection_time <= ").Append(endParam).Append('\n');
+        sql.Append("          AND ps.sql_handle IS NOT NULL\n");
+        sql.Append("          AND ps.sql_handle <> ''\n");
+        sql.Append("        OFFSET 0\n");
+        sql.Append("    ) AS rows_ps\n");
+        if (serverScopeParam is not null)
+        {
+            /* The registry rows in scope, by id like every fact read (#5525), so an out-of-scope server gets no per-server read. A scoped
+               name with no registry row matches no srv row; its handles resolve from m_unreg and the map, both scoped by name below. */
+            sql.Append("    WHERE ").Append(ServerScope("srv.", serverScopeParam, unregisteredParam)).Append('\n');
+        }
+
+        sql.Append("    ORDER BY rows_ps.server_name, rows_ps.sql_handle, rows_ps.collection_time DESC\n");
+        sql.Append("),\n");
+        if (unregisteredParam is not null)
+        {
+            /* A scoped name with no registry row (a renamed server's old name, or a name never registered; a removed server keeps its
+               row, see DarlingObservability.DisableOrphanedServersSql) has no srv row, so m_last never reads its rows. The map holds
+               its handles only up to the map's last refresh, so with a stale map they would read '(ad hoc)' where the window-wide
+               ranking named them. These names read the whole window by their stored server_name, newest row per pair, as before
+               #5811. The arm exists only when the run's scope names such a server. */
+            sql.Append("m_unreg AS MATERIALIZED (\n");
+            sql.Append("    SELECT DISTINCT ON (pu.server_name, pu.sql_handle)\n");
+            sql.Append("           pu.server_name, pu.sql_handle, pu.object_name, pu.schema_name, pu.database_name\n");
+            sql.Append("    FROM ").Append(schema).Append(".procedure_stats AS pu\n");
+            sql.Append("    WHERE pu.server_name = ANY(").Append(unregisteredParam).Append(")\n");
+            sql.Append("      AND pu.collection_time >= ").Append(startParam).Append('\n');
+            sql.Append("      AND pu.collection_time <= ").Append(endParam).Append('\n');
+            sql.Append("      AND pu.sql_handle IS NOT NULL\n");
+            sql.Append("      AND pu.sql_handle <> ''\n");
+            sql.Append("      AND NOT EXISTS (SELECT 1 FROM m_last AS r WHERE r.server_name = pu.server_name AND r.sql_handle = pu.sql_handle)\n");
+            sql.Append("    ORDER BY pu.server_name, pu.sql_handle, pu.collection_time DESC\n");
+            sql.Append("),\n");
+        }
+
+        sql.Append(ModuleAlias).Append(" AS (\n");
+        sql.Append("    SELECT server_name, sql_handle, object_name, schema_name, database_name FROM m_last\n");
+        sql.Append("    UNION ALL\n");
+        if (unregisteredParam is not null)
+        {
+            sql.Append("    SELECT server_name, sql_handle, object_name, schema_name, database_name FROM m_unreg\n");
+            sql.Append("    UNION ALL\n");
+        }
+
+        sql.Append("    SELECT mm.server_name, mm.sql_handle, mm.object_name, mm.schema_name, mm.database_name\n");
+        sql.Append("    FROM ").Append(schema).Append(".module_map AS mm\n");
+        sql.Append("    WHERE mm.last_seen >= ").Append(startParam).Append('\n');
+        if (serverScopeParam is not null)
+        {
+            sql.Append("      AND mm.server_name = ANY(").Append(serverScopeParam).Append(")\n");
+        }
+
+        sql.Append("      AND NOT EXISTS (SELECT 1 FROM m_last AS r WHERE r.server_name = mm.server_name AND r.sql_handle = mm.sql_handle)\n");
+        if (unregisteredParam is not null)
+        {
+            sql.Append("      AND NOT EXISTS (SELECT 1 FROM m_unreg AS u WHERE u.server_name = mm.server_name AND u.sql_handle = mm.sql_handle)\n");
+        }
+
+        sql.Append(")\n");
+    }
 
     /// <summary>
     /// The server scope predicate every fact read shares (#5525): <c>&lt;prefix&gt;server_id = ANY(ARRAY(SELECT reg.server_id FROM
@@ -1434,7 +1662,9 @@ public static class ComposeCompiler
     /// Every arm applies the server scope and the pushable dimension filters, over the registry join <c>s</c> and the fact-row alias
     /// <c>f</c>, so the outer query's own WHERE finds nothing left to remove. The outer query keeps its window predicate as before.
     /// </summary>
-    private static string BuildStampRelation(StampRelation stamp, string wideStartParam, string endParam, IReadOnlyList<string>? dimensionFilters)
+    private static string BuildStampRelation(
+        StampRelation stamp, string wideStartParam, string endParam, IReadOnlyList<string>? dimensionFilters,
+        string? rawRelation = null, string? startParam = null, string? factScopeSql = null)
     {
         var schema = PgSchemaGenerator.CollectSchema;
         var through = stamp.ThroughParam;
@@ -1472,8 +1702,24 @@ public static class ComposeCompiler
             + $"WHERE f.collection_time >= {through} AND f.collection_time <= {endParam}"
             + scopeAndFilters;
 
+        /* #6115: a split panel adds a fourth arm, the servers the gate refused, read raw (deduped) as the partials of each row, so the
+           outer query combines them with the other three. The three arms above already carry `server_id <> ALL(refused)` in their scope. */
+        if (rawRelation is not null)
+        {
+            var rawScopeAndFilters = (factScopeSql is null ? string.Empty : " AND " + factScopeSql)
+                + string.Concat((dimensionFilters ?? Array.Empty<string>()).Select(c => " AND " + c));
+            var rawArm = $"SELECT f.server_id, f.database_name, f.module_name, f.query_hash, f.collection_time, f.server_name{rowPartials} FROM {rawRelation} AS f "
+                + $"WHERE f.collection_time >= {startParam} AND f.collection_time <= {endParam}"
+                + rawScopeAndFilters;
+            return $"({rollup} UNION ALL {stale} UNION ALL {tail} UNION ALL {rawArm})";
+        }
+
         return $"({rollup} UNION ALL {stale} UNION ALL {tail})";
     }
+
+    /// <summary>Two server-scope predicates ANDed; null when neither exists, the one that does when only one does.</summary>
+    private static string? AndScope(string? first, string? second) =>
+        first is null ? second : second is null ? first : first + " AND " + second;
 
     private enum PartialKind { Sum, Count, CountStar, Min, Max }
 

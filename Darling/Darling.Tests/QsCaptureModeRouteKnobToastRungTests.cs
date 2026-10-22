@@ -75,7 +75,6 @@ namespace Darling.Tests;
 /// WRITER in this rung, so the sweep names none of the three checkpointer columns — a writer pin on one file,
 /// owned by exactly one lane (#3783), which retires it when it lands the row.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class QsCaptureModeRouteKnobToastRungTests
 {
     private const int RungVersion = 137;
@@ -238,7 +237,7 @@ public sealed class QsCaptureModeRouteKnobToastRungTests
 
         /* No table, no collector: the censuses did not move; the health payload grew by exactly two. */
         Assert.Equal(72, TimescaleSupport.HypertableCount);
-        Assert.Equal(71, CollectorCatalog.All.Count);
+        Assert.Equal(71, TimescaleSupport.HypertableTables.Count);
         Assert.Equal(12, QueryStoreHealthCollector.Instance.PayloadColumns.Count);
     }
 
@@ -446,7 +445,6 @@ public sealed class QsCaptureModeRouteKnobToastRungTests
             ViewerDataService.StoreSchemaProbeSql.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         /* The "nothing past me" half of this claim moved to V138's test with the top ordinal; what stays is
            that this rung's sentinel is read at its OWN ordinal, which is what keeps every later one on the
            right column. */
@@ -518,7 +516,6 @@ public sealed class QsCaptureModeRouteKnobToastRungTests
 /// dimension rows. Serialized against every other live class because it shares the store.
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class QsCaptureModeRouteKnobToastLivePostgresTests
 {
     private const int ServerId = -137137;

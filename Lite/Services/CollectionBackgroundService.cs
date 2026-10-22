@@ -8,6 +8,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -71,6 +72,29 @@ public class CollectionBackgroundService : BackgroundService
        restart the worst case is one repeated evaluation whose finding folds onto the same incident
        id and whose notification the cooldown suppresses. */
     private readonly ConcurrentDictionary<int, DateTime> _lastPileupSnapshotEvaluated = new();
+
+    /* #5642: how often the same-statement-pileup check runs. It used to run once per collection cycle, behind the
+       collectors, so a cycle held up by a slow server held the check up with it. It now has its own loop on this
+       cadence, the same 30 seconds as Lite's alert timer; the evaluate-once-per-snapshot stamp above makes a pass
+       that finds nothing new cheap. */
+    internal static readonly TimeSpan PileupInterval = TimeSpan.FromSeconds(30);
+
+    /* #5731: housekeeping (archival, retention, findings and alert purges, Query Store backfill, analysis) runs on its
+       own loops, each ticking at this cadence, so a long archive or compaction no longer keeps the collection loop from
+       its next slot. Every step keeps its own due check and its own stamp, so each still runs on its own interval; this
+       is only how often a loop looks. */
+    internal static readonly TimeSpan HousekeepingInterval = TimeSpan.FromMinutes(1);
+
+    /* #5642: held while a pileup pass is running. One pass at a time: the loop awaits each pass before it waits for
+       the next, and this gate refuses a second caller outright, so two passes can never interleave their reads and
+       their per-server evaluated stamps. */
+    private readonly SemaphoreSlim _pileupPassGate = new(1, 1);
+
+    /// <summary>#5731: the housekeeping steps that took a second or more, for the skipped-slots report.</summary>
+    private readonly HousekeepingLedger _housekeepingLedger = new();
+
+    /// <summary>The ledger the skipped-slots report reads (a test records into it).</summary>
+    internal HousekeepingLedger HousekeepingLedger => _housekeepingLedger;
 
     /* How far past its budget an in-flight pass must be before the loop starts reporting it. The
        ordinary overrun already gets the "exceeded Ns" warning; this is for the pass that ignored
@@ -175,12 +199,56 @@ public class CollectionBackgroundService : BackgroundService
         /* #4640: the logical cycle time sits on a fixed grid (CollectionInterval apart), independent of how long
            a cycle's work takes, so a collector's due check compares exact grid times. */
         var cycleStart = DateTime.UtcNow;
+
+        /* #5643: each step of a cycle is timed, so a cycle that runs past its interval can say which step took the
+           time. The previous cycle's stamp is what the next stamp is compared with to count skipped slots. */
+        var steps = new List<CycleStep>();
+        var cycleWatch = new Stopwatch();
+        var stepWatch = new Stopwatch();
+        void Lap(string name)
+        {
+            steps.Add(new CycleStep(name, stepWatch.ElapsedMilliseconds));
+            stepWatch.Restart();
+        }
+
+        /* #5642: the pileup check runs on its own cadence beside the collection loop, not behind it. It keeps the
+           loop's two gates (a paused service and a down local database) and ends with the stopping token. */
+        var pileupLoop = RunPileupCadenceAsync(
+            PileupInterval,
+            () => !IsPaused && !_collectorService.LocalDatabaseIsDown(),
+            token => RunExclusiveAsync(_pileupPassGate, () => RunPileupSweepAsync(token)),
+            (wait, token) => Task.Delay(wait, token),
+            ex => _logger?.LogWarning("Same-statement pileup pass faulted — the next pass re-evaluates: {Message}", ex.Message),
+            stoppingToken);
+
+        /* #5731: the housekeeping loops start beside the pileup loop and wait for the collection loop's first round
+           before they tick, as housekeeping always has (nothing ran before the first round, and the Query Store
+           backfill is due on cycle 1, after the live path has had its floor). */
+        var firstRound = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var housekeepingLoops = StartHousekeepingLoops(
+            BuildHousekeepingLoops(),
+            HousekeepingInterval,
+            () => !IsPaused && !_collectorService.LocalDatabaseIsDown(),
+            firstRound.Task,
+            (wait, token) => Task.Delay(wait, token),
+            (loop, step, ex) => _logger?.LogWarning("Housekeeping step {Loop}/{Step} faulted — the next tick re-evaluates: {Message}",
+                loop, step, ex.Message),
+            stoppingToken,
+            _housekeepingLedger);
+
         while (!stoppingToken.IsCancellationRequested)
         {
+            var previousCycleStart = cycleStart;
+            steps.Clear();
+            cycleWatch.Reset();
+
             /* While Lite's local database is down after a fatal error, the whole cycle skips, housekeeping included:
                every step would fail against the invalidated database. The reopen does not need a cycle to run. */
             if (!IsPaused && !_collectorService.LocalDatabaseIsDown())
             {
+                cycleWatch.Restart();
+                stepWatch.Restart();
+
                 /* Check all server connections before collecting */
                 if (_serverManager != null)
                 {
@@ -193,6 +261,7 @@ public class CollectionBackgroundService : BackgroundService
                             "Connection check faulted AFTER being abandoned — this is the wedge's own exception (#2148)"),
                         cancellationToken: stoppingToken);
                     LogStepOutcome(check, "Connection check", ConnectionCheckDeadline);
+                    Lap("connection_check");
                 }
 
                 try
@@ -214,28 +283,12 @@ public class CollectionBackgroundService : BackgroundService
                     IsCollecting = false;
                 }
 
-                /* Periodic archival (time-based or size-based) */
-                await RunArchivalIfDueAsync();
+                Lap("collectors");
 
-                await RunQueryStoreBackfillIfDueAsync(stoppingToken);
-
-                /* Periodic retention cleanup */
-                await RunRetentionIfDueAsync();
-
-                /* Periodic analysis-findings retention (rolling 30-day purge) */
-                await RunFindingsCleanupIfDueAsync();
-
-                /* Periodic dismissed-archive-alert sidecar retention (rolling 180-day purge) */
-                await RunDismissedAlertsCleanupIfDueAsync();
-
-                /* #3467: the same-statement-pileup finding, evaluated at collection cadence — NOT on
-                   the analysis interval, which is the whole point (the measured incident's evidence sat
-                   in the store 21 minutes before the scheduled pass described it). Runs every loop tick,
-                   right behind the collectors that write its input. */
-                await RunPileupSweepAsync(stoppingToken);
-
-                /* Periodic scheduled analysis + high-severity finding notifications */
-                await RunAnalysisIfDueAsync(stoppingToken);
+                /* #5731: archival, retention, the findings and dismissed-alert purges, the Query Store backfill and the
+                   scheduled analysis are no longer steps of this loop. They run on the housekeeping loops started above
+                   (StartHousekeepingLoops), so a long archive or compaction does not hold the next collection slot.
+                   #3467 / #5642: the same-statement-pileup check has its own loop too (RunPileupCadenceAsync). */
 
                 /* Log process memory at the end of each cycle. Lets bug reporters
                    self-report memory without Task Manager, gives us a continuous
@@ -243,12 +296,21 @@ public class CollectionBackgroundService : BackgroundService
                    that would otherwise need external sampling to detect. Three
                    property reads — negligible overhead at 1-minute cadence. */
                 LogProcessMemory();
+                cycleWatch.Stop();
             }
+
+            /* #5731: the first round is over (run, or skipped by a pause or a down database): housekeeping may tick. */
+            firstRound.TrySetResult();
 
             try
             {
+                var waitStartedUtc = DateTime.UtcNow;
                 cycleStart = await WaitForNextCycleAsync(cycleStart, CollectionInterval, () => DateTime.UtcNow,
                     (wait, token) => Task.Delay(wait, token), stoppingToken);
+
+                /* #5643: the wait skips a missed grid slot and does not replay it; this is where that stops being silent. */
+                await ReportSkippedSlotsAsync(previousCycleStart, cycleStart, cycleWatch.Elapsed,
+                    DateTime.UtcNow - waitStartedUtc, steps, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -256,7 +318,245 @@ public class CollectionBackgroundService : BackgroundService
             }
         }
 
+        /* #5990: a round cancelled before its map pass never flushed the query-tag sightings; write them now, briefly. */
+        _collectorService.FlushQueryTagSightingsAtShutdown(CancellationToken.None);
+
+        /* A stop before the first round finished still releases the housekeeping loops, which end on the same token. */
+        firstRound.TrySetResult();
+
+        /* The pileup loop ends on the same token; wait for a pass still in flight to leave. */
+        try
+        {
+            await pileupLoop;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning("Pileup loop ended with: {Message}", ex.Message);
+        }
+
+        /* #5731: so do the housekeeping loops. A step in flight (a parquet COPY is not interrupted) is waited for; the
+           window closing waits only five seconds for this and then disposes the database, as it always has. */
+        try
+        {
+            await Task.WhenAll(housekeepingLoops);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning("Housekeeping loops ended with: {Message}", ex.Message);
+        }
+
         _logger?.LogInformation("Collection background service stopped");
+    }
+
+    /// <summary>
+    /// #5643: after the wait returns the next cycle's stamp, says so when slots were skipped: one Warning line and one
+    /// <c>collection_log</c> row per enabled server (<see cref="RemoteCollectorService.LogSkippedCycleAsync"/>). A cycle on
+    /// time, a stamp a hair off the grid and #4732's backward clock step skip nothing and say nothing. Nothing here throws
+    /// but a stop: a failed record is logged and the loop carries on.
+    /// </summary>
+    internal async Task ReportSkippedSlotsAsync(DateTime previousCycleStart, DateTime nextCycleStart, TimeSpan cycleElapsed,
+        TimeSpan waitElapsed, IReadOnlyList<CycleStep> steps, CancellationToken cancellationToken)
+    {
+        var skipped = CollectionCycleSkip.CountSkippedSlots(previousCycleStart, nextCycleStart, CollectionInterval);
+
+        /* #5731: housekeeping is off the collection loop, so the report names the housekeeping steps that overlapped the
+           gap and, when one is known, the writer holding the store lock (a read of the lock registry, never a wait). */
+        var housekeeping = skipped > 0 ? _housekeepingLedger.Overlapping(previousCycleStart, nextCycleStart) : null;
+        var holder = housekeeping is { Count: > 0 }
+            ? StoreLockHolders.Snapshot().FirstOrDefault(h => h.Write && h.Held >= HousekeepingLedger.MinimumLength)
+            : null;
+        var report = CollectionCycleSkip.Build(
+            skipped, cycleElapsed, waitElapsed, steps, CollectionInterval, previousCycleStart, nextCycleStart,
+            housekeeping, holder);
+        if (report == null)
+        {
+            return;
+        }
+
+        _logger?.LogWarning("{Message}", report.Message);
+        await _collectorService.LogSkippedCycleAsync(nextCycleStart, report, cancellationToken);
+    }
+
+    /// <summary>
+    /// #5642: the pileup check's own loop. It waits <paramref name="interval"/>, runs one pass when
+    /// <paramref name="canRun"/> says the service may, and waits again; the pass is awaited before the next wait
+    /// starts, so passes never overlap. A pass that throws costs that pass (reported to <paramref name="onFault"/>),
+    /// never the loop. Only the stopping token ends it, and a stop during the wait or the pass leaves quietly.
+    /// Static, with the delay passed in, so a test drives it with a fake delay and no real waiting.
+    /// </summary>
+    internal static async Task RunPileupCadenceAsync(
+        TimeSpan interval,
+        Func<bool> canRun,
+        Func<CancellationToken, Task> pass,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        Action<Exception> onFault,
+        CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await delay(interval, stoppingToken);
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                if (!canRun())
+                {
+                    continue;
+                }
+
+                await pass(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                onFault(ex);
+            }
+        }
+    }
+
+    /// <summary>One housekeeping step: a name for the log and the call, which keeps its own due check and stamp.</summary>
+    internal sealed record HousekeepingStep(string Name, Func<CancellationToken, Task> Run);
+
+    /// <summary>One housekeeping loop: its name and its steps, run in this order on every tick.</summary>
+    internal sealed record HousekeepingLoop(string Name, IReadOnlyList<HousekeepingStep> Steps);
+
+    /// <summary>
+    /// #5731: the three housekeeping loops. Maintenance runs archival, retention, the findings purge and the
+    /// dismissed-alert purge in that order, because archival and retention both delete or merge parquet files and must
+    /// not overlap, and the two purges follow archival (a size-triggered reset empties and restores the sidecar the
+    /// dismissed-alert purge trims). The Query Store backfill and the scheduled analysis each get a loop of their own, so
+    /// a long compaction does not hold either back; both carry their own per-server timeouts.
+    /// </summary>
+    private IReadOnlyList<HousekeepingLoop> BuildHousekeepingLoops() =>
+    [
+        new HousekeepingLoop("maintenance",
+        [
+            new HousekeepingStep("archival", token => RunArchivalIfDueAsync(token)),
+            new HousekeepingStep("retention", _ => RunRetentionIfDueAsync()),
+            new HousekeepingStep("findings_cleanup", _ => RunFindingsCleanupIfDueAsync()),
+            new HousekeepingStep("dismissed_alerts_cleanup", _ => RunDismissedAlertsCleanupIfDueAsync()),
+        ]),
+        new HousekeepingLoop("query_store_backfill",
+        [
+            new HousekeepingStep("query_store_backfill", token => RunQueryStoreBackfillIfDueAsync(token)),
+        ]),
+        /* #6010: the evidence capture of Level 1 investigations: its own loop, so a long archival or analysis never holds back a
+           request's evidence. It reads only Lite's own database (no monitored-server connection), freezes each section once, and
+           never throws: a failed pass is logged and the next tick retries. */
+        new HousekeepingLoop("investigation_evidence",
+        [
+            new HousekeepingStep("investigation_evidence", token => RunInvestigationEvidenceAsync(token)),
+        ]),
+        new HousekeepingLoop("analysis",
+        [
+            new HousekeepingStep("analysis", token => RunAnalysisIfDueAsync(token)),
+        ]),
+    ];
+
+    /// <summary>
+    /// #5731: starts one <see cref="RunPileupCadenceAsync"/> loop per entry of <paramref name="loops"/>, each ticking at
+    /// <paramref name="interval"/> behind the same gate and each running its steps in order. No loop ticks before
+    /// <paramref name="firstRound"/> completes. A step that throws costs that step for that tick
+    /// (<paramref name="onFault"/>), never the steps after it or the loop; only the stopping token ends a loop. The loops
+    /// are independent of each other and of the collection loop, which is the point: a step that takes minutes holds up
+    /// only its own loop. Static, with the delay passed in, so a test drives it with a fake delay and no real waiting.
+    /// </summary>
+    internal static Task[] StartHousekeepingLoops(
+        IReadOnlyList<HousekeepingLoop> loops,
+        TimeSpan interval,
+        Func<bool> canRun,
+        Task firstRound,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        Action<string, string, Exception> onFault,
+        CancellationToken stoppingToken,
+        HousekeepingLedger? ledger = null)
+    {
+        return loops.Select(loop => RunHousekeepingLoopAsync(loop, interval, canRun, firstRound, delay, onFault, ledger, stoppingToken))
+            .ToArray();
+    }
+
+    private static async Task RunHousekeepingLoopAsync(
+        HousekeepingLoop loop,
+        TimeSpan interval,
+        Func<bool> canRun,
+        Task firstRound,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        Action<string, string, Exception> onFault,
+        HousekeepingLedger? ledger,
+        CancellationToken stoppingToken)
+    {
+        try
+        {
+            await firstRound.WaitAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        await RunPileupCadenceAsync(
+            interval,
+            canRun,
+            async token =>
+            {
+                foreach (var step in loop.Steps)
+                {
+                    token.ThrowIfCancellationRequested();
+                    try
+                    {
+                        /* #5731: a step of a second or more goes in the ledger (failed ones too), so a skipped-slots
+                           report can name what overlapped its gap. */
+                        if (ledger == null)
+                        {
+                            await step.Run(token);
+                        }
+                        else
+                        {
+                            await ledger.Time(step.Name, () => step.Run(token));
+                        }
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        onFault(loop.Name, step.Name, ex);
+                    }
+                }
+            },
+            delay,
+            ex => onFault(loop.Name, "pass", ex),
+            stoppingToken);
+    }
+
+    /// <summary>
+    /// #5642: runs <paramref name="body"/> only when <paramref name="gate"/> is free, holding it until the body
+    /// leaves, and returns false without running when another call holds it. The pileup pass uses it so one pass
+    /// runs at a time however it is reached.
+    /// </summary>
+    internal static async Task<bool> RunExclusiveAsync(SemaphoreSlim gate, Func<Task> body)
+    {
+        if (!await gate.WaitAsync(0))
+        {
+            return false;
+        }
+
+        try
+        {
+            await body();
+            return true;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     /// <summary>
@@ -412,7 +712,24 @@ public class CollectionBackgroundService : BackgroundService
         }
     }
 
-    private async Task RunArchivalIfDueAsync()
+    /// <summary>
+    /// How soon a time-due archival pass that skipped a unit of work retries (#5731). The pass skips a table, a
+    /// compaction group or a swap-journal replay when the store's write lock was not free within its budget; the
+    /// rows stay where they were, so waiting out the whole <see cref="ArchiveInterval"/> would leave them there for
+    /// an hour. Long enough that a retry does not hammer a lock a long read is holding.
+    /// </summary>
+    internal static readonly TimeSpan ArchiveRetryDelay = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// The value <c>_lastArchiveTime</c> takes when an archival pass ends (#5731). A complete pass stamps the clock, so
+    /// the next one is a full <see cref="ArchiveInterval"/> away. An incomplete one stamps
+    /// <see cref="ArchiveRetryDelay"/> short of due: <see cref="HousekeepingIsDue"/> then reads it as due that long
+    /// from now, through the same rule every other job uses.
+    /// </summary>
+    internal static DateTime ArchiveStampAfterRun(bool complete, DateTime nowUtc) =>
+        complete ? nowUtc : nowUtc - (ArchiveInterval - ArchiveRetryDelay);
+
+    private async Task RunArchivalIfDueAsync(CancellationToken cancellationToken = default)
     {
         if (_archiveService == null)
         {
@@ -429,6 +746,7 @@ public class CollectionBackgroundService : BackgroundService
 
         try
         {
+            var complete = true;
             if (sizeDue)
             {
                 _logger?.LogInformation("Database size ({SizeMb:F0} MB) exceeds {Threshold} MB — archiving all data and resetting database",
@@ -437,9 +755,11 @@ public class CollectionBackgroundService : BackgroundService
             }
             else
             {
-                await _archiveService.ArchiveOldDataAsync(hotDataDays: ArchiveService.HotDataDays);
+                /* #5731: the housekeeping loop's stop token reaches the pass, so a service stop ends it between tables
+                   instead of waiting out the whole pass. A stopped pass returns false and takes the retry stamp. */
+                complete = await _archiveService.ArchiveOldDataAsync(hotDataDays: ArchiveService.HotDataDays, cancellationToken: cancellationToken);
             }
-            _lastArchiveTime = DateTime.UtcNow;
+            _lastArchiveTime = ArchiveStampAfterRun(complete, DateTime.UtcNow);
         }
         catch (Exception ex)
         {
@@ -458,7 +778,25 @@ public class CollectionBackgroundService : BackgroundService
         {
             /* The views must be rebuilt after a delete (see CleanupOldArchivesAndRefreshViewsAsync). */
             if (_duckDb != null)
-                await _retentionService.CleanupOldArchivesAndRefreshViewsAsync(_duckDb, RetentionService.ArchiveRetentionMonths);
+            {
+                /* #5731: null means the write lock stayed busy for the whole budget and nothing ran. Leave the stamp
+                   alone so the next housekeeping tick retries instead of waiting out the interval. */
+                if (await _retentionService.CleanupOldArchivesAndRefreshViewsAsync(_duckDb, RetentionService.ArchiveRetentionMonths) == null)
+                    return;
+
+                /* #5820: the investigation tables' retention, as Darling's daily purge (a finished request and its
+                   journal a year, a brief 90 days). They are not archived, so nothing else ages them out. Its own
+                   catch: a busy lock or a failed purge is retried at the next pass and does not hold the archive
+                   cleanup's stamp back. */
+                try
+                {
+                    await new PerformanceMonitorLite.Database.DuckDbInvestigationStore(_duckDb).PurgeAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Investigation retention skipped; the next retention pass retries");
+                }
+            }
             else
                 _retentionService.CleanupOldArchives(retentionMonths: RetentionService.ArchiveRetentionMonths);
             _lastRetentionTime = DateTime.UtcNow;
@@ -500,6 +838,35 @@ public class CollectionBackgroundService : BackgroundService
         }
     }
 
+    /// <summary>#6010: one evidence capture pass over Lite's database. A busy write lock or a failed read costs this tick only.</summary>
+    private async Task RunInvestigationEvidenceAsync(CancellationToken token)
+    {
+        if (_duckDb == null)
+        {
+            return;
+        }
+
+        try
+        {
+            var requests = new PerformanceMonitorLite.Database.DuckDbInvestigationStore(_duckDb);
+            var capture = new PerformanceMonitorLite.Investigations.LiteInvestigationEvidenceCapture(
+                _duckDb, requests, _logger, collectorIntervalMinutes: (collector, serverId) =>
+                    _scheduleManager is not null && _serverManager is not null
+                        && _scheduleManager.GetFrequencyForStorageServer(_serverManager, serverId, collector) is { } minutes
+                            ? CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes(minutes)
+                            : -1);
+            await capture.CaptureOnceAsync(token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Investigation evidence pass skipped; the next tick retries");
+        }
+    }
+
     /// <summary>
     /// Purges dismissed_archive_alerts rows past their retention horizon on a daily cadence. The
     /// sidecar was the one table in Lite with NO purge path at all (#1651): it is INSERT-only, and
@@ -517,14 +884,39 @@ public class CollectionBackgroundService : BackgroundService
             return;
         }
 
+        var data = new LocalDataService(_duckDb);
+        await RunDismissedAlertsPurgesAsync(
+            () => data.PurgeOldDismissedArchiveAlertsAsync(),
+            () => data.PurgeOldQueryTagSightingsAsync(),
+            () => _lastDismissedAlertsCleanupTime = DateTime.UtcNow,
+            _logger);
+    }
+
+    /// <summary>
+    /// The two daily purges, each in its own try so neither can skip the other or hold back the gate. The
+    /// dismissed-alerts gate advances as soon as that purge succeeds: a routine write-lock timeout in the
+    /// sightings purge (#5989) must not turn the daily sweep into a per-tick one.
+    /// </summary>
+    internal static async Task RunDismissedAlertsPurgesAsync(Func<Task> purgeDismissedAlerts, Func<Task> purgeSightings, Action advanceGate, ILogger? logger)
+    {
         try
         {
-            await new LocalDataService(_duckDb).PurgeOldDismissedArchiveAlertsAsync();
-            _lastDismissedAlertsCleanupTime = DateTime.UtcNow;
+            await purgeDismissedAlerts();
+            advanceGate();
         }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "Dismissed-archive-alert cleanup failed");
+            logger?.LogError(ex, "Dismissed-archive-alert cleanup failed");
+        }
+
+        /* #5989: the query-tag sightings age out on the same daily tick; only they are aged, the tags, assignments and rules are configuration. */
+        try
+        {
+            await purgeSightings();
+        }
+        catch (Exception ex)
+        {
+            logger?.LogError(ex, "Query-tag sightings cleanup failed");
         }
     }
 
@@ -919,12 +1311,12 @@ public class CollectionBackgroundService : BackgroundService
         try
         {
             using var process = Process.GetCurrentProcess();
-            var wsMb = process.WorkingSet64 / 1024 / 1024;
-            var privMb = process.PrivateMemorySize64 / 1024 / 1024;
-            var gcMb = GC.GetTotalMemory(forceFullCollection: false) / 1024 / 1024;
+            var wsMiB = process.WorkingSet64 / 1024 / 1024;
+            var privMiB = process.PrivateMemorySize64 / 1024 / 1024;
+            var gcMiB = GC.GetTotalMemory(forceFullCollection: false) / 1024 / 1024;
             _logger?.LogInformation(
-                "Process memory: WS={WorkingSetMb} MB, Private={PrivateMb} MB, GC heap={GcMb} MB",
-                wsMb, privMb, gcMb);
+                "Process memory: WS={WorkingSetMiB} MiB, Private={PrivateMiB} MiB, GC heap={GcMiB} MiB",
+                wsMiB, privMiB, gcMiB);
         }
         catch (Exception ex)
         {

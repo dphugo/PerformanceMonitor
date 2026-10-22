@@ -118,7 +118,7 @@ public class DuckDbSchemaEquivalenceTests : IDisposable
            BECAUSE it is the frozen historical shape: if a SQL Server collector is added, this is supposed to
            fail until the oracle is extended by hand. That is the whole point of an oracle. */
         Assert.Equal(catalogTables, goldenTables);
-        Assert.Equal(42, GoldenCollectorSchema.Tables.Count);
+        Assert.Equal(43, GoldenCollectorSchema.Tables.Count);
 
         /* Only server_config and database_config lack an index (matches DuckDbSchemaGenerator.CreateIndex). */
         var goldenIndexless = DuckDbSchemaGenerator.StoredCollectors
@@ -244,6 +244,13 @@ public class DuckDbSchemaEquivalenceTests : IDisposable
         /* v65 (#4475): the AG's group_id from sys.availability_groups, so same-named AGs can be told apart. Appended, nullable VARCHAR. */
         "ag_replica_states.group_id",
         "ag_database_replica_states.group_id",
+        /* v76 (#5632): the head blocker's sign-in time, last request end time, open transaction count and log bytes. Appended, nullable. */
+        "dmv_blocking_snapshots.blocking_login_time",
+        "dmv_blocking_snapshots.blocking_last_request_end_time",
+        "dmv_blocking_snapshots.blocking_open_transaction_count",
+        "dmv_blocking_snapshots.blocking_tran_log_bytes_used",
+        /* v77 (#6159): the primary replica's name from sys.dm_hadr_availability_group_states. Appended, nullable VARCHAR. */
+        "ag_replica_states.primary_replica",
     };
 
     [Fact]

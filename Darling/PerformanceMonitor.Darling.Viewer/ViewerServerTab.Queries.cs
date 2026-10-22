@@ -57,7 +57,7 @@ public partial class ViewerServerTab
     private const int QueryStoreRegressionsSubTabIndex = 6;
     /* #3797, inserted after Query Store Regressions: the per-database clutter view answers the question the
        two Query Store grids above raise, and it is Darling-only for now — Lite has every input and no port
-       (CrossAppMcpToolInventoryPinTests.KnownLiteMissingMcpTools carries the port, written out). */
+       */
     private const int QueryStoreClutterSubTabIndex = 7;
     private const int PlanCorrectionsSubTabIndex = 8;
     private const int QueryHeatmapSubTabIndex = 9;
@@ -133,12 +133,12 @@ public partial class ViewerServerTab
     /// </summary>
     private async Task LoadQueriesAsync(ViewerLoadTimer? timer = null)
     {
-        var (startUtc, endUtc) = GetWindowUtc();
+        var (startUtc, endUtc, tierNowUtc) = GetWindowUtcWithTierClock();
 
         switch (QueriesSubTabControl.SelectedIndex)
         {
             case PerformanceTrendsSubTabIndex:
-                await LoadPerformanceTrendsAsync(startUtc, endUtc);
+                await LoadPerformanceTrendsAsync(startUtc, endUtc, tierNowUtc);
                 break;
             case ActiveQueriesSubTabIndex:
                 await LoadActiveQueriesAsync(startUtc, endUtc);
@@ -182,8 +182,9 @@ public partial class ViewerServerTab
     private async Task LoadTopQueriesAsync(DateTime startUtc, DateTime endUtc, ViewerLoadTimer? timer = null)
     {
         timer?.Surface = "Queries > Top Queries by Duration";
+        var tagFilter = await CurrentQueryTagFilterAsync();
         var floorTask = Timed(timer, "data start", _dataService.GetQueryStatsWindowFloorAsync(_server.ServerId, startUtc, endUtc));
-        var dataReadTask = Timed(timer, "grid read", _dataService.GetTopQueriesByCpuRoutedAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter));
+        var dataReadTask = Timed(timer, "grid read", _dataService.GetTopQueriesByCpuRoutedAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter, tags: tagFilter));
         /* Walk finding D15: the slicer's read does not depend on the grid's, so it starts beside it and is awaited after the grid
            is bound. It used to start only once the grid read was in, which put its whole round trip behind the grid's. */
         var slicerTask = Timed(timer, "slicer read", _dataService.GetQueryStatsSlicerDataAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter));
@@ -251,8 +252,9 @@ public partial class ViewerServerTab
     private async Task LoadTopProceduresAsync(DateTime startUtc, DateTime endUtc, ViewerLoadTimer? timer = null)
     {
         timer?.Surface = "Queries > Top Procedures by Duration";
+        var tagFilter = await CurrentQueryTagFilterAsync();
         var floorTask = Timed(timer, "data start", _dataService.GetProcedureStatsWindowFloorAsync(_server.ServerId, startUtc, endUtc));
-        var dataReadTask = Timed(timer, "grid read", _dataService.GetTopProceduresByCpuRoutedAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter));
+        var dataReadTask = Timed(timer, "grid read", _dataService.GetTopProceduresByCpuRoutedAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter, tags: tagFilter));
         var slicerTask = Timed(timer, "slicer read", _dataService.GetProcStatsSlicerDataAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter));
         try
         {
@@ -280,12 +282,13 @@ public partial class ViewerServerTab
     private async Task LoadQueryStoreAsync(DateTime startUtc, DateTime endUtc, ViewerLoadTimer? timer = null)
     {
         timer?.Surface = "Queries > Query Store by Duration";
+        var tagFilter = await CurrentQueryTagFilterAsync();
         var floorTask = Timed(timer, "data start", _dataService.GetQueryStoreWindowFloorAsync(_server.ServerId, startUtc, endUtc));
         /* #3953 clause 4: only a genuine custom range is a literal end the gate must honor against
            applied_through. A preset's endUtc is GetWindowUtc()'s own DateTime.UtcNow (the viewer's clock, not
            the store's), so passing it as a literal here would send a slow-clocked viewer to raw on every
            ordinary read (M1) — null tells the gate this end is open. */
-        var dataReadTask = Timed(timer, "grid read", _dataService.GetQueryStoreTopQueriesWithReachAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter, literalEndUtc: IsCustomRange ? endUtc : null));
+        var dataReadTask = Timed(timer, "grid read", _dataService.GetQueryStoreTopQueriesWithReachAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter, literalEndUtc: IsCustomRange ? endUtc : null, tags: tagFilter));
         /* Walk finding D15: the slicer's read starts beside the grid's (see LoadTopQueriesAsync). */
         var slicerTask = Timed(timer, "slicer read", _dataService.GetQueryStoreSlicerDataAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter));
         try
@@ -463,7 +466,8 @@ public partial class ViewerServerTab
            step compares its answer with that window's start. The rows are ranked by added duration, not by time, so they name no
            earlier start and the cap rule does not apply. */
         var floorTask = _dataService.GetQueryStoreRegressionsDataStartAsync(_server.ServerId, startUtc, endUtc);
-        var floorReadTask = _dataService.GetQueryStoreRegressionsAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter);
+        var floorReadTask = _dataService.GetQueryStoreRegressionsAsync(_server.ServerId, startUtc, endUtc, databaseNames: SelectedDatabaseFilter,
+            literalEndUtc: IsCustomRange ? endUtc : null); /* #5809: the interval table gate's clause 4, as the grid passes it (#3953). */
         await AwaitReadWatchingProbeAsync(floorReadTask, floorTask, "Query Store Regressions");
         var rows = floorReadTask.Result;
         _queryStoreRegressionsFilterMgr!.UpdateData(rows);
@@ -537,8 +541,9 @@ public partial class ViewerServerTab
     {
         try
         {
+            var tagFilter = await CurrentQueryTagFilterAsync();
             var floorTask = _dataService.GetQueryStatsWindowFloorAsync(_server.ServerId, e.StartUtc, e.EndUtc);
-            var dataReadTask = _dataService.GetTopQueriesByCpuRoutedAsync(_server.ServerId, e.StartUtc, e.EndUtc, databaseNames: SelectedDatabaseFilter);
+            var dataReadTask = _dataService.GetTopQueriesByCpuRoutedAsync(_server.ServerId, e.StartUtc, e.EndUtc, databaseNames: SelectedDatabaseFilter, tags: tagFilter);
             await AwaitReadWatchingProbeAsync(dataReadTask, floorTask, "Query Stats");
             var read = dataReadTask.Result;
             var rows = read.Rows;
@@ -567,8 +572,9 @@ public partial class ViewerServerTab
     {
         try
         {
+            var tagFilter = await CurrentQueryTagFilterAsync();
             var floorTask = _dataService.GetProcedureStatsWindowFloorAsync(_server.ServerId, e.StartUtc, e.EndUtc);
-            var dataReadTask = _dataService.GetTopProceduresByCpuRoutedAsync(_server.ServerId, e.StartUtc, e.EndUtc, databaseNames: SelectedDatabaseFilter);
+            var dataReadTask = _dataService.GetTopProceduresByCpuRoutedAsync(_server.ServerId, e.StartUtc, e.EndUtc, databaseNames: SelectedDatabaseFilter, tags: tagFilter);
             await AwaitReadWatchingProbeAsync(dataReadTask, floorTask, "Procedure Stats");
             var read = dataReadTask.Result;
             var rows = read.Rows;
@@ -597,9 +603,10 @@ public partial class ViewerServerTab
     {
         try
         {
+            var tagFilter = await CurrentQueryTagFilterAsync();
             var floorTask = _dataService.GetQueryStoreWindowFloorAsync(_server.ServerId, e.StartUtc, e.EndUtc);
             /* #3953 clause 4: a slicer selection is always a literal, user-drawn sub-range, never a preset. */
-            var dataReadTask = _dataService.GetQueryStoreTopQueriesAsync(_server.ServerId, e.StartUtc, e.EndUtc, databaseNames: SelectedDatabaseFilter, literalEndUtc: e.EndUtc);
+            var dataReadTask = _dataService.GetQueryStoreTopQueriesAsync(_server.ServerId, e.StartUtc, e.EndUtc, databaseNames: SelectedDatabaseFilter, literalEndUtc: e.EndUtc, tags: tagFilter);
             await AwaitReadWatchingProbeAsync(dataReadTask, floorTask, "Query Store");
             var rows = dataReadTask.Result;
             _queryStoreFilterMgr!.UpdateData(rows);

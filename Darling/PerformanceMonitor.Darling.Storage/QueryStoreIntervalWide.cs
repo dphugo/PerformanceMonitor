@@ -25,7 +25,7 @@ namespace PerformanceMonitor.Darling.Storage;
 /// carry every outcome and every column the three new reads need broke PLAN_REGRESSION (H1, H2, H4) and the
 /// slicer (H4): PLAN_REGRESSION's near-full-table scan gets 2.6x wider rows for no benefit, and the slicer's
 /// <c>COALESCE</c> predicate can't use either measured index. F1's follow-up measurement confirmed split (c): V143
-/// untouched, plus this table, 8-9 days on <c>collection_time</c>/<c>first_execution_time</c>, no secondary index
+/// untouched, plus this table, 9-10 days on <c>collection_time</c>/<c>first_execution_time</c>, no secondary index
 /// (a window index took HOT to 0%, F1). This class is the write side only: the table, its own coverage claim and
 /// pending replay table, mirroring <see cref="QueryStoreIntervalLatest"/>'s shape column for column so a later
 /// gate can parametrize on the table rather than duplicate the decision (ruling issuecomment-5836972848, item 5).
@@ -411,11 +411,13 @@ FROM batch_rows AS b;";
        table is the only record left, and ResolveReadAsync extends the bound down to
        ExactBelowFloorStart = max(window start, filled_since, table floor + PurgeEdgeMargin (26 h)) and no further: those are the
        three bounds under which the table provably holds what raw held before its purge.
-       There is no per-server probe on this table: of its two secondary btrees, idx_query_store_interval_wide_first_exec
+       There is no per-server probe on this table: of its first two secondary btrees, idx_query_store_interval_wide_first_exec
        leads with first_execution_time, and the wide btree on (server_id, first_execution_time) (#4952,
        QueryStoreBackgroundIndexes.WideServerFirstExec) leads with server_id but is built in the background by the
        service, not by a migration, so a store can lack it. The per-server reads' bound on first_execution_time is
-       served by that wide btree where it exists. */
+       served by that wide btree where it exists. The third secondary btree (#5807,
+       QueryStoreBackgroundIndexes.WideDatabaseQueryFirstExec) serves only the one-query history read, and is built
+       the same way. */
 
     /// <summary>
     /// This table's store-shape inputs for one server: its coverage row's <c>filled_since</c> and
@@ -486,6 +488,17 @@ WHERE t.server_id = $1;";
     /// chunks are still read by the columnar scan on their server_id segment index, which this index does not
     /// reach. It stays an exact read, not a cached answer, because the collector can still store a NULL start
     /// on a catalog join miss.
+    /// <para><b>Opt-in (#6267 follow-up).</b> Only a caller that passes <c>LegacyRows.Refuse</c> to
+    /// <see cref="ResolveReadAsync"/> or <see cref="ReadsTableAsync"/> pays this probe. Today that is the
+    /// Viewer's duration trend (<c>ViewerDataService.GetQueryStoreDurationTrendAsync</c>) alone, because its arm 2 places a
+    /// legacy row at every <c>collection_time</c> it was stored at, and the table kept one. Every other reader keeps ONE
+    /// snapshot per interval identity, the newest, which is exactly what the table holds for a legacy row too (PostgreSQL
+    /// matches NULL to NULL in the raw dedupe's <c>PARTITION BY</c>, and the table's identity matches them the same way), so
+    /// its answer is the same with a legacy row in the window. Those readers are the Queries grid, the grid's regressions, the
+    /// MCP top, history, plan-force precheck, aborts, regression and tag-rollup reads, the composed Query Store panels, and the
+    /// analysis pass's plan-regression failure read. They skip the probe. The probe is cheap on uncompressed chunks and
+    /// expensive on compressed ones, so the opt-in matters most to the analysis pass, which runs it for every server on
+    /// every pass (a 4 to 4.5 s read on the largest store, and a cold full read of the compressed chunks after a restart).</para>
     /// Bounded to the SAME range the table read would use
     /// (<see cref="ClampedStart"/> through <paramref name="windowEnd"/> in <see cref="ReadsTableAsync"/>), not
     /// the caller's raw windowStart, so a legacy row outside the served range cannot force a needless refusal.
@@ -512,6 +525,21 @@ SELECT EXISTS
     /// table is at least as fast as raw there, so the ruling keeps this threshold.
     /// </summary>
     public static readonly TimeSpan GridWideMinWindow = TimeSpan.FromHours(12);
+
+    /// <summary>
+    /// The window the by-Query-Store-top reads must span before the interval table is read at all (#3953's own threshold
+    /// for the MCP top read, ruling issuecomment-5836972848 item 5): below this window the table's extra round trips (the
+    /// gate's own reads plus a second transaction) cost more than they save, so the gate reads raw regardless of coverage.
+    /// A read's own constant, not <see cref="GridWideMinWindow"/> (the grid's): the two reads may not share a threshold.
+    /// Raised from 12 to 24 hours (lane B4t, rig-d4, 15-day seed at a field store's rate, end-to-end through the MCP top
+    /// read): median of 5 at the ruled 12-hour cell, table 737.0 ms (spread 655.1-746.5) against raw 581.1 ms (spread
+    /// 544.3-629.3), so the table was slower than raw there and the ruling moved this threshold to 24 hours.
+    /// <para>The ONE value of it (#5971): the MCP top read (<c>DarlingDataReader.QueryStoreTopMinWindow</c>) and the by-tag
+    /// rollup's Query Store section (<c>DarlingQueryTagRollupReader.QueryStoreMinWindow</c>) both read this field, so one
+    /// retune cannot move one and leave the other. It is not the 48-hour duration-trend threshold, which was measured
+    /// separately.</para>
+    /// </summary>
+    public static readonly TimeSpan TopMinWindow = TimeSpan.FromHours(24);
 
     /// <summary>
     /// How long one Query Store runtime-stats interval can span (V143's clause 3 restated: "B is the window minus
@@ -557,6 +585,138 @@ SELECT EXISTS
     /// </summary>
     public static readonly string PurgeEdgeMarginSql =
         $"interval '{(long)Math.Ceiling(PurgeEdgeMargin.TotalMinutes)} minutes'";
+
+    /// <summary>
+    /// <see cref="PurgeEdgeMargin"/> with the interval term (<see cref="IntervalSpanMargin"/>, one day, the longest
+    /// interval Query Store allows) replaced by the longest interval the server has actually had (#5882):
+    /// <c>longestSpan + <see cref="MaxBelowFloorCadence"/> + <see cref="WatermarkPolicy.MaxCatchup"/></c>, the same
+    /// argument <see cref="PurgeEdgeMarginSql"/>'s summary makes with a shorter span. At a 60-minute interval that is
+    /// three hours instead of 26, so the read of a 24-hour window no longer takes yesterday's whole partition. Never
+    /// longer than <see cref="PurgeEdgeMargin"/>, so a span above a day (not a Query Store setting) cannot widen the read.
+    /// </summary>
+    public static TimeSpan EdgeMarginFor(TimeSpan longestSpan)
+    {
+        var margin = longestSpan + MaxBelowFloorCadence + WatermarkPolicy.MaxCatchup;
+        return margin > PurgeEdgeMargin ? PurgeEdgeMargin : margin;
+    }
+
+    /// <summary><see cref="EdgeMarginFor"/>'s answer as the interval literal <see cref="PurgeEdgeMarginSql"/> is, rounded UP
+    /// to whole minutes. Equals <see cref="PurgeEdgeMarginSql"/> when the margin is the full <see cref="PurgeEdgeMargin"/>.</summary>
+    public static string EdgeMarginSqlFor(TimeSpan margin) =>
+        $"interval '{(long)Math.Ceiling(margin.TotalMinutes)} minutes'";
+
+    /// <summary>#5882: <paramref name="sql"/> with every use of <see cref="PurgeEdgeMarginSql"/> replaced by
+    /// <paramref name="marginSql"/> (<see cref="EdgeMarginSqlFor"/>). The margin is a literal in the statement text, not a
+    /// parameter, so the planner sees the range it will scan and every caller that binds the statement by position is unchanged.</summary>
+    public static string WithEdgeMargin(string sql, string marginSql) =>
+        sql.Replace(PurgeEdgeMarginSql, marginSql, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The longest positive <c>interval_length_minutes</c> the server's databases have reported (<c>v_query_store_health</c>, one
+    /// row per database per capture) over [readStart - 2 days, end + 1 day], and how many positive-length captures that range
+    /// holds, how many NULL or non-positive lengths it holds for a database that HAS wide rows (the collector writes 0 for a
+    /// NULL length; a database with no wide rows cannot contribute to
+    /// the read, so its non-positive row is ignored and does not pin the server at 26 hours), and the oldest positive-length
+    /// capture in it. The lookback is a day of interval plus a day of
+    /// capture cadence; the day past the end covers a change the last capture before the end did not see. The fifth column is
+    /// true when a database the server has wide rows for has no capture in that range, so its interval length is unknown and the
+    /// longest of the others bounds nothing for it. The databases come from a skip scan of <c>ux_query_store_interval_wide</c>
+    /// (<c>(server_id, database_name, ...)</c>: a handful of index probes per database), not a <c>DISTINCT</c> over the read's range:
+    /// that reads every heap row of the 26 hours the narrower floor exists to avoid (measured, #5815). The trade is a fallback,
+    /// never an under-read: a database whose wide rows are all outside the read's range (dropped or taken offline within the wide
+    /// table's ten days of retention) and has no capture in the range also returns <see cref="PurgeEdgeMargin"/>.
+    /// </summary>
+    private const string LongestIntervalSpanSql = """
+        WITH RECURSIVE wide_databases AS
+        (
+            (
+                SELECT w.database_name
+                FROM query_store_interval_wide AS w
+                WHERE w.server_id = $1
+                ORDER BY w.database_name
+                LIMIT 1
+            )
+            UNION ALL
+            SELECT
+                (
+                    SELECT w.database_name
+                    FROM query_store_interval_wide AS w
+                    WHERE w.server_id = $1
+                    AND   w.database_name > p.database_name
+                    ORDER BY w.database_name
+                    LIMIT 1
+                )
+            FROM wide_databases AS p
+            WHERE p.database_name IS NOT NULL
+        )
+        SELECT
+            MAX(h.interval_length_minutes) FILTER (WHERE h.interval_length_minutes > 0),
+            COUNT(*) FILTER (WHERE h.interval_length_minutes > 0),
+            COUNT(*) FILTER
+            (
+                WHERE (h.interval_length_minutes IS NULL OR h.interval_length_minutes <= 0)
+                AND   d.database_name IS NOT NULL
+            ),
+            MIN(h.capture_time) FILTER (WHERE h.interval_length_minutes > 0),
+            EXISTS
+            (
+                SELECT 1
+                FROM wide_databases AS d2
+                WHERE d2.database_name IS NOT NULL
+                AND   NOT EXISTS
+                (
+                    SELECT 1
+                    FROM v_query_store_health AS h2
+                    WHERE h2.server_id = $1
+                    AND   h2.database_name = d2.database_name
+                    AND   h2.capture_time >= $2 - interval '2 days'
+                    AND   h2.capture_time <= $3 + interval '1 day'
+                )
+            )
+        FROM v_query_store_health AS h
+        LEFT JOIN wide_databases AS d
+          ON d.database_name = h.database_name
+        WHERE h.server_id = $1
+        AND   h.capture_time >= $2 - interval '2 days'
+        AND   h.capture_time <= $3 + interval '1 day'
+        """;
+
+    /// <summary>
+    /// The edge margin (<see cref="EdgeMarginFor"/>) for a read of <paramref name="readStart"/> through
+    /// <paramref name="end"/> on one server (#5882), or <see cref="PurgeEdgeMargin"/> whenever the server's longest interval
+    /// cannot be trusted: no positive-length capture in the range, a NULL or non-positive length for a database with wide rows, a database with wide rows and no
+    /// capture in the health range (its length is unknown and may exceed the longest the others report), or no capture as old as a day before the
+    /// read starts (an interval that began then, or one backfilled from before the monitor connected, may have run under a
+    /// setting the captures never saw). Exact otherwise: every stored row has
+    /// <c>first_execution_time &gt; collection_time - (span + MaxCatchup)</c> (<see cref="PurgeEdgeMarginSql"/>'s argument), and
+    /// the longest length any database reported over the range bounds the span of every interval written in it. Run on the
+    /// read's own connection and snapshot. A fault is the caller's, not swallowed here: inside the read's transaction a failed
+    /// statement aborts it, so the caller's existing fault path (a raw read) is the only honest answer.
+    /// </summary>
+    public static async Task<TimeSpan> ResolveEdgeMarginAsync(
+        NpgsqlConnection connection, int serverId, DateTime readStart, DateTime end, int commandTimeoutSeconds,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(LongestIntervalSpanSql, connection) { CommandTimeout = commandTimeoutSeconds };
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Integer, Value = serverId });
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(readStart, DateTimeKind.Unspecified) });
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(end, DateTimeKind.Unspecified) });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)
+            || reader.IsDBNull(0) || reader.IsDBNull(3)
+            || reader.GetInt64(1) == 0 || reader.GetInt64(2) != 0
+            || reader.GetBoolean(4))
+        {
+            return PurgeEdgeMargin;
+        }
+
+        if (reader.GetDateTime(3) > DateTime.SpecifyKind(readStart, DateTimeKind.Unspecified) - IntervalSpanMargin)
+        {
+            return PurgeEdgeMargin;
+        }
+
+        return EdgeMarginFor(TimeSpan.FromMinutes(reader.GetInt64(0)));
+    }
 
     /// <summary>
     /// How far past a read's window end a row's <c>first_execution_time</c> may sit, for the upper bound the
@@ -664,10 +824,12 @@ FROM (
     /// these hold, otherwise run today's raw statement unchanged (ruling issuecomment-5836972848; review D4R
     /// items H3, M1). Two further clauses are the caller's, checked outside this pure function because each
     /// needs its own round trip: the viewer's store must report schema version 145 or later (needs the
-    /// viewer's own connection probe), and <see cref="ReadsTableAsync"/>'s clause 6 (a 2026 field review) —
-    /// the window must hold no legacy row (<c>interval_start_time_utc IS NULL</c>, see
-    /// <see cref="HasLegacyRowSql"/>) — checked once clauses 1-5 already say "table", so a store refused for
-    /// any other reason never pays the probe.
+    /// viewer's own connection probe), and clause 6 (a 2026 field review) — the window must hold no legacy row
+    /// (<c>interval_start_time_utc IS NULL</c>, see <see cref="HasLegacyRowSql"/>) — checked once clauses 1-5 already
+    /// say "table", so a store refused for any other reason never pays the probe. Clause 6 runs only for a caller that
+    /// passes <c>LegacyRows.Refuse</c> to <see cref="ResolveReadAsync"/> or <see cref="ReadsTableAsync"/>: the duration trend,
+    /// whose arm 2 needs every snapshot of a legacy row. The other readers keep the newest snapshot per interval, which the
+    /// table holds for a legacy row as well, so they do not ask for it.
     /// <list type="number">
     /// <item>Coverage exists (<paramref name="filledSince"/> is not null) and there is no pending batch.</item>
     /// <item><c>filledSince &lt;= max(R, S)</c> (<paramref name="rawFloor"/>, <paramref name="windowStart"/>):
@@ -770,6 +932,19 @@ FROM (
         public DateTime? EffectiveStart => UseTable ? ReadStart : null;
     }
 
+    /// <summary>
+    /// Whether the gate may route a window holding a legacy row (<c>interval_start_time_utc IS NULL</c>) to the table.
+    /// A required argument of <see cref="ResolveReadAsync"/> and <see cref="ReadsTableAsync"/>, so a new reader cannot
+    /// reach the cheap path by leaving it out. See <see cref="HasLegacyRowSql"/> for which readers need which.
+    /// </summary>
+    public enum LegacyRows
+    {
+        /// <summary>The reader keeps the newest snapshot per interval, which the table holds for a legacy row too. Clause 6 is skipped.</summary>
+        Allow,
+        /// <summary>The reader places a row at every <c>collection_time</c> it was stored at, which the table cannot give back. Clause 6 refuses the table when the window holds a legacy row.</summary>
+        Refuse,
+    }
+
     /// <summary>#4689: which bound set a <c>_wide</c> read's lower bound.</summary>
     public enum WideStartBound
     {
@@ -777,7 +952,7 @@ FROM (
         Window,
         /// <summary>The table's coverage claim (<c>filled_since</c>) starts later than the window.</summary>
         FilledSince,
-        /// <summary>The 9-day purge edge plus the one-day interval-span margin starts later than the window.</summary>
+        /// <summary>The 10-day purge edge plus the one-day interval-span margin starts later than the window.</summary>
         TablePurgeEdge,
         /// <summary>No exact span below raw's chunk floor: the read is clamped at the floor, as before #4689.</summary>
         RawFloor,
@@ -807,7 +982,7 @@ FROM (
             WideStartBound.FilledSince =>
                 $"The interval table began keeping complete history for {(!manyServers ? "this server" : settingServer ?? "these servers")} at {effectiveStart}.",
             WideStartBound.TablePurgeEdge =>
-                "The interval table keeps 9 days, and intervals that began before its purge edge are not read.",
+                "The interval table keeps 10 days, and intervals that began before its purge edge are not read.",
             WideStartBound.RawFloorSlowCadence =>
                 $"{(!manyServers ? "This server's" : settingServer is null ? "A server's" : settingServer + "'s")} Query Store collection cadence is over 60 minutes, or its collection log shows a longer gap, so older intervals are not read from the interval table.",
             WideStartBound.RawFloorLogNotYetCovering =>
@@ -815,7 +990,7 @@ FROM (
             _ =>
                 "The read is clamped at the raw tier's retention floor: nothing older than it can be shown exactly.",
         };
-        return $"The window reaches further back than the Query Store history this store holds for {scope}. Nothing older than {effectiveStart} was read. Past the raw tier's retention, intervals are read from the per-interval table (kept 9 days), which holds exactly what raw held for them. "
+        return $"The window reaches further back than the Query Store history this store holds for {scope}. Nothing older than {effectiveStart} was read. Past the raw tier's retention, intervals are read from the per-interval table (kept 10 days), which holds exactly what raw held for them. "
             + reason;
     }
 
@@ -824,7 +999,7 @@ FROM (
     public static string? BannerReason(WideStartBound bound) => bound switch
     {
         WideStartBound.FilledSince => " (interval table complete from then)",
-        WideStartBound.TablePurgeEdge => " (interval table keeps 9 days)",
+        WideStartBound.TablePurgeEdge => " (interval table keeps 10 days)",
         WideStartBound.RawFloorSlowCadence => " (slow Query Store cadence)",
         WideStartBound.RawFloorLogNotYetCovering => " (collection log not yet covering the purge edge)",
         _ => null,
@@ -873,7 +1048,7 @@ FROM (
 
     /// <summary>
     /// The largest query_store collection gap over [floor day, floor day + <see cref="GapCacheWindowDays"/>],
-    /// cached per (store, server, floor day, cadence). The range sits 7-9 days back in compressed
+    /// cached per (store, server, floor day, cadence). The range sits 8-10 days back in compressed
     /// <c>collection_log</c> chunks, so each uncached read decompresses them. Caching is exact because the
     /// range is in the past and <c>collection_log</c> rows are only ever inserted with the wall-clock
     /// <c>collection_time</c> of the insert (DarlingObservability.InsertCollectionLogSql callers pass
@@ -988,7 +1163,7 @@ FROM (
     /// <list type="bullet">
     /// <item><paramref name="filledSince"/>: the coverage claim starts there and is never backdated, and a gap
     /// check restarts it above a hole (<see cref="ResetCoverageSql"/>).</item>
-    /// <item><paramref name="tableFloor"/> + <see cref="PurgeEdgeMargin"/>: the 9-day purge deletes row by
+    /// <item><paramref name="tableFloor"/> + <see cref="PurgeEdgeMargin"/>: the 10-day purge deletes row by
     /// row on <c>first_execution_time</c>, so a row whose interval began before the table floor is gone even when
     /// its <c>collection_time</c> is inside the window.</item>
     /// <item><paramref name="windowStart"/>: never read before the window asked for.</item>
@@ -1025,6 +1200,7 @@ FROM (
     /// <see cref="ResolveReadAsync"/> reduced to the gate's answer and the clamp (<see cref="ClampedStart"/>): the
     /// table read's lower bound at and above raw's chunk floor. A caller that reads the table below the floor uses
     /// <see cref="ResolveReadAsync"/> and binds <see cref="WideReadPlan.ReadStart"/> instead.
+    /// <paramref name="legacyRows"/> is required: <see cref="LegacyRows.Refuse"/> turns clause 6 on (see <see cref="ResolveReadAsync"/>).
     /// </summary>
     public static async Task<(bool UseTable, DateTime ClampedStart)> ReadsTableAsync(
         NpgsqlConnection connection,
@@ -1035,11 +1211,12 @@ FROM (
         TimeSpan minWindow,
         int commandTimeoutSeconds,
         ILogger? logger,
+        LegacyRows legacyRows,
         CancellationToken cancellationToken)
     {
         var p = await ResolveReadAsync(
             connection, serverId, windowStart, windowEnd, literalWindowEnd, minWindow,
-            commandTimeoutSeconds, logger, cancellationToken);
+            commandTimeoutSeconds, logger, legacyRows, cancellationToken);
         return (p.UseTable, p.ClampedStart);
     }
 
@@ -1067,6 +1244,12 @@ FROM (
     /// lower bound the table read may bind (<see cref="WideReadPlan.ReadStart"/>), which reaches below raw's chunk
     /// floor down to <see cref="ExactBelowFloorStart"/> — all computed from the SAME <c>rawFloor</c> this decision
     /// read, on the SAME connection, so the decision and the bound cannot see different snapshots.
+    /// <para><paramref name="legacyRows"/> has no default, so a new reader must choose. <see cref="LegacyRows.Refuse"/> runs
+    /// clause 6, <see cref="HasLegacyRowSql"/>, and refuses the table when the window holds a legacy row. Choose it when the
+    /// read would be WRONG with one: a reader that places a row at every <c>collection_time</c> it was stored at (the
+    /// Viewer's duration trend). A reader that keeps the newest snapshot per interval gets the same answer from the table,
+    /// so it passes <see cref="LegacyRows.Allow"/> and never pays the probe, which on compressed chunks decompresses every
+    /// batch of the server to prove there are none.</para>
     /// </summary>
     public static async Task<WideReadPlan> ResolveReadAsync(
         NpgsqlConnection connection,
@@ -1077,6 +1260,7 @@ FROM (
         TimeSpan minWindow,
         int commandTimeoutSeconds,
         ILogger? logger,
+        LegacyRows legacyRows,
         CancellationToken cancellationToken,
         StoreWideInputsCache? storeWide = null)
     {
@@ -1151,12 +1335,14 @@ FROM (
             var clampedStart = ClampedStart(rawFloor, windowStart);
 
             /* Clause 6 (2026 field review): only checked once clauses 1-5 already say "table" — a store
-               refused for any other reason never pays this probe. See HasLegacyRowSql's remarks for why a
-               legacy row (interval_start_time_utc IS NULL) makes the table's answer wrong, not merely stale:
+               refused for any other reason never pays this probe — and only for a caller that asked
+               (LegacyRows.Refuse). See HasLegacyRowSql's remarks for why a legacy row
+               (interval_start_time_utc IS NULL) makes the table's answer wrong for ONE kind of reader, not merely stale:
                the upsert's identity carries no collection_time, so a legacy interval re-fetched across several
-               cycles keeps only its latest snapshot, and every caller that places these rows at collection_time
-               needs every one of them. */
-            if (useTable)
+               cycles keeps only its latest snapshot, and a caller that places these rows at collection_time
+               needs every one of them. A caller that keeps the newest snapshot per interval reads the same rows
+               either way and skips the probe. */
+            if (useTable && legacyRows == LegacyRows.Refuse)
             {
                 await using var legacy = new NpgsqlCommand(HasLegacyRowSql, connection) { CommandTimeout = commandTimeoutSeconds };
                 legacy.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Integer, Value = serverId });

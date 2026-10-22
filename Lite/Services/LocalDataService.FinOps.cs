@@ -24,7 +24,7 @@ public class ProvisioningTrendRow
     public decimal MemoryRatio { get; set; }
     public string Status { get; set; } = "";
     public string DayDisplay => Day.ToString("ddd MM/dd");
-    public string StatusDisplay => Status == ProvisioningVerdict.NotApplicable ? ProvisioningVerdict.NotApplicableLabel : Status.Replace("_", " ");
+    public string StatusDisplay => ProvisioningVerdict.StatusLabel(Status);
 }
 
 public class MemoryGrantEfficiencyRow
@@ -52,6 +52,8 @@ public class TopResourceConsumerRow
     public decimal PctIo { get; set; }
     public long TotalCpuTimeMs { get; set; }
     public decimal AvgIoMb { get; set; }
+    /// <summary>The by-average rows' CPU per execution, unrounded (#5644 W4).</summary>
+    public decimal AvgCpuMs { get; set; }
 }
 
 public class DatabaseSizeSummaryRow
@@ -388,6 +390,10 @@ public class ServerPropertyRow
     public int? IdleDbCount { get; set; }
     public string? ProvisioningStatus { get; set; }
 
+    /// <summary>The uptime in seconds, the sort key of the Uptime column (#6086): <see cref="UptimeDisplay"/> is text, which sorts
+    /// "10d" before "2d". Null when the start time is unknown.</summary>
+    public double? UptimeSeconds => SqlServerStartTime is { } start ? (DateTime.Now - start).TotalSeconds : null;
+
     public string UptimeDisplay
     {
         get
@@ -400,7 +406,7 @@ public class ServerPropertyRow
     public string HadrDisplay => IsHadrEnabled.HasValue ? (IsHadrEnabled.Value ? "Yes" : "No") : "";
     public string ClusteredDisplay => IsClustered.HasValue ? (IsClustered.Value ? "Yes" : "No") : "";
     public string AgReplicaRoleDisplay => string.Equals(AgReplicaRole, "Standalone", StringComparison.OrdinalIgnoreCase) ? "—" : AgReplicaRole;
-    public string ProvisioningDisplay => ProvisioningStatus == ProvisioningVerdict.NotApplicable ? ProvisioningVerdict.NotApplicableLabel : ProvisioningStatus?.Replace("_", " ") ?? "";
+    public string ProvisioningDisplay => string.IsNullOrEmpty(ProvisioningStatus) ? "" : ProvisioningVerdict.StatusLabel(ProvisioningStatus);
 
     // FinOps cost — from server config
     public decimal MonthlyCost { get; set; }

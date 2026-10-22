@@ -15,6 +15,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using ModelContextProtocol.Server;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Analysis;
@@ -38,6 +39,7 @@ public sealed class DarlingMcpFinOpsRecommendationsTools
     public static async Task<string> GetFinOpsRecommendations(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
+        ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -51,7 +53,7 @@ public sealed class DarlingMcpFinOpsRecommendationsTools
             /* #5558: databases this node holds only as an Availability Group secondary copy are left to the primary's findings.
                Fails open (stale or missing snapshots, standalone, Azure SQL Database skip nothing). */
             var secondary = await PgSecondaryReplicaScope.ReadAsync(
-                postgres, resolved.ServerId, DateTime.UtcNow, logger: null, cancellationToken);
+                postgres, resolved.ServerId, DateTime.UtcNow, logger, cancellationToken);
 
             /* The composer swallows every failed check; the hook names them. A cancelled request is not a failed check. */
             var skipped = new List<string>();
@@ -62,11 +64,11 @@ public sealed class DarlingMcpFinOpsRecommendationsTools
                     if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested) return;
                     if (!skipped.Contains(label, StringComparer.Ordinal)) skipped.Add(label);
                 },
-                secondaryDatabases: secondary, cancellationToken: cancellationToken));
+                secondaryDatabases: secondary, cancellationToken: cancellationToken, logger: logger));
             cancellationToken.ThrowIfCancellationRequested();
 
             return JsonSerializer.Serialize(
-                Envelope(resolved.ServerName, monthly, skipped, rows, AgReplicaScope.SkippedNote(secondary)), McpHelpers.JsonOptions);
+                Envelope(resolved.DisplayName, monthly, skipped, rows, AgReplicaScope.SkippedNote(secondary)), McpHelpers.JsonOptions);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

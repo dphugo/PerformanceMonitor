@@ -98,13 +98,13 @@ public class DarlingHardenFilesVerbTests
         var source = ReadRepoFile(Path.Combine(
             "Darling", "PerformanceMonitor.Darling.Service", "DarlingCliCommands.cs"));
 
-        var at = source.IndexOf("public static int HardenFiles(", StringComparison.Ordinal);
+        var at = source.IndexOf("private static List<HardenTarget> HardenTargets(", StringComparison.Ordinal);
         Assert.True(at >= 0, "HardenFiles is gone (#2352)");
 
         /* The same window as the two pins below: #4004's review added the log-hash key's targets to the list, which
            moved the verify pass past the old 6,000, and its round 2 the junction refusal (DarlingHardenFilesJunctionTests),
-           which moved it past 8,000. */
-        var body = source[at..Math.Min(source.Length, at + 10000)];
+           which moved it past 8,000, and #5700 the TLS key files (past 10,000). */
+        var body = source[at..Math.Min(source.Length, at + 17000)];
 
         /* It re-reads rather than trusting the call. */
         Assert.Contains("DarlingFileSecurity.IsReadableByOrdinaryUsers(", body, StringComparison.Ordinal);
@@ -143,10 +143,10 @@ public class DarlingHardenFilesVerbTests
         var source = ReadRepoFile(Path.Combine(
             "Darling", "PerformanceMonitor.Darling.Service", "DarlingCliCommands.cs"));
 
-        var at = source.IndexOf("public static int HardenFiles(", StringComparison.Ordinal);
+        var at = source.IndexOf("private static List<HardenTarget> HardenTargets(", StringComparison.Ordinal);
         Assert.True(at >= 0, "HardenFiles is gone (#2352)");
 
-        var body = source[at..Math.Min(source.Length, at + 10000)];
+        var body = source[at..Math.Min(source.Length, at + 17000)];
 
         /* It asks the SCM, and hardens for what it gets back. */
         Assert.Contains("RegisteredServiceAccount(ServiceName)", body, StringComparison.Ordinal);
@@ -173,8 +173,9 @@ public class DarlingHardenFilesVerbTests
         var source = ReadRepoFile(Path.Combine(
             "Darling", "PerformanceMonitor.Darling.Service", "DarlingCliCommands.cs"));
 
-        var at = source.IndexOf("public static int HardenFiles(", StringComparison.Ordinal);
-        var body = source[at..Math.Min(source.Length, at + 10000)];
+        var at = source.IndexOf("private static List<HardenTarget> HardenTargets(", StringComparison.Ordinal);
+        /* 11,000: the viewer and mcp credentials joined the target list, which moved the verify pass past 10,000. */
+        var body = source[at..Math.Min(source.Length, at + 18000)];
 
         Assert.Contains("GrantsHardenedAccount(", body, StringComparison.Ordinal);
         Assert.Contains("LOCKED OUT", body, StringComparison.Ordinal);
@@ -222,6 +223,64 @@ public class DarlingHardenFilesVerbTests
         Assert.Contains("ObjectName", body, StringComparison.Ordinal);
         Assert.Contains("LocalSystem", body, StringComparison.Ordinal);
         Assert.Contains("WellKnownSidType.LocalSystemSid", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// #5649: the verb hardens the backups of the config it was given, named the way the config verbs and the service's
+    /// start-up sweep name them (<c>prod.json.bak-x</c> for <c>prod.json</c>), not the default config's
+    /// <c>darling.json.bak-*</c> that may sit in the same folder for another install. The name test is ordinal and
+    /// ignores case whatever the culture (Turkish dotted and dotless I), and the service's own sweep lists the same files.
+    /// </summary>
+    [Fact]
+    public void TheVerb_HardensTheBackupsOfTheConfigItWasGiven_ByAnOrdinalNameTest()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "pm5649-cli-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(directory);
+        var previous = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            foreach (var name in new[]
+            {
+                "prod.json", "prod.json.bak-20260101-120000", "PROD.JSON.BAK-Upper", "prod.json.bak-before-edit",
+                "prod.json.bak", "prod.jsonx.bak-x", "darling.json", "darling.json.bak-other-install", "DARLING.JSON.BAK-Upper",
+            })
+            {
+                File.WriteAllText(Path.Combine(directory, name), "{}");
+            }
+
+            var expectedProd = new[] { "PROD.JSON.BAK-Upper", "prod.json.bak-20260101-120000", "prod.json.bak-before-edit" };
+            var expectedDefault = new[] { "DARLING.JSON.BAK-Upper", "darling.json.bak-other-install" };
+
+            foreach (var culture in new[] { "en-US", "tr-TR" })
+            {
+                System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo(culture);
+
+                var prod = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.OrderBy(
+                    System.Linq.Enumerable.Select(DarlingCliCommands.ConfigBackupFiles(directory, "prod.json"), Path.GetFileName), n => n, StringComparer.Ordinal));
+                Assert.Equal(expectedProd, prod);
+
+                var defaults = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.OrderBy(
+                    System.Linq.Enumerable.Select(DarlingCliCommands.ConfigBackupFiles(directory, "darling.json"), Path.GetFileName), n => n, StringComparer.Ordinal));
+                Assert.Equal(expectedDefault, defaults);
+
+                var swept = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.OrderBy(
+                    System.Linq.Enumerable.Select(DarlingConfigBackup.ListBackups(directory, "prod.json"), Path.GetFileName), n => n, StringComparer.Ordinal));
+                Assert.Equal(expectedProd, swept);
+
+                Assert.True(DarlingConfigBackup.IsBackupName("darling.json", "DARLING.JSON.BAK-X"), culture);
+                Assert.True(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak-x"), culture);
+                Assert.False(DarlingConfigBackup.IsBackupName("darling.json", "DARLİNG.JSON.BAK-X"), culture);
+                Assert.False(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak"), culture);
+                Assert.False(DarlingConfigBackup.IsBackupName("prod.json", "darling.json.bak-x"), culture);
+            }
+
+            Assert.Equal("darling.json.bak-", DarlingConfigBackup.Prefix);
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = previous;
+            Directory.Delete(directory, recursive: true);
+        }
     }
 }
 
@@ -344,10 +403,25 @@ public class DarlingHardenFilesJunctionTests
 
             var ordinary = Path.Combine(install, "darling.json");
             File.WriteAllText(ordinary, "{}");
-            Assert.Null(DarlingFileSecurity.HardenWithoutFollowingLinks(ordinary, isDirectory: false, allowInteractive: true, install));
+            /* A built-in group stands in for the operator group, which no build machine has. */
+            DarlingFileSecurity.UseOperatorGroupForTests(() => new System.Security.Principal.SecurityIdentifier(
+                System.Security.Principal.WellKnownSidType.BuiltinPerformanceLoggingUsersSid, null));
+            try
+            {
+                Assert.Null(DarlingFileSecurity.HardenWithoutFollowingLinks(ordinary, isDirectory: false, allowInteractive: true, install));
+            }
+            finally
+            {
+                DarlingFileSecurity.UseOperatorGroupForTests(null);
+            }
+
             Assert.False(DarlingFileSecurity.IsReadableByOrdinaryUsers(ordinary));
             Assert.True(DarlingFileSecurity.GrantsHardenedAccount(ordinary));
-            Assert.Contains(";;;IU)", Sddl(ordinary), StringComparison.Ordinal);
+            var sddl = Sddl(ordinary);
+            Assert.DoesNotContain(";;;IU)", sddl, StringComparison.Ordinal);
+            Assert.True(
+                sddl.Contains(";;;LU)", StringComparison.Ordinal) || sddl.Contains(";;;S-1-5-32-559)", StringComparison.Ordinal),
+                "the operator group's read entry is missing: " + sddl);
         }
         finally
         {
@@ -394,7 +468,9 @@ public class DarlingHardenFilesJunctionTests
 
             var refusal = DarlingFileSecurity.HardenWithoutFollowingLinks(backup, isDirectory: false, allowInteractive: false, install);
 
-            Assert.Equal($"{backup} is a hard link: the file has 2 names, and its ACL is the same under every one of them", refusal);
+            Assert.StartsWith($"{backup} is a hard link: the file has 2 names, and its ACL is the same under every one of them. Its other name(s): ", refusal, StringComparison.Ordinal);
+            Assert.Contains(@"\victim\someones.txt", refusal, StringComparison.OrdinalIgnoreCase);
+            Assert.EndsWith($". To list every name, run: fsutil hardlink list \"{backup}\"", refusal, StringComparison.Ordinal);
             Assert.Equal(victimFileAcl, Sddl(victimFile));
 
             /* The verb finds it as a config backup beside darling.json. The store directory is a scratch path that does
@@ -409,6 +485,8 @@ public class DarlingHardenFilesJunctionTests
 
             Assert.Equal(1, exit);
             Assert.Contains($"REFUSED  {backup} (a config backup): {backup} is a hard link", error.ToString(), StringComparison.Ordinal);
+            Assert.Contains(@"\victim\someones.txt", error.ToString(), StringComparison.OrdinalIgnoreCase);
+            Assert.Contains($"fsutil hardlink list \"{backup}\"", error.ToString(), StringComparison.Ordinal);
             Assert.Contains($"SECURED  {config} (the live config)", output.ToString(), StringComparison.Ordinal);
             Assert.Equal(victimFileAcl, Sddl(victimFile));
         }
@@ -490,5 +568,48 @@ public class DarlingHardenFilesJunctionTests
         process.StandardOutput.ReadToEnd();
         process.StandardError.ReadToEnd();
         process.WaitForExit();
+    }
+
+    /// <summary>
+    /// #5649: a name Windows folds into another (a trailing dot or a trailing space) is never a backup, the same answer the
+    /// install and upgrade scripts give (<c>Test-DarlingServiceWrittenFileName</c>): it resolves to a DIFFERENT file, so the
+    /// service must not harden it or the CLI list it as the config's backup. The files are made through a <c>\\?\</c> path,
+    /// the only way to create such a name, and both listings (the CLI's and the service's start-up sweep) skip them while the
+    /// plain backup name still counts.
+    /// </summary>
+    [Fact]
+    public void TheBackupNameTest_RefusesANameWindowsFolds_InTheNameTestAndBothListings()
+    {
+        Assert.True(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak-x"));
+        Assert.False(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak-x."));
+        Assert.False(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak-x "));
+        Assert.False(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak-x.. "));
+        Assert.False(DarlingConfigBackup.IsBackupName("darling.json", "darling.json.bak-."));
+        Assert.False(DarlingConfigBackup.IsBackupName("prod.json", "prod.json.bak-x."));
+
+        var directory = Path.Combine(Path.GetTempPath(), "pm5649-fold-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.WriteAllText(Path.Combine(directory, "darling.json.bak-x"), "{}");
+            foreach (var folded in new[] { "darling.json.bak-y.", "darling.json.bak-y " })
+            {
+                File.WriteAllText(@"\\?\" + Path.Combine(directory, folded), "{}");
+            }
+
+            var cli = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(DarlingCliCommands.ConfigBackupFiles(directory, "darling.json"), Path.GetFileName));
+            var sweep = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(DarlingConfigBackup.ListBackups(directory, "darling.json"), Path.GetFileName));
+            Assert.Equal(new[] { "darling.json.bak-x" }, cli);
+            Assert.Equal(new[] { "darling.json.bak-x" }, sweep);
+        }
+        finally
+        {
+            foreach (var folded in new[] { "darling.json.bak-y.", "darling.json.bak-y " })
+            {
+                try { File.Delete(@"\\?\" + Path.Combine(directory, folded)); } catch (IOException) { }
+            }
+
+            Directory.Delete(directory, recursive: true);
+        }
     }
 }

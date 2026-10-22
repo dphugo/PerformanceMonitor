@@ -24,6 +24,7 @@ import {
   el,
   mount,
   apiGet,
+  apiGetFleet,
   loadingStrip,
   errorStrip,
   emptyStrip,
@@ -37,6 +38,7 @@ import {
   rollupTextId,
 } from "../util.js";
 import { VIZ } from "../panels.js";
+import { displayNameFor } from "../server-order.js";
 
 /* The empty state is the NORMAL case for most fleets — Always On is opt-in, and the collectors write no rows for
    an instance that hosts no AGs (and never run against Azure SQL Database). Say so plainly rather than implying
@@ -58,8 +60,8 @@ const DATABASE_COLUMNS = [
   { key: "redo_queue_kb", label: "Redo queue (KB)", format: "int", align: "right" },
   { key: "log_send_rate_kb_sec", label: "Send rate (KB/s)", format: "int", align: "right" },
   { key: "redo_rate_kb_sec", label: "Redo rate (KB/s)", format: "int", align: "right" },
-  /* No align:"right" on the two custom-render columns — the shared cell() applies the numeric class only on the
-     format path, so asking for it here would right-align the header and leave the cell left. */
+  /* The two custom-render columns are left unaligned on purpose (they draw text such as "n/a" and a reason, not a bare number), so they
+     set no align:"right". Since #6353 cell() would right-align a render column that asked for it, header and cell alike. */
   { key: "secondary_lag_seconds", label: "Lag", render: lagCell },
   { key: "est_send_drain_minutes", label: "Est drain (min)", format: "num1", align: "right" },
   { key: "est_redo_completion_minutes", label: "Est redo (min)", format: "num1", align: "right" },
@@ -69,7 +71,10 @@ const DATABASE_COLUMNS = [
 export async function renderAg(main) {
   mount(main, [pageHead(null), loadingStrip("Loading availability groups…")]);
 
-  const res = await apiGet("/api/ag");
+  /* #6157: a card names the reporting server by its display name, as the fleet page and the sidebar do. The fleet read is the
+     source of that name; if it fails the cards fall back to the connection key rather than blocking the page. */
+  const [res, fleet] = await Promise.all([apiGet("/api/ag"), apiGetFleet()]);
+  const fleetCards = fleet.kind === "data" && fleet.data && Array.isArray(fleet.data.cards) ? fleet.data.cards : [];
   if (res.kind === "error") {
     mount(main, [pageHead(null), errorStrip(res.message)]);
     return;
@@ -82,7 +87,7 @@ export async function renderAg(main) {
     return;
   }
 
-  mount(main, [pageHead(d), truncationNote(d), rollup(d), ...groups.map(agCard)]);
+  mount(main, [pageHead(d), truncationNote(d), rollup(d), ...groups.map((g) => agCard(g, fleetCards))]);
 }
 
 /* #5042: the tiles count every view in scope, so when a response says it was cut (a limit or a byte cap) the page
@@ -153,7 +158,7 @@ export function countLabel(num, plural) {
   return num === 1 ? plural.replace(/s$/, "") : plural;
 }
 
-function agCard(g) {
+function agCard(g, fleetCards) {
   const cls = bandClass(g.severity);
 
   return el("div", { class: "card ag-card " + cls }, [
@@ -164,22 +169,28 @@ function agCard(g) {
       el("div", { class: "spacer" }),
       g.primary_replica
         ? el("span", { class: "ag-primary-note", text: "Primary: " + g.primary_replica })
-        : el("span", { class: "ag-primary-note muted", text: "No primary reported" }),
+        : el("span", { class: "ag-primary-note muted", text: primaryNote(g) }),
     ]),
-    el("div", { class: "status-line", text: viewSubtitle(g) }),
+    el("div", { class: "status-line", text: viewSubtitle(g, fleetCards) }),
     el("div", { class: "ag-replicas" }, (g.replicas || []).map(replicaChip)),
     databaseGrid(g),
   ]);
 }
 
+/* #6159: the line where the primary would be named. A card from a secondary's own view may not list the primary; that is said plainly and is
+   not a finding, where a group with no primary at all stays "No primary reported". */
+export function primaryNote(g) {
+  return g && g.primary_not_visible ? "Primary not visible from this secondary" : "No primary reported";
+}
+
 /* Whose view this is, and how fresh. The two collector sweeps land independently, so the database grain gets its
    own "as of" whenever it differs from the replica grain. */
-function viewSubtitle(g) {
+export function viewSubtitle(g, fleetCards) {
   /* #5489: a group past the fleet's offline mark is a memory of the last snapshot, not a current status — say
      so ahead of the "as reported by" line, which keeps the time the snapshot was taken. */
   let text =
     (g.is_stale ? "Stale: no current data. " : "") +
-    "As reported by " + g.server_name + " · " + (g.is_stale ? "last collected " : "collected ") + relTime(g.collection_time);
+    "As reported by " + displayNameFor(fleetCards, g.server_name) + " · " + (g.is_stale ? "last collected " : "collected ") + relTime(g.collection_time);
   if (g.database_collection_time && g.database_collection_time !== g.collection_time) {
     text += " · databases " + relTime(g.database_collection_time);
   }

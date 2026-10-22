@@ -190,8 +190,8 @@ public sealed class McpToolGuideHeadsPgBAuditIoWaitTests
 /// <summary>
 /// #3898 D3 head pins for the rest of the "pgB" family: <c>get_pg_blocking</c> (<c>DarlingMcpPgBlockingTools</c>),
 /// <c>get_pg_wait_stats</c> (<c>DarlingMcpPgWaitTools</c>) and <c>get_pg_index_usage</c>
-/// (<c>DarlingMcpPgIndexUsageTools</c>). Darling only - none of the three has a Lite twin (see
-/// <c>CrossAppMcpToolInventoryPinTests.KnownLiteMissingMcpTools</c>). A separate class from
+/// (<c>DarlingMcpPgIndexUsageTools</c>). Darling only - none of the three has a Lite twin.
+/// A separate class from
 /// <see cref="McpToolGuideHeadsPgBTests"/> and <see cref="McpToolGuideHeadsPgBAuditIoWaitTests"/> so parallel
 /// lanes converting different files in the same family never conflict on one class body.
 /// </summary>
@@ -309,7 +309,7 @@ public sealed class McpToolGuideHeadsPgBKernelXminBloatTests
         ("get_pg_kernel_stats", "SHARES ARE OF THE WINDOW: pct_of_total_cpu divides by total_cpu_ms, not the page sum"),
         ("get_pg_kernel_stats", "per-interval deltas needing a second to difference"),
         ("get_pg_xmin_horizon", "EVERY capture in the window, not just captures with a holder"),
-        ("get_pg_xmin_horizon", "no_holder: captured, found nothing - all-clear"),
+        ("get_pg_xmin_horizon", "empty: captured, found nothing - all-clear"),
         ("get_pg_xmin_horizon", "unavailable: no capture in the window"),
         ("get_pg_xmin_horizon", "feeds get_pg_wraparound_risk"),
         ("get_pg_table_bloat", "ESTIMATE, NOT MEASUREMENT"),

@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using PerformanceMonitor.Analysis.Baselines;
 
 namespace PerformanceMonitor.Analysis;
 
@@ -900,7 +901,9 @@ public static class FactAdvice
                     var sigma = fact.Metadata.TryGetValue(ConfigChangeAttribution.DeltaSigmaKey(key), out var ds) ? ds : (double?)null;
                     var rel = fact.Metadata.TryGetValue(ConfigChangeAttribution.RelativeMoveKey(key), out var rm) ? rm : (double?)null;
                     var magnitude = sigma is not null
-                        ? $"{(sigma.Value >= 0 ? "+" : string.Empty)}{sigma.Value:0.#}σ"
+                        ? (Math.Abs(sigma.Value) >= AnomalyThresholds.SigmaDisplayCap - 1e-9
+                            ? $"{(sigma.Value >= 0 ? "at least +" : "at least −")}{AnomalyThresholds.SigmaDisplayCap:0.#}σ"
+                            : $"{(sigma.Value >= 0 ? "+" : string.Empty)}{sigma.Value:0.#}σ")
                         : rel is not null && rel.Value < 1.0
                             ? $"{(worse ? "+" : "−")}{rel.Value * 100:0}%"
                             : worse ? "appeared" : "resolved";
@@ -966,6 +969,11 @@ public static class FactAdvice
     private static bool Fired(IReadOnlyDictionary<string, Fact> facts, string key) =>
         facts.TryGetValue(key, out var f) && f.Severity > 0;
 
+    /// <summary>#6267: PLAN_REGRESSION fired on a cost regression (a fact raised by timeouts or errors alone carries no cost
+    /// figures), the case the "force the historically faster plan" text is true for.</summary>
+    private static bool CostRegressionFired(IReadOnlyDictionary<string, Fact> facts) =>
+        Fired(facts, "PLAN_REGRESSION") && FactMeta(facts, "PLAN_REGRESSION", "worst_regression_factor") is not null;
+
     /// <summary>
     /// Names the query-level findings that ACTUALLY co-fired this window (plan regression, parameter
     /// sensitivity, missing indexes, plan warnings), so a CPU/wait remediation points at the real
@@ -974,10 +982,16 @@ public static class FactAdvice
     private static string QueryCauseClause(IReadOnlyDictionary<string, Fact> facts)
     {
         var bits = new List<string>();
-        if (Fired(facts, "PLAN_REGRESSION"))
-            bits.Add("a plan regression — force the historically faster plan (see that finding)");
+        /* #5630: parameter sensitivity leads when both fired: the plan regression beside it may compare plans compiled for
+           different inputs, so it is named second and carries no force advice. */
         if (Fired(facts, "PARAMETER_SENSITIVITY"))
             bits.Add("parameter sensitivity — a plan is far more expensive for some parameter values (that finding has the figures)");
+        if (CostRegressionFired(facts))
+        {
+            bits.Add(Fired(facts, "PARAMETER_SENSITIVITY")
+                ? "a plan regression — do not force a query that also shows the parameter-sensitivity signature (see that finding)"
+                : "a plan regression — force the historically faster plan (see that finding)");
+        }
         if (Fired(facts, "MISSING_INDEX"))
             bits.Add("missing-index requests — the missing-index card lists the optimizer's suggestions from this window's top plans as corroboration, with its caveat");
         if (Fired(facts, "PLAN_WARNING"))
@@ -986,8 +1000,11 @@ public static class FactAdvice
     }
 
     /// <summary>Human-readable duration from milliseconds: "850 ms", "1.4 s", "3.2 min".</summary>
+    /// <summary>#6305: a positive figure under 1 ms is shown in microseconds ("455 us"), never rounded to "0 ms"
+    /// (which read as no change beside a 21 us comparison figure). Zero stays "0 ms".</summary>
     private static string Duration(double ms) =>
-        ms < 1000 ? $"{ms:N0} ms"
+        ms > 0 && ms < 1 ? (ms * 1000 < 10 ? $"{ms * 1000:0.#} us" : $"{ms * 1000:N0} us")
+        : ms < 1000 ? $"{ms:N0} ms"
         : ms < 60000 ? $"{ms / 1000.0:0.#} s"
         : $"{ms / 60000.0:0.#} min";
 
@@ -1297,10 +1314,16 @@ public static class FactAdvice
         inv.Append(". The sessions active at the peak are attached.");
 
         var rem = new StringBuilder();
-        if (Fired(facts, "PLAN_REGRESSION"))
-            rem.Append("A plan regression co-fired — the engine attaches the historically faster plan and a ready-to-run force statement; forcing it is the fast fix while you address why the worse plan got chosen.");
-        else if (Fired(facts, "PARAMETER_SENSITIVITY"))
+        /* #5630: parameter sensitivity leads. When it fired, the plan regression beside it compares plans that may have
+           been compiled for different inputs, so its force advice must not show. */
+        if (Fired(facts, "PARAMETER_SENSITIVITY"))
+        {
             rem.Append("Parameter sensitivity co-fired — do NOT force a plan (it locks in the wrong shape for the other parameter values); use OPTION (RECOMPILE) on the affected statement, or branch the procedure by parameter.");
+            if (CostRegressionFired(facts))
+                rem.Append(" A plan regression co-fired too, but do not force a query that also shows that signature.");
+        }
+        else if (CostRegressionFired(facts))
+            rem.Append("A plan regression co-fired — the engine attaches the historically faster plan and a ready-to-run force statement; forcing it is the fast fix while you address why the worse plan got chosen.");
         else
             rem.Append("Neither a plan regression nor parameter sensitivity fired this window, so the burst is most likely ad-hoc or scheduled work — the sessions active at the peak are attached; Resource Governor or moving that work off-peak is the durable fix.");
         if (Fired(facts, "MISSING_INDEX"))
@@ -1595,8 +1618,10 @@ public static class FactAdvice
     }
 
     /// <summary>
-    /// QUERY_SPILLS composed: states total spills, how many distinct queries spilled, then the
-    /// statistics/grant remediation and the current max-server-memory sentence.
+    /// QUERY_SPILLS composed: states the pages spilled, how many distinct queries spilled, then the
+    /// statistics/grant remediation and the current max-server-memory sentence. The value is the sum of
+    /// <c>sys.dm_exec_query_stats.total_spills</c> deltas, and that column counts 8 KB PAGES written to
+    /// tempdb, not spill events, so it is named as pages and megabytes (#5633 item 2), never as "spills".
     /// </summary>
     private static AdviceBlock ComposeQuerySpills(IReadOnlyDictionary<string, Fact> facts)
     {
@@ -1607,7 +1632,8 @@ public static class FactAdvice
             return mem.Length == 0 ? fallback : fallback with { Remediation = fallback.Remediation + " " + mem };
 
         var distinct = FactMeta(facts, "QUERY_SPILLS", "spilling_query_count");
-        var inv = new StringBuilder($"{Plural(total.Value, "spill")} to tempdb this window");
+        var spilled = SpilledPagesText(total.Value);
+        var inv = new StringBuilder($"{spilled} spilled to tempdb this window");
         if (distinct is > 0)
             inv.Append($", across {Plural(distinct.Value, "distinct query")}");
         inv.Append(". A spill means a query's memory grant was too small for its sort or hash operation, so the overflow went to tempdb — disk-speed work in place of memory-speed.");
@@ -1622,10 +1648,19 @@ public static class FactAdvice
 
         return fallback with
         {
-            Headline = $"{Plural(total.Value, "query spill")} to tempdb — memory grants too small for their sorts/hashes",
+            Headline = $"{spilled} spilled to tempdb — memory grants too small for their sorts/hashes",
             Investigation = inv.ToString(),
             Remediation = rem
         };
+    }
+
+    /// <summary>"1,234 pages (9.6 MB)" for a <c>total_spills</c> value: the DMV column counts 8 KB pages, so the
+    /// megabyte figure is pages x 8 / 1024 (#5633 item 2). Internal so the tests can pin the wording.</summary>
+    internal static string SpilledPagesText(double pages)
+    {
+        var mb = pages * 8.0 / 1024.0;
+        var mbText = mb < 10 ? mb.ToString("0.0#") : mb.ToString("N0");
+        return $"{Plural(pages, "page")} ({mbText} MB)";
     }
 
     /// <summary>
@@ -1692,6 +1727,45 @@ public static class FactAdvice
         };
     }
 
+    /// <summary>#6267: the sentence about queries whose timeouts (Aborted runs) or errors (Exception runs) rose, from the
+    /// PLAN_REGRESSION fact's failure metadata. Empty when none did.</summary>
+    private static string PlanRegressionFailureText(IReadOnlyDictionary<string, Fact> facts)
+    {
+        var hours = FactMeta(facts, "PLAN_REGRESSION", "failure_recent_hours") ?? 24;
+        var parts = new List<string>();
+        var timeouts = FactMeta(facts, "PLAN_REGRESSION", "timeout_offender_count");
+        if (timeouts is > 0)
+        {
+            parts.Add($"{Plural(timeouts.Value, "query")} timed out more often (the worst, query {FactMeta(facts, "PLAN_REGRESSION", "worst_timeout_query_id"):0}, had {FactMeta(facts, "PLAN_REGRESSION", "worst_timeout_recent_runs"):0} timed-out runs in the last {hours:0} hours against {FactMeta(facts, "PLAN_REGRESSION", "worst_timeout_baseline_runs"):0} in the rest of the window)");
+        }
+
+        var errors = FactMeta(facts, "PLAN_REGRESSION", "error_offender_count");
+        if (errors is > 0)
+        {
+            parts.Add($"{Plural(errors.Value, "query")} failed with errors more often (the worst, query {FactMeta(facts, "PLAN_REGRESSION", "worst_error_query_id"):0}, had {FactMeta(facts, "PLAN_REGRESSION", "worst_error_recent_runs"):0} failed runs in the last {hours:0} hours against {FactMeta(facts, "PLAN_REGRESSION", "worst_error_baseline_runs"):0} in the rest of the window)");
+        }
+
+        return parts.Count == 0
+            ? ""
+            : "Runs that did not complete are counted apart from the cost comparison, which sees successful runs only: " + string.Join("; ", parts) + ".";
+    }
+
+    /// <summary>#6267: the PLAN_REGRESSION block when no plan's cost regressed but timeouts or errors rose. The cost comparison
+    /// counts only runs that completed, so these queries can look no worse by cost.</summary>
+    private static AdviceBlock ComposePlanRegressionFailuresOnly(IReadOnlyDictionary<string, Fact> facts, AdviceBlock fallback)
+    {
+        var timeouts = FactMeta(facts, "PLAN_REGRESSION", "timeout_offender_count") is > 0;
+        var errors = FactMeta(facts, "PLAN_REGRESSION", "error_offender_count") is > 0;
+        var what = timeouts && errors ? "timeouts and errors" : timeouts ? "timeouts" : "errors";
+        return fallback with
+        {
+            Headline = $"Query Store shows more {what} than this window's baseline",
+            Investigation = PlanRegressionFailureText(facts)
+                + " Their cost per execution is not the signal here: a run that times out is cut off, so the runs that finish can look cheaper than the plan really is.",
+            Remediation = "Look at the named queries' recent plans in Query Store: a plan change, a stale statistic, a blocked or starved workload or a changed parameter can each turn a query's runs into timeouts or errors. Compare a recent plan with an older one before forcing anything, because forcing the historically cheaper plan answers a cost regression, not a failure rise."
+        };
+    }
+
     /// <summary>
     /// PLAN_REGRESSION composed: states the regression factor, latest-vs-best per-exec CPU, how many
     /// queries regressed, and PERMUTES on whether a forced plan is failing to apply (a silent fallback
@@ -1701,8 +1775,10 @@ public static class FactAdvice
     {
         var fallback = _byKey["PLAN_REGRESSION"];
         var factor = FactMeta(facts, "PLAN_REGRESSION", "worst_regression_factor");
+        var failureOffenders = FactMeta(facts, "PLAN_REGRESSION", "failure_offender_count");
+        /* #6267: a fact raised by timeouts or errors alone carries no cost figures. */
         if (factor is null)
-            return fallback;
+            return failureOffenders is > 0 ? ComposePlanRegressionFailuresOnly(facts, fallback) : fallback;
 
         var offenders = FactMeta(facts, "PLAN_REGRESSION", "offender_count");
         var latest = FactMeta(facts, "PLAN_REGRESSION", "latest_cpu_per_exec_us");
@@ -1723,17 +1799,55 @@ public static class FactAdvice
             : bestAge.Value < 1
                 ? " (it last ran within the past day)"
                 : $" (it last ran {Plural(Math.Floor(bestAge.Value), "day")} ago)";
-        inv.Append($". Query Store has the faster plan on record{bestAgeText}, so this is a plan choice that got worse — not a query that inherently costs more.");
+        /* #5630/#5631: what the input check found for the worst query decides what the text may claim.
+           worst_input_basis: 0 not checked, 1 both plans compiled for the same values, 2 the statistics changed between the compiles. */
+        var paramSensitive = Fired(facts, "PARAMETER_SENSITIVITY");
+        var basis = FactMeta(facts, "PLAN_REGRESSION", "worst_input_basis") switch { 1 => 1, 2 => 2, _ => 0 };
+        if (paramSensitive)
+        {
+            inv.Append($". Query Store has a cheaper plan on record{bestAgeText}, but parameter sensitivity fired as well, so the cheaper plan may only have served easy parameter values — this may not be a plan choice that got worse.");
+            if (basis == 1)
+                inv.Append(" Both plans were compiled for the same parameter values.");
+            else if (basis == 2)
+                inv.Append(" The statistics changed between the two compiles.");
+        }
+        else if (basis == 1)
+            inv.Append($". Query Store has the faster plan on record{bestAgeText}, so this is a plan choice that got worse — not a query that inherently costs more: both plans were compiled for the same parameter values.");
+        else if (basis == 2)
+            inv.Append($". Query Store has the faster plan on record{bestAgeText}, so the newer plan costs more. The two plans were compiled for different parameter values, and the statistics they used changed between the compiles (updated, or a different set), so the plan may have flipped after a statistics update.");
+        else
+            inv.Append($". Query Store has the faster plan on record{bestAgeText}, so the newer plan costs more, but the compiled parameter values and statistics of the two plans could not be compared, so the cause is not established.");
+        var crossInput = FactMeta(facts, "PLAN_REGRESSION", "cross_input_excluded_count");
+        if (crossInput is > 0)
+            inv.Append($" {Plural(crossInput.Value, "other query")} {(crossInput.Value == 1 ? "was" : "were")} left out: the statement recompiles on every call, the newer plan returns many times the rows of the cheaper one at no higher cost per row, or the plans were compiled for different parameter values over unchanged statistics.");
         if (forceFailing && forceFails is not null)
             inv.Append($" A forced plan is in place but failing to apply ({Plural(forceFails.Value, "failure")}), so SQL Server is silently falling back to the regressed plan — the force is not actually protecting you.");
 
-        var rem = forceFailing
+        var unverified = FactMeta(facts, "PLAN_REGRESSION", "inputs_unverified_count");
+        var rem = paramSensitive
+            ? "Parameter sensitivity fired for this server too, so do not force a query that also shows that signature: forcing the cheaper plan can lock in the wrong shape for other parameter values and make the slow calls slower. The fix is the parameter sensitivity: OPTION (RECOMPILE) on the statement, or branch the procedure by parameter."
+            : forceFailing
             ? "Fix the failing force first — the recorded plan force is not taking effect (the plan was likely evicted or invalidated); re-force the good plan or clear the broken force, then confirm it sticks. Then address WHY the plan regressed — usually stale statistics or a parameter-sensitivity swing."
+            : basis == 2
+            ? "Look at the statistics first: they changed between the compiles (compare the last-update dates in both plans), so the newer plan may simply reflect the new statistics. Forcing the historically faster plan is the usual fix for a plan that flipped after a statistics update; confirm it on one slow call first, because the compiled parameter values also differ."
+            : basis == 0
+            ? "The compiled parameter values and statistics dates of the two plans could not be compared, so check them in both plans first. If only the compiled values differ, forcing the cheaper plan can make the slow calls slower."
             : "The engine attaches a ready-to-run force statement for the historically faster plan — forcing it stops the bleeding immediately. Then address WHY the worse plan got chosen — usually stale statistics or a parameter-sensitivity swing — so you are not relying on a forced plan indefinitely.";
+        /* The failing force is still the first thing to clear when parameter sensitivity fired too (#5630). */
+        if (paramSensitive && forceFailing)
+            rem += " A forced plan is also failing to apply, so clear the broken force (or fix why it fails) — it is not taking effect, and the plan was likely evicted or invalidated.";
+        if (unverified is > 0)
+            rem += $" {Plural(unverified.Value, "reported query")} could not be compared (a stored plan or the statement text was unavailable), so check each one's compiled parameter values and statistics dates before forcing.";
+
+        var failureText = PlanRegressionFailureText(facts);
+        if (failureText.Length > 0)
+            inv.Append(' ').Append(failureText);
 
         return fallback with
         {
-            Headline = $"A query regressed to {factor.Value:0.#}× its best plan's cost — a plan choice got worse",
+            Headline = basis == 1 && !paramSensitive
+                ? $"A query regressed to {factor.Value:0.#}× its best plan's cost — a plan choice got worse"
+                : $"A query regressed to {factor.Value:0.#}× its best plan's cost",
             Investigation = inv.ToString(),
             Remediation = rem
         };
@@ -1852,13 +1966,20 @@ public static class FactAdvice
                     "pick it up on a later window with its own detail, and treat it then with the matching wait or resource advice."
             };
         }
-        var inv = new StringBuilder($"{noun} reached {fmt(observed.Value)} this window, {sigma.Value:0.#}σ above its {fmt(mean.Value)} baseline for this hour-of-week");
+        /* #5633 item 8: name the centre the sigma was MEASURED from. When AnomalyGate.Decide ran in the robust
+           frame (a bucket with a median/MAD), both sigmas are distances from baseline.Median in MAD-derived
+           robust sigmas, so printing them beside baseline_mean (a different centre, 3x apart on a skewed metric)
+           misstates the arithmetic. A sigma at SigmaDisplayCap is a clamp, not a measurement. */
+        var robust = AnomalyUsedRobustFrame(facts, key, out var median);
+        var centre = robust ? median : mean.Value;
+        var centreWord = robust ? "baseline median" : "baseline";
+        var inv = new StringBuilder($"{noun} reached {fmt(observed.Value)} this window, {SigmaText(sigma.Value, robust)} above its {fmt(centre)} {centreWord} for this hour-of-week");
         if (samples is > 0)
             inv.Append($" (over {samples.Value:N0} baseline samples)");
         var windowMean = windowMeanKey is null ? null : FactMeta(facts, key, windowMeanKey);
         var meanSigma = FactMeta(facts, key, "mean_deviation_sigma");
         if (windowMean is not null && meanSigma is not null)
-            inv.Append($"; the window's mean of {fmt(windowMean.Value)} sat {meanSigma.Value:0.#}σ above it (the detector fires only when the mean clears its bar as well, so this is the window running high, not one hot sample)");
+            inv.Append($"; the window's mean of {fmt(windowMean.Value)} sat {SigmaText(meanSigma.Value, robust)} above it (the detector fires only when the mean clears its bar as well, so this is the window running high, not one hot sample)");
         inv.Append($". {meaning} This is a deviation from normal for this time of day and week, not necessarily a sustained problem — check whether it lines up with a workload change, a deploy, or a one-off job before treating it as chronic.");
 
         var rem =
@@ -1868,10 +1989,32 @@ public static class FactAdvice
 
         return fallback with
         {
-            Headline = $"{noun} spiked to {fmt(observed.Value)} — {sigma.Value:0.#}σ above its baseline for this time of week",
+            Headline = $"{noun} spiked to {fmt(observed.Value)} — {SigmaText(sigma.Value, robust)} above its {centreWord} for this time of week",
             Investigation = inv.ToString(),
             Remediation = rem
         };
+    }
+
+    /// <summary>Whether the anomaly fact was judged in the ROBUST frame (#5633 item 8): the bucket carried a median
+    /// or a MAD, which is exactly when <c>BaselineBucket.EffectiveRobustSigma</c> is positive and
+    /// <c>AnomalyGate.Decide</c> measured both sigmas from <c>baseline.Median</c>. The detectors stamp
+    /// <c>baseline_median</c> and <c>baseline_mad</c> as zeros for a classical-frame metric. <paramref name="median"/>
+    /// is the stamped median, the centre to name.</summary>
+    internal static bool AnomalyUsedRobustFrame(IReadOnlyDictionary<string, Fact> facts, string key, out double median)
+    {
+        median = FactMeta(facts, key, "baseline_median") ?? 0;
+        var mad = FactMeta(facts, key, "baseline_mad") ?? 0;
+        return median > 0 || mad > 0;
+    }
+
+    /// <summary>A stored deviation as words (#5633 item 8). <c>AnomalyGate</c> clamps the stored sigma at
+    /// <see cref="AnomalyThresholds.SigmaDisplayCap"/>, so a value AT the cap is a floor ("at least 25 sigma"), not a
+    /// measurement. <paramref name="robust"/> names the MAD-derived frame.</summary>
+    internal static string SigmaText(double sigma, bool robust)
+    {
+        if (sigma >= AnomalyThresholds.SigmaDisplayCap - 1e-9)
+            return $"at least {AnomalyThresholds.SigmaDisplayCap:0.#}{(robust ? " robust σ" : "σ")}";
+        return robust ? $"{sigma:0.#} robust σ" : $"{sigma:0.#}σ";
     }
 
     /// <summary>
@@ -2040,7 +2183,7 @@ public static class FactAdvice
             var meanClause = windowMean is null
                 ? ""
                 : meanModifiedZ > 0
-                    ? $"; the window's mean of {windowMean.Value:0.#} ms/sec sat {meanModifiedZ:0.#} robust σ above the baseline median " +
+                    ? $"; the window's mean of {windowMean.Value:0.#} ms/sec sat {SigmaText(meanModifiedZ, true)} above the baseline median " +
                       "(the detector fires only when the mean clears its bar as well, so this is the profile running heavy across the window, not one hot collection)"
                     : mean > 0
                         ? $"; the window's mean of {windowMean.Value:0.#} ms/sec was roughly {windowMean.Value / mean:0.#}× that baseline " +
@@ -2199,7 +2342,7 @@ public static class FactAdvice
         var inv = new StringBuilder($"{Plural(warns.Value, "plan warning")} in the top queries' execution plans this window");
         if (crit is > 0)
             inv.Append($", {crit.Value:N0} of them critical");
-        inv.Append(". Plan warnings are things the optimizer flags in the plan itself — implicit conversions defeating an index seek, missing join predicates (accidental cross joops), oversized memory grants, and spills.");
+        inv.Append(". Plan warnings are things the optimizer flags in the plan itself — implicit conversions defeating an index seek, missing join predicates (accidental cross joins), oversized memory grants, and spills.");
 
         var rem =
             "Pull the flagged plans and fix by warning type: an implicit conversion usually means a parameter or " +
@@ -2678,7 +2821,7 @@ public static class FactAdvice
             Investigation:
                 "Open the CPU tab to see the SQL vs. other-process split over the analysis window — that confirms SQL is the consumer rather than antivirus, a runaway agent job, or another tenant on the VM. The top CPU-consuming queries for the window are attached, ranked by total CPU. SOS_SCHEDULER_YIELD co-elevation on the Wait Stats tab means schedulers are saturated; a CPU spike means the load is bursty rather than steady.",
             Remediation:
-                "Tune the attached top queries — almost always cheaper than buying cores. If parameter sensitivity or a plan regression fired alongside this, they point at the specific cause: a plan cached for one parameter value reused for a worse one, or a plan worse than the same query used to run. For a plan regression, force the historically faster plan as a fast fix while you address why the worse one was chosen.");
+                "Tune the attached top queries — almost always cheaper than buying cores. If parameter sensitivity or a plan regression fired alongside this, they point at the specific cause: a plan cached for one parameter value reused for a worse one, or a plan worse than the same query used to run. If parameter sensitivity fired, do NOT force a plan: it locks in the wrong shape for the other parameter values, so use OPTION (RECOMPILE) on the affected statement or branch the procedure by parameter. For a plan regression without it, force the historically faster plan as a fast fix while you address why the worse one was chosen.");
 
         t["CPU_SPIKE"] = new AdviceBlock(
             Headline:
@@ -2686,7 +2829,7 @@ public static class FactAdvice
             Investigation:
                 "Spikes differ from steady saturation: the box has headroom most of the time but something briefly burns it all. The exact peak time and the sessions active around it are attached. Open the CPU tab and zoom to that timestamp, then cross-check the Wait Stats tab for what waits dominated. A co-fired plan regression, parameter sensitivity, or CXPACKET points at the cause.",
             Remediation:
-                "If a plan regression co-fired, force the historically faster plan as the fast fix. If parameter sensitivity co-fired, do NOT force a plan — that locks in the wrong plan for the other parameter values; use OPTION (RECOMPILE) on the affected statement, or branch the procedure by parameter value. For an ad-hoc reporting spike matching neither, Resource Governor or moving the report off-peak is the durable fix.");
+                "If parameter sensitivity co-fired, do NOT force a plan — that locks in the wrong plan for the other parameter values; use OPTION (RECOMPILE) on the affected statement, or branch the procedure by parameter value. If a plan regression co-fired without it, force the historically faster plan as the fast fix. For an ad-hoc reporting spike matching neither, Resource Governor or moving the report off-peak is the durable fix.");
 
         t["RUNNABLE_TASKS"] = new AdviceBlock(
             Headline:
@@ -2964,7 +3107,7 @@ public static class FactAdvice
             Headline:
                 "Query spills — operators are running out of granted memory and spilling intermediate results to tempdb",
             Investigation:
-                "A hash join, sort, or hash aggregate gets a grant smaller than it needs and falls back to writing to tempdb — usually 10-100x slower than the in-memory operator. Root cause is almost always a bad cardinality estimate: the optimizer guessed 1,000 rows and the operator actually saw 1,000,000. The top spilling queries for the window are attached, ranked by spill count, with the database, the query, and how often it ran. Open Queries → Top Queries by Duration in-app and sort by spill columns; the query's plan will show the operator-level estimate-vs-actual divergence.",
+                "A hash join, sort, or hash aggregate gets a grant smaller than it needs and falls back to writing to tempdb — usually 10-100x slower than the in-memory operator. Root cause is almost always a bad cardinality estimate: the optimizer guessed 1,000 rows and the operator actually saw 1,000,000. The top spilling queries for the window are attached, ranked by pages spilled (8 KB each), with the database, the query, and how often it ran. Open Queries → Top Queries by Duration in-app and sort by spill columns; the query's plan will show the operator-level estimate-vs-actual divergence.",
             Remediation:
                 "Update statistics with FULLSCAN on the tables that drive the bad estimate — stale statistics are the single most common cause. Add filtered indexes if a subset of the data is the hot spot, or rewrite the operator (a hash join over a sorted input that should have been a merge join is a classic). Per-query stopgaps: `OPTION (RECOMPILE)` re-estimates at each execution against current statistics; `OPTION (MIN_GRANT_PERCENT = X)` forces a larger grant. If many queries spill consistently and grant pressure is high, the workspace pool may simply need more memory available, so check whether `max server memory` is capped too low for the workload.");
 

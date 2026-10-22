@@ -106,10 +106,33 @@ public partial class MainWindow : Window
     /// engine. The decisions themselves are the shared PerformanceMonitor.Common.AgAlertPolicy, so both apps
     /// fire on identical rules under identical metric names.</summary>
     private readonly Services.AgAlertEvaluator _agAlertEvaluator = new();
+
+    /// <summary>#5642: when the current connection to each server began collecting, the alert snapshot's
+    /// <c>WatchingSinceUtc</c>. Keyed by the connection's id, the key <see cref="_previousConnectionStates"/> uses.</summary>
+    private readonly Services.WatchingSinceTracker _watchingSince = new();
     private McpHostService? _mcpService;
     private readonly AlertStateService _alertStateService = new();
     private readonly IAlertSettings _alertSettings = new AppAlertSettings();
     private readonly MuteRuleService _muteRuleService;
+    /// <summary>#5750: the scoped notification-route store, for the Settings window (its writes invalidate the route cache).</summary>
+    internal DuckDbNotificationRouteStore NotificationRouteStore { get; private set; } = null!;
+
+    /// <summary>The Level 1 investigation store (#5820): Lite's DuckDB twin of Darling's, behind the shared interface the
+    /// route list (its use counts), the dispatcher and the MCP tools read.</summary>
+    internal IInvestigationRequestStore InvestigationStore { get; private set; } = null!;
+
+    /// <summary>The approve screen's store (#5903): the same DuckDB store, reached by the Settings window only.</summary>
+    internal IInvestigationNoteStore InvestigationNoteStore { get; private set; } = null!;
+    /* #5820: the mcp_data_detail level of the running MCP host, for the webhook token's brief; the setting's default (full)
+       while no host runs. Set when the host starts and reset when it stops. */
+    private McpDataDetail _mcpDataDetail = McpDataDetail.Full;
+    /* #6066: Lite's pseudonym key (Windows Credential Manager, PerformanceMonitorLite_PseudonymKey), read the first time a metadataOnly answer or webhook needs it.
+       One source for the MCP host and the webhook token, so both show one login as one pseudonym. */
+    private readonly Services.LitePseudonymKeySource _pseudonymKeys = new(
+        new Services.CredentialManagerPseudonymKeyVault(new Services.CredentialService(new AppLoggerAdapter<Services.CredentialService>())),
+        message => AppLogger.Warn("MCP", message));
+    /* #5820: the investigation expiry sweep's loop, started with the background service and ended by the same token. */
+    private Task? _investigationSweepLoop;
     private EmailAlertService _emailAlertService;
 
     /// <summary>The webhook service the email service fans out to, held so the status timer can read each
@@ -136,15 +159,40 @@ public partial class MainWindow : Window
         _alertHistoryStore = new DuckDbAlertHistoryStore(_databaseInitializer);
         _webhookAlertService = new WebhookAlertService(
             _alertSettings, EmailAlertService.Branding, new AppLoggerAdapter<WebhookAlertService>(), _alertHistoryStore);
+        /* #5820: the investigation store is built before the email service, which opens requests in it through the shared
+           dispatch core. The core reads the agent routes through _alertSettings (the route cache the route store below
+           fills); Lite has no wait tool, so the open signal is null. The webhook token's brief is masked at the running
+           MCP host's mcp_data_detail, and at that setting's default (full) while no host runs. */
+        var duckInvestigationStore = new DuckDbInvestigationStore(_databaseInitializer,
+            serverNames: InvestigationServerNameLookup.FromServerManager(() => _serverManager));
+        InvestigationStore = duckInvestigationStore;
+        InvestigationNoteStore = duckInvestigationStore;
+        var investigationStore = InvestigationStore;
         _emailAlertService = new EmailAlertService(
             _alertSettings,
             _alertHistoryStore,
             _webhookAlertService,
-            new AppLoggerAdapter<EmailAlertService>());
+            new AppLoggerAdapter<EmailAlertService>(),
+            new InvestigationDispatchCore(
+                investigationStore.OpenOrJoinAsync, _alertSettings, new AppLoggerAdapter<InvestigationDispatchCore>(), opened: null, keys: _pseudonymKeys),
+            (requestId, token) => investigationStore.ReadRequestAsync(requestId, token),
+            () => _mcpDataDetail);
         _muteRuleService = new MuteRuleService(
             new DuckDbMuteRuleStore(_databaseInitializer),
             new AppLoggerAdapter<MuteRuleService>());
         _serverManager = new ServerManager(App.SharedConfigDirectory, logger: new AppLoggerAdapter<ServerManager>());
+        /* #5750: the scoped notification routes. Any route, tag or server edit invalidates the cache, which starts one
+           background reload (see NotificationRouteCache); a read that still finds it stale reloads on the calling thread.
+           Task.Run keeps that reload off the UI thread's synchronization context. */
+        /* The route secrets go to CredentialService.TrySaveCredential (RouteSecretAccess), the same write App.SaveWebhookUrl
+           uses (#5772), so a refused save names Windows's reason in the edit dialog and the route stays unchanged (#5750);
+           a value of up to CredentialStore.MaxSecretLength characters is stored. */
+        NotificationRouteStore = new DuckDbNotificationRouteStore(
+            _databaseInitializer,
+            _serverManager.GetKnownServerIds,
+            RouteSecretAccess.CredentialManager());
+        var routeStore = NotificationRouteStore;
+        NotificationRouteCache.Configure(() => Task.Run(() => routeStore.ListAsync()).GetAwaiter().GetResult());
         /* The edition comes from _engineEditions, the same as the alert sweep's: the live status when it has read
            one, else the edition seeded from the store in MainWindow_Loaded. */
         PerformanceMonitorLite.Analysis.AnalysisService.SeparatelyMonitoredDatabasesProvider = serverId =>
@@ -213,6 +261,11 @@ public partial class MainWindow : Window
 
             // Initialize the DuckDB database
             await _databaseInitializer.InitializeAsync();
+
+            /* #5775: remove route credentials no route points at (a crash between writing a new generation and the row, or a
+               delete that failed). Off the UI thread and not awaited: the sweep takes the write lock briefly, logs only a count
+               and never throws. It runs once the file is open, which the store's constructor above cannot wait for. */
+            _ = Task.Run(() => NotificationRouteStore.SweepOrphanedSecretsAsync());
 
             /* The stored engine editions, for the Azure master scope. Awaited here, before anything below that reads
                the scope starts, so the first alert sweep and the first analysis already have them. The wait is
@@ -295,6 +348,11 @@ public partial class MainWindow : Window
                app-lifetime token; this stays the only place the background service is started with it. */
             _ = Task.Run(() => _backgroundService.StartAsync(_backgroundCts.Token));
 
+            /* #5820: the investigation expiry sweep, every 60 seconds whatever the MCP settings say: a lapsed claim is
+               journaled once and an old request expires even while no agent can reach Lite. Ends with the same token. */
+            var investigationSweep = new InvestigationSweepService(InvestigationStore, new AppLoggerAdapter<InvestigationSweepService>());
+            _investigationSweepLoop = Task.Run(() => investigationSweep.RunAsync(_backgroundCts.Token));
+
             // Initialize system tray
             _trayService = new SystemTrayService(this, RestoreFromTray, _backgroundService);
             _trayService.Initialize();
@@ -332,8 +390,10 @@ public partial class MainWindow : Window
                    fetcher's seam shape, and the same degrade: every failure is an empty map, so a
                    denied or broken msdb read costs a card its job NAME and never the card. */
                 agentJobStepResolver: FetchAgentJobStepNamesForAlertAsync,
-                resolutionCallback: ShowAlertResolutionToastAsync,
+                resolutionCallback: LiteAlertResolutionRecorder.Callback(_alertHistoryStore, ShowAlertResolutionToastAsync),
                 logger: new AppLoggerAdapter<AlertEngine>(),
+                /* #5715 part B: a Warning delivered before a restart still lets the Critical through at once. */
+                escalationSeedReader: PerformanceMonitor.Alerting.EscalationSeed.ReaderFor(_alertHistoryStore),
                 /* #3013: the process counter every swallowed condition read is tallied on, which
                    get_collection_health's alert_read_health block reads back. Lite's alert reads hit the
                    local DuckDB store rather than a Postgres one, so the deadline mechanism #3013 measured
@@ -380,6 +440,8 @@ public partial class MainWindow : Window
             AlertsHistoryContent.Initialize(_dataService, OpenTabClockFor);
             AlertsHistoryContent.MuteRuleService = _muteRuleService;
             AlertsHistoryContent.AlertsDismissed += OnAlertHistoryDismissed;
+            AlertsHistoryContent.FullChainOpener = FullChainOpenerFor;
+            AlertsHistoryContent.DetailWindowSizeStore = new Windows.AlertDetailWindow.SettingsSizeStore();
 
             /* Initialize job history tab. The display-name snapshot resolves each row's stored
                server_id back to the operator's alias (#2126's Lite half) — the config layer owns
@@ -559,6 +621,19 @@ public partial class MainWindow : Window
             }
         }
 
+        /* #5820: the sweep loop ends on _backgroundCts, cancelled above; a pass in flight gets the same five seconds. */
+        if (_investigationSweepLoop != null)
+        {
+            try
+            {
+                await _investigationSweepLoop.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (TimeoutException)
+            {
+                /* Shutdown timed out, proceeding anyway */
+            }
+        }
+
         /* #3916 PR B: drop the analysis hold-back queue unstamped once collection has stopped — a page queued
            at close is not a delivery, so nothing holds its story and the next launch re-attempts it. */
         _analysisNotificationService?.Dispose();
@@ -661,7 +736,8 @@ public partial class MainWindow : Window
                 return;
             }
 
-            _mcpService = new McpHostService(_dataService!, _serverManager, _muteRuleService, _databaseInitializer, mcpSettings.Port, _scheduleManager);
+            _mcpService = new McpHostService(_dataService!, _serverManager, _muteRuleService, _databaseInitializer, mcpSettings.Port, InvestigationStore, _scheduleManager, mcpSettings.AllowWrites, mcpSettings.AllowInvestigations, mcpSettings.DataDetail, _pseudonymKeys);
+            _mcpDataDetail = mcpSettings.DataDetail;
             _ = _mcpService.StartAsync(_backgroundCts!.Token);
         }
         catch (Exception ex)
@@ -684,6 +760,7 @@ public partial class MainWindow : Window
                 /* MCP shutdown timed out */
             }
             _mcpService = null;
+            _mcpDataDetail = McpDataDetail.Full;
         }
     }
 
@@ -866,6 +943,7 @@ public partial class MainWindow : Window
         {
             "blocked_process_report" => "blocking",
             "deadlocks" => "deadlock",
+            "attention" => "client-timeout",
             "long_query_completions" => "long-query",
             _ => name,
         }));
@@ -965,9 +1043,24 @@ public partial class MainWindow : Window
         return clock;
     }
 
-    private void ServerListView_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    private void ServerListView_MouseDoubleClick(object sender, MouseButtonEventArgs e) => OpenSelectedServerTab();
+
+    /// <summary>#5763: Enter on the server list opens the selected server's tab, through the same
+    /// <see cref="OpenSelectedServerTab"/> the double-click runs. The key is marked handled so the list does not
+    /// also beep or move the selection.</summary>
+    private void ServerListView_KeyDown(object sender, KeyEventArgs e) =>
+        ServerListKeyboard.HandleKeyDown(e, OpenSelectedServerTab);
+
+    /// <summary>#6138: the Invoke (default action) an automation client sends a sidebar row selects it and runs the
+    /// same <see cref="OpenSelectedServerTab"/> the double-click and Enter run.</summary>
+    private void ServerListView_ItemInvoked(object? sender, ItemInvokedEventArgs e) =>
+        ServerListKeyboard.HandleInvoke(ServerListView, e.Item, OpenSelectedServerTab);
+
+    /// <summary>Opens (or focuses) the selected server's tab: the one body behind the list's double-click and its
+    /// Enter key.</summary>
+    private void OpenSelectedServerTab()
     {
-        /* Only a server row connects; a header row's double-click is a no-op (a single click already
+        /* Only a server row connects; a header row's double-click or Enter is a no-op (a single click already
            toggles its expand/collapse via SelectionChanged). */
         if (ServerListView.SelectedItem is FleetServerRow row && row.Server.Connection is { } server)
         {
@@ -979,13 +1072,29 @@ public partial class MainWindow : Window
     {
         if (e.ClickCount == 2 && sender is FrameworkElement fe && fe.DataContext is ServerSummaryItem summary)
         {
-            /* By the card's storage server id, never its host name: databases on one Azure SQL Database server
-               share a host name, so a name match opens the first of them for every card. */
-            var server = summary.FindServer(_serverManager.GetAllServers());
-            if (server != null)
-            {
-                ConnectToServer(server);
-            }
+            OpenOverviewCard(summary);
+        }
+    }
+
+    /// <summary>#6138: the Invoke (default action) an automation client sends a card runs the same
+    /// <see cref="OpenOverviewCard"/> the double-click runs.</summary>
+    private void OverviewItemsControl_ItemInvoked(object? sender, ItemInvokedEventArgs e)
+    {
+        if (e.Item is ServerSummaryItem summary)
+        {
+            OpenOverviewCard(summary);
+        }
+    }
+
+    /// <summary>Opens the server an Overview card shows: the one body behind the card's double-click and its Invoke.</summary>
+    private void OpenOverviewCard(ServerSummaryItem summary)
+    {
+        /* By the card's storage server id, never its host name: databases on one Azure SQL Database server
+           share a host name, so a name match opens the first of them for every card. */
+        var server = summary.FindServer(_serverManager.GetAllServers());
+        if (server != null)
+        {
+            ConnectToServer(server);
         }
     }
 
@@ -1131,12 +1240,53 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void ConnectToServer(ServerConnection server)
+    private async void ConnectToServer(ServerConnection server) => await ConnectToServerAsync(server, null);
+
+    /// <summary>
+    /// #5847: the Alert Details window's "open the full chain" action for a Blocking or Deadlocks alert: open (or focus) the
+    /// alert's server tab and show its Blocked Process Reports or Deadlocks grid over a window around the alert's time.
+    /// Null (no link) for any other alert, or a server no longer in the list.
+    /// </summary>
+    private Action? FullChainOpenerFor(AlertHistoryRow row)
+    {
+        var view = AlertChainLink.ViewFor(row.MetricName);
+        if (view == AlertChainView.None)
+        {
+            return null;
+        }
+
+        var server = _serverManager.GetAllServers().FirstOrDefault(s => RemoteCollectorService.GetServerId(s) == row.ServerId);
+        if (server is null)
+        {
+            return null;
+        }
+
+        var (fromUtc, toUtc) = AlertChainLink.WindowUtc(row.AlertTime);
+        return async () =>
+        {
+            try
+            {
+                await ConnectToServerAsync(server, (view, fromUtc, toUtc));
+            }
+            catch (Exception ex)
+            {
+                StatusText.Text = $"Opening the {view} view failed: {ex.Message}";
+            }
+        };
+    }
+
+    /// <param name="server">The server to open or focus.</param>
+    /// <param name="incident">#5847: when set, the tab opens on its Blocking or Deadlocks grid over this window.</param>
+    private async Task ConnectToServerAsync(ServerConnection server, (AlertChainView View, DateTime FromUtc, DateTime ToUtc)? incident)
     {
         // Check if tab already open
         if (_openServerTabs.TryGetValue(server.Id, out var existingTab))
         {
             ServerTabControl.SelectedItem = existingTab;
+            if (incident is { } shown && existingTab.Content is ServerTab openTab)
+            {
+                await openTab.ShowIncidentAsync(shown.View, shown.FromUtc, shown.ToUtc, reload: true);
+            }
             return;
         }
 
@@ -1240,6 +1390,12 @@ public partial class MainWindow : Window
         ServerTabControl.Visibility = Visibility.Visible;
 
         _serverManager.UpdateLastConnected(server.Id);
+
+        // #5847: a tab opened from an alert's link starts on that alert's view; the first refresh below reads it.
+        if (incident is { } first)
+        {
+            await serverTab.ShowIncidentAsync(first.View, first.FromUtc, first.ToUtc, reload: false);
+        }
 
         // Show existing historical data immediately
         serverTab.RefreshData();
@@ -1407,6 +1563,9 @@ public partial class MainWindow : Window
                         text.Text = totalAlerts > 0
                             ? (totalAlerts > 99 ? "99+" : totalAlerts.ToString())
                             : "!";
+
+                        /* #6138: the painted "3" or "!" alone says nothing to a screen reader. */
+                        System.Windows.Automation.AutomationProperties.SetName(text, totalAlerts > 0 ? UnreadAlertsName.For(totalAlerts) : "Unread alert");
 
                         var extras = new System.Collections.Generic.List<string>();
                         if (hasLowDisk) extras.Add("low disk");
@@ -1658,6 +1817,14 @@ public partial class MainWindow : Window
         }
     }
 
+    /* #5904: the read-only investigations panel. Modeless, so it can stay open beside the servers; it reads through the
+       store at Full, as the operator's own window (mcp.dataDetail masks agents over MCP only, so _mcpDataDetail is not used here). */
+    private void InvestigationsButton_Click(object sender, RoutedEventArgs e)
+    {
+        var reader = new PerformanceMonitorLite.Investigations.InvestigationPanelReader(InvestigationStore);
+        new PerformanceMonitorLite.Windows.InvestigationsWindow(reader) { Owner = this }.Show();
+    }
+
     private async void ManageTagsButton_Click(object sender, RoutedEventArgs e)
     {
         if (_dataService == null)
@@ -1675,9 +1842,21 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ManageQueryTagsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService == null)
+        {
+            return;
+        }
+
+        var dialog = new PerformanceMonitorLite.Windows.ManageQueryTagsWindow(
+            _dataService, _serverManager.GetAllServers()) { Owner = this };
+        dialog.ShowDialog();
+    }
+
     private async void SettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        var window = new SettingsWindow(_scheduleManager, _serverManager, _backgroundService, _mcpService, _muteRuleService) { Owner = this };
+        var window = new SettingsWindow(_scheduleManager, _serverManager, _backgroundService, _mcpService, _muteRuleService, NotificationRouteStore, _dataService, InvestigationNoteStore) { Owner = this };
         window.ShowDialog();
         UpdateStatusBar();
 
@@ -1980,9 +2159,14 @@ public partial class MainWindow : Window
         if (result == MessageBoxResult.Yes)
         {
             CloseServerTab(server.Id);
-            await RemoveServerAsync(server);
+            var removedCleanly = await RemoveServerAsync(server);
             RefreshServerList();
-            StatusText.Text = $"Removed server: {server.DisplayNameWithIntent}";
+            /* #5650: when the tag clear gave up on a busy store, the removal left its own explanation in the status bar
+               (what was and was not done). Writing "Removed server" over it, as this used to, hid that. */
+            if (removedCleanly)
+            {
+                StatusText.Text = $"Removed server: {server.DisplayNameWithIntent}";
+            }
         }
     }
 
@@ -1994,9 +2178,16 @@ public partial class MainWindow : Window
     /// itself (#4795). Both doors call this — the sidebar context menu's Remove and Manage Servers' Delete —
     /// so the two paths cannot drift again; before this, Manage Servers deleted the registry entry and left
     /// all three behind.
+    ///
+    /// <para>Returns <c>false</c> when the tag clear gave up on a busy local database (#5650): the server is still removed,
+    /// and the status bar holds the message that says its tag assignments were not cleared. The caller must leave
+    /// that text alone. <c>true</c> means the status bar is blank and the caller may report the removal. Manage Servers'
+    /// Delete takes this method as a plain <c>Func&lt;ServerConnection, Task&gt;</c>, ignores the outcome, and so
+    /// leaves the status bar as this method set it.</para>
     /// </summary>
-    private async Task RemoveServerAsync(ServerConnection server)
+    private async Task<bool> RemoveServerAsync(ServerConnection server)
     {
+        var statusIsClean = true;
         var removedServerId = RemoteCollectorService.GetDeterministicHashCode(
             RemoteCollectorService.GetServerNameForStorage(server));
 
@@ -2006,14 +2197,32 @@ public partial class MainWindow : Window
         {
             try
             {
-                await _dataService.ClearServerTagsForServerAsync(removedServerId);
+                /* #5650: the clear can wait up to 30 s for the local database, so the status bar says so. There is no
+                   control to grey out here (the removal comes from a context menu and from Manage Servers' own window)
+                   and the removal is not cancellable once started, so a second Remove of the same server is not
+                   refused: the second clear finds nothing to clear. */
+                StatusText.Text = StoreBusyReport.WaitingText($"removing '{server.DisplayName}'");
+                await Task.Run(() => _dataService.ClearServerTagsForServerAsync(removedServerId));
+                await Task.Run(() => _dataService.ClearQueryTagsForServerAsync(removedServerId));
+                StatusText.Text = string.Empty;
+            }
+            catch (StoreLockTimeoutException ex)
+            {
+                /* The removal goes on without the clear, as it always has on a failure here; what the user needs to
+                   know is that this one piece did not happen, and that adding the server again could bring its old tags back. */
+                statusIsClean = false;
+                StatusText.Text = StoreBusyReport.Report("Tags", $"Remove server '{server.DisplayName}': clear its tag assignments", ex,
+                    $"removing '{server.DisplayName}'",
+                    "the server was removed but its tag assignments were not cleared, and they come back if it is added again");
             }
             catch (PendingRestoreException ex)
             {
+                StatusText.Text = string.Empty;
                 AppLogger.Warn("Tags", $"Tags for the removed server were not cleared: {ex.Message}");
             }
             catch (Exception ex)
             {
+                StatusText.Text = string.Empty;
                 AppLogger.Info("Tags", $"Failed to clear tags for removed server: {ex.Message}");
             }
         }
@@ -2033,6 +2242,7 @@ public partial class MainWindow : Window
            state that had just been dropped. */
         _collectorService?.ClearHealthForServer(removedServerId);
         _agAlertEvaluator.Forget(removedServerId);
+        _watchingSince.Forget(server.Id);
         /* #4795: the connection alert keeps its own per-server state, keyed by the connection's id rather than the
            storage-name hash. The pending retry goes with the server, and so do the two marks a send still in
            flight would read when its answer arrives: without the previous-state mark, that answer would find the
@@ -2050,6 +2260,7 @@ public partial class MainWindow : Window
            delta against a different identity. Same deterministic id, same one deep-cleanup. */
         _collectorService?.DeltaCalculator?.ClearServer(removedServerId);
         _serverManager.DeleteServer(server.Id);
+        return statusIsClean;
     }
 
     private bool _sidebarCollapsed;
@@ -2126,7 +2337,7 @@ public partial class MainWindow : Window
     /// The tray notice for a webhook channel that keeps failing (#4750), on the same status timer as
     /// <see cref="CheckConnectionsAndNotify"/>: one notice when a channel reaches
     /// <see cref="WebhookAlertService.FailingChannelThreshold"/> failures in a row, one when it delivers again
-    /// or is turned off (no destination left in the settings; Lite has no routes), and none in between — an
+    /// or is turned off (no destination left in the settings or on an enabled route), and none in between — an
     /// edge like the server-down notice, decided by the same
     /// <see cref="WebhookChannelFailurePolicy"/> Darling's "Notification Channel Failing" alert uses. A channel
     /// can fail for weeks while another one delivers every alert, and nothing else told the user.
@@ -2181,6 +2392,8 @@ public partial class MainWindow : Window
                 if (status?.IsOnline == null) continue;
 
                 bool isOnline = status.IsOnline == true;
+                /* #5642: an offline reading ends the connection, so the next online one is a new "watching since". */
+                _watchingSince.Observe(server.Id, isOnline, DateTime.UtcNow);
                 var healthSummary = _collectorService != null && isOnline
                     ? _collectorService.GetHealthSummary(server)
                     : null;

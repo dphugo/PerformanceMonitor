@@ -9,6 +9,7 @@
 using System.ComponentModel;
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -175,6 +176,30 @@ public sealed class MuteRulesBehaviourTests
     }
 
     [Fact]
+    public void ALinkFillsOnlyTheFieldsTheAppsOwnLinksSend_NotTheReasonSourceStartOrExpiry()
+    {
+        if (!TryRun("linkPrefill", out var r)) return;
+
+        var parsed = r.GetProperty("parsed");
+        Assert.Equal(
+            new[] { "client_app_pattern", "database_pattern", "job_name_pattern", "metric_name", "query_text_pattern", "server_id", "server_name", "wait_type_pattern" },
+            parsed.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("Sales", parsed.GetProperty("database_pattern").GetString());
+        foreach (var ignored in new[] { "reason", "external_source", "starts_at_utc", "expires_at_utc" })
+        {
+            Assert.False(parsed.TryGetProperty(ignored, out _), ignored + " was taken from the link");
+        }
+
+        // What a save would send: no reason, no source, no start, no expiry.
+        var body = r.GetProperty("body");
+        Assert.False(body.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.String && reason.GetString()!.Length > 0);
+        Assert.False(body.TryGetProperty("external_source", out var source) && source.ValueKind == JsonValueKind.String && source.GetString()!.Length > 0);
+        Assert.False(body.TryGetProperty("expires_at_utc", out var expires) && expires.ValueKind == JsonValueKind.String);
+        Assert.False(body.TryGetProperty("starts_at_utc", out var starts) && starts.ValueKind == JsonValueKind.String);
+        Assert.Equal("This form was filled in from a link. Check every field before saving.", r.GetProperty("notice").GetString());
+    }
+
+    [Fact]
     public void AnExpiredSession_IsSignInNotReadOnly_AndAnUnparseable2xxIsNotASave()
     {
         if (!TryRun("expiry", out var r)) return;
@@ -187,6 +212,23 @@ public sealed class MuteRulesBehaviourTests
         /* The 401 reached the shared sign-in takeover; the 403 did not. */
         Assert.Equal(1, r.GetProperty("after401").GetInt32());
         Assert.Equal(1, r.GetProperty("after403").GetInt32());
+    }
+
+    /// <summary>#5654: the form's External source field is empty by default, sends only when filled, clears with an
+    /// explicit null, and counts as a scope on its own.</summary>
+    [Fact]
+    public void TheExternalSourceField_IsEmptyByDefault_AndRidesTheCreateAndPatchBodies()
+    {
+        if (!TryRun("source", out var r)) return;
+
+        Assert.Equal("{\"server_name\":\"A\"}", r.GetProperty("blank").GetRawText());
+        Assert.Equal("{\"server_name\":\"A\",\"external_source\":\"nagios\"}", r.GetProperty("set").GetRawText());
+        Assert.False(r.GetProperty("alone").GetBoolean());
+        Assert.Equal("{\"external_source\":\"nagios\"}", r.GetProperty("patchSet").GetRawText());
+        Assert.Equal("{\"external_source\":null}", r.GetProperty("patchCleared").GetRawText());
+        Assert.Equal("{}", r.GetProperty("patchSame").GetRawText());
+        Assert.Equal("external_source", r.GetProperty("invalid").GetProperty("field").GetString());
+        Assert.Contains("external_source", r.GetProperty("fields").EnumerateArray().Select(e => e.GetString()));
     }
 
     [Fact]

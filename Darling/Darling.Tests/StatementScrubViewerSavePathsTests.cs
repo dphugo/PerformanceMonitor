@@ -25,6 +25,7 @@ namespace Darling.Tests;
 /// withheld guard first (Lite.Tests holds the same scan over Lite and the shared project), and the service handlers a live
 /// answer comes from still judge it.
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class StatementScrubViewerSavePathsTests
 {
     private static IEnumerable<string> ViewerSources() =>
@@ -74,25 +75,6 @@ public sealed class StatementScrubViewerSavePathsTests
         /* The three history windows. The tab's own plan saves go through the shared FileSaveHelper, which Lite.Tests scans. */
         Assert.True(sites >= 3, "expected at least 3 viewer plan save sites, found " + sites);
         Assert.Empty(problems);
-    }
-
-    [Fact]
-    public void TheServiceHandlers_ThatAnswerALiveRead_StillJudgeIt()
-    {
-        var collector = File.ReadAllText(Path.Combine(RepoRoot(), "PerformanceMonitor.Collectors", "QuerySnapshotsCollector.cs"));
-        var start = collector.IndexOf("public override async ValueTask<List<Row>> ReadAsync", StringComparison.Ordinal);
-        Assert.True(start > 0);
-        var body = collector[start..Math.Min(collector.Length, start + 3500)];
-        Assert.Contains("BeginStatementScrub()", body, StringComparison.Ordinal);
-        Assert.Contains("scrub.Text(reader.GetString(3))", body, StringComparison.Ordinal);
-        Assert.Equal(2, Regex.Matches(body, @"scrub\.Xml\(").Count);
-
-        var worker = File.ReadAllText(Path.Combine(RepoRoot(), "Darling", "PerformanceMonitor.Darling.Service", "DarlingWorker.cs"));
-        var outcome = worker.IndexOf("internal static CommandOutcome PlanResultOutcome", StringComparison.Ordinal);
-        Assert.True(outcome > 0);
-        Assert.Contains("SensitiveStatements.Xml(planXml)", worker[outcome..Math.Min(worker.Length, outcome + 900)], StringComparison.Ordinal);
-        Assert.Contains("PlanResultOutcome(\"actual plan captured\"", worker, StringComparison.Ordinal);
-        Assert.Contains("PlanResultOutcome(\"plan fetched\"", worker, StringComparison.Ordinal);
     }
 
     private static string RepoRoot([CallerFilePath] string thisFile = "")

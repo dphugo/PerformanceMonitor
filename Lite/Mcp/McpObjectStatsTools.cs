@@ -54,7 +54,7 @@ public sealed class McpObjectStatsTools
                 if (names != null && (await dataService.GetObjectSizeGrowthAsync(resolved.ServerId, 1)).Count > 0)
                 {
                     return McpHelpers.StatusForDatabase("empty",
-                        $"No table size rows for {McpDatabaseSelection.Scope(names)} on {resolved.ServerName} at the latest snapshot, "
+                        $"No table size rows for {McpDatabaseSelection.Scope(names)} on {resolved.DisplayName} at the latest snapshot, "
                         + "though the server has index rows in its other databases. Check the database name against get_database_sizes: "
                         + "the filter matches exactly, and an excluded or renamed database looks identical to one with no tables.",
                         McpDatabaseSelection.Describe(names));
@@ -62,7 +62,7 @@ public sealed class McpObjectStatsTools
 
                 /* #5244: every answer shape says which database it was limited to (null for every database). */
                 return McpHelpers.WithDatabase(
-                           await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "index_object_stats"),
+                           await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "index_object_stats"),
                            McpDatabaseSelection.Describe(names))
                     ?? McpHelpers.StatusForDatabase("unavailable", "No object size data available. Index/object stats are collected daily.", McpDatabaseSelection.Describe(names));
             }
@@ -101,7 +101,7 @@ public sealed class McpObjectStatsTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 database_name = McpDatabaseSelection.Describe(names),
                 history = new
                 {
@@ -155,7 +155,7 @@ public sealed class McpObjectStatsTools
         return notes.Count == 0 ? null : string.Join("; ", notes) + ".";
     }
 
-    [McpServerTool(Name = "get_index_usage"), Description("Per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classed Unused, Write-only, or Active. Unused/write-only sort first as drop candidates: on a server with many, results can be one database's unused indexes, hiding Active ones elsewhere. Counters reset at the last restart or index rebuild, so Write-only means no reads since then. last_user_access is UTC (de-skewed): compare directly with get_collection_log and list_servers. <<GUIDE>> Gets per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classifying each index as Unused, Write-only, or Active. Unused and write-only indexes are listed FIRST because they are drop candidates - which means that on a server with many unused indexes the row limit can be filled entirely by one database's unused indexes, hiding every Active index elsewhere. Pass database_name to ask about one database, which is almost always what you want; the response carries matching_index_count and truncated so a short answer is never mistaken for an absent one. Counters are cumulative since the last instance restart. last_user_access is UTC - the underlying sys.dm_db_index_usage_stats columns are in the monitored server's local clock and this read de-skews them - so it compares directly against get_collection_log and list_servers. Classification: Unused is zero seeks, scans and lookups AND zero updates; Write-only is zero of the first three but at least one update; everything else is Active. sys.dm_db_index_usage_stats also clears on an index rebuild and on a database detach/reattach, not only on an instance restart, so a heavily-used index that was just rebuilt can read as Unused until it accrues new activity - check the index's maintenance history before treating an Unused row as a drop candidate. Empty results are two different things here. If database_name is given and matches no rows there, but the server has index data in other databases, status is empty, not unavailable, with a note to check the name against get_database_sizes. If nothing matches anywhere on the server, whether or not database_name was given, the result is not_collected (if the engine's collection state says so) or unavailable instead - this tool never reports a truly empty server as empty. The note field says whether the answer is complete or truncated. Truncated means more indexes matched than the cap returned; every Active index that did not fit is among the omitted rows, since Active is never returned ahead of an Unused or write-only one, and if unused/write-only indexes alone outnumber the cap, none of them appear either - a truncated, all-Unused answer says nothing about how many Active indexes exist.")]
+    [McpServerTool(Name = "get_index_usage"), Description("Per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classed Unused, Write-only, or Active. Unused/write-only sort first as drop candidates: on a server with many, results can be one database's unused indexes, hiding Active ones elsewhere. Counters reset at the last restart or index rebuild, so Write-only means no reads since then. last_user_access is UTC (de-skewed): compare directly with get_collection_log and list_servers. <<GUIDE>> Gets per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classifying each index as Unused, Write-only, or Active. Unused and write-only indexes are listed FIRST because they are drop candidates - which means that on a server with many unused indexes the row limit can be filled entirely by one database's unused indexes, hiding every Active index elsewhere. Pass database_name to ask about one database, which is almost always what you want; the response carries matching_index_count and truncated so a short answer is never mistaken for an absent one. Counters are cumulative since they were last cleared, which is not always the instance restart (see the caveat below). last_user_access is UTC - the underlying sys.dm_db_index_usage_stats columns are in the monitored server's local clock and this read de-skews them - so it compares directly against get_collection_log and list_servers. Classification: Unused is zero seeks, scans and lookups AND zero updates; Write-only is zero of the first three but at least one update; everything else is Active. That is the rule for a nonclustered index; a heap or a clustered index (the table itself, never a drop candidate) with no reads is Table not read, with reads it is Active. sys.dm_db_index_usage_stats clears on an instance restart, a database restore, a detach and attach, the database going offline, and (for that index) a rebuild, so a heavily-used index that was just rebuilt can read as Unused until it accrues new activity - check the index's maintenance history before treating an Unused row as a drop candidate. Empty results are two different things here. If database_name is given and matches no rows there, but the server has index data in other databases, status is empty, not unavailable, with a note to check the name against get_database_sizes. If nothing matches anywhere on the server, whether or not database_name was given, the result is not_collected (if the engine's collection state says so) or unavailable instead - this tool never reports a truly empty server as empty. The note field says whether the answer is complete or truncated. Truncated means more indexes matched than the cap returned; every Active index that did not fit is among the omitted rows, since Active is never returned ahead of an Unused or write-only one, and if unused/write-only indexes alone outnumber the cap, none of them appear either - a truncated, all-Unused answer says nothing about how many Active indexes exist.")]
     public static async Task<string> GetIndexUsage(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -196,7 +196,7 @@ public sealed class McpObjectStatsTools
                     {
                         return McpHelpers.Status(
                             "empty",
-                            $"No index usage rows for database '{database}' on {resolved.ServerName} at the "
+                            $"No index usage rows for database '{database}' on {resolved.DisplayName} at the "
                             + $"latest snapshot, though the server has {anyOnServer:N0} across its other "
                             + "databases. Check the database name against get_database_sizes — the filter "
                             + "matches exactly, and an excluded or renamed database looks identical to one "
@@ -204,7 +204,7 @@ public sealed class McpObjectStatsTools
                     }
                 }
 
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "index_object_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "index_object_stats")
                     ?? McpHelpers.Status("unavailable", "No index usage data available. Index/object stats are collected daily.");
             }
 
@@ -233,7 +233,7 @@ public sealed class McpObjectStatsTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 database_name = database,
                 returned_index_count = rows.Count,
                 matching_index_count = matching,
@@ -254,6 +254,7 @@ public sealed class McpObjectStatsTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_object_locking"), Description("Gets per-index locking and latch contention (row/page lock waits in ms, lock escalations, page-latch and page-IO-latch waits) from the latest daily snapshot, top contended objects first. Use to find tables/indexes driving blocking and contention. Counters are cumulative since the last instance restart. LATEST IS A TIME: this reads the newest index/object snapshot for the server, not a window, and captured_at is the instant it was collected - these are the databases and indexes that existed AT that stamp, and because object stats are collected DAILY the stamp can be most of a day old on a healthy server and older still on one whose collector has stalled.")]
     public static async Task<string> GetObjectLocking(
         LocalDataService dataService,
@@ -295,14 +296,14 @@ public sealed class McpObjectStatsTools
                     && (await dataService.GetIndexLockingAsync(resolved.ServerId, 1)).Count > 0)
                 {
                     return McpHelpers.Status("empty",
-                        $"No lock/latch contention{inScope} on {resolved.ServerName} at the latest snapshot, though other databases on "
+                        $"No lock/latch contention{inScope} on {resolved.DisplayName} at the latest snapshot, though other databases on "
                         + "the server have some. Check the database name against get_database_sizes "
                         + "— the filter matches exactly, and an excluded or renamed database looks identical to one with no contention."
                         + (optimizedLockingNote is null ? "" : " " + optimizedLockingNote),
                         optimizedLockingNote is null ? null : new { optimized_locking_note = optimizedLockingNote });
                 }
 
-                var notCollected = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "index_object_stats");
+                var notCollected = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "index_object_stats");
                 if (notCollected is not null) return notCollected;
 
                 /* #5372 (r2 Low): a latest snapshot that holds index rows, none of them contended, is a TRUE negative:
@@ -314,7 +315,7 @@ public sealed class McpObjectStatsTools
                     return McpHelpers.Status("empty",
                         "No lock/latch contention"
                         + (database is null ? "" : $"{inScope} or in any other database")
-                        + $" on {resolved.ServerName} at the latest snapshot."
+                        + $" on {resolved.DisplayName} at the latest snapshot."
                         + (optimizedLockingNote is null ? "" : " " + optimizedLockingNote),
                         optimizedLockingNote is null ? null : new { optimized_locking_note = optimizedLockingNote });
                 }
@@ -348,7 +349,7 @@ public sealed class McpObjectStatsTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3880: captured_at, the #3637 census's one spelling for a latest read's stamp - see
                    McpServerInfoTools.GetServerProperties for why it is a cut-over and not an alias. Erik's
                    ruling on the call Darling's twin recorded in #3878/#3879 (stamp it, do not roster it as

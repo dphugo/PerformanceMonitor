@@ -18,6 +18,10 @@ public class ArchivePreservedStateTablesTests
     [InlineData("analysis_muted")]
     [InlineData("server_tags")]
     [InlineData("server_tag_map")]
+    [InlineData("notification_routes")]
+    [InlineData("query_tags")]
+    [InlineData("query_tag_assignments")]
+    [InlineData("query_tag_rules")]
     public void PreservedConfigTables_KeepsTable(string table)
     {
         Assert.Contains(table, ArchiveService.PreservedConfigTables);

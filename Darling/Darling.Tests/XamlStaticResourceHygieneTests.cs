@@ -36,7 +36,6 @@ namespace Darling.Tests;
 /// dictionary — moving it there is the fix this test demands, never widening the model back.</para>
 /// </summary>
 [Trait("Stage", "Guard")]
-[Trait("Reads", "Lite")]
 public sealed class XamlStaticResourceHygieneTests
 {
     /* Each app scope: its XAML subtrees. Shared control libraries would join the scope of every
@@ -144,7 +143,7 @@ public sealed class XamlStaticResourceHygieneTests
         return keys;
     }
 
-    /// <summary>Same walk-up idiom as <c>DocCommentHygieneTests.FindRepoRoot</c>.</summary>
+    /// <summary>Walks up from the test binary to the repository root.</summary>
     private static string? FindRepoRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

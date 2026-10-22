@@ -25,7 +25,7 @@ public sealed partial class DarlingMcpFinOpsTools
         "database_resources: CPU, reads, writes and I/O per database.";
 
     internal const string DatabaseResourcesViewGuide =
-        "database_resources gives one row per database: CPU ms, logical and physical reads, logical writes and executions from the query-stats window, and read and write MB and stall ms from the file-I/O window. cpu_share_pct and io_share_pct are the database's share of the server's CPU and I/O, rounded to 0.01. rows lists every database up to 500, ordered by CPU, then I/O, then name; database_count is the number of databases and truncated says when there were more. Older windows read the hourly or daily rollups, chosen by the same rule as the desktop viewer. top_by_total and top_by_avg rank databases by total CPU and by CPU per execution, from the query-grain window, and limit caps only these two lists. top_by_total can include databases with 0 CPU that only had file I/O; a database with no executions is left out of top_by_avg, so top_by_avg is empty when no database has executions in the window; an unattributed one is left out of top_by_total. Above 72 hours, rows reads the per-database rollup and the top lists read the query-grain rollup, so one database's CPU can differ between them. avg_cpu_ms is rounded to a whole millisecond, avg_io_mb has 4 decimals, io_total_mb has 2, and total_cpu_ms is the total behind the average. The top lists follow hours_back, while the desktop's top-consumer grids always cover 24 hours, so send hours_back=24 to match them. No cost fields.";
+        "database_resources gives one row per database: CPU ms, logical and physical reads, logical writes and executions from the query-stats window, and read and write MB and stall ms from the file-I/O window. cpu_share_pct and io_share_pct are the database's share of the server's CPU and I/O, rounded to 0.01. rows lists every database up to 500, ordered by CPU, then I/O, then name; database_count is the number of databases and truncated says when there were more. Older windows read the hourly or daily rollups, chosen by the same rule as the desktop viewer. top_by_total and top_by_avg rank databases by total CPU and by CPU per execution, from the query-grain window, and limit caps only these two lists. top_by_total can include databases with 0 CPU that only had file I/O; a database with no executions is left out of top_by_avg, so top_by_avg is empty when no database has executions in the window; an unattributed one is left out of top_by_total. Above 72 hours, rows reads the per-database rollup and the top lists read the query-grain rollup, so one database's CPU can differ between them. avg_cpu_ms has 2 decimals and top_by_avg is ranked on it before any rounding, avg_io_mb has 4 decimals, io_total_mb has 2, and total_cpu_ms is the total behind the average. The top lists follow hours_back, while the desktop's top-consumer grids always cover 24 hours, so send hours_back=24 to match them. No cost fields.";
 
     /// <summary>The fixed ceiling on <c>rows</c>; <c>limit</c> caps only the two top lists.</summary>
     internal const int MaxDatabaseRows = 500;
@@ -39,7 +39,7 @@ public sealed partial class DarlingMcpFinOpsTools
             .ToList();
 
     private static async Task<string> ReadDatabaseResourcesAsync(
-        NpgsqlDataSource postgres, (int ServerId, string ServerName) resolved, int hoursBack, int limit, CancellationToken ct)
+        NpgsqlDataSource postgres, (int ServerId, string ServerName, string DisplayName) resolved, int hoursBack, int limit, CancellationToken ct)
     {
         /* The cutoff is taken before the rollup probe, the viewer's order. */
         var cutoff = DateTime.UtcNow.AddHours(-hoursBack);
@@ -49,9 +49,9 @@ public sealed partial class DarlingMcpFinOpsTools
         if (rows.Count == 0)
         {
             /* The view reads two collectors, so it is not_collected only when both are gated. */
-            var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_stats", ct);
+            var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_stats", ct);
             if (gated is not null
-                && await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "file_io_stats", ct) is not null)
+                && await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "file_io_stats", ct) is not null)
             {
                 return gated;
             }
@@ -66,7 +66,7 @@ public sealed partial class DarlingMcpFinOpsTools
 
         return JsonSerializer.Serialize(new
         {
-            server = resolved.ServerName,
+            server = resolved.DisplayName,
             view = DatabaseResourcesView,
             hours_back = hoursBack,
             database_count = ordered.Count,
@@ -104,11 +104,11 @@ public sealed partial class DarlingMcpFinOpsTools
         io_share_pct = r.PctIo,
     };
 
-    /// <summary>One top-by-CPU-per-execution row in the wire shape; <c>CpuTimeMs</c> holds the average on these rows.</summary>
+    /// <summary>One top-by-CPU-per-execution row in the wire shape; <c>AvgCpuMs</c> holds the unrounded average on these rows (#5644 W4).</summary>
     internal static object TopByAvgRow(TopResourceConsumer r) => new
     {
         database_name = r.DatabaseName,
-        avg_cpu_ms = r.CpuTimeMs,
+        avg_cpu_ms = r.AvgCpuMs,
         execution_count = r.ExecutionCount,
         total_cpu_ms = r.TotalCpuTimeMs,
         io_total_mb = r.IoTotalMb,

@@ -10,7 +10,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpQueryTools
 {
-    [McpServerTool(Name = "get_top_queries_by_cpu"), Description("Gets expensive cached queries from sys.dm_exec_query_stats, ranked by CPU over a window ending at as_of. Filters (database_name, parallel_only, min_dop) apply before the top-N cap: filter_applied names the floor in force, and an empty page under it is the window's real answer, not a miss. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes, not windowed; cpu_attribution's ratio is omitted, not invented, when its inputs are missing. window_truncated marks a window floor, not a page cut; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> Gets expensive queries from sys.dm_exec_query_stats (plan cache). Best for: currently cached queries with detailed per-execution stats, DOP, spills, and query_hash for trending. Returns query_hash, query_plan_hash, sql_handle, plan_handle, and host_object (the hosting procedure/function for proc-hosted statements, null for ad-hoc) — groups key on (database, query_hash, host_object), so INSERT...EXEC callers in different procedures report separately with their own text. distinct_texts counts statement texts merged into a group (>1 = ad-hoc literal variants or pre-upgrade history; query_text is one representative, 0 means no stored text for the group). Supports database and parallelism filtering; every filter is applied IN the query before the ranking and the cap, so the page is the top-N of the FILTERED population (filter_applied names the parallelism floor in force, null when none), and an empty page under parallel_only/min_dop is the window's answer rather than a page artefact. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes for the plan's time in cache (same semantics as max_dop), not windowed — totals and avgs are windowed deltas; rows where an extreme provably predates the window carry extremes_note. max_dop comes from sys.dm_exec_query_stats and is a lifetime-max for the plan's time in cache, so a plan compiled before MAXDOP was lowered keeps reporting the old higher value until it is evicted or recompiled; confirm current parallelism with analyze_query_plan, which reads the actual plan. Reads the raw tier only, which on a store with a lowered retention_days or less history than the window can be shorter than hours_back: window_truncated is the store's retention floor, not a page cut, and effective_start / effective_hours_back say where the answer begins." + McpHelpers.WindowTruncatedDescription + " " + McpToolGuideTopics.CpuTimeExtremesAndAttribution)]
+    [McpServerTool(Name = "get_top_queries_by_cpu"), Description("Gets expensive cached queries from sys.dm_exec_query_stats, ranked by CPU over a window ending at as_of. Filters (database_name, parallel_only, min_dop) apply before the top-N cap: filter_applied names the floor in force, and an empty page under it is the window's real answer, not a miss. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes, not windowed; cpu_attribution's ratio is omitted, not invented, when its inputs are missing. window_truncated marks a window floor, not a page cut; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> Gets expensive queries from sys.dm_exec_query_stats (plan cache). Best for: currently cached queries with detailed per-execution stats, DOP, spilled pages (total_spills counts 8 KB pages written to tempdb, not spill events), and query_hash for trending. Returns query_hash, query_plan_hash, sql_handle, plan_handle, and host_object (the hosting procedure/function for proc-hosted statements, null for ad-hoc) — groups key on (database, query_hash, host_object), so INSERT...EXEC callers in different procedures report separately with their own text. distinct_texts counts statement texts merged into a group (>1 = ad-hoc literal variants or pre-upgrade history; query_text is one representative, 0 means no stored text for the group). Supports database and parallelism filtering; every filter is applied IN the query before the ranking and the cap, so the page is the top-N of the FILTERED population (filter_applied names the parallelism floor in force, null when none), and an empty page under parallel_only/min_dop is the window's answer rather than a page artefact. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes for the plan's time in cache (same semantics as max_dop), not windowed — totals and avgs are windowed deltas; rows where an extreme provably predates the window carry extremes_note. max_dop comes from sys.dm_exec_query_stats and is a lifetime-max for the plan's time in cache, so a plan compiled before MAXDOP was lowered keeps reporting the old higher value until it is evicted or recompiled; confirm current parallelism with analyze_query_plan, which reads the actual plan. Reads the raw tier only, which on a store with a lowered retention_days or less history than the window can be shorter than hours_back: window_truncated is the store's retention floor, not a page cut, and effective_start / effective_hours_back say where the answer begins." + McpHelpers.WindowTruncatedDescription + " " + McpToolGuideTopics.CpuTimeExtremesAndAttribution)]
     public static async Task<string> GetTopQueriesByCpu(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -20,13 +20,21 @@ public sealed class McpQueryTools
         [Description("Filter to a specific database.")] string? database_name = null,
         [Description("If true, only return queries whose cached plan has EVER run at DOP > 1 (a LIFETIME max_dop; can read stale after a MAXDOP change). See the tool's reading guide.")] bool parallel_only = false,
         [Description("Minimum DOP to filter on. Implies parallel filtering. Filters the same lifetime-max value as parallel_only, not current parallelism.")] int min_dop = 0,
-        [Description(McpHelpers.AsOfDescription)] string? as_of = null)
+        [Description(McpHelpers.AsOfDescription)] string? as_of = null,
+        [Description(QueryTagReadScope.ParameterDescription)] string? tag = null)
     {
         var (resolved, error) = ServerResolver.ResolveOrError(serverManager, server_name);
         if (error != null) return error;
 
         try
         {
+            /* #5992: the query tag filter. A name no tag carries is an empty answer that says so. */
+            var tagScope = await dataService.GetQueryTagReadScopeAsync(resolved.ServerId, tag);
+            if (tagScope.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadScope.UnknownTagMessage(tagScope.Requested!));
+            }
+
             var hoursError = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
             if (hoursError != null) return hoursError;
 
@@ -51,6 +59,14 @@ public sealed class McpQueryTools
                 ? $"lifetime max_dop >= {minMaxDop} (applied in SQL before the top-{top} ranking; the page is the top-{top} of the parallel population)"
                 : null;
 
+            /* #5984 round 1 (Darling's twin): a tag that cut the population is named in filter_applied beside the parallel floor, so a
+               tag-only call never publishes null over a population the tag shaped. A call without a tag is unchanged. */
+            if (tagScope.Named is { } queryTagName)
+            {
+                var tagText = $"query tag '{queryTagName}' (applied in SQL before the top-{top} ranking)";
+                filterApplied = filterApplied is null ? tagText : filterApplied + "; " + tagText;
+            }
+
             /* #4793: the ranking read floors last_execution_time, a stamp on THIS server's wall clock, at the
                window's start, so the floor needs THIS server's clock. It used to get none and floored at the
                UTC number: west of UTC a query last run early in the window was dropped, east of UTC one from
@@ -58,19 +74,47 @@ public sealed class McpQueryTools
             var serverClock = await McpServerLocalWindow.ClockForAsync(dataService, resolved.ServerId);
 
             var requestedStart = nowUtc.AddHours(-hours_back);
-            var rows = await dataService.GetTopQueriesByCpuAsync(resolved.ServerId, hours_back, top, serverClock: serverClock, databaseNames: string.IsNullOrEmpty(database_name) ? null : new[] { database_name }, asOfUtc: windowEnd, minMaxDop: minMaxDop);
+            var rows = await dataService.GetTopQueriesByCpuAsync(resolved.ServerId, hours_back, top, serverClock: serverClock, databaseNames: string.IsNullOrEmpty(database_name) ? null : new[] { database_name }, asOfUtc: windowEnd, minMaxDop: minMaxDop, tags: tagScope);
             if (rows.Count == 0)
             {
+                if (tagScope.Active)
+                {
+                    return McpHelpers.Status("empty", $"No query-stats group on {resolved.DisplayName} in the last {hours_back} hour(s) carries query tag '{tagScope.Requested}'. The tag filter was applied in SQL before the top-{top} ranking.");
+                }
+
                 /* A filtered miss is not a collection miss — same words as Darling's twin. */
                 if (minMaxDop > 0)
                 {
                     return McpHelpers.Status(
                         "empty",
-                        $"No query-stats group on {resolved.ServerName} in the last {hours_back} hour(s) has a cached plan with lifetime max_dop >= {minMaxDop}. The filter was applied in SQL over the whole window, so this is the window's answer rather than a page artefact — drop parallel_only / min_dop to see the unfiltered ranking, or confirm current parallelism with analyze_query_plan.",
+                        $"No query-stats group on {resolved.DisplayName} in the last {hours_back} hour(s) has a cached plan with lifetime max_dop >= {minMaxDop}. The filter was applied in SQL over the whole window, so this is the window's answer rather than a page artefact — drop parallel_only / min_dop to see the unfiltered ranking, or confirm current parallelism with analyze_query_plan.",
                         new { filter_applied = filterApplied });
                 }
 
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_stats")
+                /* #6127 (Darling's twin): a window that stored snapshots but none with a measured delta is not a collection miss. */
+                var (snapshots, newestMeasured) = await dataService.GetQueryStatsSnapshotProbeAsync(
+                    resolved.ServerId, hours_back, asOfUtc: windowEnd, databaseNames: string.IsNullOrEmpty(database_name) ? null : new[] { database_name });
+                if (snapshots > 0)
+                {
+                    return McpHelpers.Status(
+                        "empty",
+                        McpHelpers.SnapshotsWithoutDeltaMessage(resolved.DisplayName, hours_back, snapshots, newestMeasured, windowEnd),
+                        new
+                        {
+                            snapshots_in_window = snapshots,
+                            snapshots_with_measured_delta = 0,
+                            newest_measured_delta_at = McpHelpers.FormatEffectiveStart(newestMeasured),
+                            suggested_hours_back = newestMeasured is { } at ? McpHelpers.SuggestedHoursBack(at, windowEnd) : (int?)null
+                        });
+                }
+
+                /* #6226 (Darling's twin): the collector looked and nothing ran. query_stats stores only what executed since its
+                   watermark, so a window in which it ran successfully and stored no row is a measurement (empty), not a gap
+                   (unavailable). After not_collected, which names an engine that never runs the collector. */
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_stats")
+                    ?? EmptyCollectorRan(
+                        await dataService.GetCollectorRunFactsAsync(resolved.ServerId, "query_stats", hours_back, asOfUtc: windowEnd),
+                        "query_stats", hours_back, "executed statements", database_name)
                     ?? McpHelpers.Status("unavailable", "No query stats available for the specified time range.");
             }
 
@@ -105,6 +149,7 @@ public sealed class McpQueryTools
             {
                 database_name = r.DatabaseName,
                 query_hash = r.QueryHash,
+                tag = tagScope.TagOfHash(r.QueryHash),
                 query_plan_hash = r.QueryPlanHash,
                 sql_handle = r.SqlHandle,
                 plan_handle = r.PlanHandle,
@@ -144,7 +189,7 @@ public sealed class McpQueryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4231: what was served, beside what was asked for — query_stats is raw-only (no rollup
                    fallback), so a lowered retention_days or a young install can serve less than hours_back
@@ -173,6 +218,26 @@ public sealed class McpQueryTools
         }
     }
 
+    /// <summary>#6226: the <c>empty</c> envelope for a ranking over a window the collector ran in and stored nothing, with
+    /// <c>successful_runs_in_window</c> beside the sentence; null when it has no successful run in the window. Twin of
+    /// <c>DarlingMcpDataTools.EmptyCollectorRan</c>; the words are shared in <see cref="CollectorRunFacts.RanFoundNothing"/>.</summary>
+    internal static string? EmptyCollectorRan(
+        CollectorRunFacts facts, string collectorName, int hoursBack, string found, string? databaseName)
+    {
+        var message = facts.RanFoundNothing(collectorName, hoursBack, found,
+            string.IsNullOrEmpty(databaseName) ? null : McpDatabaseSelection.Scope(new[] { databaseName }));
+        return message is null ? null : McpHelpers.Status("empty", message, new { successful_runs_in_window = facts.SuccessfulRunsInWindow });
+    }
+
+    /// <summary>#5633 item 3: the empty-page envelope of get_top_procedures_by_cpu, from the collector's own run history. Two cycles only while
+    /// the collector is new; <c>empty</c> once it has run and found no procedure in the window. Words in <see cref="CollectorRunFacts"/>,
+    /// shared with Darling's twin.</summary>
+    internal static string EmptyProcedureStatsStatus(CollectorRunFacts facts, int hoursBack, int databasesLeftOut = 0)
+    {
+        var (status, message) = facts.ProcedureStatsEmpty(hoursBack, databasesLeftOut);
+        return McpHelpers.Status(status, message);
+    }
+
     [McpServerTool(Name = "get_top_procedures_by_cpu"), Description("Gets the most expensive stored procedures ranked by total CPU time over a window ending at as_of. Delta-based: requires ~30 minutes after adding a new server before data appears. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes, not windowed (extremes_note flags a provably stale one); cpu_attribution's ratio is omitted, not invented, when its inputs are missing. window_truncated marks a window floor, not a page cut; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> Shows execution counts, CPU/elapsed times, and I/O metrics. Delta-based: requires ~30 minutes after adding a new server before data appears. Reads the raw tier only, which on a store with a lowered retention_days or less history than the window can be shorter than hours_back." + McpHelpers.WindowTruncatedDescription + " " + McpToolGuideTopics.CpuTimeExtremesAndAttribution)]
     public static async Task<string> GetTopProceduresByCpu(
         LocalDataService dataService,
@@ -181,13 +246,21 @@ public sealed class McpQueryTools
         [Description("Hours of history. Default 24.")] int hours_back = 24,
         [Description("Number of top procedures. Default 20.")] int top = 20,
         [Description("Filter to a specific database.")] string? database_name = null,
-        [Description(McpHelpers.AsOfDescription)] string? as_of = null)
+        [Description(McpHelpers.AsOfDescription)] string? as_of = null,
+        [Description(QueryTagReadScope.ParameterDescription)] string? tag = null)
     {
         var (resolved, error) = ServerResolver.ResolveOrError(serverManager, server_name);
         if (error != null) return error;
 
         try
         {
+            /* #5992: the query tag filter. A name no tag carries is an empty answer that says so. */
+            var tagScope = await dataService.GetQueryTagReadScopeAsync(resolved.ServerId, tag);
+            if (tagScope.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadScope.UnknownTagMessage(tagScope.Requested!));
+            }
+
             var hoursError = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
             if (hoursError != null) return hoursError;
 
@@ -200,13 +273,29 @@ public sealed class McpQueryTools
             var serverClock = await McpServerLocalWindow.ClockForAsync(dataService, resolved.ServerId);
 
             var requestedStart = nowUtc.AddHours(-hours_back);
-            var rows = await dataService.GetTopProceduresByCpuAsync(resolved.ServerId, hours_back, top, serverClock: serverClock, databaseNames: string.IsNullOrEmpty(database_name) ? null : new[] { database_name }, asOfUtc: windowEnd);
+            /* #5633 item 4: with no database named, rank without the databases the server DROPPED (named by an earlier database_states
+               snapshot and absent from the newest), not those dropped since: their rows would fill the page. A database no snapshot ever
+               listed (created after the newest one) is still read. Unknown (no snapshot) leaves out nothing. A named database is read as asked. */
+            var droppedDatabases = string.IsNullOrEmpty(database_name)
+                ? await dataService.GetDroppedDatabasesAsync(resolved.ServerId, asOfUtc: string.IsNullOrWhiteSpace(as_of) ? null : nowUtc, windowStartUtc: requestedStart)
+                : null;
+            var rows = await dataService.GetTopProceduresByCpuAsync(resolved.ServerId, hours_back, top, serverClock: serverClock, databaseNames: string.IsNullOrEmpty(database_name) ? null : new[] { database_name }, asOfUtc: windowEnd, excludeDatabaseNames: droppedDatabases, tags: tagScope);
+            /* #5633 review (finding D): the narrowing is disclosed, never silent (Darling's twin does the same, in the same words). The names
+               it left out ride the envelope of an empty page and of a page with rows, and an empty page's sentence claims only the databases
+               the server still has, so "the collector recorded nothing" is never said over a window with rows in a dropped database. */
+            var leftOut = DatabasesLeftOut.Distinct(droppedDatabases);
+            if (rows.Count == 0 && tagScope.Active)
+            {
+                return McpHelpers.WithDatabasesLeftOut(McpHelpers.Status("empty", $"No procedure on {resolved.DisplayName} in the last {hours_back} hour(s) carries query tag '{tagScope.Requested}'. The tag filter was applied in SQL before the top-{top} ranking."), leftOut)!;
+            }
+
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "procedure_stats")
-                    ?? McpHelpers.Status(
-                        "unavailable",
-                        "No procedure stats available. Delta-based collection requires at least two collection cycles (~30 minutes) to produce non-zero values.");
+                return McpHelpers.WithDatabasesLeftOut(
+                    await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "procedure_stats")
+                    ?? EmptyProcedureStatsStatus(
+                        await dataService.GetCollectorRunFactsAsync(resolved.ServerId, "procedure_stats", hours_back, asOfUtc: windowEnd),
+                        hours_back, leftOut?.Count ?? 0), leftOut)!;
             }
 
             /* #4231: what the window ACTUALLY reached, from the SAME relation (v_procedure_stats) the ranking
@@ -235,6 +324,7 @@ public sealed class McpQueryTools
             {
                 database_name = r.DatabaseName,
                 full_name = r.FullName,
+                tag = tagScope.TagOfObject(r.DatabaseName, r.SchemaName, r.ObjectName),
                 object_type = r.ObjectType,
                 sql_handle = r.SqlHandle,
                 plan_handle = r.PlanHandle,
@@ -257,9 +347,9 @@ public sealed class McpQueryTools
                 total_spills = r.TotalSpills
             });
 
-            return JsonSerializer.Serialize(new
+            return WithTagFilter(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4231: what was served, beside what was asked for — procedure_stats is raw-only (no rollup
                    fallback), so a lowered retention_days or a young install can serve less than hours_back
@@ -277,8 +367,11 @@ public sealed class McpQueryTools
                     attributed_cpu_ratio = attribution.AttributedCpuRatio,
                     note = attribution.Note
                 },
+                /* #5633 review (finding D): null when the read left no database out. */
+                databases_left_out = DatabasesLeftOut.Named(leftOut),
+                databases_left_out_note = DatabasesLeftOut.Note(leftOut),
                 procedures = result
-            }, McpHelpers.JsonOptions);
+            }, tagScope.Named);
         }
         catch (Exception ex)
         {
@@ -287,12 +380,51 @@ public sealed class McpQueryTools
     }
 
     /// <summary>
+    /// Serializes a payload and, only when a tag shaped the read, adds a <c>tag_filter</c> member naming it: the tag as the caller gave it,
+    /// or <c>untagged</c> (the twin of Darling's #5984 payload member). A call without a tag is unchanged.
+    /// </summary>
+    internal static string WithTagFilter(object payload, string? tagName)
+    {
+        if (tagName is null)
+        {
+            return JsonSerializer.Serialize(payload, McpHelpers.JsonOptions);
+        }
+
+        var node = JsonSerializer.SerializeToNode(payload, McpHelpers.JsonOptions)!.AsObject();
+        node["tag_filter"] = tagName;
+        return node.ToJsonString(McpHelpers.JsonOptions);
+    }
+
+    /// <summary>
     /// #4198: the default page's <c>query_text</c> preview length. Mirrors
     /// <c>DarlingMcpDataTools.QueryTextPreviewLength</c> -- see that constant's remarks for why 400.
     /// </summary>
     private const int QueryTextPreviewLength = 400;
 
-    [McpServerTool(Name = "get_query_store_top"), Description("Cost-ranked top Query Store queries (heaviest first), not time-ordered. Requires Query Store enabled on target databases. window_truncated marks a window floor, not a page cut — no limit changes it — because stored history can be shorter than asked; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> Gets expensive queries from Query Store (persistent, survives restarts). Best for: historical analysis, queries no longer in plan cache. Requires Query Store enabled on target databases. Supports database and module filtering. Rows are per Query Store execution outcome (execution_type: Regular, Aborted, Exception): a plan with aborted executions returns one row per outcome, each with its own counts and averages. The execution_type filter keeps one outcome, and module_name keeps one module: the exact, case-sensitive schema-qualified name the collector records (get_top_procedures_by_cpu's full_name; Adhoc for ad-hoc statements, Unknown for an object it could not resolve), applied after interval deduplication and before ranking. When a filter matches nothing but the same read without the filters has rows, the answer is empty (a measured zero), not a Query Store precondition; a module_name miss also carries the window read (effective_start, effective_hours_back, window_truncated) as hints. query_text is a 400-character preview by default (query_text_truncated marks a cut row); full_text=true returns each row's whole statement." + McpHelpers.WindowTruncatedDescription)]
+    /// <summary>
+    /// #6181: Lite's twin of Darling's first-interval answer for a Query Store top read that found nothing; null when a Query Store
+    /// sample was ever stored or the health state is unknown or off, so the caller keeps its own text.
+    /// </summary>
+    private static async Task<string?> FirstIntervalStatusAsync(
+        LocalDataService dataService, int serverId, string serverName, string? databaseName)
+    {
+        try
+        {
+            if (await dataService.HasAnyQueryStoreStatAsync(serverId))
+            {
+                return null;
+            }
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        var message = await McpRuntimePrecondition.QueryStoreFirstIntervalMessageAsync(dataService, serverId, serverName, databaseName);
+        return message is null ? null : McpHelpers.Status("unavailable", message);
+    }
+
+    [McpServerTool(Name = "get_query_store_top"), Description("Cost-ranked top Query Store queries (heaviest first), not time-ordered. Requires Query Store enabled on target databases. window_truncated marks a window floor, not a page cut — no limit changes it — because stored history can be shorter than asked; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> Gets expensive queries from Query Store (persistent, survives restarts). Best for: historical analysis, queries no longer in plan cache. Requires Query Store enabled on target databases. Supports database and module filtering. Rows are per Query Store execution outcome (execution_type: Regular, Aborted, Exception): a plan with aborted executions returns one row per outcome, each with its own counts and averages. The execution_type filter keeps one outcome, and module_name keeps one module: the exact, case-sensitive schema-qualified name the collector records (get_top_procedures_by_cpu's full_name; Adhoc for ad-hoc statements, Unknown for an object it could not resolve), applied after interval deduplication and before ranking. When a filter matches nothing but the same read without the filters has rows, the answer is empty (a measured zero), not a Query Store precondition; a module_name miss also carries the window read (effective_start, effective_hours_back, window_truncated) as hints. query_text is a 400-character preview by default (query_text_truncated marks a cut row); full_text=true returns each row's whole statement. The page is also capped at the shared ~32 KB response budget, heaviest rows kept: truncated says rows were cut for that, and budget_note says how many fit (window_truncated stays the window floor)." + McpHelpers.WindowTruncatedDescription)]
     public static async Task<string> GetQueryStoreTop(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -303,13 +435,21 @@ public sealed class McpQueryTools
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         [Description("Filter by Query Store execution outcome: Regular, Aborted, or Exception.")] string? execution_type = null,
         [Description("Exact schema-qualified module name, as get_top_procedures_by_cpu returns it in full_name (e.g. dbo.usp_ProcessOrder). Case-sensitive; applied before ranking. Ad-hoc statements are Adhoc.")] string? module_name = null,
-        [Description("Return each row's full query_text instead of a 400-character preview. Default false.")] bool full_text = false)
+        [Description("Return each row's full query_text instead of a 400-character preview. Default false.")] bool full_text = false,
+        [Description(QueryTagReadScope.ParameterDescription)] string? tag = null)
     {
         var (resolved, error) = ServerResolver.ResolveOrError(serverManager, server_name);
         if (error != null) return error;
 
         try
         {
+            /* #5992: the query tag filter. A name no tag carries is an empty answer that says so. */
+            var tagScope = await dataService.GetQueryTagReadScopeAsync(resolved.ServerId, tag);
+            if (tagScope.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadScope.UnknownTagMessage(tagScope.Requested!));
+            }
+
             var hoursError = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
             if (hoursError != null) return hoursError;
 
@@ -333,7 +473,8 @@ public sealed class McpQueryTools
                 databaseNames: string.IsNullOrEmpty(database_name) ? null : new[] { database_name },
                 asOfUtc: windowEnd,
                 executionType: execution_type,
-                moduleName: module_name);
+                moduleName: module_name,
+                tags: tagScope);
 
             /* #4231 (Lite's twin of Darling's #2364): what the window ACTUALLY reached. rows above are the top
                N by COST, so their timestamps say nothing about how far back the read went. query_store_stats
@@ -344,8 +485,15 @@ public sealed class McpQueryTools
             var effectiveStart = EffectiveWindowStart(floor, requestedStart);
             var truncated = IsWindowTruncated(floor, requestedStart);
 
-            if (rows.Count == 0)
+            /* #6074: every empty answer below is also read against the database's newest query_store_health row: when Query
+               Store is not READ_WRITE there, the answer says so and names get_query_store_health. The ladder is unchanged. */
+            async Task<string> EmptyAnswerAsync()
             {
+                if (tagScope.Active)
+                {
+                    return McpHelpers.Status("empty", $"No Query Store query on {resolved.DisplayName} in the last {hours_back} hour(s) carries query tag '{tagScope.Requested}'. The tag filter was applied in SQL before the top-{top} ranking.");
+                }
+
                 /* A filter that matched nothing is an answer, not a missing collection. Most queries never abort,
                    so an Aborted or Exception filter is empty far more often than not, and falling through to the
                    chain below ended at "Query Store may not be enabled" -- false, whenever the same read without
@@ -365,18 +513,31 @@ public sealed class McpQueryTools
                             window_truncated = truncated
                         });
 
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_store")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_store")
                     /* #2546: the sentence below GUESSES ("may not be enabled"), and it had to, because the
                        read had no way to find out. The store has known all along — query_store_health
                        records actual_state per database every hour for exactly this purpose. Asking it turns
                        a hedge into a fact plus the ALTER DATABASE that fixes it, and it answers for the
                        database this read was scoped to rather than for the server's most flattering one. */
-                    ?? await McpRuntimePrecondition.QueryStoreStatusAsync(dataService, resolved.ServerId, resolved.ServerName, database_name)
+                    ?? await McpRuntimePrecondition.QueryStoreStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, database_name)
                     /* And the collector's own last run, for the case Query Store is on and the collector is
                        the thing that cannot read it. */
-                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_store")
+
+                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_store")
+                    /* #6181: a server just added stores no Query Store row until its first interval closes. When none was
+                       ever stored but Query Store is READ_WRITE and the collector's last run succeeded, say that instead of
+                       "may not be enabled". */
+                    ?? await FirstIntervalStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, database_name)
+                    /* #6226 (Darling's twin): the collector ran in the window and stored nothing, so nothing executed: empty, not a gap. */
+                    ?? EmptyCollectorRan(
+                        await dataService.GetCollectorRunFactsAsync(resolved.ServerId, "query_store", hours_back, asOfUtc: windowEnd),
+                        "query_store", hours_back, "Query Store intervals", database_name)
                     ?? McpHelpers.Status("unavailable", "No Query Store data available. Query Store may not be enabled on target databases.");
             }
+
+            if (rows.Count == 0)
+                return await McpRuntimePrecondition.WithQueryStoreNotWritingHintAsync(
+                    await EmptyAnswerAsync(), dataService, resolved.ServerId, database_name);
 
             var result = rows.Select(r => new
             {
@@ -384,6 +545,7 @@ public sealed class McpQueryTools
                 query_id = r.QueryId,
                 plan_id = r.PlanId,
                 query_hash = r.QueryHash,
+                tag = tagScope.TagOfHash(r.QueryHash),
                 query_plan_hash = r.QueryPlanHash,
                 execution_type = r.ExecutionTypeDesc,
                 module_name = r.ModuleName,
@@ -399,9 +561,9 @@ public sealed class McpQueryTools
                 query_text_truncated = !full_text && r.QueryText != null && r.QueryText.Length > QueryTextPreviewLength
             });
 
-            return JsonSerializer.Serialize(new
+            var topJson = WithTagFilter(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4231: what was served, beside what was asked for — hours_back alone is a request echoed
                    back as though it described the data. Same keys, same meaning as Darling's get_query_store_top. */
@@ -412,7 +574,13 @@ public sealed class McpQueryTools
                     ? "The window reaches further back than this server's raw query_store_stats retains (or this server has been monitored for less time than that), so the older part of it was not read. This tool reads the raw tier only: no rollup carries query_id or plan_id, and plan identity is what it exists to return."
                     : null,
                 queries = result
-            }, McpHelpers.JsonOptions);
+            }, tagScope.Named);
+
+            /* #6131: the page is capped under the shared response budget (top 200 measured 177 KB on the Darling twin, which
+               has the same shape), and `truncated` says when it was. It is the budget cut only; the window floor keeps
+               window_truncated and its own note. */
+            return McpResponseBudget.CapPage(
+                System.Text.Json.Nodes.JsonNode.Parse(topJson)!.AsObject(), "queries", "heaviest first", "queries");
         }
         catch (Exception ex)
         {
@@ -431,7 +599,7 @@ public sealed class McpQueryTools
     /// </summary>
     private const int RegressionsQueryTextPreviewLength = 240;
 
-    [McpServerTool(Name = "get_query_store_regressions"), Description("Finds queries whose Query Store performance got WORSE: recent window (hours_back, ending at as_of) vs a fixed 7-day baseline before it (see baseline_start/baseline_end). get_query_store_top ranks EXPENSIVE, this ranks CHANGED. Gated: average CPU regressed over 25%. duration_regression_percent, io_regression_percent and severity are null, not 0%, when their baseline is 0. additional_duration_ms is the ranking key. empty: no regression, or nothing yet in the baseline window. unavailable: no baseline exists yet. not_collected: this server's engine cannot run Query Store. <<GUIDE>> Finds queries whose Query Store performance got WORSE, by comparing each (database, query_id) group's averages inside a recent window against its baseline - a FIXED 7-day lookback ending at that window's start (before this it was every capture EVER collected before the window, so its cost tracked how much history the store still retained rather than the window asked for, and the comparison period silently grew on a server with more retention). baseline_start and baseline_end report exactly which period was compared - a regression against something older than the baseline lookback is not caught; a store retaining less than that is unaffected. Returns baseline vs recent duration, CPU and logical reads with the regression percent for each, the execution-count-weighted extra duration (the ranking key: a 5 ms regression executed a million times outranks a 5-second one executed twice), the plan counts on both sides, and a duration-driven severity band. get_query_store_top answers what is EXPENSIVE; the most expensive query is usually the one that always was. This answers what CHANGED. Rows are kept only where average CPU regressed by more than 25%. A regression percent whose BASELINE side is 0 has no denominator and is returned as null, with the reason under undefined_percents - never as 0, which would read as no change when the truth is the largest possible one; compare the two absolute figures instead. The ranking key is the absolute, execution-weighted duration delta, which exists whether or not a ratio does, so a null percent never sorts as 0. severity is banded from the duration percent and is null when that percent is.")]
+    [McpServerTool(Name = "get_query_store_regressions"), Description("Finds queries whose Query Store performance got WORSE: recent window (hours_back) vs a fixed 7-day baseline before it. get_query_store_top ranks EXPENSIVE, this ranks CHANGED. Gated: average CPU regressed over 25%. Timeouts or errors that rose also qualify (regression_reason). duration_regression_percent and severity are null, not 0%, when their baseline is 0. additional_duration_ms is the ranking key. empty: no regression, or nothing yet in the baseline window. unavailable: no baseline exists yet. not_collected: this server's engine cannot run Query Store. <<GUIDE>> Finds queries whose Query Store performance got WORSE, by comparing each (database, query_id) group's per-execution cost inside a recent window against its baseline - a FIXED 7-day lookback ending at that window's start (before this it was every capture EVER collected before the window, so its cost tracked how much history the store still retained rather than the window asked for, and the comparison period silently grew on a server with more retention). baseline_start and baseline_end report exactly which period was compared - a regression against something older than the baseline lookback is not caught; a store retaining less than that is unaffected. Returns baseline vs recent duration and CPU with the regression percent for each (logical reads are not reported, #5506), and beside them the Aborted (timeouts, cancels) and Exception (errors) runs of the same query: for each group the run count, the CPU and duration per execution, and the count per hour, for the baseline and the recent window (the two differ in length, so compare the per-hour figures), the execution-count-weighted extra duration (the ranking key: a 5 ms regression executed a million times outranks a 5-second one executed twice), the plan counts on both sides, and a duration-driven severity band. get_query_store_top answers what is EXPENSIVE; the most expensive query is usually the one that always was. This answers what CHANGED. Rows are kept where Regular average CPU regressed by more than 25% (regression_reason cost), or where the Aborted rate per hour (timeouts) or the Exception rate per hour (errors) in the recent window is at least twice the baseline's, or nonzero where the baseline had none, with at least 3 such runs in the recent window - so a query whose timeouts rose is listed even if its Regular CPU fell, and one 30 s timeout among a thousand fast runs, which barely moves an average, is not hidden. regression_reason is cost, timeouts, errors or a comma-separated combination. Failure-only rows are listed after the cost rows and take at most a third of the limit (more only if cost rows leave room), so a flood of errors cannot push the cost rows out; their severity is HIGH when the rate is at least five times the baseline's (or the baseline had none) and MEDIUM otherwise, never CRITICAL. Cost compares Regular runs only: blending Aborted runs in would hide them. A regression percent whose BASELINE side is 0 has no denominator and is returned as null, with the reason under undefined_percents - never as 0, which would read as no change when the truth is the largest possible one; compare the two absolute figures instead. The ranking key is the absolute, execution-weighted duration delta, which exists whether or not a ratio does, so a null percent never sorts as 0. severity is banded from the duration percent and is null when that percent is. Both sides are WEIGHTED per execution (the summed cost divided by the summed executions, so a busy interval counts for what it ran, not an average of the interval averages), over Regular executions only.")]
     public static async Task<string> GetQueryStoreRegressions(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -475,13 +643,13 @@ public sealed class McpQueryTools
                 emptyAnswer: rows.Count == 0);
 
             if (rows.Count == 0)
-                return await EmptyRegressionsAsync(dataService, resolved.ServerId, resolved.ServerName, hours_back, windowEnd, notice, databases);
+                return await EmptyRegressionsAsync(dataService, resolved.ServerId, resolved.DisplayName, hours_back, windowEnd, notice, databases);
 
             var truncated = rows.Count > limit;
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* The window floor, always present (false and null when the store covered the baseline). No
                    effective_hours_back: this payload carries a page `truncated`, and the census holds that key apart
@@ -495,42 +663,12 @@ public sealed class McpQueryTools
                 baseline_start = baselineStart.ToString("o"),
                 baseline_end = windowStart.ToString("o"),
                 baseline_is = $"Query Store captures from baseline_start to the recent window's start ({LocalDataService.BaselineLookbackDays} days)",
-                gate = "average CPU regressed by more than 25%",
-                regression_count = Math.Min(rows.Count, limit),
+                gate = "Regular average CPU regressed by more than 25% (cost), or the recent Aborted (timeouts) or Exception (errors) rate per hour is at least twice the baseline's (or nonzero where the baseline had none) with at least 3 such runs",
+                /* #6128: every regression that passed the gate, whatever limit asked for; returned_count is this page. */
+                regression_count = Math.Max(rows[0].TotalCount, rows.Count),
+                returned_count = Math.Min(rows.Count, limit),
                 truncated,
-                regressions = rows.Take(limit).Select(r => new
-                {
-                    database_name = r.DatabaseName,
-                    query_id = r.QueryId,
-                    /* Banded from the duration percent by the TVF's CASE, whose ELSE is 'LOW' — which for a
-                       row with NO duration ratio is a verdict about a number that does not exist. Null there
-                       (#3541 A12); the SQL's band is kept verbatim for the viewer it is shared with. */
-                    severity = r.DurationRegressionPercent is null ? null : r.Severity,
-                    baseline_duration_ms = Round(r.BaselineDurationMs),
-                    recent_duration_ms = Round(r.RecentDurationMs),
-                    duration_regression_percent = Round(r.DurationRegressionPercent),
-                    baseline_cpu_ms = Round(r.BaselineCpuMs),
-                    recent_cpu_ms = Round(r.RecentCpuMs),
-                    cpu_regression_percent = Round(r.CpuRegressionPercent),
-                    baseline_reads = Round(r.BaselineReads),
-                    recent_reads = Round(r.RecentReads),
-                    io_regression_percent = Round(r.IoRegressionPercent),
-                    /* Null percents, and why (#3541 A12): a 0 baseline has no ratio, and the reader used to
-                       publish that as 0 — "no change" — for the row that changed the most. */
-                    undefined_percents = UndefinedPercentNotes(r),
-                    /* The ranking key, and the one number that says whether this regression MATTERS. It is
-                       an absolute delta, so it exists for every row and a null ratio never sorts as 0. */
-                    additional_duration_ms = Round(r.AdditionalDurationMs),
-                    baseline_exec_count = r.BaselineExecCount,
-                    recent_exec_count = r.RecentExecCount,
-                    /* A plan count that moved between the two sides is the first thing to check: a query
-                       that regressed while gaining a plan is usually a plan-choice problem, not a data one. */
-                    baseline_plan_count = r.BaselinePlanCount,
-                    recent_plan_count = r.RecentPlanCount,
-                    last_execution_time = r.LastExecutionTime?.ToString("o"),
-                    query_text = full_text ? r.QueryTextSample : McpHelpers.TruncateStatement(r.QueryTextSample, RegressionsQueryTextPreviewLength),
-                    query_text_truncated = !full_text && r.QueryTextSample.Length > RegressionsQueryTextPreviewLength,
-                }),
+                regressions = rows.Take(limit).Select(r => RegressionRowJson(r, full_text)),
             }, McpHelpers.JsonOptions);
         }
         catch (Exception ex)
@@ -550,23 +688,96 @@ public sealed class McpQueryTools
 
     private static double? Round(double? value) => value is null ? null : Math.Round(value.Value, 2);
 
+    /// <summary>One regression row. The Regular figures are always there. Each of the Aborted and Exception groups always carries its
+    /// counts, so a 0 reads as none; its CPU and duration per execution are left out of a side with no runs (there is no figure to
+    /// show), and its runs per hour only on a row whose reason names it, where they are the figure the reason was judged on (#6268,
+    /// Darling's #5506). Logical reads are not reported. Darling's twin builds the same row.</summary>
+    private static Dictionary<string, object?> RegressionRowJson(QueryStoreRegressionRow r, bool full_text)
+    {
+        var row = new Dictionary<string, object?>
+        {
+            ["database_name"] = r.DatabaseName,
+            ["query_id"] = r.QueryId,
+            /* Banded from the duration percent by the SQL's CASE, whose ELSE is 'LOW' - which for a cost row with NO duration
+               ratio is a verdict about a number that does not exist. Null there (#3541 A12). */
+            ["severity"] = r.DurationRegressionPercent is null && r.RegressionReason == "cost" ? null : r.Severity,
+            /* #6268: why the row is listed: cost, timeouts, errors or a comma-separated combination. */
+            ["regression_reason"] = r.RegressionReason,
+            ["baseline_duration_ms"] = Round(r.BaselineDurationMs),
+            ["recent_duration_ms"] = Round(r.RecentDurationMs),
+            ["duration_regression_percent"] = Round(r.DurationRegressionPercent),
+            ["baseline_cpu_ms"] = Round(r.BaselineCpuMs),
+            ["recent_cpu_ms"] = Round(r.RecentCpuMs),
+            ["cpu_regression_percent"] = Round(r.CpuRegressionPercent),
+            /* Null percents, and why (#3541 A12): a 0 baseline has no ratio, and the reader used to
+               publish that as 0 - "no change" - for the row that changed the most. */
+            ["undefined_percents"] = UndefinedPercentNotes(r),
+            /* The ranking key, and the one number that says whether this regression MATTERS. It is
+               an absolute delta, so it exists for every row and a null ratio never sorts as 0. */
+            ["additional_duration_ms"] = Round(r.AdditionalDurationMs),
+            ["baseline_exec_count"] = r.BaselineExecCount,
+            ["recent_exec_count"] = r.RecentExecCount,
+            /* A plan count that moved between the two sides is the first thing to check: a query
+               that regressed while gaining a plan is usually a plan-choice problem, not a data one. */
+            ["baseline_plan_count"] = r.BaselinePlanCount,
+            ["recent_plan_count"] = r.RecentPlanCount,
+            ["baseline_regular_per_hour"] = Round(r.BaselineRegularPerHour),
+            ["recent_regular_per_hour"] = Round(r.RecentRegularPerHour),
+        };
+        AddGroup(row, "aborted", r.Aborted, r.RegressionReason.Contains("timeouts", StringComparison.Ordinal));
+        AddGroup(row, "exception", r.Exception, r.RegressionReason.Contains("errors", StringComparison.Ordinal));
+        row["last_execution_time"] = r.LastExecutionTime?.ToString("o");
+        row["query_text"] = full_text ? r.QueryTextSample : McpHelpers.TruncateStatement(r.QueryTextSample, RegressionsQueryTextPreviewLength);
+        row["query_text_truncated"] = !full_text && r.QueryTextSample.Length > RegressionsQueryTextPreviewLength;
+        return row;
+    }
+
+    private static void AddGroup(Dictionary<string, object?> row, string name, QueryStoreRunGroup g, bool reasonNamesIt)
+    {
+        row["baseline_" + name + "_count"] = g.BaselineCount;
+        row["recent_" + name + "_count"] = g.RecentCount;
+        if (g.BaselineCount > 0)
+        {
+            row["baseline_" + name + "_cpu_ms"] = Round(g.BaselineCpuMs);
+            row["baseline_" + name + "_duration_ms"] = Round(g.BaselineDurationMs);
+        }
+        if (g.RecentCount > 0)
+        {
+            row["recent_" + name + "_cpu_ms"] = Round(g.RecentCpuMs);
+            row["recent_" + name + "_duration_ms"] = Round(g.RecentDurationMs);
+        }
+        if (reasonNamesIt)
+        {
+            row["baseline_" + name + "_per_hour"] = Round(g.BaselinePerHour);
+            row["recent_" + name + "_per_hour"] = Round(g.RecentPerHour);
+        }
+    }
+
     /// <summary>
-    /// Which of a row's three regression percents are undefined, and why (#3541 A12, contract rule 5). Each
-    /// percent divides through <c>NULLIF(baseline, 0)</c>, so a NULL means the baseline side was 0 — there is
-    /// no denominator, not no change — and the caller is pointed at the absolute pair it can still compare.
+    /// Which of a row's two regression percents are undefined, and why (#3541 A12, contract rule 5). Each
+    /// percent divides through <c>NULLIF(baseline, 0)</c>, so a NULL means the baseline side was 0 - there is
+    /// no denominator, not no change - and the caller is pointed at the absolute pair it can still compare.
     /// Null when every percent is defined, so the common row carries no noise. Darling's twin builds the same
     /// sentences.
     /// </summary>
     private static List<string>? UndefinedPercentNotes(QueryStoreRegressionRow r)
     {
         List<string>? notes = null;
+        /* #6268: a row listed only for timeouts or errors can have no Regular runs on one side, so there is no cost comparison:
+           say so once instead of calling a missing side a zero baseline. */
+        if (r.BaselineExecCount == 0 || r.RecentExecCount == 0)
+        {
+            return r.DurationRegressionPercent is null || r.CpuRegressionPercent is null
+                ? new List<string> { "duration_regression_percent and cpu_regression_percent are null: there are no Regular runs in the " + (r.BaselineExecCount == 0 ? "baseline" : "recent") + " window, so this row has no cost comparison; it is listed for regression_reason." }
+                : null;
+        }
+
         void Note(string field, string baseline, string recent)
             => (notes ??= new List<string>()).Add(
                 $"{field} is null: no_baseline — {baseline} is 0, so the ratio has no denominator; this is NOT 0% change. Compare {baseline} to {recent} directly.");
 
         if (r.DurationRegressionPercent is null) Note("duration_regression_percent", "baseline_duration_ms", "recent_duration_ms");
         if (r.CpuRegressionPercent is null) Note("cpu_regression_percent", "baseline_cpu_ms", "recent_cpu_ms");
-        if (r.IoRegressionPercent is null) Note("io_regression_percent", "baseline_reads", "recent_reads");
         return notes;
     }
 
@@ -590,7 +801,11 @@ public sealed class McpQueryTools
 
         if (!hasBaseline && !hasRecent)
         {
+            /* #6181: Query Store on, collector healthy, first interval not closed yet: say so instead of "may be OFF". */
             return await McpEngineCapability.NotCollectedStatusAsync(dataService, serverId, serverName, "query_store")
+                ?? (await McpRuntimePrecondition.QueryStoreFirstIntervalMessageAsync(
+                        dataService, serverId, serverName, databases is { Length: 1 } ? databases[0] : null)
+                    is { } firstInterval ? McpHelpers.Status("unavailable", firstInterval + " There is nothing to compare yet, so this is not a report of zero regressions.") : null)
                 ?? McpHelpers.Status(
                     "unavailable",
                     $"No Query Store data has EVER been collected for {serverName}, so this is NOT a report of zero regressions — there is nothing to compare. Query Store may be OFF on this server's databases, which get_query_store_health will say; otherwise check that collection is running for this server.");
@@ -650,7 +865,7 @@ public sealed class McpQueryTools
             "empty",
             McpHelpers.QuietUnlessCut(
                 notice.WindowTruncated, notice.EffectiveStart,
-                factual: $"No query on {serverName} regressed in the last {hours_back} hour(s). Both a baseline and this window were collected and no query's average CPU is more than 25% worse than its baseline",
+                factual: $"No query on {serverName} regressed in the last {hours_back} hour(s). Both a baseline and this window were collected and no query's Regular average CPU is more than 25% worse than its baseline, and none of their timeouts or errors rose",
                 coveredClaim: " — this IS the all-clear for this read."),
             notice.AsHints());
     }
@@ -720,7 +935,7 @@ public sealed class McpQueryTools
                 requestedStart, windowEnd, "query_stats", emptyAnswer: rows.Count == 0);
 
             if (rows.Count == 0)
-                return await EmptyHeatmapAsync(dataService, resolved.ServerId, resolved.ServerName, hours_back, windowEnd, notice, filtered: databases is not null);
+                return await EmptyHeatmapAsync(dataService, resolved.ServerId, resolved.DisplayName, hours_back, windowEnd, notice, filtered: databases is not null);
 
             var truncated = rows.Count > limit;
             var cells = rows.Take(limit).ToList();
@@ -753,7 +968,7 @@ public sealed class McpQueryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* The window floor, always present (false and null when the store covered the window). No
                    effective_hours_back: this payload carries a page `truncated`, and the census holds that key apart
@@ -907,7 +1122,7 @@ public sealed class McpQueryTools
                 /* Same two states again, same words as Darling's twin. The probe reads v_query_stats
                    because THIS trend does; Darling's probes the base table because ITS trend does. Each
                    probe follows its own read — what the caller sees is one sentence, not two. */
-                var gated = McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_stats"), database);
+                var gated = McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_stats"), database);
                 if (gated != null)
                 {
                     return gated;
@@ -916,17 +1131,17 @@ public sealed class McpQueryTools
                 return await dataService.HasAnyQueryStatAsync(resolved.ServerId)
                     ? EmptyStatus(
                         "empty",
-                        $"No query samples recorded for {ScopedServer(resolved.ServerName, database)} in the last {hours_back} hour(s). This server HAS collected query stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.",
+                        $"No query samples recorded for {ScopedServer(resolved.DisplayName, database)} in the last {hours_back} hour(s). This server HAS collected query stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.",
                         startUtc, windowEnd, grain, database)
                     : EmptyStatus(
                         "unavailable",
-                        $"No query stats have EVER been recorded for {resolved.ServerName}. This is not an empty window — the query_stats collector has stored nothing at all for this server. Check that collection is running and that the server is enabled; get_top_queries_by_cpu will be equally empty until it does.",
+                        $"No query stats have EVER been recorded for {resolved.DisplayName}. This is not an empty window — the query_stats collector has stored nothing at all for this server. Check that collection is running and that the server is enabled; get_top_queries_by_cpu will be equally empty until it does.",
                         startUtc, windowEnd, grain, database);
             }
 
             /* The two siblings below serialize through the SAME helper, so the three Performance-Trends
                reads cannot advertise three different field sets for one shape. */
-            return SerializeTrend(resolved.ServerName, hours_back, startUtc, windowEnd, points, grain,
+            return SerializeTrend(resolved.DisplayName, hours_back, startUtc, windowEnd, points, grain,
                 await dataService.GetBaselineDiscontinuitiesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd), database);
         }
         catch (Exception ex)
@@ -965,20 +1180,20 @@ public sealed class McpQueryTools
                 resolved.ServerId, hours_back, asOfUtc: windowEnd, bucketMinutes, database == null ? null : new[] { database });
             if (points.Count == 0)
             {
-                var gated = McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "procedure_stats"), database);
+                var gated = McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "procedure_stats"), database);
                 if (gated != null)
                 {
                     return gated;
                 }
 
                 return await EmptyTrendAsync(
-                    dataService.HasAnyProcedureStatAsync(resolved.ServerId), resolved.ServerName, database, hours_back,
+                    dataService.HasAnyProcedureStatAsync(resolved.ServerId), resolved.DisplayName, database, hours_back,
                     startUtc, windowEnd, grain,
                     "stored-procedure",
                     "Check that collection is running and that the server is enabled. A server that genuinely runs no stored procedures also lands here, and that is a real answer rather than a fault.");
             }
 
-            return SerializeTrend(resolved.ServerName, hours_back, startUtc, windowEnd, points, grain,
+            return SerializeTrend(resolved.DisplayName, hours_back, startUtc, windowEnd, points, grain,
                 await dataService.GetBaselineDiscontinuitiesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd), database);
         }
         catch (Exception ex)
@@ -1017,20 +1232,21 @@ public sealed class McpQueryTools
                     every database on the instance. A server with no Query Store data is not a server with
                     no slow queries, so the message names that cause first.
                 */
-                var gated = McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_store"), database);
+                var gated = McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_store"), database);
                 if (gated != null)
                 {
                     return gated;
                 }
 
                 return await EmptyTrendAsync(
-                    dataService.HasAnyQueryStoreStatAsync(resolved.ServerId), resolved.ServerName, database, hours_back,
+                    dataService.HasAnyQueryStoreStatAsync(resolved.ServerId), resolved.DisplayName, database, hours_back,
                     startUtc, windowEnd, PerInterval,
                     "Query Store",
-                    "Query Store may be OFF on this server's databases — that, not an absence of slow queries, is the usual cause. Check QUERY_STORE = ON per database, then that collection is running for this server.");
+                    "Query Store may be OFF on this server's databases — that, not an absence of slow queries, is the usual cause. Check QUERY_STORE = ON per database, then that collection is running for this server.",
+                    () => McpRuntimePrecondition.QueryStoreFirstIntervalMessageAsync(dataService, resolved.ServerId, resolved.DisplayName, database));
             }
 
-            return SerializeTrend(resolved.ServerName, hours_back, startUtc, windowEnd, points, PerInterval,
+            return SerializeTrend(resolved.DisplayName, hours_back, startUtc, windowEnd, points, PerInterval,
                 await dataService.GetBaselineDiscontinuitiesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd), database);
         }
         catch (Exception ex)
@@ -1335,9 +1551,17 @@ public sealed class McpQueryTools
     /// </summary>
     private static async Task<string> EmptyTrendAsync(
         Task<bool> probe, string serverName, string? database, int hours_back, DateTime startUtc, DateTime windowEndUtc, TrendGrain grain,
-        string what, string checkThis)
+        string what, string checkThis, Func<Task<string?>>? neverSampledOverride = null)
     {
         var everSampled = await probe;
+
+        /* #6181: a caller that can tell "no sample yet, but the source is healthy" supplies the whole answer for the
+           never-sampled state; null keeps the standard text. */
+        if (!everSampled && neverSampledOverride != null && await neverSampledOverride() is { } overrideText)
+        {
+            return EmptyStatus("unavailable", overrideText, startUtc, windowEndUtc, grain, database);
+        }
+
         return everSampled
             ? EmptyStatus(
                 "empty",
@@ -1370,7 +1594,7 @@ public sealed class McpQueryTools
             var rows = await dataService.GetQueryStatsHistoryAsync(resolved.ServerId, database_name, query_hash, hours_back, asOfUtc: windowEnd);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_stats")
                     ?? McpHelpers.Status("empty", $"No history found for query_hash '{query_hash}' in database '{database_name}' within the last {hours_back} hours.");
             }
 
@@ -1398,7 +1622,7 @@ public sealed class McpQueryTools
                the SKUs' envelopes disagreed until a review of the trio's change pointed at it. */
             var envelope = new Dictionary<string, object?>
             {
-                ["server"] = resolved.ServerName,
+                ["server"] = resolved.DisplayName,
                 ["database_name"] = database_name,
                 ["query_hash"] = query_hash,
                 ["hours_back"] = hours_back,

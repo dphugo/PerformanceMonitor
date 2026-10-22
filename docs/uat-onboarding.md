@@ -511,7 +511,7 @@ scripted check — catch it and read `$_.ErrorDetails.Message` for the body.
 
 Be clear about this before you file it as a bug. The web dashboard reads the store as the least-privilege
 `viewer` role. Its `/api/read/*` surface is machine-derived from the MCP tool catalog minus an explicit
-exclusion list — 93 read endpoints out of 112 tools — and these are the exclusions that matter to you:
+exclusion list, and these are the exclusions that matter to you:
 
 - **No plan analysis.** The whole `analyze_query_plan` / `analyze_procedure_plan` / `analyze_query_store_plan` /
   `analyze_plan_xml` family is excluded. **Use the WPF viewer for plans** — it has the graphical plan viewer,
@@ -648,8 +648,8 @@ running 0.4 executions a second used to report zero and read as idle.
 
 **Desktop things a web imitation would be worse than.** No graphical plan viewer, no interactive query
 heatmap **plot** (the underlying read ships as a bucketed table on the Queries tab — same answer, no canvas),
-no block-chain reconstruction — the Blocking tab hands you the captured blocked-process-report XML
-(and the deadlock-graph XML, beside a drawn graph you can click) verbatim instead of pretending. No period-compare grids. The
+the Blocking tab hands you the captured blocked-process-report XML verbatim (and the deadlock-graph XML,
+beside a drawn graph you can click), and a Blocking row's **Block chain** button draws the lead-blocker tree the Viewer draws. No period-compare grids. The
 per-query drill-down above charts the same history the viewer's window does, but it is not that **window**:
 no stored-plan download or cached-plan fetch from it, and none of the desktop grids' own affordances —
 per-column filter popups, CSV export, Copy Repro Script, and right-click drill-down into a ±30-minute
@@ -703,19 +703,20 @@ Restart-Service 'PerformanceMonitor Darling'
 ```
 
 **How the auth actually works in a browser.** Open `http://192.168.1.205:5153/` and paste the token into the
-minimal login form, or go straight to `http://192.168.1.205:5153/?token=<token>`. The host validates it
-constant-time, sets an **HMAC-signed, HttpOnly, SameSite=Strict cookie** named `darling_web_session` with a
-12-hour lifetime, and 302-redirects to strip the token out of the URL so it never lands in history or a
-`Referer`. Every later request rides the cookie. The signing key is per-process, so **a service restart logs
-everyone out** — present the token again.
+minimal login form, which POSTs it to `/auth/login`. The host validates it constant-time, sets an
+**HMAC-signed, HttpOnly, SameSite=Strict cookie** named `darling_web_session` with a 12-hour lifetime, and
+302-redirects to the page you were opening. A token in the URL (`?token=`) is not accepted, so it never lands
+in history or a `Referer`. Every later request rides the cookie. The signing key is per-process, so **a service
+restart logs everyone out** — present the token again. Repeated misses from one address are throttled (429
+with `Retry-After`), and a token shorter than 16 characters keeps the dashboard loopback-only at start.
 
 Two gates, and the order matters:
 
 1. **CIDR**, checked in-app on the remote address. Outside `allowFrom` is **403** with an empty body, cookie or
    no cookie. A remote address the host cannot determine fails closed to 403 as well. **Loopback skips this
    check** — otherwise `127.0.0.1` would 403 the operator's own browser.
-2. **Credential.** A valid cookie passes; a valid `?token=` is exchanged for one; anything else gets the login
-   form back as **HTTP 200**, not a 401.
+2. **Credential.** A valid cookie passes; a valid token POSTed by the login form is exchanged for one; anything
+   else gets the login form back as **HTTP 200**, not a 401.
 
 > **Loopback does *not* skip step 2.** Once a `web.network` block exposes the dashboard, **every** request
 > authenticates, including one from the box itself. It used to pass tokenless on the grounds that the surface
@@ -787,7 +788,7 @@ claude mcp add --transport http --scope user sql-monitor-darling http://localhos
 port you configured.)
 
 **Proof:** `claude mcp list` shows `sql-monitor-darling` as connected, and `/mcp` in a new Claude Code session
-lists **101 tools** — `list_servers`, `get_fleet_overview`, `get_wait_stats`, `analyze_server` and the rest.
+lists the Darling tools — `list_servers`, `get_fleet_overview`, `get_wait_stats`, `analyze_server` and the rest.
 Ask it *"what servers are being monitored?"* and it should answer from your store.
 
 Two details that save a round of guessing: the endpoint is the **root path** (`http://localhost:5152/`, not
@@ -879,9 +880,15 @@ If the block itself is bad the service *is* loud, and it fails closed rather tha
 ```
 MCP network exposure requested (mcp.network.listen is non-loopback) but no bearer token is set — refusing to expose; binding loopback-only. Set mcp.network.encryptedToken (via --encrypt-password) or mcp.network.token.
 MCP network token could not be decrypted (...); MCP server not started.
+MCP network token (mcp.network.token / mcp.network.encryptedToken) is shorter than 16 characters, and at least 16 are required for an exposed surface (...) — refusing to expose; binding loopback-only.
+MCP bearer token (mcp.network.token / mcp.network.encryptedToken) is shorter than 16 characters, and at least 16 are required for an exposed surface (...) — the MCP write tools stay off.
 MCP network exposure requested but mcp.network.allowFrom '...' is not a valid CIDR list or an entry's address family does not match mcp.network.listen — refusing to expose; binding loopback-only. Use one CIDR (e.g. 192.168.1.0/24) or several, separated by commas (e.g. 10.8.0.0/16,192.168.1.5/32): every entry in CIDR form (/32 for one address), with each IPv4 address written as four plain decimal numbers (no leading zeros) and no IPv6 zone index, and of the same family as listen (a :: listen takes IPv6 entries only). Host bits are masked (192.168.1.5/24 means 192.168.1.0/24).
 mcp.network.* is set but postgres.managed = false — MCP network exposure is managed-mode (or container) only and is ignored ...
 ```
+
+The MCP token must have at least 16 characters. In network mode, a shorter token keeps MCP loopback-only, with the "shorter than 16 characters" line above that ends in "refusing to expose". With `mcp.allowWrites` on, a shorter token leaves the write tools off, with the "shorter than 16 characters" line that ends in "the MCP write tools stay off".
+
+One address can send three wrong bearer tokens without delay. The fourth starts a wait of 2 seconds, and each further wrong token doubles the wait, up to 5 minutes. During the wait the host answers every request from that address with `429` and a `Retry-After` header. It compares no token during the wait, so a correct token is refused too.
 
 A "could not be decrypted" line on a box you copied `darling.json` onto is gotcha 4 in Part 5, not a bug.
 

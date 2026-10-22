@@ -59,9 +59,18 @@ public partial class AlertsHistoryTab : UserControl
     /// </summary>
     public event Action<int?>? AlertsDismissed;
 
+    /// <summary>#5847: builds the Alert Details window's "open the full chain" action for a row, or null when the row has
+    /// no Blocking or Deadlocks view to open (set by the shell, which owns the server tabs).</summary>
+    public Func<AlertHistoryRow, Action?>? FullChainOpener { get; set; }
+
+    /// <summary>#5847: where the Alert Details window keeps its last size (set by the shell).</summary>
+    public Windows.AlertDetailWindow.ISizeStore? DetailWindowSizeStore { get; set; }
+
     public AlertsHistoryTab()
     {
         InitializeComponent();
+        /* #6136: each column is at least as wide as its own header, so no title is cut at a fixed width. */
+        Loaded += (_, _) => DataGridHeaderFit.Apply(this);
         RangePicker.Value = TimeRangePresets.FromLegacyHours(24)!; /* 24 hours, as the list opened */
         /* #5562 M1: typed times and calendar periods are read in the zone the Time column is worded in (the display mode), as the
            Darling Viewer's Alert History does with its display zone. */
@@ -108,7 +117,8 @@ public partial class AlertsHistoryTab : UserControl
 
         var displayCount = AlertsDataGrid.ItemsSource is ICollection<AlertHistoryRow> coll ? coll.Count : alerts.Count;
         NoAlertsMessage.Visibility = displayCount == 0 ? Visibility.Visible : Visibility.Collapsed;
-        AlertTimeHeaderText.Text = TimeColumnTitle.For("Time", ServerTimeHelper.CurrentDisplayMode); // D5: the column names its clock
+        AlertTimeHeaderText.Text = TimeColumnTitle.For("Time", ServerTimeHelper.CurrentDisplayMode, alerts.Any(a => a.MixedServers)); // D5: the column names its clock
+        DataGridHeaderFit.Apply(AlertsDataGrid); // #6136: the longer title widens its column
         /* D7: the cap applies to the READ (alerts.Count), not to what a column filter leaves on screen. */
         _lastReadRowCount = alerts.Count;
         AlertCountIndicator.Text = JobHistoryCap.CountText(displayCount, _lastReadRowCount, RowCap, "alert(s)");
@@ -196,8 +206,12 @@ public partial class AlertsHistoryTab : UserControl
         Func<int, ServerClock?>? openTabClock)
     {
         var chosen = new Dictionary<int, ServerClock>();
-        foreach (var row in rows)
+        var all = rows as IList<AlertHistoryRow> ?? rows.ToList();
+        /* #6137: a list of several servers reads on one clock, so each row is told whether it sits in such a list. */
+        var mixed = PerformanceMonitor.Ui.MultiServerTime.IsMixed(all.Select(r => r.ServerId));
+        foreach (var row in all)
         {
+            row.MixedServers = mixed;
             if (!chosen.TryGetValue(row.ServerId, out var clock))
             {
                 collected.TryGetValue(row.ServerId, out var own);
@@ -385,12 +399,33 @@ public partial class AlertsHistoryTab : UserControl
     {
         var selected = AlertsDataGrid.SelectedItems.OfType<AlertHistoryRow>().ToList();
         var liveCount = selected.Count(a => !a.IsArchived);
-        DismissSelectedButton.IsEnabled = liveCount > 0;
+        DismissSelectedButton.IsEnabled = liveCount > 0 && !_dismissInFlight;
+    }
+
+    /* #5650: a dismiss can wait up to 30 s for the local database (LocalDataService.OpenUserWriteConnectionAsync) while
+       archival or a collector write holds it. While it waits, both buttons are off, the line beside them says so, and a
+       second click (the context menu's too) is refused rather than queued behind the first. The flag is read and set on
+       the dispatcher, so it needs no lock; the write itself runs inside Task.Run, so the window stays responsive. */
+    private bool _dismissInFlight;
+
+    private void SetDismissInFlight(bool inFlight)
+    {
+        _dismissInFlight = inFlight;
+        DismissAllButton.IsEnabled = !inFlight;
+        DismissWaitIndicator.Visibility = inFlight ? Visibility.Visible : Visibility.Collapsed;
+        if (inFlight)
+        {
+            DismissSelectedButton.IsEnabled = false;
+        }
+        else
+        {
+            AlertsDataGrid_SelectionChanged(this, null!);
+        }
     }
 
     private async void DismissSelected_Click(object sender, RoutedEventArgs e)
     {
-        if (_dataService == null) return;
+        if (_dataService == null || _dismissInFlight) return;
 
         var selected = AlertsDataGrid.SelectedItems
             .OfType<AlertHistoryRow>()
@@ -422,6 +457,7 @@ public partial class AlertsHistoryTab : UserControl
             if (confirmResult != MessageBoxResult.Yes) return;
         }
 
+        SetDismissInFlight(true);
         try
         {
             var affected = await System.Threading.Tasks.Task.Run(() => _dataService.DismissAlertsAsync(liveAlerts));
@@ -437,10 +473,11 @@ public partial class AlertsHistoryTab : UserControl
             foreach (var dismissedServerId in liveAlerts.Select(a => a.ServerId).Distinct())
                 AlertsDismissed?.Invoke(dismissedServerId);
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
+            AppLogger.Warn("AlertsHistory", StoreBusyReport.LogLine("Dismiss selected", ex));
             MessageBox.Show(
-                "The database is currently busy (archival or maintenance in progress).\n\nPlease try again in a few moments.",
+                StoreBusyReport.DialogText(ex),
                 "Dismiss Unavailable",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
@@ -453,11 +490,15 @@ public partial class AlertsHistoryTab : UserControl
         {
             AppLogger.Error("AlertsHistory", $"Failed to dismiss selected alerts: {ex.Message}");
         }
+        finally
+        {
+            SetDismissInFlight(false);
+        }
     }
 
     private async void DismissAll_Click(object sender, RoutedEventArgs e)
     {
-        if (_dataService == null) return;
+        if (_dataService == null || _dismissInFlight) return;
 
         var allAlerts = (AlertsDataGrid.ItemsSource as IEnumerable<AlertHistoryRow>)?.ToList();
         if (allAlerts == null || allAlerts.Count == 0) return;
@@ -488,6 +529,7 @@ public partial class AlertsHistoryTab : UserControl
 
         if (result != MessageBoxResult.Yes) return;
 
+        SetDismissInFlight(true);
         try
         {
             /* The same window the grid read (#5562): a range that ended in the past dismisses only the rows up to its end. */
@@ -503,10 +545,11 @@ public partial class AlertsHistoryTab : UserControl
             /* Clear the matching server tab badge(s) so the indicator matches the cleared list (issue #1092). */
             AlertsDismissed?.Invoke(serverId);
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
+            AppLogger.Warn("AlertsHistory", StoreBusyReport.LogLine("Dismiss all", ex));
             MessageBox.Show(
-                "The database is currently busy (archival or maintenance in progress).\n\nPlease try again in a few moments.",
+                StoreBusyReport.DialogText(ex),
                 "Dismiss Unavailable",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
@@ -518,6 +561,10 @@ public partial class AlertsHistoryTab : UserControl
         catch (Exception ex)
         {
             AppLogger.Error("AlertsHistory", $"Failed to dismiss all alerts: {ex.Message}");
+        }
+        finally
+        {
+            SetDismissInFlight(false);
         }
     }
 
@@ -552,7 +599,7 @@ public partial class AlertsHistoryTab : UserControl
         if (row.DataContext is not AlertHistoryRow item) return;
 
         var owner = Window.GetWindow(this);
-        var detailWindow = new Windows.AlertDetailWindow(item);
+        var detailWindow = new Windows.AlertDetailWindow(item, FullChainOpener?.Invoke(item), DetailWindowSizeStore);
         if (owner != null) detailWindow.Owner = owner;
         detailWindow.ShowDialog();
     }
@@ -564,7 +611,7 @@ public partial class AlertsHistoryTab : UserControl
         if (dataGrid?.SelectedItem is not AlertHistoryRow item) return;
 
         var owner = Window.GetWindow(this);
-        var detailWindow = new Windows.AlertDetailWindow(item);
+        var detailWindow = new Windows.AlertDetailWindow(item, FullChainOpener?.Invoke(item), DetailWindowSizeStore);
         if (owner != null) detailWindow.Owner = owner;
         detailWindow.ShowDialog();
     }

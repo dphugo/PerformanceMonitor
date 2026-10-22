@@ -27,7 +27,8 @@ public sealed class McpSessionTools
         [Description("Only rows waiting on this wait type at capture, e.g. PAGEIOLATCH_SH: exact name, any case. Applied in SQL. A head blocker on another wait is then off the page (blocker_not_shown = filtered).")] string? wait_type = null,
         [Description("Maximum number of rows to return. Default 25 (#4198, down from 50 — sized to fit the response budget). The page is bounded by limit, not hours_back — truncated says whether the window held more.")] int limit = DefaultLimit,
         [Description("Return each row's full query text instead of a 400-character preview. Default false.")] bool full_text = false,
-        [Description(McpHelpers.AsOfDescription)] string? as_of = null)
+        [Description(McpHelpers.AsOfDescription)] string? as_of = null,
+        [Description(QueryTagReadScope.ParameterDescription)] string? tag = null)
     {
         var (resolved, error) = ServerResolver.ResolveOrError(serverManager, server_name);
         if (error != null) return error;
@@ -39,6 +40,13 @@ public sealed class McpSessionTools
 
         try
         {
+            /* #5992: the query tag filter. A name no tag carries is an empty answer that says so. */
+            var tagScope = await dataService.GetQueryTagReadScopeAsync(resolved.ServerId, tag);
+            if (tagScope.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadScope.UnknownTagMessage(tagScope.Requested!));
+            }
+
             var filter = string.IsNullOrWhiteSpace(database_name) ? null : database_name.Trim();
             /* #5235: the wait filter is trimmed the same way, so a blank is none and the echo below names the value that was applied. */
             var waitFilter = string.IsNullOrWhiteSpace(wait_type) ? null : wait_type.Trim();
@@ -47,7 +55,7 @@ public sealed class McpSessionTools
                the cap so truncation is OBSERVED on the filtered population; total_snapshots is that read's
                COUNT(*) OVER () of the same population. Darling's twin is DarlingSessionReader.ActiveQueriesSql. */
             var (rows, populationCount) = await dataService.GetActiveQueriesPageAsync(
-                resolved.ServerId, hours_back, limit + 1, filter, blocking_only, waitFilter, asOfUtc: windowEnd);
+                resolved.ServerId, hours_back, limit + 1, filter, blocking_only, waitFilter, asOfUtc: windowEnd, tags: tagScope);
 
             /* #4966: where this server's query_snapshots start for the window, beside the page cut below — the two
                are different facts: truncated says the window held more than limit, this says the store did not hold
@@ -64,17 +72,18 @@ public sealed class McpSessionTools
             if (rows.Count == 0)
             {
                 /* A filtered miss is not a collection miss — Darling's twin's words. */
-                if (filter != null || blocking_only || waitFilter != null)
+                if (filter != null || blocking_only || waitFilter != null || tagScope.Active)
                 {
                     return McpHelpers.Status(
                         "empty",
-                        $"No active query snapshots on {resolved.ServerName} in the last {hours_back} hour(s) matched "
+                        $"No active query snapshots on {resolved.DisplayName} in the last {hours_back} hour(s) matched "
                         + DescribeActiveQueryFilters(filter, blocking_only, waitFilter)
+                        + (tagScope.Active ? $" (query tag '{tagScope.Requested}')" : "")
                         + ". The filters were applied in SQL over the whole window, so unfiltered snapshots may well exist — drop them to see what the window holds.",
                         notice.AsHints());
                 }
 
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "query_snapshots")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "query_snapshots")
                     ?? McpHelpers.Status("empty", "No active query snapshots found in the requested time range.", notice.AsHints());
             }
 
@@ -110,13 +119,14 @@ public sealed class McpSessionTools
                 login_name = r.LoginName,
                 host_name = r.HostName,
                 program_name = r.ProgramName,
+                tag = tagScope.TagOfHash(r.QueryHash),
                 query_text = full_text ? r.QueryText : McpHelpers.TruncateStatement(r.QueryText, QueryTextPreviewLength),
                 query_text_truncated = !full_text && (r.QueryText?.Length ?? 0) > QueryTextPreviewLength
             }).ToList();
 
-            return JsonSerializer.Serialize(new
+            var activePayload = JsonSerializer.SerializeToNode(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: the window floor, always present (false and null when the store covered the window). No
                    effective_hours_back: this payload carries a page `truncated`, and the census holds that key
@@ -140,7 +150,15 @@ public sealed class McpSessionTools
                 oldest_returned_collection_time = McpHelpers.FormatEffectiveStart(shown[^1].CollectionTime),
                 newest_returned_collection_time = McpHelpers.FormatEffectiveStart(shown[0].CollectionTime),
                 queries = result
-            }, McpHelpers.JsonOptions);
+            }, McpHelpers.JsonOptions)!.AsObject();
+
+            /* #5984 round 1 (Darling's twin): the tag is part of the population total_snapshots counts, so filters_applied names it (only when a tag was sent). */
+            if (tagScope.Named is { } sessionTagName && activePayload["filters_applied"] is System.Text.Json.Nodes.JsonObject appliedFilters)
+            {
+                appliedFilters["tag"] = sessionTagName;
+            }
+
+            return activePayload.ToJsonString(McpHelpers.JsonOptions);
         }
         catch (Exception ex)
         {
@@ -178,6 +196,7 @@ public sealed class McpSessionTools
         return string.Join(" with ", parts);
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_session_stats"), Description("Gets connection and session statistics grouped by application. Shows connection counts, running/sleeping/dormant breakdown, and aggregate resource usage per application. LATEST IS A TIME: this reads the newest session snapshot, not a window, and captured_at is the instant it was collected - the connection counts are what was connected AT that stamp, not a peak or an average over anything.")]
     public static async Task<string> GetSessionStats(
         LocalDataService dataService,
@@ -191,7 +210,7 @@ public sealed class McpSessionTools
         {
             var rows = await dataService.GetLatestSessionStatsAsync(resolved.ServerId);
             if (rows.Count == 0)
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "session_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "session_stats")
                     ?? McpHelpers.Status("unavailable", "No session statistics available. The session collector may not have run yet.");
 
             var totalConnections = rows.Sum(r => r.ConnectionCount);
@@ -201,7 +220,7 @@ public sealed class McpSessionTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3653: captured_at, the #3637 census's one spelling for a latest read's stamp - see
                    McpServerInfoTools.GetServerProperties for why it is a cut-over and not an alias. */
                 captured_at = rows[0].CollectionTime.ToString("o"),

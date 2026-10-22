@@ -83,14 +83,14 @@ public sealed class WebQueryStoreGridGroupsTests
     public void EachGrid_StartsOnItsCoreColumns_WithATogglePerGroup()
     {
         var r = Run("defaults");
-        Assert.Equal(new[] { "Columns:", "CPU and reads", "Executions and plans" }, Arr(r, "regressions", "toggles"));
-        Assert.Equal(new[] { "Severity", "Database", "Query", "QueryID", "ExtraDuration", "Duration+%", "BaselineDuration", "RecentDuration", "CPU+%", "Reads+%", "LastExec" },
+        Assert.Equal(new[] { "Columns:", "CPU", "Executions and plans", "Timeouts (Aborted)", "Errors (Exception)" }, Arr(r, "regressions", "toggles"));
+        Assert.Equal(new[] { "Severity", "Why", "Database", "Query", "QueryID", "RecentTimeouts", "RecentErrors", "ExtraDuration", "Duration+%", "BaselineDuration", "RecentDuration", "CPU+%", "LastExec" },
             Arr(r, "regressions", "heads"));
         Assert.Equal(new[] { "Columns:", "I/O and rows", "Session" }, Arr(r, "completions", "toggles"));
         Assert.Equal(new[] { "Time", "Statement", "EventType", "Duration", "CPU", "Result", "Database", "Object", "QueryHash" },
             Arr(r, "completions", "heads"));
         Assert.Equal(new[] { "Columns:", "Plans", "Plan metrics", "Lifecycle" }, Arr(r, "corrections", "toggles"));
-        Assert.Equal(new[] { "Collected", "Query", "Database", "State", "StateReason", "Reason", "Score", "Est.gain(s)", "QueryID" },
+        Assert.Equal(new[] { "Firstseen", "Lastseen", "Captures", "Query", "Database", "State", "StateReason", "Reason", "Score", "Est.gain(s)", "QueryID" },
             Arr(r, "corrections", "heads"));
     }
 
@@ -104,8 +104,10 @@ public sealed class WebQueryStoreGridGroupsTests
         Assert.Contains("RevertedAt", Arr(r, "plansOn"));
         Assert.DoesNotContain("ValidSince", Arr(r, "allOff"));
         Assert.DoesNotContain("RegressedPlan", Arr(r, "allOff"));
-        Assert.Equal(new[] { "BaseExecs", "RecentExecs", "BaselinePlans", "RecentPlans" },
-            Arr(r, "regressionsExecs").Where(h => h.StartsWith("Base", StringComparison.Ordinal) && h != "BaselineDuration" || h.StartsWith("Recent", StringComparison.Ordinal) && h != "RecentDuration").ToArray());
+        var execs = Arr(r, "regressionsExecs");
+        foreach (var h in new[] { "BaseExecs", "RecentExecs", "BaselinePlans", "RecentPlans", "BaselineExecs/Hour", "RecentExecs/Hour" })
+            Assert.Contains(h, execs);
+        Assert.DoesNotContain("BaselineTimeoutsExecs", execs);
         Assert.Equal(new[] { "SPID", "App", "Login" }, Arr(r, "completionsSession").Skip(8).Take(3).ToArray());
     }
 
@@ -126,9 +128,9 @@ public sealed class WebQueryStoreGridGroupsTests
         var r = Run("localTime");
         var expected = r.GetProperty("expected").GetString()!;
         Assert.Equal("1/15/2026, 12:30:00 PM", expected);
-        // Collected, Valid Since, Last Refresh and Executed At (Lifecycle is on in this scenario).
+        // First seen, Last seen, Valid Since, Last Refresh and Executed At (Lifecycle is on in this scenario; #5644 W21 put two stamps and Captures first).
         var cells = Arr(r, "cells");
-        foreach (var i in new[] { 0, 9, 10, 12 }) Assert.Equal(expected, cells[i]);
+        foreach (var i in new[] { 0, 1, 11, 12, 14 }) Assert.Equal(expected, cells[i]);
         Assert.Equal(expected, Arr(r, "regressionCells").Last());
         Assert.Equal(expected, Arr(r, "completionCells").First());
     }

@@ -67,7 +67,7 @@ internal static class DarlingRuntimePrecondition
     /// has never run has no row to find, so for it the read still goes through the server's whole retained history.
     /// $1 server_id, $2 collector.</para>
     /// </summary>
-    public const string CollectorLastRunSql = @"
+    public const string CollectorLastRunSql = $@"
 SELECT (
            SELECT collection_time
            FROM collection_log
@@ -80,11 +80,13 @@ SELECT (
            SELECT MAX(collection_time)
            FROM collection_log
            WHERE server_id = $1
+           AND   {CollectionCycleRow.NotCycleRowSql}
        ) AS server_last_collected,
        (
            SELECT collection_time
            FROM collection_log
            WHERE server_id = $1
+           AND   {CollectionCycleRow.NotCycleRowSql}
            ORDER BY collection_time ASC
            LIMIT 1
        ) AS server_first_collected";
@@ -129,7 +131,7 @@ LIMIT 1";
     /// Store, and a server-wide answer would hide an off database behind a healthy sibling.</para>
     /// </summary>
     public const string LatestQueryStoreStatesSql = @"
-SELECT database_name, actual_state, capture_time
+SELECT database_name, actual_state, capture_time, interval_length_minutes
 FROM v_query_store_health
 WHERE server_id = $1
 AND   capture_time = (SELECT MAX(capture_time) FROM v_query_store_health WHERE server_id = $1)
@@ -257,6 +259,64 @@ ORDER BY database_name";
         return message is null ? null : McpHelpers.Status(CollectorRuntimePrecondition.StatusWord, message);
     }
 
+    /// <summary>
+    /// #6181: the message for a Query Store read that found no sample EVER stored, when the latest health snapshot says Query
+    /// Store is on and the query_store collector's latest run succeeded (see
+    /// <see cref="CollectorRuntimePrecondition.QueryStoreFirstIntervalMessage"/>), or null when it does not (state unknown,
+    /// off, read-only, in error, or a collector run that failed or is missing) and the caller keeps its "may be OFF" text.
+    /// Null as well when either read fails: this runs on a path that already found nothing.
+    /// </summary>
+    public static async Task<string?> QueryStoreFirstIntervalMessageAsync(
+        NpgsqlDataSource postgres, int serverId, string serverName, DatabaseFilter databases, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var (states, observedUtc) = await ReadQueryStoreStatesAsync(postgres, serverId, databases, cancellationToken);
+            var (status, _, _) = await ReadLatestOutcomeAsync(postgres, serverId, "query_store", cancellationToken);
+            return CollectorRuntimePrecondition.QueryStoreFirstIntervalMessage(serverName, states, status, observedUtc);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// #6074: the sentence a Query Store read that found nothing appends when a database it covers is not READ_WRITE
+    /// (see <see cref="CollectorRuntimePrecondition.QueryStoreNotWritingHint"/>), read from the same
+    /// <c>v_query_store_health</c> row <c>get_query_store_health</c> answers from. Null when every database in scope is collecting,
+    /// when there is no health row, and when the read fails: this runs on a path that already found nothing, and a diagnostic
+    /// must not turn that into an error.
+    /// </summary>
+    public static async Task<string?> QueryStoreNotWritingHintAsync(
+        NpgsqlDataSource postgres, int serverId, DatabaseFilter databases, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var (states, observedUtc) = await ReadQueryStoreStatesAsync(postgres, serverId, databases, cancellationToken);
+            return CollectorRuntimePrecondition.QueryStoreNotWritingHint(states, observedUtc);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="answer"/> with <see cref="QueryStoreNotWritingHintAsync"/>'s sentence appended to its message when the
+    /// answer is an empty or unavailable status (#6074). Other statuses (a precondition, a not-collected answer, an error) already say their own cause.
+    /// </summary>
+    public static async Task<string> WithQueryStoreNotWritingHintAsync(
+        string answer, NpgsqlDataSource postgres, int serverId, DatabaseFilter databases, CancellationToken cancellationToken = default)
+    {
+        if (!McpHelpers.IsEmptyOrUnavailableStatus(answer))
+        {
+            return answer;
+        }
+
+        return McpHelpers.AppendToMessage(answer, await QueryStoreNotWritingHintAsync(postgres, serverId, databases, cancellationToken));
+    }
+
     private static async Task<(string? Status, string? ErrorMessage, DateTime? ObservedUtc)> ReadLatestOutcomeAsync(
         NpgsqlDataSource postgres,
         int serverId,
@@ -324,7 +384,8 @@ ORDER BY database_name";
         {
             states.Add(new CollectorRuntimePrecondition.QueryStoreDatabaseState(
                 reader.IsDBNull(0) ? string.Empty : reader.GetString(0),
-                reader.IsDBNull(1) ? null : reader.GetString(1)));
+                reader.IsDBNull(1) ? null : reader.GetString(1),
+                reader.IsDBNull(3) ? null : reader.GetInt64(3)));
 
             observedUtc ??= reader.IsDBNull(2)
                 ? null

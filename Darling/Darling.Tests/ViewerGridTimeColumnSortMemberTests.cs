@@ -76,6 +76,8 @@ public sealed class ViewerGridTimeColumnSortMemberTests
         { "ViewerServerTab.xaml", "PlanCorrectionGrid", "ExecuteActionInitiatedTimeLocal", Name(typeof(PlanCorrectionRow)), "ExecuteActionInitiatedTime" },
         { "ViewerServerTab.xaml", "PlanCorrectionGrid", "RevertActionInitiatedTimeLocal", Name(typeof(PlanCorrectionRow)), "RevertActionInitiatedTime" },
         { "ViewerServerTab.xaml", "BlockedProcessReportGrid", "EventTimeLocal", Name(typeof(ViewerBlockedProcessRow)), "EventTime" },
+        { "ViewerServerTab.xaml", "BlockedProcessReportGrid", "BlockingLoginTimeLocal", Name(typeof(ViewerBlockedProcessRow)), "BlockingLoginTime" },
+        { "ViewerServerTab.xaml", "BlockedProcessReportGrid", "BlockingLastRequestEndTimeLocal", Name(typeof(ViewerBlockedProcessRow)), "BlockingLastRequestEndTime" },
         { "ViewerServerTab.xaml", "DeadlockGrid", "DeadlockTimeLocal", Name(typeof(DeadlockProcessDetail)), "DeadlockTime" },
         { "ViewerServerTab.xaml", "AutomaticTuningGrid", "CollectionTimeLocal", Name(typeof(AutomaticTuningRow)), "CollectionTime" },
         { "ViewerServerTab.xaml", "ServerConfigGrid", "CaptureTimeLocal", Name(typeof(ServerConfigRow)), "CaptureTime" },
@@ -187,6 +189,23 @@ public sealed class ViewerGridTimeColumnSortMemberTests
         { "FinOpsTab.xaml", "FinOpsObjectIndexDetailGrid", "CollectionTime", Name(typeof(IndexUsageRow)), "CollectionTimeUtc" },
         { "FinOpsTab.xaml", "FinOpsIndexAnalysisRollupGrid", "CollectionTime", Name(typeof(IndexCleanupRollupRow)), "CollectionTimeUtc" },
         { "FinOpsTab.xaml", "FinOpsIndexAnalysisDetailGrid", "CollectionTime", Name(typeof(IndexCleanupRecommendationRow)), "CollectionTimeUtc" },
+
+        /* #5632: the investigations window's request list, its two detail grids and its notes. */
+        { "InvestigationsWindow.xaml", "RequestsGrid", "OpenedDisplay", Name(typeof(InvestigationRequestViewRow)), "OpenedAtUtc" },
+        { "InvestigationsWindow.xaml", "RequestsGrid", "ExpiresDisplay", Name(typeof(InvestigationRequestViewRow)), "ExpiresAtUtc" },
+        { "InvestigationsWindow.xaml", "AlertsGrid", "TimeDisplay", Name(typeof(InvestigationAlertViewRow)), "AlertTimeUtc" },
+        { "InvestigationsWindow.xaml", "JournalGrid", "TimeDisplay", Name(typeof(InvestigationJournalViewRow)), "EventTimeUtc" },
+        { "InvestigationsWindow.xaml", "NotesGrid", "CreatedDisplay", Name(typeof(InvestigationNoteViewRow)), "CreatedAtUtc" },
+        { "InvestigationsWindow.xaml", "NotesGrid", "ExpiresDisplay", Name(typeof(InvestigationNoteViewRow)), "ExpiresAtUtc" },
+        { "AgentChangesTab.xaml", "ChangesGrid", "WhenDisplay", Name(typeof(AgentChangeViewRow)), "CalledAtUtc" },
+        { "AgentChangesTab.xaml", "RefusalsGrid", "WhenDisplay", Name(typeof(AgentRefusalViewRow)), "AtUtc" },
+        { "ServerActionsTab.xaml", "ServersGrid", "ChangedDisplay", Name(typeof(ServerActionViewRow)), "ChangedAtUtc" },
+
+        /* #5913: the report feedback tab's two time columns sort by the row wrapper's UTC DateTime. */
+        { "InvestigationsWindow.xaml", "FeedbackReportsGrid", "ReportedDisplay", Name(typeof(InvestigationsWindow.FeedbackReportItem)), "ReportedAtUtc" },
+        { "InvestigationsWindow.xaml", "FeedbackGivenGrid", "WhenDisplay", Name(typeof(InvestigationsWindow.FeedbackGivenItem)), "CreatedAtUtc" },
+        { "KnownPatternsWindow.xaml", "PatternsGrid", "TimeDisplay", Name(typeof(KnownPatternRow)), "TimeOfDaySortKey" },
+        { "KnownPatternsWindow.xaml", "PatternsGrid", "ExpiresDisplay", Name(typeof(KnownPatternRow)), "ExpiresSortUtc" },
     };
 
     /// <summary>
@@ -213,6 +232,7 @@ public sealed class ViewerGridTimeColumnSortMemberTests
         [("ViewerServerTab.xaml", "PgPlanCaptureGrid", "Observed")] = "the setting value the readiness check observed, not a time",
         [("ViewerServerTab.xaml", "PgIndexBloatGrid", "EstimatedReclaimableBytes")] = "a byte count",
         [("ViewerServerTab.xaml", "PgIndexBloatGrid", "SkippedReason")] = "the reason a measurement was skipped, text",
+        [("KnownPatternsWindow.xaml", "PatternsGrid", "CreatedBy")] = "the name of whoever created the entry, not when",
     };
 
     /// <summary>

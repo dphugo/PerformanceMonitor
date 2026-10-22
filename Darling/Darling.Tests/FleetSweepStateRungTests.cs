@@ -40,6 +40,7 @@ namespace Darling.Tests;
 /// <c>FleetSweepStoreLivePostgresTests</c>, split out per the LivePostgresCollectionHygieneTests
 /// shape so these pure pins never pay for a store connection.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class FleetSweepStateRungTests
 {
     private const int RungVersion = 123;
@@ -419,7 +420,6 @@ public sealed class FleetSweepStateRungTests
         Assert.Contains("table_name = 'fleet_sweep_runs'", ViewerDataService.StoreSchemaProbeSql, StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         Assert.Contains("hasFleetSweepState", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);

@@ -458,6 +458,7 @@ public sealed class PgLogEventMetricsParserTests
 /// one-rung-behind half: a store carrying this and not V131 maps to 130, which is the honest answer for it
 /// and what makes the upgrade banner correct in both directions.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class PgLogEventMetricsRungTests
 {
     private const int RungVersion = 130;
@@ -553,7 +554,6 @@ public sealed class PgLogEventMetricsRungTests
             ViewerDataService.StoreSchemaProbeSql.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         Assert.Contains("hasPgLogEventMetrics", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);

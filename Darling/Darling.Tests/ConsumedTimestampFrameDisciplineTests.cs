@@ -38,7 +38,7 @@ namespace Darling.Tests;
 ///
 /// <para><b>This reports; it does not repair.</b> #3206 owns the MCP payload defects and #3207 the desktop
 /// render ones. <see cref="Inventory"/> carries every offending site instead, labelled, in the shape
-/// <c>DocCommentHygieneTests</c> uses for its unresolved cref targets: pinned at SET EQUALITY, which is a
+/// of an allow-list pinned at SET EQUALITY, which is a
 /// ratchet in BOTH directions. A new offender fails, and so does a FIXED one whose row is still here —
 /// that second direction is the only thing keeping an inventory from becoming a permanent excuse list.</para>
 ///
@@ -58,7 +58,6 @@ namespace Darling.Tests;
 /// declaration carrying the C#-side evidence, pinned at set equality against the classifier's own
 /// unreadable set and counted, so the hole cannot quietly grow.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class ConsumedTimestampFrameDisciplineTests
 {
     /// <summary>Which clock a stored value is in. Naive UTC is the store's default and the frame every
@@ -77,10 +76,10 @@ public sealed class ConsumedTimestampFrameDisciplineTests
        item 13) added cpu_utilization_stats.sample_time_utc, so 68 over 70, 50 SqlServer; V139 (#3955)
        added pg_write_stats.postmaster_start_time (AT TIME ZONE 'UTC' inline), so 69 over 71, 19 PostgreSql;
        V155 (#4765) added query_store_stats.interval_end_time_utc beside interval_start_time_utc, so 70 over 71,
-       51 SqlServer. Pinned exactly rather than as a floor because the whole point is a closed census — a floor would let
+       51 SqlServer; #5640 added attention_events.event_time (a SQL Server XE table), so 71, 52 SqlServer; #5632 added two UTC columns on query_store_forced_plans, so 73, 54 SqlServer; #5632 added blocking_login_time and blocking_last_request_end_time on dmv_blocking_snapshots (SQL Server, server-local), so 75, 56 SqlServer. Pinned exactly rather than as a floor because the whole point is a closed census — a floor would let
        a column vanish. */
-    private const int TimestampColumnCount = 70;
-    private const int SqlServerTimestampColumnCount = 51;
+    private const int TimestampColumnCount = 75;
+    private const int SqlServerTimestampColumnCount = 56;
     private const int PostgresTimestampColumnCount = 19;
 
     private static IReadOnlyList<(string Table, string Column, string Collector, CollectorTargetEngine Engine)>
@@ -191,6 +190,9 @@ public sealed class ConsumedTimestampFrameDisciplineTests
             "a dm_exec_* stats DMV shipped verbatim"),
         ("sys.dm_tran_active_transactions", ["transaction_begin_time"], ClockFrame.ServerLocal,
             "a dm_tran_* DMV shipped verbatim"),
+        /* #5632: the head blocker's sign-in time and the end of its last request, shipped verbatim off its session row. */
+        ("sys.dm_exec_sessions", ["login_time", "last_request_end_time"], ClockFrame.ServerLocal,
+            "a dm_exec_* session DMV shipped verbatim, and stored raw so a kill can compare login_time with the server's own"),
         ("sys.dm_tran_persistent_version_store_stats",
             ["aborted_version_cleaner_start_time", "aborted_version_cleaner_end_time",
              "offrow_version_cleaner_start_time", "offrow_version_cleaner_end_time"],
@@ -268,13 +270,16 @@ public sealed class ConsumedTimestampFrameDisciplineTests
     ];
 
     private const int NonTsqlProvenanceCount = 9;
-    private const int TsqlServerLocalCount = 28;
+    private const int TsqlServerLocalCount = 30;
     /* 12 until V134 (#3653 item 13): cpu_utilization_stats.sample_time_utc is read as Utc off its own
        SYSUTCDATETIME() — the first SqlServer table to carry BOTH frames as two columns, and the reason
        the sibling sample_time stays ServerLocal beside it rather than flipping. */
     /* 13 until V155 (#4765): query_store_stats.interval_end_time_utc is read as Utc off its own
-       AT TIME ZONE 'UTC', the twin of interval_start_time_utc beside it. */
-    private const int TsqlUtcCount = 14;
+       AT TIME ZONE 'UTC', the twin of interval_start_time_utc beside it.
+       15 since #5640: attention_events.event_time is read as Utc off the XE event's own @timestamp, like the other XE tables.
+       17 since #5632: query_store_forced_plans.last_execution_time and .last_compile_start_time are read as Utc off their own
+       AT TIME ZONE 'UTC' in the collector's SELECT. */
+    private const int TsqlUtcCount = 17;
 
     /// <summary>
     /// The classifier's verdict per column, in the census's own (table, column) ordinal order — the whole
@@ -300,6 +305,7 @@ public sealed class ConsumedTimestampFrameDisciplineTests
         "ag_database_replica_states.last_received_time=ServerLocal",
         "ag_database_replica_states.last_redone_time=ServerLocal",
         "agent_status.next_scheduled_run=ServerLocal",
+        "attention_events.event_time=Utc",
         "blocked_process_reports.event_time=Utc",
         "cpu_utilization_stats.sample_time=ServerLocal",
         /* V134 (#3653 item 13): the same instant in UTC beside the local stamp, derived by the same DATEADD
@@ -310,7 +316,9 @@ public sealed class ConsumedTimestampFrameDisciplineTests
         "default_trace_events.end_time=ServerLocal",
         "default_trace_events.event_time=ServerLocal",
         "dmv_blocking_snapshots.blocked_last_tran_started=ServerLocal",
+        "dmv_blocking_snapshots.blocking_last_request_end_time=ServerLocal",
         "dmv_blocking_snapshots.blocking_last_tran_started=ServerLocal",
+        "dmv_blocking_snapshots.blocking_login_time=ServerLocal",
         "index_object_stats.last_user_lookup=ServerLocal",
         "index_object_stats.last_user_scan=ServerLocal",
         "index_object_stats.last_user_seek=ServerLocal",
@@ -339,6 +347,8 @@ public sealed class ConsumedTimestampFrameDisciplineTests
         "query_snapshots.tran_start_time=ServerLocal",
         "query_stats.creation_time=ServerLocal",
         "query_stats.last_execution_time=ServerLocal",
+        "query_store_forced_plans.last_compile_start_time=Utc",
+        "query_store_forced_plans.last_execution_time=Utc",
         "query_store_stats.interval_end_time_utc=Utc",
         "query_store_stats.interval_start_time_utc=Utc",
         "running_jobs.start_time=ServerLocal",
@@ -832,6 +842,10 @@ public sealed class ConsumedTimestampFrameDisciplineTests
         ("FormatServerTime", ClockFrame.Utc),
         ("FormatStoredUtc", ClockFrame.Utc),
         ("FormatServerClock", ClockFrame.ServerLocal),
+        /* #6010: Lite's investigation evidence capture renders an instant into a frozen section as
+           yyyy-MM-ddTHH:mm:ssZ, so it is a UTC renderer: it states Z and does no conversion. The columns it is handed
+           are deadlocks.deadlock_time and blocked_process_reports.event_time, both naive UTC. */
+        ("Value", ClockFrame.Utc),
     ];
 
     /// <summary>
@@ -936,6 +950,10 @@ public sealed class ConsumedTimestampFrameDisciplineTests
             "blocked_last_batch_completed", "blocked_process_reports", 1, "get_blocking; de-skewed at the read by #3206"),
         (SiteLabel.DeSkewedAtRead, "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingMcpBlockingTools.cs",
             "blocking_last_batch_completed", "blocked_process_reports", 1, "get_blocking; de-skewed at the read by #3206"),
+        (SiteLabel.DeSkewedAtRead, "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingMcpBlockingTools.cs",
+            "blocking_login_time", "dmv_blocking_snapshots", 1, "get_blocking (#5632); de-skewed at the read"),
+        (SiteLabel.DeSkewedAtRead, "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingMcpBlockingTools.cs",
+            "blocking_last_request_end_time", "dmv_blocking_snapshots", 1, "get_blocking (#5632); de-skewed at the read"),
         (SiteLabel.DeSkewedAtRead, "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingMcpJobTools.cs",
             "start_time", "running_jobs", 1,
             "get_running_jobs; captured_at (collection_time before #3653) in the same object is UTC, so a job started seconds ago "
@@ -972,6 +990,10 @@ public sealed class ConsumedTimestampFrameDisciplineTests
             "blocked_last_batch_completed", "blocked_process_reports", 1, "Lite get_blocking; de-skewed at the read by #3206"),
         (SiteLabel.DeSkewedAtRead, "Lite/Mcp/McpBlockingTools.cs",
             "blocking_last_batch_completed", "blocked_process_reports", 1, "Lite get_blocking; de-skewed at the read by #3206"),
+        (SiteLabel.DeSkewedAtRead, "Lite/Mcp/McpBlockingTools.cs",
+            "blocking_login_time", "dmv_blocking_snapshots", 1, "Lite get_blocking (#5632); de-skewed at the read"),
+        (SiteLabel.DeSkewedAtRead, "Lite/Mcp/McpBlockingTools.cs",
+            "blocking_last_request_end_time", "dmv_blocking_snapshots", 1, "Lite get_blocking (#5632); de-skewed at the read"),
         (SiteLabel.DeSkewedAtRead, "Lite/Mcp/McpJobTools.cs", "start_time", "running_jobs", 1,
             "Lite get_running_jobs; de-skewed at the read by #3206"),
         (SiteLabel.McpPayloadUnmarked, "Lite/Mcp/McpPlanCacheSchedulerTools.cs", "oldest_plan_create_time",
@@ -1036,7 +1058,7 @@ public sealed class ConsumedTimestampFrameDisciplineTests
        TrendPayloads.CpuUtilization builder. */
     private const int McpPayloadUnmarkedSites = 1;
     private const int DesktopRenderMismatchSites = 0;
-    private const int DeSkewedAtReadSites = 27;
+    private const int DeSkewedAtReadSites = 31;
 
     /* ═══════════════════════ 5. resolving which table a site's column came from ═══════════════════════ */
 
@@ -1058,7 +1080,7 @@ public sealed class ConsumedTimestampFrameDisciplineTests
             .ToDictionary(m => "StoredEventCopies." + m.Groups[1].Value + "(", m => m.Groups[2].Value, StringComparer.Ordinal));
 
     /// <summary>
-    /// Row-type files carry no SQL, so the table comes from the enclosing type instead. Three entries, each
+    /// Row-type files carry no SQL, so the table comes from the enclosing type instead. Four entries, each
     /// asserted present in the file it names by
     /// <see cref="RowTypeTables_AreDeclaredAgainstTypesThatExist"/>. This exists because
     /// <c>ViewerHistoryRows.cs</c> holds all three history row types side by side and the frame differs
@@ -1069,12 +1091,17 @@ public sealed class ConsumedTimestampFrameDisciplineTests
         ("ViewerQueryStatsHistoryRow", "query_stats"),
         ("ViewerProcedureStatsHistoryRow", "procedure_stats"),
         ("ViewerQueryStoreHistoryRow", "query_store_stats"),
+        /* #5506: the regressions row's SQL moved to Storage (QueryStoreRegressionBaseline), so its file names no table.
+           last_execution_time is query_store_stats' on the raw arm, and the same value copied into the wide table on the
+           wide arm: naive UTC either way. */
+        ("ViewerQueryStoreRegressionRow", "query_store_stats"),
     ];
 
     [Fact]
     public void RowTypeTables_AreDeclaredAgainstTypesThatExist()
     {
-        var rows = File.ReadAllText(RepoPath("Darling/PerformanceMonitor.Darling.Viewer/ViewerHistoryRows.cs"));
+        var rows = File.ReadAllText(RepoPath("Darling/PerformanceMonitor.Darling.Viewer/ViewerHistoryRows.cs"))
+            + File.ReadAllText(RepoPath("Darling/PerformanceMonitor.Darling.Viewer/ViewerDataService.QueryStoreRegressions.cs"));
         var tables = TimestampColumns().Select(c => c.Table).ToHashSet(StringComparer.Ordinal);
 
         foreach (var (rowType, table) in RowTypeTables)
@@ -1336,7 +1363,7 @@ public sealed class ConsumedTimestampFrameDisciplineTests
         ("Lite/Mcp/McpHealthParserTools.cs", "event_time", 9),
         ("Lite/Mcp/McpLongQueryTools.cs", "event_time", 1),
         ("Lite/Mcp/McpMemoryTools.cs", "sample_time", 1),
-        ("Lite/Mcp/McpQueryTools.cs", "last_execution_time", 2),
+        ("Lite/Mcp/McpQueryTools.cs", "last_execution_time", 1),
     ];
 
     /// <summary>Payload field names that carry a ServerLocal frame: the ServerLocal census columns, plus
@@ -1863,6 +1890,10 @@ public sealed class ConsumedTimestampFrameDisciplineTests
                 "BlockedLastBatchCompletedUtc = DarlingServerClockReader.ToUtc(clock, reader, 29),"),
             ("blocking_last_batch_completed", "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingBlockingReader.cs",
                 "BlockingLastBatchCompletedUtc = DarlingServerClockReader.ToUtc(clock, reader, 30),"),
+            ("blocking_login_time", "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingBlockingReader.cs",
+                "BlockingLoginTimeUtc = DarlingServerClockReader.ToUtc(clock, reader, 20),"),
+            ("blocking_last_request_end_time", "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingBlockingReader.cs",
+                "BlockingLastRequestEndTimeUtc = DarlingServerClockReader.ToUtc(clock, reader, 21),"),
             ("start_time", "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingJobReader.cs",
                 "clock.ToUtc(reader.GetDateTime(4))"),
             ("last_user_access", "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingObjectStatsReader.cs",
@@ -1879,6 +1910,10 @@ public sealed class ConsumedTimestampFrameDisciplineTests
                 "DateTime? Time(int i) => DarlingServerClockReader.ToUtc(clock, reader, first + i);"),
             ("cached_time", "Darling/PerformanceMonitor.Darling.Service/Mcp/DarlingDataReader.cs",
                 "DateTime? Time(int i) => DarlingServerClockReader.ToUtc(clock, reader, first + i);"),
+            ("blocking_login_time", "Lite/Mcp/McpBlockingTools.cs",
+                "UtcOrNull(r.BlockingLoginTime)"),
+            ("blocking_last_request_end_time", "Lite/Mcp/McpBlockingTools.cs",
+                "UtcOrNull(r.BlockingLastRequestEndTime)"),
             ("blocked_last_tran_started", "Lite/Mcp/McpBlockingTools.cs",
                 "UtcOrNull(r.BlockedLastTranStarted)"),
             ("blocking_last_tran_started", "Lite/Mcp/McpBlockingTools.cs",
@@ -2105,7 +2140,7 @@ public sealed class ConsumedTimestampFrameDisciplineTests
            take naive UTC and exactly ONE takes the server's own clock — asserted as a count rather than
            left as a comment, because the defect class IS a value reaching the renderer for the other
            frame, and a second server-local renderer appearing unnoticed would split that side. */
-        Assert.Equal(5, Renderers.Length);
+        Assert.Equal(6, Renderers.Length);
         Assert.Equal(2, Renderers.Select(r => r.Expects).Distinct().Count());
         Assert.Equal(ClockFrame.ServerLocal, Renderers.Single(r => r.Renderer == "FormatServerClock").Expects);
         Assert.Equal(ClockFrame.Utc, Renderers.Single(r => r.Renderer == "FormatServerTime").Expects);

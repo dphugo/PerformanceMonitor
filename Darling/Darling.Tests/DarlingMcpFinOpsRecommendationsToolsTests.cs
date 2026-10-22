@@ -15,6 +15,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using ModelContextProtocol.Server;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Service.Mcp;
@@ -27,6 +28,7 @@ namespace Darling.Tests;
 /// Pins for <c>get_finops_recommendations</c> that need no store: the tool surface, the row and envelope shape on
 /// hand-built records, and the culture pin.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpFinOpsRecommendationsToolsTests
 {
     private static FinOpsRecommendation Rec(decimal? savings, string category = "Hardware") =>
@@ -48,9 +50,12 @@ public sealed class DarlingMcpFinOpsRecommendationsToolsTests
         Assert.Equal(typeof(Task<string>), method.ReturnType);
 
         var parameters = method.GetParameters();
-        Assert.Equal(new[] { "postgres", "server_name", "cancellationToken" }, parameters.Select(p => p.Name).ToArray());
+        /* #5633 review: the host's logger is a DI seat (no Description, so a client never sees or sends it), the same seat
+           get_wait_stats has; it carries CurrentDatabaseScope's fail-open warning. The client-visible surface is still server_name. */
+        Assert.Equal(new[] { "postgres", "server_name", "logger", "cancellationToken" }, parameters.Select(p => p.Name).ToArray());
         Assert.Equal(typeof(NpgsqlDataSource), parameters[0].ParameterType);
-        Assert.Equal(typeof(CancellationToken), parameters[2].ParameterType);
+        Assert.Equal(typeof(ILogger), parameters[2].ParameterType);
+        Assert.Equal(typeof(CancellationToken), parameters[3].ParameterType);
         Assert.True(parameters[1].HasDefaultValue);
         Assert.Null(parameters[1].DefaultValue);
         Assert.Equal(new[] { "server_name" }, parameters.Where(p => p.GetCustomAttribute<DescriptionAttribute>() is not null).Select(p => p.Name).ToArray());

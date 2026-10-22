@@ -99,6 +99,16 @@ public sealed class DarlingConfig
     public int QueryStoreTextBudgetMb { get; set; } = 64;
 
     /// <summary>
+    /// #6211: how many plans per database-hour, on each of seven metrics (CPU, duration, physical reads, writes, memory grant, tempdb,
+    /// executions), the Query Store collector fetches the statement text and plan XML of. Forced plans, the other plans of a query with a
+    /// forced plan, and plans named by plan correction are fetched whatever their rank. The rest keep their runtime statistics and are fetched
+    /// by a later run if they rank then. Seeds <c>config_service.query_store_fetch_top_n</c> (V209) on a fresh store; the store wins after
+    /// that, and a change there reaches the next cycle with no restart. Default 100. 0 or less fetches every new plan (the behaviour before this).
+    /// </summary>
+    [JsonPropertyName("queryStoreFetchTopN")]
+    public int QueryStoreFetchTopN { get; set; } = 100;
+
+    /// <summary>
     /// #2316: how many days a stored plan XML outlives its last sighting before the dimension GC may
     /// take it — the bound the fact-coupled horizon cannot provide on a store younger than the fact
     /// retention (measured: 127 GB of parameter-sniffing plan churn in the dim's first 22 days, with
@@ -373,14 +383,34 @@ public sealed class DarlingConfig
 
     private HeartbeatConfig _heartbeat = new();
 
-    public static string ResolveConfigPath(string? explicitPath = null)
+    /// <summary>
+    /// Read admission (#5506): how many long reads the MCP and web hosts run at once. File-only, like <see cref="Peers"/>;
+    /// see <see cref="ReadsConfig"/>. Omit it for the default.
+    /// </summary>
+    [JsonPropertyName("reads")]
+    public ReadsConfig Reads
+    {
+        get => _reads;
+
+        /* "reads": null means the defaults, the same as an absent block (the #5460 heartbeat rule). */
+        set => _reads = value ?? new();
+    }
+
+    private ReadsConfig _reads = new();
+
+    public static string ResolveConfigPath(string? explicitPath = null) =>
+        ResolveConfigPath(explicitPath, Environment.GetEnvironmentVariable);
+
+    /// <summary><see cref="ResolveConfigPath(string?)"/> reading the environment through <paramref name="environment"/>, so a
+    /// test can supply <c>DARLING_CONFIG</c> without setting it for the whole process.</summary>
+    internal static string ResolveConfigPath(string? explicitPath, Func<string, string?> environment)
     {
         if (!string.IsNullOrWhiteSpace(explicitPath))
         {
             return explicitPath;
         }
 
-        var fromEnvironment = Environment.GetEnvironmentVariable("DARLING_CONFIG");
+        var fromEnvironment = environment("DARLING_CONFIG");
         if (!string.IsNullOrWhiteSpace(fromEnvironment))
         {
             return fromEnvironment;
@@ -410,9 +440,19 @@ public sealed class DarlingConfig
                 $"Configuration file not found: {path}. Copy darling.sample.json to darling.json and edit it.", path);
         }
 
-        var loaded = Parse(File.ReadAllText(path));
-        DarlingOwnedSecrets.Set(DarlingOwnedSecrets.Compute(loaded, path));
-        return loaded;
+        try
+        {
+            var loaded = Parse(File.ReadAllText(path));
+            DarlingOwnedSecrets.Set(DarlingOwnedSecrets.Compute(loaded, path));
+            return loaded;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            /* The file is restricted on purpose (it holds every stored secret), so a refusal is the expected
+               first experience of a new operator: say which group to join instead of a bare access error. */
+            throw new UnauthorizedAccessException($"{DarlingOperatorGroup.AccessDeniedAdvice(path)} ({ex.Message})", ex);
+        }
+
     }
 
     public static DarlingConfig Parse(string json)
@@ -439,6 +479,7 @@ public sealed class DarlingConfig
 
             server.EncryptedPasswordDeclaredByFile = DarlingSecrets.DeclaresSecretText(server.EncryptedPassword);
             server.RemediationEncryptedPasswordDeclaredByFile = DarlingSecrets.DeclaresSecretText(server.RemediationEncryptedPassword);
+            server.HypotheticalIndexEncryptedPasswordDeclaredByFile = DarlingSecrets.DeclaresSecretText(server.HypotheticalIndexEncryptedPassword);
         }
 
         if (config.Smtp is not null)
@@ -782,6 +823,51 @@ public sealed class AlertsConfig
     [JsonPropertyName("poisonWaitThresholdMs")]
     public int PoisonWaitThresholdMs { get; set; } = 500;
 
+    /// <summary>The Runnable Queue alert (#5641) switch: runnable tasks per visible online scheduler, averaged over
+    /// <see cref="RunnableQueueEvaluator.WindowMinutes"/> minutes. ON by default, like Poison Wait. Persisted as the
+    /// store column <c>runnable_queue_enabled</c> (V177).</summary>
+    [JsonPropertyName("runnableQueueEnabled")]
+    public bool RunnableQueueEnabled { get; set; } = true;
+
+    /// <summary>Runnable Queue Warning bar (#5641), runnable tasks per scheduler, window average. Shipped 8 (the
+    /// measurement is on <see cref="RunnableQueueEvaluator"/>). Read through <see cref="RunnableQueueEvaluator.ClampBars"/>.
+    /// Store column <c>runnable_queue_warning_per_scheduler</c> (V177).</summary>
+    [JsonPropertyName("runnableQueueWarningPerScheduler")]
+    public int RunnableQueueWarningPerScheduler { get; set; } = RunnableQueueEvaluator.DefaultWarningPerScheduler;
+
+    /// <summary>Runnable Queue Critical bar (#5641). Shipped 16. Never read below the Warning bar. Store column
+    /// <c>runnable_queue_critical_per_scheduler</c> (V177).</summary>
+    [JsonPropertyName("runnableQueueCriticalPerScheduler")]
+    public int RunnableQueueCriticalPerScheduler { get; set; } = RunnableQueueEvaluator.DefaultCriticalPerScheduler;
+
+    /// <summary>The Client Timeouts alert (#5640) switch: client attentions (a client cancelled or timed out a query) per
+    /// minute, from the attention collector. OFF by default: the bars are a guess until checked against captured data.
+    /// Persisted as the store column <c>client_timeouts_enabled</c> (V179).</summary>
+    [JsonPropertyName("clientTimeoutsEnabled")]
+    public bool ClientTimeoutsEnabled { get; set; }
+
+    /// <summary>Client Timeouts Warning FLOOR (#5640, #5736), attentions per minute over the covered span. Shipped 10. The bar is the higher of this and
+    /// the Warning multiple times the server's own baseline. Read through
+    /// <see cref="AttentionEvaluator.ClampBars"/>. Store column <c>client_timeouts_warning_per_minute</c> (V179).</summary>
+    [JsonPropertyName("clientTimeoutsWarningPerMinute")]
+    public int ClientTimeoutsWarningPerMinute { get; set; } = AttentionEvaluator.DefaultWarningPerMinute;
+
+    /// <summary>Client Timeouts Critical FLOOR (#5640, #5736). Shipped 60. Never read below the Warning floor. Store column
+    /// <c>client_timeouts_critical_per_minute</c> (V179).</summary>
+    [JsonPropertyName("clientTimeoutsCriticalPerMinute")]
+    public int ClientTimeoutsCriticalPerMinute { get; set; } = AttentionEvaluator.DefaultCriticalPerMinute;
+
+    /// <summary>Client Timeouts Warning multiple (#5736). The Warning bar is the higher of <see cref="ClientTimeoutsWarningPerMinute"/> (the floor) and
+    /// this many times the server's own baseline, the p99.9 of its 3-minute average attention rate over the last 7 days. Shipped 3. Store column
+    /// <c>client_timeouts_warning_multiple</c> (V211).</summary>
+    [JsonPropertyName("clientTimeoutsWarningMultiple")]
+    public int ClientTimeoutsWarningMultiple { get; set; } = AttentionBaselineMath.DefaultWarningMultiple;
+
+    /// <summary>Client Timeouts Critical multiple (#5736). Shipped 10. Never read below the Warning multiple. Store column
+    /// <c>client_timeouts_critical_multiple</c> (V211).</summary>
+    [JsonPropertyName("clientTimeoutsCriticalMultiple")]
+    public int ClientTimeoutsCriticalMultiple { get; set; } = AttentionBaselineMath.DefaultCriticalMultiple;
+
     [JsonPropertyName("longRunningQueryEnabled")]
     public bool LongRunningQueryEnabled { get; set; } = true;
 
@@ -984,6 +1070,13 @@ public sealed class AlertsConfig
     /// <summary>Databases excluded from blocking/deadlock/long-running-query alert evaluation.</summary>
     [JsonPropertyName("excludedDatabases")]
     public List<string> ExcludedDatabases { get; set; } = new();
+
+    /// <summary>Mount points the Volume Free Space alert ignores on every server (#6098), stored in
+    /// <c>config_alert_settings.excluded_volumes</c> (V200) beside <c>excluded_databases</c>, and the store row wins
+    /// over this file after the first seed. Matched by <see cref="PerformanceMonitor.Alerting.VolumeExclusions"/>:
+    /// the whole mount point, case-insensitive, a trailing <c>\</c> or <c>/</c> on either side ignored.</summary>
+    [JsonPropertyName("excludedVolumes")]
+    public List<string> ExcludedVolumes { get; set; } = new();
 
     /// <summary>
     /// How deadlock/blocking alerts are delivered (#1141): <see cref="AlertNotificationMode.Summary"/>
@@ -1280,6 +1373,14 @@ public sealed class SmtpConfig
     /// <summary>Email/webhook channel cooldown between repeated alerts (Lite's default 15).</summary>
     [JsonPropertyName("emailCooldownMinutes")]
     public int EmailCooldownMinutes { get; set; } = 15;
+
+    /// <summary>
+    /// Opt-in (V187, #5825, <c>config_notification.email_send_resolutions</c>): when an alert clears, email the
+    /// resolution to the recipients its fire reached. Off by default. A notification route can override it for its
+    /// own destinations (<see cref="NotificationRouteResolutions"/>).
+    /// </summary>
+    [JsonPropertyName("emailSendResolutions")]
+    public bool SendResolutions { get; set; } = false;
 }
 
 /// <summary>
@@ -1303,6 +1404,57 @@ public sealed class McpConfig
     /// on a seeded store.</summary>
     [JsonPropertyName("port")]
     public int Port { get; set; } = 5152;
+
+    /// <summary>
+    /// Default OFF. Offers the MCP tools that change monitoring configuration (alert settings and routes, mute
+    /// rules, custom alert rules, Custom Views, the analysis mute). File-only and restart-only, like
+    /// <see cref="Network"/>: no store equivalent. Writes are only offered when a bearer token also resolves
+    /// (<see cref="McpNetworkConfig.EncryptedToken"/> or <see cref="McpNetworkConfig.Token"/>), and every
+    /// request must then present it, loopback included. See <c>DarlingMcpWritePolicy</c>.
+    /// </summary>
+    [JsonPropertyName("allowWrites")]
+    public bool AllowWrites { get; set; }
+
+    /// <summary>
+    /// Default OFF. Additionally offers <c>add_servers</c> and <c>remove_server</c>, which change the servers
+    /// this service connects to as its own account. Has no effect unless <see cref="AllowWrites"/> is on.
+    /// </summary>
+    [JsonPropertyName("allowServerAdmin")]
+    public bool AllowServerAdmin { get; set; }
+
+    /// <summary>
+    /// Default OFF (#5632 Phase A, ruling R2). Offers <c>claim_investigation_request</c> and
+    /// <c>submit_investigation_report</c>, which write only investigation state. Served only when a bearer token
+    /// resolves AND <see cref="AllowWrites"/> is off: one token cannot tell an agent from a person, so with both on the
+    /// investigation tools stay off and the start logs one Critical line. File-only and restart-only, like
+    /// <see cref="AllowWrites"/>. The two investigation reads are ordinary reads and need no setting.
+    /// </summary>
+    [JsonPropertyName("allowInvestigations")]
+    public bool AllowInvestigations { get; set; }
+
+    /// <summary>
+    /// Default OFF. <c>add_servers</c> defaults to Windows authentication, where this service presents its own
+    /// computer account to the host the caller names. Off, it refuses a Windows-authentication entry that also
+    /// sets <c>trust_server_certificate</c> or an <c>encrypt_mode</c> other than Mandatory or Strict, because the
+    /// service could not confirm which server it reached. On, it accepts them. SQL authentication and the Entra
+    /// modes are not affected. Applies to the MCP tool only: the <c>--add-server</c> command is the operator's own
+    /// and is not gated. File-only and restart-only, like <see cref="AllowWrites"/>. Has no effect unless
+    /// <see cref="AllowServerAdmin"/> is on, since <c>add_servers</c> is not served otherwise.
+    /// </summary>
+    [JsonPropertyName("allowWindowsAuthOverUnverifiedTls")]
+    public bool AllowWindowsAuthOverUnverifiedTls { get; set; }
+
+    /// <summary>
+    /// How much collected data the MCP tools hand out (#5632): <c>full</c> (the default, everything as read),
+    /// <c>maskLiterals</c> (statement text, error text and plans keep their shape with every literal replaced;
+    /// parameter values replaced) or <c>metadataOnly</c> (statement text, error text, plans, input buffers and
+    /// parameter values withheld; logins and host names masked). Object and database names, counts, durations, waits,
+    /// times and program names are kept at every level. Applied to every tool answer on this listener by
+    /// <c>McpDataDetailFilter</c>, never inside a reader. An unrecognized value runs as <c>metadataOnly</c> and logs one
+    /// warning at start. File-only and restart-only, like <see cref="AllowWrites"/>.
+    /// </summary>
+    [JsonPropertyName("dataDetail")]
+    public string DataDetail { get; set; } = McpDataDetailModes.DefaultValue;
 
     /// <summary>
     /// Opt-in network exposure for the MCP server (darling-network-endpoints). Omit for the secure
@@ -1673,7 +1825,7 @@ public sealed class WebConfig
 /// Omit the whole <c>network</c> object for the secure default = loopback-only HTTP. When present with a
 /// non-loopback <see cref="Listen"/> AND managed mode AND a token AND a valid <see cref="AllowFrom"/>, the web
 /// host binds the network interface behind an in-app CIDR check and a token gate: a browser presents the token
-/// once via <c>?token=</c>, which is exchanged for an HMAC-signed session cookie. While exposed EVERY request
+/// once in the sign-in form, which is exchanged for an HMAC-signed session cookie. While exposed EVERY request
 /// authenticates, loopback included — loopback is exempt from the CIDR test only, never from the credential
 /// (#1649). Any missing precondition keeps the dashboard loopback-only + LogCritical (fail-closed, enforced in
 /// the web host).
@@ -1741,6 +1893,28 @@ public sealed class WebNetworkConfig
     public WebOidcConfig? Oidc { get; set; }
 
     /// <summary>
+    /// The reverse proxies in front of the dashboard whose <c>X-Forwarded-For</c> / <c>X-Forwarded-Proto</c> /
+    /// <c>X-Forwarded-Host</c> headers the host honors — each entry an IP or a CIDR. Omit (the default) and
+    /// the headers are ignored from every source. Needed behind a TLS-terminating proxy: the connection to
+    /// this host is plain HTTP there, so without it the session cookie is not marked Secure and the OIDC
+    /// redirect URI is built as <c>http://</c>. With it, <see cref="AllowFrom"/> is checked against the
+    /// forwarded client address rather than the proxy's, so it has to cover the clients. Parsed by
+    /// <c>DarlingHostBinding.TryParseTrustedProxies</c>; an entry that does not parse keeps the dashboard
+    /// loopback-only with a Critical line.
+    /// </summary>
+    [JsonPropertyName("trustedProxies")]
+    public string[]? TrustedProxies { get; set; }
+
+    /// <summary>
+    /// True to send <c>Strict-Transport-Security</c> (one year, no subdomains) on every response to an HTTPS
+    /// request. Off by default: a browser that has seen it uses HTTPS for every port of this host name for a
+    /// year and cannot be told otherwise, including for other services on that name that speak plain HTTP.
+    /// Turn it on once the dashboard is reached over HTTPS only.
+    /// </summary>
+    [JsonPropertyName("hsts")]
+    public bool Hsts { get; set; }
+
+    /// <summary>
     /// True when any field is set — used only for the BYO "network.* is ignored" caller warning (D-BYO);
     /// NOT the same as "exposed".
     /// </summary>
@@ -1751,7 +1925,8 @@ public sealed class WebNetworkConfig
         || !string.IsNullOrWhiteSpace(EncryptedToken)
         || !string.IsNullOrWhiteSpace(Token)
         || (Tls?.IsConfigured ?? false)
-        || (Oidc?.IsConfigured ?? false);
+        || (Oidc?.IsConfigured ?? false)
+        || (TrustedProxies?.Length ?? 0) > 0;
 
     /// <summary>
     /// The access token, preferring <see cref="EncryptedToken"/> (DPAPI-decrypted; Windows-only) over the
@@ -2098,8 +2273,10 @@ public static class DarlingNetwork
     /// read-only <c>viewer</c> ones — which the roles have always supported and the single generated
     /// <c>hostssl</c> line did not.
     ///
-    /// <para>Accepts <c>"admin"</c>, <c>"viewer"</c>, or both in one string separated by a comma, a plus or
-    /// whitespace (<c>"admin,viewer"</c>, <c>"admin+viewer"</c>). A JSON array would be the tidier surface
+    /// <para>Accepts <c>"admin"</c>, <c>"viewer"</c> and <c>"sources"</c> (#5654: every external alert source login, through
+    /// the <c>darling_alert_sources</c> group), alone or several in one string separated by a comma, a plus or
+    /// whitespace (<c>"admin,viewer"</c>, <c>"viewer+sources"</c>). <c>sources</c> is a token, not a role name: the pg_hba
+    /// line writes it as <c>+darling_alert_sources</c> (<c>DarlingManagedPostgres.PgHbaRoleField</c>). A JSON array would be the tidier surface
     /// and is not worth a breaking change to a field that has shipped: everything already written stays
     /// valid, and a list is expressible without it.</para>
     ///
@@ -2139,7 +2316,7 @@ public static class DarlingNetwork
         {
             var normalized = part.ToLowerInvariant();
 
-            if (normalized is not ("viewer" or "admin"))
+            if (normalized is not ("viewer" or "admin" or "sources"))
             {
                 return null;
             }
@@ -2152,7 +2329,7 @@ public static class DarlingNetwork
 
         /* Stable order regardless of how it was written, so the generated pg_hba block is identical for
            "admin,viewer" and "viewer,admin" — otherwise the reconciler rewrites the file and reloads the
-           server every time somebody reorders the field. */
+           server every time somebody reorders the field. Ordinal order: admin, sources, viewer. */
         seen.Sort(StringComparer.Ordinal);
         return seen;
     }
@@ -2188,12 +2365,21 @@ public sealed class WebhooksConfig
     [JsonPropertyName("genericHeaders")]
     public string GenericHeaders { get; set; } = "";
 
-    /// <summary>The JSON body, with <c>{{metric}}</c>/<c>{{server}}</c>/… placeholders; empty uses the shared default.</summary>
+    /// <summary>The JSON body, with <c>{{metric}}</c>/<c>{{server}}</c>/… placeholders; empty uses the shared default.
+    /// <c>{{investigation_json}}</c> (#5821) is the investigation request the alert opened or joined, empty when it opened none.</summary>
     [JsonPropertyName("genericBodyTemplate")]
     public string GenericBodyTemplate { get; set; } = "";
 
     [JsonPropertyName("genericProxy")]
     public string GenericProxy { get; set; } = "";
+
+    /// <summary>
+    /// The generic URL's signing keys (#5998, V193 <c>signing_key</c>, <c>previous_signing_key</c> and
+    /// <c>previous_signing_key_until</c>): sealed as the store holds them, opened by <see cref="DarlingWebhookSecrets.Open"/>.
+    /// Store only: Darling generates the key, so darling.json never carries one and this is never written to JSON.
+    /// </summary>
+    [JsonIgnore]
+    public WebhookSigningKeys? GenericSigning { get; set; }
 
     /* PagerDuty webhook — Events API v2. The routing key is a bearer-secret-like opaque token (comparable
        to the Teams/Slack/Generic webhook URLs), so it is stored as a plaintext column in Postgres with a
@@ -2218,6 +2404,22 @@ public sealed class WebhooksConfig
     /// </summary>
     [JsonPropertyName("pagerDutyAutoResolve")]
     public bool PagerDutyAutoResolve { get; set; } = false;
+
+    /* V187 (#5825): send an alert's resolution to the channels its fire reached, one opt-in per channel, all off by
+       default. Stored on the singleton notification row beside the destinations they govern. A route can override
+       each for its own destinations; NotificationRouteResolutions holds that rule. */
+
+    /// <summary>Send resolutions to Slack (<c>config_notification.slack_send_resolutions</c>).</summary>
+    [JsonPropertyName("slackSendResolutions")]
+    public bool SlackSendResolutions { get; set; } = false;
+
+    /// <summary>Send resolutions to Teams (<c>config_notification.teams_send_resolutions</c>).</summary>
+    [JsonPropertyName("teamsSendResolutions")]
+    public bool TeamsSendResolutions { get; set; } = false;
+
+    /// <summary>Send resolutions to the generic webhook (<c>config_notification.generic_send_resolutions</c>).</summary>
+    [JsonPropertyName("genericSendResolutions")]
+    public bool GenericSendResolutions { get; set; } = false;
 }
 
 public sealed class MonitoredServer
@@ -2280,6 +2482,17 @@ public sealed class MonitoredServer
     [JsonPropertyName("multiSubnetFailover")]
     public bool MultiSubnetFailover { get; set; }
 
+    /// <summary>
+    /// #6254: where Query Store is read from instead of this server, a host (<c>host,port</c> allowed) or an availability group
+    /// listener name. Empty, the default, reads it from the server itself. SQL Server only; the replica connection is
+    /// <see cref="MonitoredServerConnection.BuildQueryStoreReplicaConnectionString"/>. It is
+    /// the last field of <see cref="ConnectionIdentity"/>: a change of it is a change of how the server is reached, and it is bound
+    /// into a sealed password (<see cref="SecretBinding"/>) only when it is set, so a change of it needs the password again and no
+    /// stored password is sent to a replica host nobody entered it for.
+    /// </summary>
+    [JsonPropertyName("queryStoreReplica")]
+    public string? QueryStoreReplica { get; set; }
+
     [JsonPropertyName("excludedDatabases")]
     public List<string> ExcludedDatabases { get; set; } = new();
 
@@ -2339,11 +2552,7 @@ public sealed class MonitoredServer
     /// immediately anyway — the SQL Server detection query fails against a Postgres target.
     /// </summary>
     [JsonIgnore]
-    public CollectorTargetEngine TargetEngine => Engine?.Trim().ToLowerInvariant() switch
-    {
-        "postgres" or "postgresql" or "pg" or "aurora-postgresql" or "aurora" => CollectorTargetEngine.PostgreSql,
-        _ => CollectorTargetEngine.SqlServer,
-    };
+    public CollectorTargetEngine TargetEngine => MonitoredEngineKind.ParseConfiguredEngine(Engine);
 
     /// <summary>True when this entry targets PostgreSQL, so the SQL Server-only config is inapplicable.</summary>
     [JsonIgnore]
@@ -2415,22 +2624,58 @@ public sealed class MonitoredServer
     /// <para><b>Settable from the file</b>, unlike <see cref="PlanForceBotEnabled"/> — and the difference is
     /// deliberate. That flag is an ARM STATE, so a file knob would be a silent no-op on a seeded box
     /// (#2254). This is a CREDENTIAL, and the container/compose deploy has no viewer to type one into; the
-    /// <c>env:</c>/<c>file:</c> reference path is the only way to arm a Linux install at all. It is still
-    /// only read at seed time like every other credential field here.</para>
+    /// <c>env:</c>/<c>file:</c> reference path is the only way to arm a Linux install at all. Unlike every other
+    /// per-server field here it is NOT only a seed value (#6262): when BOTH keys are present,
+    /// <c>StoreConfigProvider.SyncRemediationLoginsAsync</c> sets or replaces the registered server's login on every start, only on the
+    /// server that pairs with this entry and connects the same way. Absent keys never clear it, and one key alone changes nothing (it is
+    /// logged): removing the keys disarms nothing. To stop agent actions on a server, turn off its action switches, or turn off agent
+    /// changes service-wide; the switches cover agent actions only, not operator remediation from the Viewer. To remove a server's
+    /// remediation login entirely, so neither agents nor operators can use it, take both keys out of the file and run, as the store owner,
+    /// <c>UPDATE config_monitored_servers SET remediation_username = NULL, remediation_encrypted_password = NULL,
+    /// modified_at = now() AT TIME ZONE 'UTC' WHERE name = 'alpha-sql-01'</c>. Services that share one
+    /// store should declare the same logins, because each copies its own file on start.</para>
     /// </summary>
     [JsonPropertyName("remediationUsername")]
     public string? RemediationUsername { get; set; }
 
     /// <summary>
-    /// The remediation credential's DPAPI-LocalMachine blob, base64 — produced by the same
-    /// <c>--encrypt-password</c> as <see cref="EncryptedPassword"/>, and resolvable as an
-    /// <c>env:</c>/<c>file:</c> reference by the same <c>DarlingSecretSource</c>. There is deliberately no
+    /// The remediation credential's secret: an <c>env:</c>/<c>file:</c> reference (resolved by the same
+    /// <c>DarlingSecretSource</c>; a Level 3 server action, #5632, refuses any other form as <c>credential_not_reference</c>) or a DPAPI-LocalMachine blob, base64, produced by the same
+    /// <c>--encrypt-password</c> as <see cref="EncryptedPassword"/>. Only a reference works for every action (#6262), and a plain password (none of a reference, a sealed value or a DPAPI blob) is not copied into the store:
+    /// a blob opens for operator remediation (#2138), but the agent server actions (plan force, plan eviction, session
+    /// kill) accept only a reference and <c>--validate-config</c> and the service warn about a blob. There is deliberately no
     /// plaintext sibling of this one (no counterpart to <see cref="Password"/>): the dev-convenience
     /// plaintext slot exists because a wrong monitoring password fails a read, and a wrong remediation
     /// password fails a write to a production server.
     /// </summary>
     [JsonPropertyName("remediationEncryptedPassword")]
     public string? RemediationEncryptedPassword { get; set; }
+
+    /// <summary>
+    /// The login the PostgreSQL hypothetical-index check runs under (<c>config_monitored_servers.hypothetical_index_username</c>, #6170),
+    /// a third identity beside the monitoring login and the remediation login, set up the way the remediation login is.
+    ///
+    /// <para>The check plans statements taken from <c>pg_stat_statements</c>, and planning can evaluate a function a
+    /// database role created when its arguments are constants, under the roles of the login that plans. So the check never runs under the
+    /// monitoring login, which usually holds <c>pg_monitor</c> or <c>pg_read_all_stats</c>. It runs under this login, which needs only
+    /// CONNECT, USAGE on the schemas and SELECT on the tables of the statements to test. Null here means the check is refused on this
+    /// server with a message that says what to set up. There is no fallback.</para>
+    ///
+    /// <para>Presence is the auth mode: always SQL auth. Read at seed time, and (#6262) when BOTH keys are in the file they are also applied
+    /// to the registered server on every start (<c>StoreConfigProvider.SyncHypotheticalIndexLoginsAsync</c>): set, or replaced, only on
+    /// the server that pairs with this entry and connects the same way. The file never clears the slot (the same rule as the remediation
+    /// login), because an owner's UPDATE on the store row is a documented way to set it too; only an <c>env:</c> or <c>file:</c>
+    /// reference is written.</para>
+    /// </summary>
+    [JsonPropertyName("hypotheticalIndexUsername")]
+    public string? HypotheticalIndexUsername { get; set; }
+
+    /// <summary>
+    /// The password of <see cref="HypotheticalIndexUsername"/> as an <c>env:NAME</c> or <c>file:path</c> reference, read on the Darling
+    /// host when the check runs. Only a reference is accepted: a stored password is refused, as it is for the remediation login.
+    /// </summary>
+    [JsonPropertyName("hypotheticalIndexEncryptedPassword")]
+    public string? HypotheticalIndexEncryptedPassword { get; set; }
 
     /// <summary>
     /// The AWS IAM role Darling assumes to reach this Amazon RDS or Aurora target (#5452), as a role ARN such as
@@ -2497,6 +2742,10 @@ public sealed class MonitoredServer
     [JsonIgnore]
     internal bool RemediationEncryptedPasswordDeclaredByFile { get; set; }
 
+    /// <summary><see cref="EncryptedPasswordDeclaredByFile"/> for <see cref="HypotheticalIndexEncryptedPassword"/> (#6170).</summary>
+    [JsonIgnore]
+    internal bool HypotheticalIndexEncryptedPasswordDeclaredByFile { get; set; }
+
     /// <summary>
     /// The connection as the store row holds it, read once by <see cref="ServerConnectionIdentity.FromStoredColumns"/> from the raw
     /// columns (null text and a null port are not defaulted any further). Null for an entry read from darling.json, whose
@@ -2519,7 +2768,8 @@ public sealed class MonitoredServer
     /// </summary>
     [JsonIgnore]
     internal ServerConnectionIdentity ConnectionIdentity => StoredIdentity ?? ServerConnectionIdentity.FromStoredColumns(
-        Host, Port, Engine, Database, ReadOnlyIntent, Auth, Username, EncryptMode, TrustServerCertificate, MultiSubnetFailover);
+        Host, Port, Engine, Database, ReadOnlyIntent, Auth, Username, EncryptMode, TrustServerCertificate, MultiSubnetFailover,
+        QueryStoreReplica);
 
     /// <summary>The binding a sealed <c>encryptedPassword</c> must have been sealed for.</summary>
     [JsonIgnore]
@@ -2758,4 +3008,17 @@ public sealed class PeerStoreConfig
     /// </summary>
     [JsonPropertyName("matches")]
     public List<string> Matches { get; set; } = new();
+}
+
+/// <summary>
+/// Read admission (#5506). A read whose route took 2 seconds or more at its window size is a long read; at most
+/// <see cref="MaxHeavyReads"/> of them run at once, up to 16 more wait for up to 45 seconds, and past that a read is
+/// refused as busy. Short reads never wait. The limit is per service process: the MCP and web hosts share it, and the
+/// WPF viewer, which reads the store directly, is not counted. File-only; read when each host starts.
+/// </summary>
+public sealed class ReadsConfig
+{
+    /// <summary>How many long reads run at once (default 2). 0 turns the limit off.</summary>
+    [JsonPropertyName("maxHeavyReads")]
+    public int MaxHeavyReads { get; set; } = ReadAdmission.DefaultMaxHeavyReads;
 }

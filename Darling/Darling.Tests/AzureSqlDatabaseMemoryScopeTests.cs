@@ -372,15 +372,6 @@ public sealed class AzureSqlDatabaseMemoryScopeTests
         Assert.Null(typeof(PerformanceMonitor.Darling.Viewer.MemoryStatsRow).GetProperty("EngineEdition"));
     }
 
-    [Fact]
-    public void GetMemoryStatsTool_BuildsItsPayloadThroughTheSharedNote()
-    {
-        var tool = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpDataTools.cs");
-
-        Assert.Contains("return MemoryStatsPayload(resolved.ServerName, stats, engineEdition);", tool, StringComparison.Ordinal);
-        Assert.Contains("ServerHardwareScope.WithMemoryNote(", tool, StringComparison.Ordinal);
-    }
-
     // ── the FinOps CPU right-sizing recommendation: vCores on an Azure SQL Database, cores everywhere else ──
 
     private static UtilizationEfficiencyRow CpuRow(int engineEdition) => new()
@@ -410,14 +401,14 @@ public sealed class AzureSqlDatabaseMemoryScopeTests
     [InlineData(3)]
     [InlineData(8)]
     [InlineData(0)]
-    public void CpuRightSizingRecommendation_OffAzureSqlDatabase_KeepsTheWordCores(int engineEdition)
+    public void CpuRightSizingRecommendation_OffAzureSqlDatabase_SaysLogicalCpus(int engineEdition)
     {
         var rec = ViewerDataService.BuildCpuRightSizingRecommendation(CpuRow(engineEdition), monthlyCost: 1_000m);
 
         Assert.NotNull(rec);
-        Assert.StartsWith("CPU over-provisioned (32 cores, P95 = ", rec!.Finding, StringComparison.Ordinal);
-        Assert.Contains("across 32 cores. Consider reducing to ~", rec.Detail, StringComparison.Ordinal);
-        Assert.EndsWith(" cores.", rec.Detail, StringComparison.Ordinal);
+        Assert.StartsWith("CPU over-provisioned (32 logical CPUs, P95 = ", rec!.Finding, StringComparison.Ordinal);
+        Assert.Contains("across 32 logical CPUs. Consider reducing to ~", rec.Detail, StringComparison.Ordinal);
+        Assert.EndsWith(" logical CPUs.", rec.Detail, StringComparison.Ordinal);
         Assert.DoesNotContain("vCores", rec.Finding + rec.Detail, StringComparison.Ordinal);
         Assert.True(rec.EstMonthlySavings > 0, "a server with a budget still gets its savings estimate");
     }

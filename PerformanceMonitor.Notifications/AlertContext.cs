@@ -14,6 +14,15 @@ using PerformanceMonitor.Analysis;
 
 namespace PerformanceMonitor.Notifications;
 
+/// <summary>The newest sample behind an alert (#5642): <paramref name="Source"/> is a short label ("CPU",
+/// "Wait stats"), <paramref name="InstantUtc"/> the newest sample's UTC instant, and <paramref name="Age"/>
+/// the gap to the fire time, computed once when the alert fires.</summary>
+public sealed record AlertNewestSample(string Source, DateTime InstantUtc, TimeSpan Age);
+
+/// <summary>Where an external alert came from (#5654): the source's registered name, the alert key it chose, and the
+/// id of the queue row Darling drained, which is how a restart tells whether a claimed row was delivered.</summary>
+public sealed record AlertExternalOrigin(string Source, string Key, long PendingId);
+
 /// <summary>
 /// Optional detail context attached to alert emails.
 /// Populated from blocking/deadlock detail queries at alert time.
@@ -42,6 +51,16 @@ public class AlertContext
     /// <see cref="AttachmentXml"/> stays unpersisted for its own reason (no dialog surface, and size).</para>
     /// </summary>
     public AlertSeverityLevel? SeverityOverride { get; set; }
+
+    /// <summary>
+    /// True when this firing is a tier ESCALATION the engine wants delivered at once (#5641): an open incident that
+    /// was delivered at Warning has just been graded Critical. The email and webhook cooldowns
+    /// (<see cref="IncidentCooldown"/>) and the repeat ceiling (<see cref="RepeatDeliveryBudget"/>) read it and let
+    /// the firing through inside the window; a successful send still stamps the cooldown, so it restarts the
+    /// clock. Set by the engine's <c>TierEscalation</c> helper, for the alerts that opt in (Runnable Queue, Client
+    /// Timeouts, High CPU, Deadlocks Detected, Poison Wait and Volume Free Space). Transient: never persisted (the serializer's projection does not carry it) and never rendered.
+    /// </summary>
+    public bool EscalationBypassesCooldown { get; set; }
 
     /// <summary>
     /// One entry per distinct grouped incident this alert covers (#1140). Carries the stable
@@ -111,6 +130,17 @@ public class AlertContext
     /// exactly the shape consumers can reason about — see the helper for why.
     /// </summary>
     public string? AgReplicaIdentity { get; set; }
+
+    /// <summary>The newest source sample behind this alert (#5642): its source label, its UTC instant, and its
+    /// age computed ONCE at fire time. Null when the alert has no UTC instant to age (a pre-V134 local stamp, a
+    /// live read, or a check not yet wired). Persisted with the alert's context, so the age never drifts at
+    /// render time. The renderers print it as one line per body.</summary>
+    public AlertNewestSample? NewestSample { get; set; }
+
+    /// <summary>The external source, key and queue row this alert came from (#5654), or null on every alert Darling
+    /// raises itself. Darling builds it from the claimed row; the submitting service never supplies context. Persisted
+    /// with the alert's context, which is how the history rows are tied back to the queue row and to a source.</summary>
+    public AlertExternalOrigin? External { get; set; }
 
     /// <summary>
     /// A copy of this context that shares its member objects (#5320): the alert statement filter replaces the
@@ -360,7 +390,24 @@ public record AlertContextDto(
     /* #4223 self-monitor notebook: trailing and nullable like WaitType, so a row written before this
        member existed rehydrates to null ("this row carries no collector name") rather than a fabricated
        value. */
-    string? CollectorName = null);
+    string? CollectorName = null,
+    /* #5642 sample age: trailing and nullable like CollectorName, so a row written before this member
+       existed rehydrates to null ("this row carries no sample age") rather than a fabricated age. */
+    AlertNewestSampleDto? NewestSample = null,
+    /* #5654 external alerts: trailing and nullable like NewestSample, so a row written before this member
+       existed rehydrates to null ("this row came from no external source"). */
+    AlertExternalDto? External = null);
+
+/// <summary>JSON mirror of <see cref="AlertExternalOrigin"/> (#5654). <c>PendingId</c> is the LAST member on purpose:
+/// <see cref="AlertContextSerializer.BuildPendingIdLikePattern"/> anchors on <c>"PendingId":&lt;n&gt;}</c>.</summary>
+public record AlertExternalDto(string Source, string Key, long PendingId);
+
+/// <summary>
+/// JSON mirror of <see cref="AlertNewestSample"/> (#5642): the age rides as whole-and-fractional seconds,
+/// computed ONCE when the alert fired, so the history row, the web pages, the MCP read and the Viewer all say
+/// what the notification said and never re-measure against a later clock.
+/// </summary>
+public record AlertNewestSampleDto(string Source, DateTime InstantUtc, double AgeSeconds);
 
 /// <summary>
 /// The persisted routing DECISION for an analysis finding (#3712): trailing and nullable on
@@ -667,6 +714,45 @@ public static class AlertContextSerializer
         return "%" + likeSafe + "%";
     }
 
+    /// <summary>
+    /// The <c>LIKE</c> pattern (with <c>%</c> wildcards, no escape character needed) that finds the history rows an
+    /// external alert's queue row wrote (#5654): the serialized <c>"PendingId":&lt;n&gt;}</c> that closes the nested
+    /// <c>External</c> object. The closing brace stops <c>12</c> from matching <c>123</c>.
+    /// </summary>
+    public static string BuildPendingIdLikePattern(long pendingId) =>
+        "%\"PendingId\":" + pendingId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}%";
+
+    /// <summary>The external origin a persisted history row carries (#5654), or null when it carries none.</summary>
+    public static AlertExternalOrigin? TryReadExternal(string? contextJson)
+    {
+        if (string.IsNullOrWhiteSpace(contextJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(contextJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object
+                || !document.RootElement.TryGetProperty(nameof(AlertContextDto.External), out var external)
+                || external.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            var dto = external.Deserialize<AlertExternalDto>();
+            return dto is not null && !string.IsNullOrWhiteSpace(dto.Source)
+                ? new AlertExternalOrigin(dto.Source, dto.Key, dto.PendingId)
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The external source name a persisted history row carries (#5654), or null. Reads the one property, like
+    /// <see cref="TryReadNewestSample"/>.</summary>
+    public static string? TryReadExternalSource(string? contextJson) => TryReadExternal(contextJson)?.Source;
+
     public static string Serialize(AlertContext context)
     {
         var dto = new AlertContextDto(
@@ -688,7 +774,13 @@ public static class AlertContextSerializer
             /* #4223: the wait type this firing is about, as structured data. Already the persisted shape. */
             context.WaitType,
             /* #4223: the collector this firing is about, as structured data. Already the persisted shape. */
-            context.CollectorName);
+            context.CollectorName,
+            /* #5642: the newest sample's source, instant and fire-time age. */
+            context.NewestSample is { } sample
+                ? new AlertNewestSampleDto(sample.Source, DateTime.SpecifyKind(sample.InstantUtc, DateTimeKind.Utc), sample.Age.TotalSeconds)
+                : null,
+            /* #5654: the external source, key and queue row. */
+            context.External is { } external ? new AlertExternalDto(external.Source, external.Key, external.PendingId) : null);
         return JsonSerializer.Serialize(dto);
     }
 
@@ -803,6 +895,41 @@ public static class AlertContextSerializer
             }
 
             return route.Deserialize<AlertRouteDto>();
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The newest-sample carrier a persisted alert-history row holds (#5642): the sample's source label, UTC
+    /// instant and the age computed ONCE when the alert fired. <c>null</c> when the row carries none (an alert
+    /// with no UTC sample instant, a row written before the member existed, a resolution row, or unparseable
+    /// JSON). Reads the one property rather than rehydrating the whole context, for the reason
+    /// <see cref="TryReadRoute"/> gives; every surface that shows the age reads it here and never measures it
+    /// again against a later clock.
+    /// </summary>
+    public static AlertNewestSample? TryReadNewestSample(string? contextJson)
+    {
+        if (string.IsNullOrWhiteSpace(contextJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(contextJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object
+                || !document.RootElement.TryGetProperty(nameof(AlertContextDto.NewestSample), out var sample)
+                || sample.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            var dto = sample.Deserialize<AlertNewestSampleDto>();
+            return dto is not null && !string.IsNullOrWhiteSpace(dto.Source)
+                ? new AlertNewestSample(dto.Source, DateTime.SpecifyKind(dto.InstantUtc, DateTimeKind.Utc),
+                    TimeSpan.FromSeconds(Math.Max(0, dto.AgeSeconds)))
+                : null;
         }
         catch (JsonException)
         {
@@ -937,6 +1064,19 @@ public static class AlertContextSerializer
             /* #4223: the collector this firing is about, null on every non-Collector-Cost-Regression alert
                and every row written before this member existed. */
             context.CollectorName = dto.CollectorName;
+
+            /* #5642: the fire-time sample age, null on every alert without a UTC sample instant and every row
+               written before this member existed. */
+            context.NewestSample = dto.NewestSample is { } newest && !string.IsNullOrWhiteSpace(newest.Source)
+                ? new AlertNewestSample(newest.Source, DateTime.SpecifyKind(newest.InstantUtc, DateTimeKind.Utc),
+                    TimeSpan.FromSeconds(Math.Max(0, newest.AgeSeconds)))
+                : null;
+
+            /* #5654: the external source that raised this firing, null on every alert not raised through the store's
+               submission function and every row written before this member existed. */
+            context.External = dto.External is { } external && !string.IsNullOrWhiteSpace(external.Source)
+                ? new AlertExternalOrigin(external.Source, external.Key, external.PendingId)
+                : null;
 
             foreach (var d in dto.Details)
             {

@@ -15,6 +15,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using Microsoft.Win32;
 using PerformanceMonitorLite.Helpers;
 using PerformanceMonitorLite.Models;
@@ -431,143 +432,163 @@ public partial class ServerTab : UserControl
         var grid = FindParentDataGrid(menuItem);
         if (grid?.CurrentItem == null) return;
 
-        string? queryText = null;
-        string? databaseName = null;
-        string? planXml = null;
-        string? isolationLevel = null;
-        string label = "Actual Plan";
-
-        switch (grid.CurrentItem)
-        {
-            case QuerySnapshotRow snapshot:
-                queryText = snapshot.QueryText;
-                databaseName = snapshot.DatabaseName;
-                isolationLevel = snapshot.TransactionIsolationLevel;
-                label = $"Actual Plan - SPID {snapshot.SessionId}";
-                /* #4239: fetch BEFORE QueryModificationDetector.Detect below judges planXml — a null plan
-                   fails safe to "this may modify data" for every click, not just the genuinely plan-less ones. */
-                planXml = await Task.Run(() => _dataService.ResolveSnapshotLivePlanAsync(_serverId, snapshot));
-                if (planXml == null)
-                    planXml = await Task.Run(() => _dataService.ResolveSnapshotEstimatedPlanAsync(_serverId, snapshot));
-                break;
-            case QueryStatsRow stats:
-                queryText = stats.QueryText;
-                databaseName = stats.DatabaseName;
-                label = $"Actual Plan - {stats.QueryHash}";
-                if (!string.IsNullOrEmpty(stats.QueryHash))
-                {
-                    try { planXml = await FetchPlanByHash(stats.QueryHash); }
-                    catch { }
-                }
-                break;
-            case QueryStoreRow qs:
-                queryText = qs.QueryText;
-                databaseName = qs.DatabaseName;
-                label = $"Actual Plan - QS {qs.QueryId}";
-                if (qs.PlanId > 0)
-                {
-                    try
-                    {
-                        var connStr = _credentialResolver.GetConnectionString(_server);
-                        planXml = await LivePlanDisplay.FilterAsync(await LocalDataService.FetchQueryStorePlanAsync(connStr, qs.DatabaseName, qs.PlanId));
-                    }
-                    catch { }
-                }
-                break;
-            case QueryStatsComparisonItem comp:
-                queryText = comp.QueryText;
-                databaseName = comp.DatabaseName;
-                label = $"Actual Plan - {comp.QueryHash}";
-                if (!string.IsNullOrEmpty(comp.QueryHash))
-                {
-                    try { planXml = await FetchPlanByHash(comp.QueryHash); }
-                    catch { }
-                }
-                break;
-        }
-
-        if (string.IsNullOrWhiteSpace(queryText))
-        {
-            MessageBox.Show("No query text available for this row.", "No Query Text",
-                MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
-
-        /* Data-modification gate: detect from the estimated plan XML (fail-safe to "modifying" when the plan
-           can't be analyzed) and flag it PROMINENTLY — distinct from the normal warning — since re-executing an
-           INSERT/UPDATE/DELETE/MERGE RE-APPLIES those writes to the database. FLAG, don't refuse: the operator
-           decides with eyes open. */
-        var modification = QueryModificationDetector.Detect(planXml, queryText);
-        var modificationWarning = QueryModificationDetector.BuildConsentWarning(modification, databaseName);
-
-        var prompt = new StringBuilder();
-        if (modificationWarning.Length > 0)
-        {
-            prompt.AppendLine(modificationWarning);
-            prompt.AppendLine("──────────────────────────────────────────");
-            prompt.AppendLine();
-        }
-        prompt.AppendLine($"You are about to execute this query against {_server.ServerName} in database [{databaseName ?? "default"}].");
-        prompt.AppendLine();
-        prompt.AppendLine("Make sure you understand what the query does before proceeding.");
-        prompt.AppendLine("The query will execute with SET STATISTICS XML ON to capture the actual plan.");
-        prompt.AppendLine("All data results will be discarded.");
-        prompt.AppendLine();
-        prompt.AppendLine(QueryModificationDetector.CapturedQueryNotice);
-
-        var result = MessageBox.Show(
-            prompt.ToString(),
-            modification.ModifiesData ? "Get Actual Plan (re-run) — DATA WILL BE MODIFIED" : "Get Actual Plan (re-run)",
-            MessageBoxButton.OKCancel,
-            MessageBoxImage.Warning);
-
-        if (result != MessageBoxResult.OK) return;
-
-        ShowPlanLoading(label);
-
-        _actualPlanCts?.Dispose();
-        _actualPlanCts = new CancellationTokenSource();
-
+        /* #5639: one actual-plan read at a time. A second click while the first is open returns before it opens a second prompt. */
+        if (_actualPlanRequestOpen) return;
+        _actualPlanRequestOpen = true;
         try
         {
-            var connectionString = _credentialResolver.GetConnectionString(_server);
+            string? queryText = null;
+            string? databaseName = null;
+            string? planXml = null;
+            string? isolationLevel = null;
+            string label = "Actual Plan";
 
-            /* #4348: the re-run's plan comes from the monitored server, not the collected rows, so it is judged here. */
-            var actualPlanXml = await LivePlanDisplay.FilterAsync(await ActualPlanExecutor.ExecuteForActualPlanAsync(
-                connectionString,
-                databaseName ?? "",
-                queryText,
-                planXml,
-                isolationLevel,
-                isAzureSqlDb: false,
-                timeoutSeconds: 0,
-                _actualPlanCts.Token,
-                productName: "SQL Server Performance Monitor Lite"));
+            Mouse.OverrideCursor = Cursors.Wait;
+            try
+            {
+                switch (grid.CurrentItem)
+                {
+                    case QuerySnapshotRow snapshot:
+                        queryText = snapshot.QueryText;
+                        databaseName = snapshot.DatabaseName;
+                        isolationLevel = snapshot.TransactionIsolationLevel;
+                        label = $"Actual Plan - SPID {snapshot.SessionId}";
+                        /* #4239: fetch BEFORE QueryModificationDetector.Detect below judges planXml — a null plan
+                           fails safe to "this may modify data" for every click, not just the genuinely plan-less ones. */
+                        planXml = await Task.Run(() => _dataService.ResolveSnapshotLivePlanAsync(_serverId, snapshot));
+                        if (planXml == null)
+                            planXml = await Task.Run(() => _dataService.ResolveSnapshotEstimatedPlanAsync(_serverId, snapshot));
+                        break;
+                    case QueryStatsRow stats:
+                        queryText = stats.QueryText;
+                        databaseName = stats.DatabaseName;
+                        label = $"Actual Plan - {stats.QueryHash}";
+                        if (QueryModificationDetector.IsUsableQueryHash(stats.QueryHash))
+                        {
+                            try { planXml = await FetchPlanByHash(stats.QueryHash); }
+                            catch { }
+                        }
+                        break;
+                    case QueryStoreRow qs:
+                        queryText = qs.QueryText;
+                        databaseName = qs.DatabaseName;
+                        label = $"Actual Plan - QS {qs.QueryId}";
+                        if (qs.PlanId > 0)
+                        {
+                            try
+                            {
+                                var connStr = _credentialResolver.GetConnectionString(_server);
+                                planXml = await LivePlanDisplay.FilterAsync(await LocalDataService.FetchQueryStorePlanAsync(connStr, qs.DatabaseName, qs.PlanId));
+                            }
+                            catch { }
+                        }
+                        break;
+                    case QueryStatsComparisonItem comp:
+                        queryText = comp.QueryText;
+                        databaseName = comp.DatabaseName;
+                        label = $"Actual Plan - {comp.QueryHash}";
+                        if (QueryModificationDetector.IsUsableQueryHash(comp.QueryHash))
+                        {
+                            try { planXml = await FetchPlanByHash(comp.QueryHash); }
+                            catch { }
+                        }
+                        break;
+                }
+            }
+            finally
+            {
+                Mouse.OverrideCursor = null;
+            }
 
-            if (!string.IsNullOrEmpty(actualPlanXml))
+            if (string.IsNullOrWhiteSpace(queryText))
             {
-                _ = OpenPlanTab(actualPlanXml, label, queryText);
-                PlanViewerTabItem.IsSelected = true;
+                MessageBox.Show("No query text available for this row.", "No Query Text",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
             }
-            else
+
+            /* Data-modification gate: detect from the estimated plan XML (fail-safe to "modifying" when the plan
+               can't be analyzed) and flag it PROMINENTLY — distinct from the normal warning — since re-executing an
+               INSERT/UPDATE/DELETE/MERGE RE-APPLIES those writes to the database. FLAG, don't refuse: the operator
+               decides with eyes open. */
+            var modification = QueryModificationDetector.Detect(planXml, queryText);
+            var modificationWarning = QueryModificationDetector.BuildConsentWarning(modification, databaseName);
+
+            var prompt = new StringBuilder();
+            if (modificationWarning.Length > 0)
             {
-                MessageBox.Show("Query executed but no execution plan was captured.",
-                    "No Plan", MessageBoxButton.OK, MessageBoxImage.Information);
+                prompt.AppendLine(modificationWarning);
+                prompt.AppendLine("──────────────────────────────────────────");
+                prompt.AppendLine();
             }
-        }
-        catch (OperationCanceledException)
-        {
-            MessageBox.Show("The query was cancelled or timed out.",
-                "Cancelled", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"Failed to get actual plan:\n\n{ex.Message}",
-                "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            prompt.AppendLine("You are about to execute this query on " +
+                QueryModificationDetector.BuildConsentTarget(_server.ServerName, databaseName) + ".");
+            prompt.AppendLine();
+            prompt.AppendLine(QueryModificationDetector.BuildConsentQueryText(queryText));
+            prompt.AppendLine("Make sure you understand what the query does before proceeding.");
+            prompt.AppendLine("The query will execute with SET STATISTICS XML ON to capture the actual plan.");
+            prompt.AppendLine("All data results will be discarded.");
+            prompt.AppendLine();
+            prompt.AppendLine(QueryModificationDetector.CapturedQueryNotice);
+
+            var result = MessageBox.Show(
+                prompt.ToString(),
+                QueryModificationDetector.BuildConsentTitle(modification),
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+
+            if (result != MessageBoxResult.OK) return;
+
+            ShowPlanLoading(label);
+
+            _actualPlanCts?.Dispose();
+            _actualPlanCts = new CancellationTokenSource();
+
+            try
+            {
+                var connectionString = _credentialResolver.GetConnectionString(_server);
+
+                /* #4348: the re-run's plan comes from the monitored server, not the collected rows, so it is judged here. */
+                var actualPlanXml = await LivePlanDisplay.FilterAsync(await ActualPlanExecutor.ExecuteForActualPlanAsync(
+                    connectionString,
+                    databaseName ?? "",
+                    queryText,
+                    planXml,
+                    isolationLevel,
+                    isAzureSqlDb: false,
+                    timeoutSeconds: 0,
+                    _actualPlanCts.Token,
+                    productName: "SQL Server Performance Monitor Lite"));
+
+                if (!string.IsNullOrEmpty(actualPlanXml))
+                {
+                    _ = OpenPlanTab(actualPlanXml, label, queryText);
+                    PlanViewerTabItem.IsSelected = true;
+                }
+                else
+                {
+                    MessageBox.Show("Query executed but no execution plan was captured.",
+                        "No Plan", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                MessageBox.Show("The query was cancelled or timed out.",
+                    "Cancelled", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to get actual plan:\n\n{ex.Message}",
+                    "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                HidePlanLoading();
+            }
         }
         finally
         {
-            HidePlanLoading();
+            _actualPlanRequestOpen = false;
         }
     }
 
@@ -594,10 +615,9 @@ public partial class ServerTab : UserControl
 
     // ── Blocked Process Report plan lookup ──
 
-    /* SQL Server writes this 42-byte all-zero handle into executionStack frames
-       for dynamic SQL / system contexts where no persistent sql_handle exists.
-       Filter matches sp_HumanEventsBlockViewer's XPath exclusion. */
-    private static readonly string ZeroSqlHandle = "0x" + new string('0', 84);
+    /* SQL Server writes an all-zero handle into executionStack frames for dynamic SQL / system
+       contexts where no persistent sql_handle exists; DeadlockGraphParser.IsZeroSqlHandle skips
+       it whatever its length (the same test the deadlock pane uses). */
 
     private async void ViewBlockedSidePlan_Click(object sender, RoutedEventArgs e)
         => await ShowBlockedProcessPlanAsync(sender, blockingSide: false);
@@ -654,7 +674,7 @@ public partial class ServerTab : UserControl
         }
     }
 
-    private static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractBlockedProcessFrames(
+    internal static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractBlockedProcessFrames(
         string bprXml, bool blockingSide)
     {
         var empty = Array.Empty<(string, int, int)>();
@@ -676,7 +696,7 @@ public partial class ServerTab : UserControl
             {
                 var handle = frame.Attribute("sqlhandle")?.Value;
                 if (string.IsNullOrWhiteSpace(handle)) continue;
-                if (string.Equals(handle, ZeroSqlHandle, StringComparison.OrdinalIgnoreCase)) continue;
+                if (PerformanceMonitor.Common.DeadlockGraphParser.IsZeroSqlHandle(handle)) continue;
 
                 int stmtStart = 0;
                 int stmtEnd = -1;
@@ -705,10 +725,19 @@ public partial class ServerTab : UserControl
         var grid = FindParentDataGrid(menuItem);
         if (grid?.CurrentItem is not DeadlockProcessDetail row) return;
 
-        var sideLabel = row.IsVictim ? "Victim" : "Deadlocker";
-        var label = $"Est Plan - {sideLabel} SPID {row.Spid}";
+        await ViewDeadlockProcessPlanAsync(
+            row.DeadlockGraphXml, row.ProcessId, row.IsVictim, row.Spid, row.DatabaseName, row.SqlText);
+    }
 
-        var frames = ExtractDeadlockProcessFrames(row.DeadlockGraphXml, row.ProcessId);
+    /* The deadlock-process plan lookup behind both the grid's context item and the graph viewer's Properties
+       panel button (#6205): one lookup, keyed by the process id inside the graph XML. */
+    private async System.Threading.Tasks.Task ViewDeadlockProcessPlanAsync(
+        string graphXml, string processId, bool isVictim, int spid, string databaseName, string sqlText)
+    {
+        var sideLabel = isVictim ? "Victim" : "Deadlocker";
+        var label = $"Est Plan - {sideLabel} SPID {spid}";
+
+        var frames = ExtractDeadlockProcessFrames(graphXml, processId);
         if (frames.Count == 0)
         {
             MessageBox.Show(
@@ -726,7 +755,7 @@ public partial class ServerTab : UserControl
             foreach (var f in frames)
             {
                 planXml = await LivePlanDisplay.FilterAsync(await LocalDataService.FetchPlanBySqlHandleAsync(
-                    connStr, row.DatabaseName, f.SqlHandle, f.StmtStart, f.StmtEnd));
+                    connStr, databaseName, f.SqlHandle, f.StmtStart, f.StmtEnd));
                 if (!string.IsNullOrEmpty(planXml)) break;
             }
         }
@@ -734,7 +763,7 @@ public partial class ServerTab : UserControl
 
         if (!string.IsNullOrEmpty(planXml))
         {
-            _ = OpenPlanTab(planXml, label, row.SqlText);
+            _ = OpenPlanTab(planXml, label, sqlText);
             PlanViewerTabItem.IsSelected = true;
         }
         else
@@ -746,7 +775,7 @@ public partial class ServerTab : UserControl
         }
     }
 
-    private static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractDeadlockProcessFrames(
+    internal static IReadOnlyList<(string SqlHandle, int StmtStart, int StmtEnd)> ExtractDeadlockProcessFrames(
         string graphXml, string processId)
     {
         var empty = Array.Empty<(string, int, int)>();
@@ -763,7 +792,7 @@ public partial class ServerTab : UserControl
             /* Try process-level sqlhandle first — deadlock graphs frequently put it on <process>. */
             var procHandle = process.Attribute("sqlhandle")?.Value;
             if (!string.IsNullOrWhiteSpace(procHandle) &&
-                !string.Equals(procHandle, ZeroSqlHandle, StringComparison.OrdinalIgnoreCase))
+                !PerformanceMonitor.Common.DeadlockGraphParser.IsZeroSqlHandle(procHandle))
             {
                 int ps = 0, pe = -1;
                 int.TryParse(process.Attribute("stmtstart")?.Value, out ps);
@@ -779,7 +808,7 @@ public partial class ServerTab : UserControl
                 {
                     var handle = frame.Attribute("sqlhandle")?.Value;
                     if (string.IsNullOrWhiteSpace(handle)) continue;
-                    if (string.Equals(handle, ZeroSqlHandle, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (PerformanceMonitor.Common.DeadlockGraphParser.IsZeroSqlHandle(handle)) continue;
 
                     int fs = 0, fe = -1;
                     int.TryParse(frame.Attribute("stmtstart")?.Value, out fs);

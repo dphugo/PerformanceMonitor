@@ -54,6 +54,11 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 [McpServerToolType]
 public sealed class DarlingMcpDataTools
 {
+    /// <summary>#5824: get_collection_log's status vocabulary on Darling: the shared set plus ANALYZED, the scheduled analysis
+    /// pass's row (<see cref="AnalysisPassRow"/>), which only Darling writes.</summary>
+    internal static readonly IReadOnlyList<string> CollectionLogStatuses =
+        AnalysisPassRow.WithAnalysisPassStatuses(EnumeratedCollectorDriver.CollectionLogStatuses);
+
     /* ═══════════════════════════ resource metrics ═══════════════════════════ */
 
     [McpServerTool(Name = "get_cpu_utilization"), Description("Gets CPU utilization over time in time buckets: SQL Server CPU %, other process CPU %, total CPU % and idle %, with each bucket's busiest sample. Use this to identify CPU pressure periods, then use get_top_queries_by_cpu to find the culprit queries.")]
@@ -80,7 +85,7 @@ public sealed class DarlingMcpDataTools
         if (error != null) return error;
 
         /* #5562: reaches the raw table's 30-day retention (720 h); 0.62 s at 30 days on a large store. The ceiling is the WebReadReach row. */
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, WebReadReach.MaxHoursFor("get_cpu_utilization"), out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, WebReadReach.MaxHoursFor("get_cpu_utilization"), out var windowEnd);
         if (validation != null) return validation;
 
         var bucketError = TrendBuckets.Resolve(hours_back, bucket_minutes, 1, budget, out var bucketMinutes);
@@ -90,13 +95,13 @@ public sealed class DarlingMcpDataTools
         {
             var points = await DarlingDataReader.GetCpuBucketsAsync(postgres, resolved.ServerId, windowEnd.AddHours(-hours_back), windowEnd, bucketMinutes, cancellationToken);
             if (points.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "cpu_utilization", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "cpu_utilization", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No CPU utilization data available.");
 
             /* #3653 A15/A16: the source-cadence sentence both SKUs publish is TrendPayloads.CpuCadenceNote, the one
                place it is spelled (the ring buffer writes one record a minute on-prem, MI and RDS; Azure SQL DB's
                sys.dm_db_resource_stats one every 15 seconds; samples_in_bucket is the measured count). */
-            return TrendPayloads.CpuUtilization(resolved.ServerName, hours_back, points, bucketMinutes, bucket_minutes is not null, budget.AutoPoints);
+            return TrendPayloads.CpuUtilization(resolved.DisplayName, hours_back, points, bucketMinutes, bucket_minutes is not null, budget.AutoPoints);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -117,7 +122,7 @@ public sealed class DarlingMcpDataTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -129,7 +134,7 @@ public sealed class DarlingMcpDataTools
                signal. The reader's LIMIT 50 sat under a limit the tool accepts up to 1,000. */
             var rows = await DarlingDataReader.GetWaitStatsAsync(postgres, resolved.ServerId, now.AddHours(-hours_back), now, limit + 1, cancellationToken);
             if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "wait_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "wait_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No wait stats data available for the specified time range.");
 
             var truncated = rows.Count > limit;
@@ -161,7 +166,7 @@ public sealed class DarlingMcpDataTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,
@@ -192,7 +197,7 @@ public sealed class DarlingMcpDataTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -209,7 +214,7 @@ public sealed class DarlingMcpDataTools
                     wants somebody to look at collection, and widening will never fill it. Probed only here,
                     against the SAME source the read walks.
                 */
-                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "wait_stats", cancellationToken);
+                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "wait_stats", cancellationToken);
                 if (gated != null)
                 {
                     return gated;
@@ -218,15 +223,15 @@ public sealed class DarlingMcpDataTools
                 return await DarlingDataReader.HasAnyWaitStatAsync(postgres, resolved.ServerId, cancellationToken)
                     ? McpHelpers.Status(
                         "empty",
-                        $"No wait types recorded for {resolved.ServerName} in the last {hours_back} hour(s). This server HAS collected wait stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
+                        $"No wait types recorded for {resolved.DisplayName} in the last {hours_back} hour(s). This server HAS collected wait stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
                     : McpHelpers.Status(
                         "unavailable",
-                        $"No wait stats have EVER been recorded for {resolved.ServerName}. This is not an empty window — nothing has been stored for this server at all. Delta wait stats need a SECOND collection cycle before the first row exists, so on a newly added server this clears itself; otherwise check that collection is running and that the server is enabled.");
+                        $"No wait stats have EVER been recorded for {resolved.DisplayName}. This is not an empty window — nothing has been stored for this server at all. Delta wait stats need a SECOND collection cycle before the first row exists, so on a newly added server this clears itself; otherwise check that collection is running and that the server is enabled.");
             }
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 wait_types = types
             }, McpHelpers.JsonOptions);
@@ -258,7 +263,7 @@ public sealed class DarlingMcpDataTools
         if (error != null) return error;
 
         /* #5562: reaches the raw table's 30-day retention (720 h); 0.70 s at 30 days on a large store. The ceiling is the WebReadReach row. */
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, WebReadReach.MaxHoursFor("get_wait_trend"), out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, WebReadReach.MaxHoursFor("get_wait_trend"), out var windowEnd);
         if (validation != null) return validation;
 
         var bucketError = TrendBuckets.Resolve(hours_back, bucket_minutes, 1, budget, out var bucketMinutes);
@@ -275,7 +280,7 @@ public sealed class DarlingMcpDataTools
                    the miss path, so either order keeps the property that matters — but a permanently gated
                    engine takes this branch on every call, forever, and the probe below could never tell it
                    anything. Asking first makes that case one query instead of two. */
-                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "wait_stats", cancellationToken);
+                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "wait_stats", cancellationToken);
                 if (gated != null)
                 {
                     return gated;
@@ -284,16 +289,9 @@ public sealed class DarlingMcpDataTools
                 /* Distinguish "unknown wait type here" from "nothing collected at all", handing back the
                    ones that do have data — Lite's get_wait_trend miss vocabulary. */
                 var collected = await DarlingDataReader.GetDistinctWaitTypesAsync(postgres, resolved.ServerId, start, now, cancellationToken);
-                if (collected.Count == 0)
-                    return McpHelpers.Status(
-                        "unavailable",
-                        $"No trend data for wait type '{wait_type}'. No wait stats have been collected for this server in the last {hours_back}h yet " +
-                        "(the collector may not have run, or delta wait stats need a second collection cycle).");
-
-                return McpHelpers.Status(
-                    "not_collected",
-                    $"No trend data for wait type '{wait_type}'. It may not be a wait type observed on this server in this window — see hints.collected_wait_types for the {collected.Count} that have data.",
-                    new { collected_wait_types = collected });
+                /* #6446: the collector skips the ignored (benign) waits, so only those are never collected; a wait type it would
+                   store that had no waiting in the window is empty, not not_collected. The hint stays for a typo. */
+                return TrendPayloads.WaitTrendMiss(wait_type, hours_back, IgnoredWaitDefaults.All, collected);
             }
 
             /* #3653 A5: wait_stats is the FIRST identity-epoch carrier (#3705), so this is the trend whose
@@ -303,7 +301,7 @@ public sealed class DarlingMcpDataTools
             var discontinuities = await DarlingTrendReader.GetBaselineDiscontinuitiesAsync(postgres, resolved.ServerId, start, now, cancellationToken);
 
             return TrendPayloads.WaitTrend(
-                resolved.ServerName, wait_type, hours_back, points, bucketMinutes, bucket_minutes is not null,
+                resolved.DisplayName, wait_type, hours_back, points, bucketMinutes, bucket_minutes is not null,
                 budget.AutoPoints, BaselineDiscontinuities.ToPayload(discontinuities));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -312,6 +310,7 @@ public sealed class DarlingMcpDataTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_memory_stats"), Description("Gets the latest memory statistics snapshot: physical memory, buffer pool size, plan cache size, memory utilization %, and SQL Server memory model. Use this for a quick memory health check; use get_memory_clerks to see detailed breakdown by component. LATEST IS A TIME: this reads one snapshot, not a window, and captured_at is the instant that snapshot was collected - read it before treating any figure as current, because the newest row a store holds can be minutes or days old.")]
     public static async Task<string> GetMemoryStats(
         NpgsqlDataSource postgres,
@@ -325,7 +324,7 @@ public sealed class DarlingMcpDataTools
         {
             var stats = await DarlingDataReader.GetLatestMemoryStatsAsync(postgres, resolved.ServerId, cancellationToken);
             if (stats == null)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "memory_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "memory_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No memory stats available.");
 
             /* ONE edition for the whole answer: the REGISTRY's (servers.sql_engine_edition), read once through the reader every
@@ -334,12 +333,32 @@ public sealed class DarlingMcpDataTools
                with its own not_collected answers. The memory read carries no edition of its own. */
             var engineEdition = await DarlingEngineCapability.EngineEditionAsync(postgres, resolved.ServerId, cancellationToken);
 
-            return MemoryStatsPayload(resolved.ServerName, stats, engineEdition);
+            return MemoryStatsPayload(resolved.DisplayName, stats, engineEdition);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return McpHelpers.FormatError("get_memory_stats", ex);
         }
+    }
+
+    /// <summary>#6226: the <c>empty</c> envelope for a ranking over a window the collector ran in and stored nothing, with
+    /// <c>successful_runs_in_window</c> beside the sentence; null when it has no successful run in the window. Words in
+    /// <see cref="CollectorRunFacts.RanFoundNothing"/>, shared with Lite. Names the database when the read was scoped to one.</summary>
+    internal static string? EmptyCollectorRan(
+        CollectorRunFacts facts, string collectorName, int hoursBack, string found, DatabaseFilter databases, bool requireDeltaBaseline = false)
+    {
+        var chosen = databases.Describe();
+        var scope = chosen is null ? null : chosen == DatabaseFilter.ManyDatabasesDescription ? chosen : $"database '{chosen}'";
+        var message = facts.RanFoundNothing(collectorName, hoursBack, found, scope, requireDeltaBaseline);
+        return message is null ? null : McpHelpers.Status("empty", message, new { successful_runs_in_window = facts.SuccessfulRunsInWindow });
+    }
+
+    /// <summary>#5633 item 3: the empty-page envelope of the procedure tools, from the collector's own run history. Two cycles only while
+    /// the collector is new; <c>empty</c> once it has run and found no procedure in the window. Words in <see cref="CollectorRunFacts"/>.</summary>
+    internal static string EmptyProcedureStatsStatus(CollectorRunFacts facts, int hoursBack, int databasesLeftOut = 0)
+    {
+        var (status, message) = facts.ProcedureStatsEmpty(hoursBack, databasesLeftOut);
+        return McpHelpers.Status(status, message);
     }
 
     /// <summary>
@@ -387,6 +406,7 @@ public sealed class DarlingMcpDataTools
         return ServerHardwareScope.WithMemoryNote(scoped).ToJsonString(McpHelpers.JsonOptions);
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_memory_clerks"), Description("Gets the top memory consumers by memory clerk type — shows which SQL Server components are using the most memory. LATEST IS A TIME: this reads the newest clerk snapshot, not a window, and captured_at is the instant it was collected.")]
     public static async Task<string> GetMemoryClerks(
         NpgsqlDataSource postgres,
@@ -409,10 +429,10 @@ public sealed class DarlingMcpDataTools
                     the caller does need is to be told that an empty clerk list is NEVER a quiet period,
                     because on a live SQL Server it cannot be: the DMV always has clerks.
                 */
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "memory_clerks", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "memory_clerks", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
-                        $"No memory-clerk snapshot is available for {resolved.ServerName}. This read returns the LATEST snapshot rather than a window, so an empty result is never a quiet period — a live SQL Server always has memory clerks. It means nothing the memory_clerks collector stored is still retained, either because it has not run for this server or because its rows have aged out. Check get_collection_health and get_collection_log for the memory_clerks collector.");
+                        $"No memory-clerk snapshot is available for {resolved.DisplayName}. This read returns the LATEST snapshot rather than a window, so an empty result is never a quiet period — a live SQL Server always has memory clerks. It means nothing the memory_clerks collector stored is still retained, either because it has not run for this server or because its rows have aged out. Check get_collection_health and get_collection_log for the memory_clerks collector.");
 
             var result = snapshot.Rows.Select(r => new
             {
@@ -422,7 +442,7 @@ public sealed class DarlingMcpDataTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 clerks = result
             }, McpHelpers.JsonOptions);
@@ -433,6 +453,7 @@ public sealed class DarlingMcpDataTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_file_io_stats"), Description("Gets the latest per-database-file I/O stats: read/write counts, bytes, stall times, calculated latency. LATEST IS A TIME: the newest snapshot, not a window; captured_at is when it was collected, and the deltas cover the sample_interval_seconds ending there. sample_interval_seconds 0 means no delta was knowable for that file (first sighting, counter reset, a gap) and that row's latencies are null, not 0. <<GUIDE>> Gets the latest file I/O statistics per database file: read/write counts, bytes, stall times, and calculated latency. High read latency (>20ms) or write latency (>10ms for data, >2ms for log) often indicates storage bottlenecks. Each row carries sample_interval_seconds, the measured seconds its deltas accrued over; a 0 means no delta was knowable for that file at this collection (first sighting, counter reset, or a gap past the delta policy — typically a restart) and its latencies are null rather than 0. LATEST IS A TIME: this reads the newest file-I/O snapshot, not a window, and captured_at is the instant it was collected; the deltas cover the sample_interval_seconds ending there.")]
     public static Task<string> GetFileIoStats(
         NpgsqlDataSource postgres,
@@ -467,7 +488,7 @@ public sealed class DarlingMcpDataTools
                     {
                         return McpHelpers.StatusForDatabase(
                             "empty",
-                            $"The newest file I/O snapshot for {resolved.ServerName} (captured_at {capturedAt.Value.ToString("o")}) holds no files{DarlingMcpBlockingTools.ForChosenDatabases(databases)}. "
+                            $"The newest file I/O snapshot for {resolved.DisplayName} (captured_at {capturedAt.Value.ToString("o")}) holds no files{DarlingMcpBlockingTools.ForChosenDatabases(databases)}. "
                             + $"The {(databases.Names.Count == 1 ? "name" : "names")}"
                             + " must match a collected database exactly; omit database_name for every database.",
                             databases.Describe());
@@ -475,7 +496,7 @@ public sealed class DarlingMcpDataTools
                 }
 
                 return McpHelpers.WithDatabase(
-                           await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "file_io_stats", cancellationToken),
+                           await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "file_io_stats", cancellationToken),
                            databases.Describe())
                     ?? McpHelpers.StatusForDatabase("unavailable", "No file I/O stats available.", databases.Describe());
             }
@@ -484,7 +505,7 @@ public sealed class DarlingMcpDataTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 database_name = databases.Describe(),
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 files = result
@@ -545,7 +566,7 @@ public sealed class DarlingMcpDataTools
         if (error != null) return error;
 
         /* #5562: reaches the raw table's 30-day retention (720 h); 0.90 s at 30 days on a large store. The ceiling is the WebReadReach row. */
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, WebReadReach.MaxHoursFor("get_tempdb_trend"), out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, WebReadReach.MaxHoursFor("get_tempdb_trend"), out var windowEnd);
         if (validation != null) return validation;
 
         var bucketError = TrendBuckets.Resolve(hours_back, bucket_minutes, 1, budget, out var bucketMinutes);
@@ -555,10 +576,11 @@ public sealed class DarlingMcpDataTools
         {
             var points = await DarlingDataReader.GetTempDbBucketsAsync(postgres, resolved.ServerId, windowEnd.AddHours(-hours_back), windowEnd, bucketMinutes, cancellationToken);
             if (points.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "tempdb_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "tempdb_stats", cancellationToken)
+                    ?? await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "tempdb_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No TempDB data available.");
 
-            return TrendPayloads.TempDbTrend(resolved.ServerName, hours_back, points, bucketMinutes, bucket_minutes is not null, budget.AutoPoints);
+            return TrendPayloads.TempDbTrend(resolved.DisplayName, hours_back, points, bucketMinutes, bucket_minutes is not null, budget.AutoPoints);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -566,6 +588,7 @@ public sealed class DarlingMcpDataTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_perfmon_stats"), Description("Gets the latest SQL Server performance counter values (batch requests/sec, compilations/sec, deadlocks/sec, and more). LATEST IS A TIME: the newest snapshot, not a window; captured_at is when it was collected; use get_perfmon_trend for history. counter_kind: gauge = value IS the reading, delta_value null; rate = value is cumulative, delta_value its per-interval change, per_second that change per second (null when unknowable); other = a non-rate per-interval change; null counter_kind predates the column, classify by name (ends in /sec = rate). <<GUIDE>> Gets the latest SQL Server performance counter values: batch requests/sec, compilations/sec, deadlocks/sec, and more. Provides throughput context to distinguish a busy server from a sick one. Use counter_name or instance_name to filter results. LATEST IS A TIME: this reads the newest counter snapshot, not a window, and captured_at is the instant it was collected; use get_perfmon_trend for a counter over time. Each row carries counter_kind from the stored cntr_type: 'gauge' means value IS the reading (a level such as Total Server Memory (KB); delta_value is null because a level has no delta), 'rate' means value is a cumulative count (a running total, not a rate), delta_value is its change over the last collection interval, and per_second is that change divided by the interval's seconds: the counter's rate, the figure to report for it, and null when no delta was knowable (a first collection, a counter reset or a restart), 'other' means an average/fraction numerator whose delta_value is a per-interval change and not a rate; null counter_kind is a row written before the type was stored — classify it by name (a counter whose name ends in /sec is a rate, and carries per_second).")]
     public static async Task<string> GetPerfmonStats(
         NpgsqlDataSource postgres,
@@ -581,7 +604,7 @@ public sealed class DarlingMcpDataTools
         {
             var snapshot = await DarlingDataReader.GetLatestPerfmonStatsAsync(postgres, resolved.ServerId, cancellationToken);
             if (snapshot.IsEmpty)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "perfmon_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "perfmon_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No perfmon stats available.");
 
             IEnumerable<DarlingDataReader.PerfmonRow> filtered = snapshot.Rows;
@@ -594,14 +617,10 @@ public sealed class DarlingMcpDataTools
                calls too: counter_kind is the stored type's three-way reading (V132, #3653 A7), delta_value is null
                on a gauge because the collector writes none, and a rate row adds per_second, its delta over the
                stored interval, so the running total in value is never the only number a reader gets. */
-            var result = filtered.Select(PerfmonRowPayload);
+            var result = filtered.Select(PerfmonRowPayload).ToList();
 
-            return JsonSerializer.Serialize(new
-            {
-                server = resolved.ServerName,
-                captured_at = snapshot.CapturedAt!.Value.ToString("o"),
-                counters = result
-            }, McpHelpers.JsonOptions);
+            /* #6180: the page is cut to the shared response target (see TrendPayloads.PerfmonLatestReply). */
+            return TrendPayloads.PerfmonLatestReply(resolved.DisplayName, snapshot.CapturedAt!.Value.ToString("o"), result);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -617,7 +636,7 @@ public sealed class DarlingMcpDataTools
 
     /* ═══════════════════════════ query performance ═══════════════════════════ */
 
-    [McpServerTool(Name = "get_top_queries_by_cpu"), Description("Gets expensive cached queries from sys.dm_exec_query_stats, ranked by CPU over a window ending at as_of. Filters (database_name, parallel_only, min_dop) apply before the top-N cap: filter_applied names the floor in force, and an empty page under it is the window's real answer, not a miss. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes, not windowed; cpu_attribution's ratio is omitted, not invented, when its inputs are missing. window_truncated marks a window floor, not a page cut; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> On tier_used=hourly, min/max_cpu_ms and min/max_elapsed_ms are null, as are the columns the rollup does not carry (see precision_note), and parallel_only/min_dop/group_by=host_object keep the read on raw. Gets expensive queries from sys.dm_exec_query_stats (plan cache). Best for: currently cached queries with detailed per-execution stats, DOP, spills, and query_hash for trending. Returns query_hash, query_plan_hash, sql_handle, plan_handle, and host_object (the hosting procedure/function for proc-hosted statements, null for ad-hoc) — groups key on (database, query_hash, host_object), so INSERT...EXEC callers in different procedures report separately with their own text. distinct_texts counts statement texts merged into a group (>1 = ad-hoc literal variants or pre-upgrade history; query_text is one representative, 0 means only rows predating the text dimension). 'host_object' rolls all of a procedure's statements into one row — use it when dynamic SQL with per-value literals fragments one statement across many hashes, which no top-N-by-hash ranking can surface. Ad-hoc statements have no host object and stay grouped per hash in both modes. distinct_query_hashes reports how many hashes a row rolled up. Set group_by='host_object' to roll all of a procedure's statements into one row — necessary when dynamic SQL with per-value literals fragments one statement across many hashes, which no top-N-by-hash ranking can surface. detail='full' adds the desktop grid's remaining columns (last_execution_time, creation_time, physical-read, row, grant, spill and thread min/max, total_clr_ms, plan_generation_num, worker_time_per_second), non-null only, raw tier only. Supports database and parallelism filtering; every filter is applied IN the query before the ranking and the cap, so the page is the top-N of the FILTERED population (filter_applied names the parallelism floor in force, null when none), and an empty page under parallel_only/min_dop is the window's answer rather than a page artefact. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes for the plan's time in cache (same semantics as max_dop), not windowed — totals and avgs are windowed deltas; rows where an extreme provably predates the window carry extremes_note. max_dop comes from sys.dm_exec_query_stats and is a lifetime-max for the plan's time in cache, so a plan compiled before MAXDOP was lowered keeps reporting the old higher value until it is evicted or recompiled; confirm current parallelism with analyze_query_plan, which reads the actual plan." + McpHelpers.WindowTruncatedDescription + " " + McpToolGuideTopics.CpuTimeExtremesAndAttribution)]
+    [McpServerTool(Name = "get_top_queries_by_cpu"), Description("Gets expensive cached queries from sys.dm_exec_query_stats, ranked by CPU over a window ending at as_of. Filters (database_name, parallel_only, min_dop) apply before the top-N cap: filter_applied names the floor in force, and an empty page under it is the window's real answer, not a miss. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes, not windowed; cpu_attribution's ratio is omitted, not invented, when its inputs are missing. window_truncated marks a window floor, not a page cut; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> On tier_used=hourly, min/max_cpu_ms and min/max_elapsed_ms are null, as are the columns the rollup does not carry (see precision_note), and parallel_only/min_dop/group_by=host_object keep the read on raw. Gets expensive queries from sys.dm_exec_query_stats (plan cache). Best for: currently cached queries with detailed per-execution stats, DOP, spilled pages (total_spills counts 8 KB pages written to tempdb, not spill events), and query_hash for trending. Returns query_hash, query_plan_hash, sql_handle, plan_handle, and host_object (the hosting procedure/function for proc-hosted statements, null for ad-hoc) — groups key on (database, query_hash, host_object), so INSERT...EXEC callers in different procedures report separately with their own text. distinct_texts counts statement texts merged into a group (>1 = ad-hoc literal variants or pre-upgrade history; query_text is one representative, 0 means only rows predating the text dimension). 'host_object' rolls all of a procedure's statements into one row — use it when dynamic SQL with per-value literals fragments one statement across many hashes, which no top-N-by-hash ranking can surface. Ad-hoc statements have no host object and stay grouped per hash in both modes. distinct_query_hashes reports how many hashes a row rolled up. Set group_by='host_object' to roll all of a procedure's statements into one row — necessary when dynamic SQL with per-value literals fragments one statement across many hashes, which no top-N-by-hash ranking can surface. detail='full' adds the desktop grid's remaining columns (last_execution_time, creation_time, physical-read, row, grant, spilled-page (8 KB pages) and thread min/max, total_clr_ms, plan_generation_num, worker_time_per_second), non-null only, raw tier only. Supports database and parallelism filtering; every filter is applied IN the query before the ranking and the cap, so the page is the top-N of the FILTERED population (filter_applied names the parallelism floor in force, null when none), and an empty page under parallel_only/min_dop is the window's answer rather than a page artefact. min/max_cpu_ms and min/max_elapsed_ms are LIFETIME extremes for the plan's time in cache (same semantics as max_dop), not windowed — totals and avgs are windowed deltas; rows where an extreme provably predates the window carry extremes_note. max_dop comes from sys.dm_exec_query_stats and is a lifetime-max for the plan's time in cache, so a plan compiled before MAXDOP was lowered keeps reporting the old higher value until it is evicted or recompiled; confirm current parallelism with analyze_query_plan, which reads the actual plan." + McpHelpers.WindowTruncatedDescription + " " + McpToolGuideTopics.CpuTimeExtremesAndAttribution)]
     public static Task<string> GetTopQueriesByCpu(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -627,10 +646,11 @@ public sealed class DarlingMcpDataTools
         [Description("If true, only return queries whose cached plan has EVER run at DOP > 1 (a LIFETIME max_dop; can read stale after a MAXDOP change). See the tool's reading guide.")] bool parallel_only = false,
         [Description("Minimum DOP to filter on. Implies parallel filtering. Filters the same lifetime-max value as parallel_only, not current parallelism.")] int min_dop = 0,
         [Description("Grouping. 'query_hash' (default): one row per (database, query_hash, host_object). 'host_object': rolls a proc's statements into ONE row. See the tool's reading guide.")] string group_by = "query_hash",
+        [Description(QueryTagReadJoin.TagParameterDescription)] string? tag = null,
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         [Description("'summary' (default) or 'full': full adds the remaining desktop columns (grants, threads, extremes, times), omitting nulls.")] string detail = "summary",
         CancellationToken cancellationToken = default)
-        => GetTopQueriesRanked(postgres, server_name, hours_back, top, database_name, parallel_only, min_dop, group_by, as_of, detail, order_by: null, cancellationToken);
+        => GetTopQueriesRanked(postgres, server_name, hours_back, top, database_name, parallel_only, min_dop, group_by, as_of, detail, order_by: null, cancellationToken, tag);
 
     /// <summary>
     /// #5226: the body of <see cref="GetTopQueriesByCpu"/> with the ranking choice the web page offers. The MCP tool
@@ -641,9 +661,9 @@ public sealed class DarlingMcpDataTools
     /// </summary>
     internal static Task<string> GetTopQueriesRanked(
         NpgsqlDataSource postgres, string? server_name, int hours_back, int top, string? database_name, bool parallel_only, int min_dop,
-        string group_by, string? as_of, string detail, string? order_by, CancellationToken cancellationToken) =>
+        string group_by, string? as_of, string detail, string? order_by, CancellationToken cancellationToken, string? tag = null) =>
         GetTopQueriesRanked(
-            postgres, server_name, hours_back, top, DatabaseFilter.One(database_name), parallel_only, min_dop, group_by, as_of, detail, order_by, cancellationToken);
+            postgres, server_name, hours_back, top, DatabaseFilter.One(database_name), parallel_only, min_dop, group_by, as_of, detail, order_by, cancellationToken, tag);
 
     /// <summary>
     /// #5245: <see cref="GetTopQueriesRanked(NpgsqlDataSource,string,int,int,string,bool,int,string,string,string,string,CancellationToken)"/>
@@ -653,7 +673,7 @@ public sealed class DarlingMcpDataTools
     /// </summary>
     internal static async Task<string> GetTopQueriesRanked(
         NpgsqlDataSource postgres, string? server_name, int hours_back, int top, DatabaseFilter databases, bool parallel_only, int min_dop,
-        string group_by, string? as_of, string detail, string? order_by, CancellationToken cancellationToken)
+        string group_by, string? as_of, string detail, string? order_by, CancellationToken cancellationToken, string? tag = null)
     {
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
@@ -681,7 +701,7 @@ public sealed class DarlingMcpDataTools
             return McpHelpers.Refusal("order_by", $"order_by must be {TopRankings.Accepted} (got '{order_by}').");
         }
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(top, "top");
         if (validation != null) return validation;
@@ -694,16 +714,32 @@ public sealed class DarlingMcpDataTools
            is parallel), min_dop when the caller set one above that, 0 (admit all) otherwise; min_dop implies
            parallel filtering, as its description has always said. */
         var minMaxDop = min_dop > 1 ? min_dop : parallel_only ? 2 : 0;
-        var filterApplied = minMaxDop > 0
+        var dopFilterApplied = minMaxDop > 0
             ? $"lifetime max_dop >= {minMaxDop} (applied in SQL before the top-{top} ranking; the page is the top-{top} of the parallel population)"
             : null;
+        string? filterApplied = dopFilterApplied;
 
         try
         {
+            /* #5984: the query tag filter. A name no tag carries is an empty answer that says so; it never reads the store. */
+            var tagFilter = await QueryTagReadJoin.ResolveAsync(postgres, tag, cancellationToken);
+            if (tagFilter.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadJoin.UnknownTagMessage(tagFilter.Requested!));
+            }
+
+            /* #5984 round 1: a tag that cut the population is named in filter_applied beside the parallel floor, so a tag-only call
+               never publishes null over a population the tag shaped. A call without a tag is unchanged. */
+            if (tagFilter.Named is { } queryTagName)
+            {
+                var tagText = $"query tag '{queryTagName}' (applied in SQL before the top-{top} ranking)";
+                filterApplied = dopFilterApplied is null ? tagText : dopFilterApplied + "; " + tagText;
+            }
+
             var now = windowEnd;
             var requestedStart = now.AddHours(-hours_back);
             var routed = await DarlingDataReader.GetTopQueriesByCpuRoutedAsync(
-                postgres, resolved.ServerId, requestedStart, now, top, databases, rollUpByHostObject: rollUp, minMaxDop: minMaxDop, ranking: ranking, cancellationToken: cancellationToken);
+                postgres, resolved.ServerId, requestedStart, now, top, databases, rollUpByHostObject: rollUp, minMaxDop: minMaxDop, ranking: ranking, cancellationToken: cancellationToken, tags: tagFilter);
             var rows = routed.Rows;
             var tierUsed = routed.Tier == RetentionTier.Hourly ? "hourly" : "raw";
 
@@ -800,6 +836,14 @@ public sealed class DarlingMcpDataTools
 
             if (rows.Count == 0)
             {
+                /* #5984: a tag that matched nothing is an answer, not a collection miss. */
+                if (tagFilter.Active)
+                {
+                    return McpHelpers.Status(
+                        "empty",
+                        $"No query-stats group on {resolved.DisplayName} in the last {hours_back} hour(s) carries query tag '{tagFilter.Requested}'. The tag filter was applied in SQL before the top-{top} ranking.");
+                }
+
                 /* A filtered miss is not a collection miss: with the floor in the query, an empty page under
                    parallel_only means the window held no group whose plan ever ran parallel, and saying
                    "no query stats available" for that would send the caller to collection health. */
@@ -808,8 +852,8 @@ public sealed class DarlingMcpDataTools
                     return McpHelpers.Status(
                         "empty",
                         windowTruncated
-                            ? $"No query-stats group on {resolved.ServerName} in the last {hours_back} hour(s) has a cached plan with lifetime max_dop >= {minMaxDop}. The filter was applied in SQL over the part of the window raw query_stats still holds (from {McpHelpers.FormatEffectiveStart(effectiveStart)}; the older part was not read), so this is that part's answer rather than a page artefact — drop parallel_only / min_dop to see the unfiltered ranking, or confirm current parallelism with analyze_query_plan."
-                            : $"No query-stats group on {resolved.ServerName} in the last {hours_back} hour(s) has a cached plan with lifetime max_dop >= {minMaxDop}. The filter was applied in SQL over the whole window, so this is the window's answer rather than a page artefact — drop parallel_only / min_dop to see the unfiltered ranking, or confirm current parallelism with analyze_query_plan.",
+                            ? $"No query-stats group on {resolved.DisplayName} in the last {hours_back} hour(s) has a cached plan with lifetime max_dop >= {minMaxDop}. The filter was applied in SQL over the part of the window raw query_stats still holds (from {McpHelpers.FormatEffectiveStart(effectiveStart)}; the older part was not read), so this is that part's answer rather than a page artefact — drop parallel_only / min_dop to see the unfiltered ranking, or confirm current parallelism with analyze_query_plan."
+                            : $"No query-stats group on {resolved.DisplayName} in the last {hours_back} hour(s) has a cached plan with lifetime max_dop >= {minMaxDop}. The filter was applied in SQL over the whole window, so this is the window's answer rather than a page artefact — drop parallel_only / min_dop to see the unfiltered ranking, or confirm current parallelism with analyze_query_plan.",
                         new
                         {
                             filter_applied = filterApplied,
@@ -819,7 +863,37 @@ public sealed class DarlingMcpDataTools
                         });
                 }
 
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_stats", cancellationToken)
+                /* #6127: the ranking reads only rows that carry a measured delta. A window that stored snapshots but none of
+                   those (a plan sighted once stores zero deltas, and so does one sighted again with unmoved counters) is not a
+                   collection miss, and "no query stats available" sent callers to collection health, which shows rows. Said
+                   plainly, with the newest window that does carry a delta. Raw tier only: the hourly rollups keep their own
+                   rows. */
+                if (!hourly)
+                {
+                    var probe = await DarlingDataReader.GetQueryStatsSnapshotProbeAsync(postgres, resolved.ServerId, requestedStart, now, databases, cancellationToken);
+                    if (probe.SnapshotsInWindow > 0)
+                    {
+                        return McpHelpers.Status(
+                            "empty",
+                            McpHelpers.SnapshotsWithoutDeltaMessage(resolved.DisplayName, hours_back, probe.SnapshotsInWindow, probe.NewestMeasuredDeltaAt, now),
+                            new
+                            {
+                                snapshots_in_window = probe.SnapshotsInWindow,
+                                snapshots_with_measured_delta = 0,
+                                newest_measured_delta_at = probe.NewestMeasuredDeltaAt is { } newest ? McpHelpers.FormatEffectiveStart(newest) : null,
+                                suggested_hours_back = probe.NewestMeasuredDeltaAt is { } at ? McpHelpers.SuggestedHoursBack(at, now) : (int?)null
+                            });
+                    }
+                }
+
+                /* #6226: the collector looked and nothing ran. query_stats stores only what executed since its watermark, so a window in
+                   which it ran successfully and stored no row is a measurement (empty), not a gap (unavailable). Raw tier only, like the
+                   probe above: a window the hourly rollup serves has its own rows, and a run count says nothing about a rollup. After
+                   not_collected, which names an engine that never runs the collector. */
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_stats", cancellationToken)
+                    ?? (hourly ? null : EmptyCollectorRan(
+                        await DarlingCollectorRunFactsReader.ReadAsync(postgres, resolved.ServerId, "query_stats", requestedStart, now, cancellationToken),
+                        "query_stats", hours_back, "executed statements", databases))
                     ?? McpHelpers.Status("unavailable", "No query stats available for the specified time range.");
             }
 
@@ -895,9 +969,9 @@ public sealed class DarlingMcpDataTools
                     : null
             }, r.Detail, full));
 
-            return JsonSerializer.Serialize(new
+            var queriesPayload = JsonSerializer.SerializeToNode(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4231: what was served, beside what was asked for — the same disclosure get_query_store_top
                    makes (#2364), over query_stats instead of query_store_stats. */
@@ -935,7 +1009,16 @@ public sealed class DarlingMcpDataTools
                    for every other ranking, so the MCP tools (CPU only) always send null. The web page draws it above the grid. */
                 retention_notice = routed.RetentionNotice,
                 queries = result
-            }, McpHelpers.JsonOptions);
+            }, McpHelpers.JsonOptions)!.AsObject();
+
+            /* #5984: the row's query tag, by its query_hash; an unmapped hash carries no `tag` member. */
+            if (queriesPayload["queries"] is JsonArray queryRows)
+            {
+                await QueryTagReadJoin.AttachAsync(postgres, resolved.ServerId, QueryTagReadJoin.HashKind, queryRows.OfType<JsonObject>(),
+                    row => row["query_hash"]?.GetValue<string>(), cancellationToken);
+            }
+
+            return queriesPayload.ToJsonString(McpHelpers.JsonOptions);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -1036,10 +1119,12 @@ public sealed class DarlingMcpDataTools
         [Description("Hours of history. Default 24.")] int hours_back = 24,
         [Description("Number of top procedures. Default 20.")] int top = 20,
         [Description("Filter to a specific database.")] string? database_name = null,
+        [Description(QueryTagReadJoin.TagParameterDescription)] string? tag = null,
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         [Description("'summary' (default) or 'full': full adds the remaining desktop columns (times, read/write/spill extremes), omitting nulls.")] string detail = "summary",
+        ILogger? logger = null,
         CancellationToken cancellationToken = default)
-        => GetTopProceduresRanked(postgres, server_name, hours_back, top, database_name, as_of, detail, order_by: null, cancellationToken);
+        => GetTopProceduresRanked(postgres, server_name, hours_back, top, database_name, as_of, detail, order_by: null, cancellationToken, logger, tag);
 
     /// <summary>
     /// #5226: the body of <see cref="GetTopProceduresByCpu"/> with the ranking choice the web page offers; the MCP
@@ -1047,9 +1132,9 @@ public sealed class DarlingMcpDataTools
     /// </summary>
     internal static Task<string> GetTopProceduresRanked(
         NpgsqlDataSource postgres, string? server_name, int hours_back, int top, string? database_name, string? as_of, string detail,
-        string? order_by, CancellationToken cancellationToken) =>
+        string? order_by, CancellationToken cancellationToken, ILogger? logger = null, string? tag = null) =>
         GetTopProceduresRanked(
-            postgres, server_name, hours_back, top, DatabaseFilter.One(database_name), as_of, detail, order_by, cancellationToken);
+            postgres, server_name, hours_back, top, DatabaseFilter.One(database_name), as_of, detail, order_by, cancellationToken, logger, tag);
 
     /// <summary>
     /// #5245: <see cref="GetTopProceduresRanked(NpgsqlDataSource,string,int,int,string,string,string,string,CancellationToken)"/>
@@ -1057,7 +1142,7 @@ public sealed class DarlingMcpDataTools
     /// </summary>
     internal static async Task<string> GetTopProceduresRanked(
         NpgsqlDataSource postgres, string? server_name, int hours_back, int top, DatabaseFilter databases, string? as_of, string detail,
-        string? order_by, CancellationToken cancellationToken)
+        string? order_by, CancellationToken cancellationToken, ILogger? logger = null, string? tag = null)
     {
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
@@ -1074,16 +1159,35 @@ public sealed class DarlingMcpDataTools
             return McpHelpers.Refusal("order_by", $"order_by must be {TopRankings.Accepted} (got '{order_by}').");
         }
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(top, "top");
         if (validation != null) return validation;
 
         try
         {
+            /* #5984: the query tag filter. A name no tag carries is an empty answer that says so; it never reads the store. */
+            var tagFilter = await QueryTagReadJoin.ResolveAsync(postgres, tag, cancellationToken);
+            if (tagFilter.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadJoin.UnknownTagMessage(tagFilter.Requested!));
+            }
+
             var now = windowEnd;
             var requestedStart = now.AddHours(-hours_back);
-            var routed = await DarlingDataReader.GetTopProceduresByCpuRoutedAsync(postgres, resolved.ServerId, requestedStart, now, top, databases, ranking, cancellationToken);
+            /* #5633 item 4: with no database chosen the ranking leaves out the databases the server DROPPED (named by an earlier
+               database_states snapshot, absent from the newest), not a database dropped since: the rank's LIMIT would otherwise fill
+               with its rows, and a window that reaches back past the drop returned nothing else. The exclusion travels in the filter
+               ($6 of the statement). A database no snapshot ever listed (created after the newest one) is read. A database the
+               caller names is read as asked. Unknown (no snapshot) leaves out nothing. */
+            /* Review M2: an as_of read takes the newest snapshot at or before the anchor, so a database dropped since the window still ranks. */
+            databases = await CurrentDatabaseScope.NarrowAsync(postgres, resolved.ServerId, databases,
+                asOfUtc: string.IsNullOrWhiteSpace(as_of) ? null : windowEnd, windowStartUtc: requestedStart, cancellationToken: cancellationToken, logger: logger);
+            /* #5633 review (finding D): the narrowing is disclosed, never silent. The names it left out ride the envelope of an empty page
+               and of a page with rows (databases_left_out + a note), and an empty page's sentence claims only the databases the server
+               still has, so "the collector recorded nothing" is never said over a window where it recorded rows in a dropped database. */
+            var leftOut = DatabasesLeftOut.Distinct(databases.ExcludedNames);
+            var routed = await DarlingDataReader.GetTopProceduresByCpuRoutedAsync(postgres, resolved.ServerId, requestedStart, now, top, databases, ranking, cancellationToken, tagFilter);
             var rows = routed.Rows;
             var tierUsed = routed.Tier == RetentionTier.Hourly ? "hourly" : "raw";
 
@@ -1091,8 +1195,14 @@ public sealed class DarlingMcpDataTools
                here rather than per row, since it is a property of the tier, not the row. */
             string? precisionNote = null;
 
+            /* #5984: a tag that matched nothing is an answer, not a collection miss. */
+            if (rows.Count == 0 && tagFilter.Active)
+                return McpHelpers.WithDatabasesLeftOut(McpHelpers.Status(
+                    "empty",
+                    $"No procedure on {resolved.DisplayName} in the last {hours_back} hour(s) carries query tag '{tagFilter.Requested}'. The tag filter was applied in SQL before the top-{top} ranking."), leftOut)!;
+
             if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "procedure_stats", cancellationToken)
+                return McpHelpers.WithDatabasesLeftOut(await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "procedure_stats", cancellationToken)
                     ?? (routed.RawForced
                         /* #5226: a reads ranking that read raw (the io rollup, procedure_stats_io_hourly, did not reach back further
                            than raw), so an empty page here means raw holds nothing in the window while the stitched hourly rollups
@@ -1101,9 +1211,11 @@ public sealed class DarlingMcpDataTools
                             "empty",
                             "raw procedure_stats holds nothing in this window; the hourly rollup, which covers this window, cannot rank by reads (the stitched rollups carry no per-procedure logical reads, and the io hourly rollup, procedure_stats_io_hourly, does not reach this window's start on this store). Rank by cpu, duration or executions to read the rollup.",
                             new { window_truncated = true })
-                        : McpHelpers.Status(
-                            "unavailable",
-                            "No procedure stats available. Delta-based collection requires at least two collection cycles (~30 minutes) to produce non-zero values."));
+                        /* #5633 item 3: the two-cycles reason is true only while the collector is new. Past two successful runs an
+                           empty page means the collector looked and no procedure ran, so say that (shared words, Lite says the same). */
+                        : EmptyProcedureStatsStatus(
+                            await DarlingCollectorRunFactsReader.ReadAsync(postgres, resolved.ServerId, "procedure_stats", requestedStart, now, cancellationToken),
+                            hours_back, leftOut?.Count ?? 0)), leftOut)!;
 
             /* #4231: what the raw tier actually held, beside what was asked for — same probe and disclosure as
                get_top_queries_by_cpu and get_query_store_top (#2364), over procedure_stats.
@@ -1187,9 +1299,9 @@ public sealed class DarlingMcpDataTools
                 total_spills = hourly ? (long?)null : r.TotalSpills
             }, r.Detail, r.TotalExecutions, r.TotalSpills, full));
 
-            return JsonSerializer.Serialize(new
+            var proceduresPayload = JsonSerializer.SerializeToNode(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4231: what was served, beside what was asked for. */
                 effective_start = McpHelpers.FormatEffectiveStart(effectiveStart),
@@ -1216,8 +1328,26 @@ public sealed class DarlingMcpDataTools
                           + "server has been monitored for less time than that), so the older part of it was not read.",
                 /* #5226: as on get_top_queries_by_cpu: the raw route's retention notice for a reads ranking past raw's reach. */
                 retention_notice = routed.RetentionNotice,
+                /* #5633 review (finding D): null when the read left no database out. */
+                databases_left_out = DatabasesLeftOut.Named(leftOut),
+                databases_left_out_note = DatabasesLeftOut.Note(leftOut),
                 procedures = result
-            }, McpHelpers.JsonOptions);
+            }, McpHelpers.JsonOptions)!.AsObject();
+
+            /* #5984: the row's query tag, by its (database, schema, object) key; an unmapped procedure carries no `tag` member. */
+            if (proceduresPayload["procedures"] is JsonArray procedureRows)
+            {
+                await QueryTagReadJoin.AttachByKeysAsync(postgres, resolved.ServerId, QueryTagReadJoin.ObjectKind, procedureRows.OfType<JsonObject>().ToList(),
+                    rows.Select(r => (string?)QueryTagReadJoin.ObjectKey(r.DatabaseName, r.SchemaName, r.ObjectName)).ToList(), cancellationToken);
+            }
+
+            /* #5984 round 1: the answer names the tag that cut its population (present only when a tag was sent). */
+            if (tagFilter.Named is { } procedureTagName)
+            {
+                proceduresPayload["tag_filter"] = procedureTagName;
+            }
+
+            return proceduresPayload.ToJsonString(McpHelpers.JsonOptions);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -1259,7 +1389,31 @@ public sealed class DarlingMcpDataTools
     /// </summary>
     private const int QueryTextPreviewLength = 400;
 
-    [McpServerTool(Name = "get_query_store_top"), Description("Cost-ranked top Query Store queries (heaviest first), not time-ordered. Requires Query Store enabled on target databases. window_truncated marks a window floor, not a page cut — no limit changes it — because stored history can be shorter than asked; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> effective_start is where complete history begins. Long windows may read whole days from a daily summary; approximate: true says so. approximation_note says what the summary can miss; summary_days names the days it covered. Gets expensive queries from Query Store (persistent, survives restarts). Best for: historical analysis, queries no longer in plan cache. Requires Query Store enabled on target databases. Supports database and module filtering. Reads the raw tier, and the per-interval table for the older part of a long window (the corrected rollups carry no query_id or plan_id); history_source says which served. Rows are per Query Store execution outcome (execution_type: Regular, Aborted, Exception): a plan with aborted executions returns one row per outcome, each with its own counts and averages. The execution_type filter keeps one outcome, and module_name keeps one module: the exact, case-sensitive schema-qualified name the collector records (get_top_procedures_by_cpu's full_name; Adhoc for ad-hoc statements, Unknown for an object it could not resolve), applied after interval deduplication and before ranking. When a filter matches nothing but the same read without the filters has rows, the answer is empty (a measured zero), not a Query Store precondition; a module_name miss also carries the window read (effective_start, effective_hours_back, window_truncated) as hints. query_text is a 400-character preview by default (query_text_truncated marks a cut row); full_text=true returns each row's whole statement." + McpHelpers.WindowTruncatedDescription)]
+    /// <summary>
+    /// #6181: the <c>unavailable</c> answer for a Query Store top read that found nothing when no Query Store sample has ever
+    /// been stored, Query Store is on in the latest health snapshot and the collector's last run succeeded; null otherwise
+    /// (a sampled server, or an unknown or off state), so the caller keeps its own text.
+    /// </summary>
+    private static async Task<string?> FirstIntervalStatusAsync(
+        NpgsqlDataSource postgres, int serverId, string serverName, DatabaseFilter databases, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (await DarlingTrendReader.HasAnyQueryStoreStatAsync(postgres, serverId, cancellationToken))
+            {
+                return null;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+
+        var message = await DarlingRuntimePrecondition.QueryStoreFirstIntervalMessageAsync(postgres, serverId, serverName, databases, cancellationToken);
+        return message is null ? null : McpHelpers.Status("unavailable", message);
+    }
+
+    [McpServerTool(Name = "get_query_store_top"), Description("Cost-ranked top Query Store queries (heaviest first), not time-ordered. Requires Query Store enabled on target databases. window_truncated marks a window floor, not a page cut — no limit changes it — because stored history can be shorter than asked; effective_start / effective_hours_back give the reach actually served. <<GUIDE>> effective_start is where complete history begins. Long windows may read whole days from a daily summary; approximate: true says so. approximation_note says what the summary can miss; summary_days names the days it covered. Gets expensive queries from Query Store (persistent, survives restarts). Best for: historical analysis, queries no longer in plan cache. Requires Query Store enabled on target databases. Supports database and module filtering. Reads the raw tier, and the per-interval table for the older part of a long window (the corrected rollups carry no query_id or plan_id); history_source says which served. Rows are per Query Store execution outcome (execution_type: Regular, Aborted, Exception): a plan with aborted executions returns one row per outcome, each with its own counts and averages. The execution_type filter keeps one outcome, and module_name keeps one module: the exact, case-sensitive schema-qualified name the collector records (get_top_procedures_by_cpu's full_name; Adhoc for ad-hoc statements, Unknown for an object it could not resolve), applied after interval deduplication and before ranking. When a filter matches nothing but the same read without the filters has rows, the answer is empty (a measured zero), not a Query Store precondition; a module_name miss also carries the window read (effective_start, effective_hours_back, window_truncated) as hints. query_text is a 400-character preview by default (query_text_truncated marks a cut row); full_text=true returns each row's whole statement. The page is also capped at the shared ~32 KB response budget, heaviest rows kept: truncated says rows were cut for that, and budget_note says how many fit (window_truncated stays the window floor)." + McpHelpers.WindowTruncatedDescription)]
     public static Task<string> GetQueryStoreTop(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -1270,8 +1424,9 @@ public sealed class DarlingMcpDataTools
         [Description("Filter by Query Store execution outcome: Regular, Aborted, or Exception.")] string? execution_type = null,
         [Description("Exact schema-qualified module name, as get_top_procedures_by_cpu returns it in full_name (e.g. dbo.usp_ProcessOrder). Case-sensitive; applied before ranking. Ad-hoc statements are Adhoc.")] string? module_name = null,
         [Description("Return each row's full query_text instead of a 400-character preview. Default false.")] bool full_text = false,
+        [Description(QueryTagReadJoin.TagParameterDescription)] string? tag = null,
         CancellationToken cancellationToken = default) =>
-        GetQueryStoreTop(postgres, server_name, hours_back, top, database_name, as_of, execution_type, module_name, full_text, QueryTextPreviewLength, cancellationToken);
+        GetQueryStoreTop(postgres, server_name, hours_back, top, database_name, as_of, execution_type, module_name, full_text, QueryTextPreviewLength, cancellationToken, tag, McpResponseBudget.DefaultBytes);
 
     /// <summary>The sentence beside <c>approximate: true</c> on get_query_store_top (#5094): whole days of the window came from the
     /// daily summary, which is built after each day ends.</summary>
@@ -1286,11 +1441,14 @@ public sealed class DarlingMcpDataTools
     /// query_text already had before this opt-in existed, so the viewer's page does not change. Same overload
     /// shape #3897's trend tools use <c>TrendBudget.Chart</c> for.
     /// </summary>
+    #pragma warning disable CA1068 // #5984: tag trails the token on purpose; putting it before would shift every positional caller
     internal static Task<string> GetQueryStoreTop(
         NpgsqlDataSource postgres, string? server_name, int hours_back, int top, string? database_name, string? as_of,
-        string? execution_type, string? module_name, bool full_text, int previewLength, CancellationToken cancellationToken = default) =>
+        string? execution_type, string? module_name, bool full_text, int previewLength, CancellationToken cancellationToken = default, string? tag = null,
+        int? responseByteBudget = McpResponseBudget.DefaultBytes) =>
+    #pragma warning restore CA1068
         GetQueryStoreTop(
-            postgres, server_name, hours_back, top, DatabaseFilter.One(database_name), as_of, execution_type, module_name, full_text, previewLength, cancellationToken);
+            postgres, server_name, hours_back, top, DatabaseFilter.One(database_name), as_of, execution_type, module_name, full_text, previewLength, cancellationToken, tag, responseByteBudget);
 
     /// <summary>
     /// #5245: <see cref="GetQueryStoreTop(NpgsqlDataSource,string,int,int,string,string,string,string,bool,int,CancellationToken)"/>
@@ -1299,14 +1457,17 @@ public sealed class DarlingMcpDataTools
     /// databases" for two or more names and leaves the one-name text exactly as it was), and the Query Store
     /// precondition, which stays silent while any database in scope is READ_WRITE.
     /// </summary>
+    #pragma warning disable CA1068 // #5984: tag trails the token on purpose; putting it before would shift every positional caller
     internal static async Task<string> GetQueryStoreTop(
         NpgsqlDataSource postgres, string? server_name, int hours_back, int top, DatabaseFilter databases, string? as_of,
-        string? execution_type, string? module_name, bool full_text, int previewLength, CancellationToken cancellationToken = default)
+        string? execution_type, string? module_name, bool full_text, int previewLength, CancellationToken cancellationToken = default, string? tag = null,
+        int? responseByteBudget = McpResponseBudget.DefaultBytes)
     {
+    #pragma warning restore CA1068
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(top, "top");
         if (validation != null) return validation;
@@ -1322,9 +1483,16 @@ public sealed class DarlingMcpDataTools
 
         try
         {
+            /* #5984: the query tag filter. A name no tag carries is an empty answer that says so; it never reads the store. */
+            var tagFilter = await QueryTagReadJoin.ResolveAsync(postgres, tag, cancellationToken);
+            if (tagFilter.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadJoin.UnknownTagMessage(tagFilter.Requested!));
+            }
+
             var now = windowEnd;
             var requestedStart = now.AddHours(-hours_back);
-            var read = await DarlingDataReader.GetQueryStoreTopWithReachAsync(postgres, resolved.ServerId, requestedStart, now, top, databases, execution_type, module_name, cancellationToken);
+            var read = await DarlingDataReader.GetQueryStoreTopWithReachAsync(postgres, resolved.ServerId, requestedStart, now, top, databases, execution_type, module_name, cancellationToken, tagFilter);
             var rows = read.Rows;
             var tablePlan = read.Table;
 
@@ -1354,8 +1522,20 @@ public sealed class DarlingMcpDataTools
                 truncated = RawWindowFloor.IsTruncated(floor, requestedStart);
             }
 
-            if (rows.Count == 0)
+            /* #6074: every empty answer below is also read against the database's newest query_store_health row: when Query
+               Store is not READ_WRITE there, the answer says so and names get_query_store_health, because an empty page from a
+               read-only Query Store looks like a tool error or a quiet database. The ladder is unchanged; its answer gets one
+               more sentence when it is an empty or unavailable status. */
+            async Task<string> EmptyAnswerAsync()
             {
+                /* #5984: a tag that matched nothing is an answer, not a missing collection. */
+                if (tagFilter.Active)
+                {
+                    return McpHelpers.Status(
+                        "empty",
+                        $"No Query Store query on {resolved.DisplayName} in the last {hours_back} hour(s) carries query tag '{tagFilter.Requested}'. The tag filter was applied in SQL before the top-{top} ranking.");
+                }
+
                 /* A filter that matched nothing is an answer, not a missing collection. Most queries never abort,
                    so an Aborted or Exception filter is empty far more often than not, and falling through to the
                    chain below ended at "Query Store may not be enabled" -- false, whenever the same read without
@@ -1391,16 +1571,28 @@ public sealed class DarlingMcpDataTools
                                 window_truncated = truncated
                             }, scopeText);
 
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store", cancellationToken)
                     /* #2546: the sentence below GUESSES ("may not be enabled"), and it has to, because the
                        read had no way to find out. The store has known all along -- query_store_health
                        records actual_state per database every hour for exactly this purpose. Asking it turns
                        a hedge into a fact plus the ALTER DATABASE that fixes it, and it answers for the
                        database this read was scoped to rather than for the server's most flattering one. */
-                    ?? await DarlingRuntimePrecondition.QueryStoreStatusAsync(postgres, resolved.ServerId, resolved.ServerName, databases, cancellationToken)
+                    ?? await DarlingRuntimePrecondition.QueryStoreStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, databases, cancellationToken)
                     /* And the collector's own last run, for the case Query Store is on and the collector is
                        the thing that cannot read it. */
-                    ?? await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store", cancellationToken)
+                    ?? await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store", cancellationToken)
+                    /* #6181: a server just added stores no Query Store row until its first interval closes. When none was
+                       ever stored but Query Store is READ_WRITE and the collector's last run succeeded, say that instead of
+                       "may not be enabled". */
+                    ?? await FirstIntervalStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, databases, cancellationToken)
+                    /* #6226: the collector ran in the window and stored nothing, so nothing executed: empty, not a gap. Only when the
+                       raw tier answered and the window is inside what it keeps (raw is dropped at RawRetentionSpan on a store with the
+                       rollups armed, and collection_log outlives it, so a longer window's runs prove nothing about the dropped part). */
+                    ?? (tablePlan is null && read.DailyDaysUsed == 0 && now - requestedStart <= TimescaleSupport.RawRetentionSpan
+                        ? EmptyCollectorRan(
+                            await DarlingCollectorRunFactsReader.ReadAsync(postgres, resolved.ServerId, "query_store", requestedStart, now, cancellationToken),
+                            "query_store", hours_back, "Query Store intervals", databases)
+                        : null)
                     ?? McpHelpers.Status(
                         "unavailable",
                         $"No Query Store rows for this server in the {hours_back}-hour window searched. Query Store " +
@@ -1409,6 +1601,10 @@ public sealed class DarlingMcpDataTools
                         "nothing was read for the older part of it. Try a shorter window before concluding the " +
                         "queries did not run.");
             }
+
+            if (rows.Count == 0)
+                return await DarlingRuntimePrecondition.WithQueryStoreNotWritingHintAsync(
+                    await EmptyAnswerAsync(), postgres, resolved.ServerId, databases, cancellationToken);
 
             var approximate = read.DailyDaysUsed > 0 && read.DailySpan is not null;
             var result = rows.Select(r => new
@@ -1436,9 +1632,9 @@ public sealed class DarlingMcpDataTools
                 replica_role = r.ReplicaRole
             });
 
-            return JsonSerializer.Serialize(new
+            var storePayload = JsonSerializer.SerializeToNode(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #2364: what was served, beside what was asked for. hours_back alone was a request echoed
                    back as though it described the data. */
@@ -1473,7 +1669,31 @@ public sealed class DarlingMcpDataTools
                           + "carry no query_id or plan_id, and plan identity is what it exists to return."
                         : QueryStoreTableNote(effectiveStart, tablePlan.Value.StartBound),
                 queries = result
-            }, McpHelpers.JsonOptions);
+            }, McpHelpers.JsonOptions)!.AsObject();
+
+            /* #5984: the row's query tag, by its query_hash; an unmapped hash carries no `tag` member. */
+            if (storePayload["queries"] is JsonArray storeRows)
+            {
+                await QueryTagReadJoin.AttachAsync(postgres, resolved.ServerId, QueryTagReadJoin.HashKind, storeRows.OfType<JsonObject>(),
+                    row => row["query_hash"]?.GetValue<string>(), cancellationToken);
+            }
+
+            /* #5984 round 1: the answer names the tag that cut its population (present only when a tag was sent). */
+            if (tagFilter.Named is { } storeTagName)
+            {
+                storePayload["tag_filter"] = storeTagName;
+            }
+
+            /* #6131: the page is capped under the shared response budget, as the other read tools' pages are. top 200 measured
+               177 KB with nothing to say rows had been left out. The rows are heaviest first, so the cut drops the lightest.
+               `truncated` is this page cut ONLY: the window floor keeps its own flag, window_truncated, and its own note.
+               The web viewer's mirror passes a null budget and keeps its page exactly. */
+            if (responseByteBudget is int budget)
+            {
+                return McpResponseBudget.CapPage(storePayload, "queries", "heaviest first", "queries", budget);
+            }
+
+            return storePayload.ToJsonString(McpHelpers.JsonOptions);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -1494,7 +1714,7 @@ public sealed class DarlingMcpDataTools
 
     /* ═══════════════════════════ discovery / health ═══════════════════════════ */
 
-    [McpServerTool(Name = "list_servers"), Description("Lists monitored servers with collection freshness status and last collection time. Darling has no live connection to monitored servers: status is derived from how recently each was collected (Online = fresh, Warning = stale, Offline = no recent collection). Lite's status IS a live connection check, independent of whether anything is being collected. <<GUIDE>> Use this first to see available servers before calling other tools. Lists all monitored servers — SQL Server and PostgreSQL — with their collection freshness status and last collection time. Each row says which engine it describes: engine_kind is the raw registry token (sqlserver, postgres, aurora-postgres; null when no connect has stamped the row — the same vocabulary get_fleet_overview uses) and engine_version is the engine-aware version label (\"SQL Server 2022\", \"PostgreSQL 18\", or \"Azure SQL Database\" / \"Azure SQL Managed Instance\" with no year for those two Azure platforms; empty when no version has been collected). sql_version is a DEPRECATED legacy alias carrying the same value as engine_version, kept so existing consumers keep working — read engine_version instead, and never infer the engine from that key's name: a PostgreSQL row's sql_version reads \"PostgreSQL 18\". The service has no live connection to the monitored servers, so status is derived from how recently each server was collected (Online = fresh, Warning = stale, Offline = no recent collection). The peer_fleets block names the SIBLING Darling stores that monitor the rest of a split fleet, with what each one covers — this server can only NAME them (no cross-store reads), and peer_note says what an empty peer_fleets does and does not prove.")]
+    [McpServerTool(Name = "list_servers"), Description("Lists monitored servers with collection freshness status and last collection time. Darling has no live connection to monitored servers: status is derived from how recently each was collected (Online = fresh, Warning = stale, Offline = no recent collection). Lite's status IS a live connection check, independent of whether anything is being collected. <<GUIDE>> Use this first to see available servers before calling other tools. Lists all monitored servers — SQL Server and PostgreSQL — with their collection freshness status and last collection time. Each row says which engine it describes: engine_kind is the raw registry token (sqlserver, postgres, aurora-postgres; null when no connect has stamped the row — the same vocabulary get_fleet_overview uses) and engine_version is the engine-aware version label (\"SQL Server 2022\", \"PostgreSQL 18\", or \"Azure SQL Database\" / \"Azure SQL Managed Instance\" with no year for those two Azure platforms; empty when no version has been collected). sql_version is a DEPRECATED legacy alias carrying the same value as engine_version, kept so existing consumers keep working — read engine_version instead, and never infer the engine from that key's name: a PostgreSQL row's sql_version reads \"PostgreSQL 18\". The service has no live connection to the monitored servers, so status is derived from how recently each server was collected (Online = fresh, Warning = stale, Offline = no recent collection). The peer_fleets block names the SIBLING Darling stores that monitor the rest of a split fleet, with what each one covers — this server can only NAME them (no cross-store reads), and peer_note says what an empty peer_fleets does and does not prove. same_machine_as lists the names of the OTHER enabled registrations that last reported the same machine identity as this one (empty when none): an address can start reaching another machine, for example after an availability group listener fails over, and then two registrations watch one machine. Nothing is refused and nothing alerts; the list is worked out when you read it, so it clears when the address moves back. An agent-scoped notification route on one of those registrations does not cover the other.")]
     public static async Task<string> ListServers(
         NpgsqlDataSource postgres,
         CancellationToken cancellationToken = default)
@@ -1514,14 +1734,19 @@ public sealed class DarlingMcpDataTools
                 return McpHelpers.FormatError("list_servers (reading the servers registry from the store)", ex);
             }
 
-            /* #2339: the empty-registry answer is prose, not the JSON envelope, so it carries the peer
+            /* #2339: the empty-registry answer is not the server-list envelope, so it carries the peer
                disclosure explicitly — otherwise it is the one path where the declaration silently vanishes,
                and it is the worst one to lose it on: a store with nothing registered is a fresh or
                just-restarted box, where "no servers here" with no mention of the siblings is the strongest
-               version of the wrong conclusion. */
+               version of the wrong conclusion. #6277: it is the `empty` status envelope, the true negative
+               get_fleet_overview already answers an empty registry with, and not bare prose: prose is not
+               JSON, so the web read surface mapped it to a 400 and the Alert History, FinOps and Job History
+               pages logged a console error on a fresh install. */
             if (servers.Count == 0)
-                return "No servers are registered yet. The service registers each monitored server on its first successful connection."
-                    + DarlingPeerDirectory.EmptyRegistryDisclosure(DarlingPeerDirectory.Current);
+                return McpHelpers.Status(
+                    "empty",
+                    "No servers are registered yet. The service registers each monitored server on its first successful connection."
+                    + DarlingPeerDirectory.EmptyRegistryDisclosure(DarlingPeerDirectory.Current));
 
             return RenderServerList(servers, DateTime.UtcNow, DarlingPeerDirectory.Current);
         }
@@ -1574,7 +1799,9 @@ public sealed class DarlingMcpDataTools
                 sql_version = engineVersion,
                 status = FreshnessStatus(s.LastCollection, s.RegisteredAt, nowUtc),
                 read_only = s.ServerName.EndsWith(":RO", StringComparison.Ordinal),
-                last_collection = s.LastCollection?.ToString("o")
+                last_collection = s.LastCollection?.ToString("o"),
+                /* #6351: the other enabled registrations that last reported this machine's identity. Worked out at read, never stored. */
+                same_machine_as = s.SameMachineAs ?? Array.Empty<string>()
             };
         });
 
@@ -1595,14 +1822,99 @@ public sealed class DarlingMcpDataTools
         }, McpHelpers.JsonOptions);
     }
 
-    [McpServerTool(Name = "get_collection_health"), Description("Per-collector 7-day health for a server. STOPPED (gate off) does not count as failing; rows_stored=0 is NOT a fault by itself — output_finding says whether it is a resting event-collector or a denial needing a grant. last_error is a sticky slot, not necessarily current: check last_error_at/denied_since_last_success. regressed_from_productive floors WARNING on an axis SEPARATE from failed_collector_count — never add them. alert_read_health uses a DIFFERENT since-restart window, not this one; zero there means none since restart, not none in 7 days. <<GUIDE>> Shows the health status of all data collectors for a server — whether they're running successfully, failing, or stale. A collector reads STOPPED rather than FAILING when it has attempted nothing at all — no success, no error, nothing — for longer than the FAILING cutoff, despite a history of runs: that is a collector whose gate (AppliesTo) flipped off for this target rather than one that keeps running and erroring, and it does not count toward a server's failing-collector total. A collector reads EXTENSION_MISSING when every attempt in the window was skipped because a PostgreSQL extension it declares is not installed on the target - last_error names the extension, CREATE EXTENSION (plus shared_preload_libraries and a restart where the message says so) is the remedy, never a grant, and an optional extension left uninstalled is a legitimate resting state rather than a fault. That last reading holds ONLY for a collector that never produced on this target, and regressed_from_productive is the field that tells you which one you are looking at: it is true when this collector WAS storing rows and has reported a named skip - EXTENSION_MISSING, PERMISSIONS or SESSION_MISSING - on every cycle since. That is a restart or an upgrade changing what the collector can read, which is a regression rather than rest, and it is not something the band can tell you on its own: the skip bands are reached only when the whole window holds no success, so a collector that regressed inside the last day still has a fresh success, reads HEALTHY on the ordinary staleness ladder, and is floored to WARNING by this flag alone. last_productive_at is when this collector last stored anything, rows_in_prior_7d is how much it stored over this seven-day window and is served only when the flag is true (only then is that figure entirely pre-regression, because a named skip stores nothing), and regression_finding is the sentence that puts the three facts in the order they happened. The flag is also true for the second regression class: a collector that WAS storing rows and has recorded SUCCESS with zero rows on its last three runs, which no skip word or staleness reading can show. A collector whose rows exist only while the target is busy (waiting_tasks, query_snapshots, running_jobs, job_history, procedure_stats, pg_lock_stats, pg_session_states) must also have gone 72 hours without a row, because an idle target legitimately returns nothing for that long, and query_store must have gone just over a day, its longest Query Store interval. get_fleet_overview counts the same rows per server as regressed_collector_count. That count is a SEPARATE AXIS from failed_collector_count and the two must never be added: one regression reads WARNING on its first day and FAILING once its success clock runs out, and is regressed on both. Check this before investigating data to ensure collectors are working properly. Each row also carries last_note/note_count: what a NON-failing run reported, e.g. an enumeration that came back with 0 items. For a note without counts, note_count equal to total_runs means the collector has been collecting nothing all window — not a fault (the target may be legitimately empty), but the reason a HEALTHY collector can still have no data; when last_note carries label=value counts it is the newest NOTED run's counts and never a window total, and note_count equal to total_runs then says only that every run measured itself. target_has_user_databases tells those two apart: true means the target DID have user databases in the same window, so an all-window empty enumeration is worth investigating (a login that cannot enter them, an exclusion filter that matched everything, a databases scope on the collector's schedule row that admits nothing - the last a Darling-only schedule knob); false means either no user databases or no inventory to go on. Each row also carries abandoned and abandon_rate_pct: cycles the 120-second whole-server wall-clock budget gave up on, which stored nothing and advanced no watermark. Unlike a yield, which retries, an abandoned cycle is collected data you do not have. A rate above 0.5% bands the collector WARNING, so a WARNING here may have nothing to do with errors - read abandoned beside errors to attribute it. CRITICAL for reading last_error: it is a single slot carrying the newest ERROR, PERMISSIONS, or EXTENSION_MISSING message in the whole window, and a message in it is NOT evidence that the condition is current. Read last_error_at for when it happened, last_denied_at for when the newest DENIAL specifically happened, and denied_since_last_success for the derived answer - true means a denial is the collector's current state, false means every denial in the window predates a later success and the collector is reading fine now. A fault recorded before a code path changed will sit in last_error for the rest of the window while every cycle since succeeds. Do not infer a live condition from last_error alone. Total abandonment still reads FAILING through staleness; the rate exists for the partial case, where a collector abandons some cycles and succeeds often enough to stay fresh, which otherwise read HEALTHY with errors 0 indefinitely. The sweep_pressure block is the server-level roll-up: it compares the collectors' combined execution demand (average duration amortized by cadence) against the minute the fastest cadence holds. SATURATED means the collection body cannot fit inside its cadence, so relaunches are skipped and the server collects at a multiple of its configured interval while every collector still reads healthy — heaviest_collectors names where that budget goes. That verdict is the SUSTAINED answer only. peak_cycle_risk is the separate single-sweep answer: peak_cycle_ms is what the body costs on the cycle where every scheduled cadence comes due together, and BODY_OVERRUN means that one body cannot fit the budget even when the verdict reads OK — the signature of one infrequent heavy collector, which amortization hides and heaviest_collectors therefore ranks out of sight. peak_collector names it, and peak_cycle_note explains it. Read both fields: a server can be OK/BODY_OVERRUN (a schedule-shape problem, fix by moving or splitting that collector) or SATURATED/BODY_OVERRUN (a capacity problem). Every collector row carries avg_duration_ms, p95_duration_ms and max_duration_ms, because a collector's runs are not always one population. Read the three together: avg close to p95 close to max is one population, avg far below p95 is two, and p95 far below max is one pathological run. peak_cycle_ms is built from p95 (floored at the mean, so it can never read lower than a mean-based figure) for exactly that reason, and peak_collector carries peak_run_ms beside avg_duration_ms so the gap is visible. Those three still describe RUNS, and a collector that runs once per DATABASE writes one blended row, so no run-level statistic can say which database cost what. Five fan out from an enumeration on any SQL Server target (query_store, plan_correction, query_store_health, index_object_stats, database_scoped_config); separately, eleven more fan out over a per-database connection loop when the target is Azure SQL DB, and pg_autovacuum_stats always does on PostgreSQL. The per-collector `fanout` block is that answer, null for a collector that does not fan out: `items` is how wide the fan-out was, `slowest`/`slowest_ms` name the dearest database and its cost on the window's worst run, `run_ms` is that whole run, `slowest_share_pct` is slowest_ms / run_ms as a percentage — the slowest item's share of the whole pass — and `dominance` is slowest_ms * items / run_ms, the slowest item against the MEAN item: 1.0 for a perfectly even fan-out, rising with concentration. The remediation decision routes through the SHARE, not through dominance: a low share means the cost is the fan-out's WIDTH — no single database is worth chasing, and bounded parallelism is the lever — while a high share means one database dominates the pass and a per-database schedule override or a stagger is what helps. Dominance is NOT that verdict, because its ceiling is items. A fixed threshold on dominance misreads exactly the widest fan-outs, where the cost lives. Dominance only reads as dominance when it approaches a meaningful fraction of items (share = dominance / items); it stays published as the evenness ratio, for continuity. Do not try to infer any of this from p95 versus avg — on a per-database collector that ratio is usually saturated by empty-versus-productive runs and says nothing about databases. Every field named so far describes what a collector SPENT; rows_stored, runs_with_rows and productive_run_pct are what it BOUGHT, counted over the same window as total_runs and the durations, so cost and output on a row always describe the same runs. Read them together for the readings that need different actions: rows_stored above zero is expensive AND productive; rows_stored zero with denied_since_last_success false, no faulted run and no note is a collector that read and found nothing, which for one that stores a row only when an event occurs (e.g. deadlocks, blocked_process_report, pg_blocking, pg_xmin_horizon) is the correct resting state and needs no action; rows_stored zero with denied_since_last_success true is a collector that could not read and needs a grant. output_finding says which zero reading applies and is null whenever rows_stored is positive. There are five, in the order they are decided: a current denial is the grant case; errors plus session_missing above zero means that many runs recorded a fault rather than a result, so on those runs the collector was UNABLE to read and the resting-state reading is withheld for the whole window (every run faulted is nothing read at all and needs action - the case an Azure SQL DB target produced when two collectors failed on every database every sweep and were recorded SUCCESS with a sentence saying they had read and found nothing); note_count above zero means the runs themselves recorded what they found, so the finding defers to last_note instead of assuming a category - which is what keeps a DELIBERATE zero distinguishable from a collector that quietly stopped storing rows; nothing on the row explaining the zero from an event collector is that collector at rest; and the same from a collector that is NOT event-triggered - a configuration or snapshot read such as database_scoped_config, which returns a row per setting per database - is its source coming back empty on every run, which is not a resting state and the finding says needs a look. The event-collector set is a closed list on the shared classifier, so a collector left off it gets the non-reassuring sentence rather than the reassuring one. query_store on a read-replica target is the deliberate case: it is not an event collector, and every run notes an empty enumeration because Query Store on a readable secondary is excluded by design. This is deliberately NOT a band. A verdict keyed on cost-plus-zero-rows would fire on the healthy quiet install rather than the blind one. These are NOT the hourly per-collector series Darling's get_collector_cost reports as total_rows - a separate series over that caller's own days_back and across every server at once, and Darling-only, so Lite has no twin of it; the top-level output_note names both windows and disclaims that one. rows_stored is also what a run STORED, never what the monitored engine counted, so a zero cannot tell a genuinely quiet source apart from a reader capturing nothing off a busy one - nothing on this surface measures that. One block on this response is deliberately NOT on the seven-day window: alert_read_health, which counts the alerting layer's OWN store reads that failed and were swallowed. A condition check that cannot read the store logs one line and skips - correctly, because firing on absent evidence would fabricate an alert and resolving on it would fabricate a recovery - and that skip is not a collector run, so it writes no collection_log row and reaches no other health surface: only a grep of the service log found the class. It matters out of proportion to the count because the alert pass runs on a much shorter store deadline than the collection sweep, so as store latency rises the alerting layer is the FIRST thing to fail and collection is the last - during one measured episode of store lock contention the service log's error rate rose 41 to 61 per hour, every line an alerting-side read, while collector failures over the same hours FELL from 23 to 2. Read server_read_failures beside server_alert_passes for this server (a pass is one alert evaluation pass containing many reads, so more failures than passes is ordinary and the pair is NOT a ratio; a Darling sweep runs two passes for a SQL Server target, three for a PostgreSQL one, and Lite runs one, so the denominator is comparable within a host and engine but not across them), instance_read_failures for the whole service (which also covers the fleet-scoped conditions that belong to no server and so appear in no per-server count: " + AlertReadFailureCounter.FleetScopedReads + "), fleet_read_failures for how many of that service total belong to no server at all - the figure that makes a nonzero service count readable from a server whose own count is zero, because those two populations take opposite actions: a blind fleet-scoped read means the store's own self-alerts went quiet and two of them are the reads whose alerts would say the store is in trouble, while one on another server is answered by reading this same block there, last_failure_read for which condition went blind most recently, last_failure_elapsed_ms for how long that read ran before it faulted - which is the term that says whose deadline ended it ONLY WHERE THE ALERT PASS SETS ONE. The Darling service does, on every store read; Lite's alerting reads go into its local store with no command deadline at all, so on Lite this is a plain duration that says a read became slow and nothing about who ended it. Where there is a deadline: an elapsed at or about it means this process stopped waiting while the statement was still running on the store, one well below that bound means the store returned a fault, and the exception text cannot make that distinction because a client-side deadline renders as a torn stream with no SQLSTATE exactly like a dropped connection. A figure well ABOVE the bound is a third reading: the failure was not a single bounded read, which each site's clock restart between consecutive awaits makes rare and which is expected only on the shared engine sweep entry, whose awaited operation is a whole alert pass - and last_failure_at to tell a healed episode from a live one: this count never ages out of a window, so a nonzero value with a stamp from days ago is history. Every count on this block carries its own newest-failure stamp, read name and elapsed, so none of them sits undated: last_failure_* are THIS server's, fleet_last_failure_* are the fleet-scoped conditions' and are attributable by construction, and instance_last_failure_* are the newest failure anywhere in this service whatever its scope - that last trio may therefore name a read on a server you did not ask about and makes no claim about which, which is why the fleet trio is reported separately rather than inferred from it. The third population is a subtraction: instance_read_failures minus server_read_failures minus fleet_read_failures is how many failed on OTHER servers, and that one has no stamp here by design - nothing holds a newest failure for it, and a count with nothing to date or name it is the gap the three trios close, so read this block on those servers to attribute it. retried_reads is the SECOND population and on the Darling service is where most of what this block used to count now lands: reads that crossed the 10 s alert-pass deadline once and succeeded on the single retry two seconds later - the store's write bands' cost, counted rather than blinding an alert. Every one of those would once have been a swallowed failure, so read the two together: retries rising with failures at zero is a store under write pressure whose alerting is intact, and both rising is a store where a second attempt twelve seconds later still found the band on, which wants the store's write schedule looked at rather than the reader's. A read that failed twice counts in both. It carries no stamp and no read name, deliberately - a retried read did not go blind, so there is no episode to date or attribute, and a stamp would invite reading a retry as a soft failure. instance_retried_reads is the same figure across the whole service, with no fleet part because nothing records a fleet-scoped retry today. On Lite both read zero as a property of the SKU and not of a quiet store: Lite's alerting reads carry no command deadline, so there is no deadline to cross and nothing to retry. counting_since is when this process began counting, early in its own startup - these are in-memory counts and a restart takes them to zero, so a zero means \"none since counting_since\" and NOT \"none in seven days\"; check the stamp before reading the zero as reassurance. Deliberately not persisted, because what it counts is a failure to READ the store. It does NOT count alerts that failed to DELIVER and makes no claim about them - that is get_alert_history's question. And deliberately not a band, for the same reason the output figures are not: any threshold over it would have to guess how many blind reads make alerting unhealthy, and a wrong guess on this particular surface fails by saying nothing is wrong. The service block beside alert_read_health is the build-attribution read: nothing else on this surface says WHAT build is answering, so the question an operator watching an install actually asks - \"is the running service the build that carries fix X\" - is answered by version directly instead of by restart inference plus a merge-list lookup the watcher has no way to perform. version is the running build's informational version - the same read the Darling service's --version verb prints, with any SemVer build-metadata suffix stripped and the prerelease suffix KEPT, because the nightly stamp lives in the prerelease and one nightly differs from the next in nothing else; Lite has no version verb and reads the same attribute off its own app assembly, stamped from the same single declaration. counting_since remains the restart detector, and a restart is NOT a build: a crash-restart moves counting_since exactly the way an install does, which is why inferring a build from it misattributes. started_at is the SAME instant counting_since carries, deliberately - both mean \"when this process came up\", and a second clock for one fact would put two near-identical stamps on one payload whose skew a reader would have to explain away. compiled_schema_version is the schema rung this BUILD expects - the compiled constant, not a read of the store's migrated rung - so beside version it says what this build requires of the store it serves, whether or not that store has caught up. When a recent analysis pass could not read one of its fact families for this server, the payload also carries analysis_caveats (analysis_time, families_failed, families_total, entries[{family, read, outcome, message, failed_in_last_passes}]) — the analysis pass's own reads of the collectors' tables, a different layer from the collector rows; absent when the last 24 remembered passes were clean. Process memory: a service restart forgets. full_detail (#4198): every collector row above defaults to a compact shape - collector, status, compact, total_runs, rows_stored, avg_duration_ms, last_success - for a collector that is HEALTHY with zero errors, session_missing, extension_missing, permission_denied and abandoned runs this window, not regressed, and either stored rows or is a known event collector reading zero at rest. Any other row - failing, stale, stopped, erroring, denied, regressed, or a non-event collector's unexplained zero - is never dropped and never silently shortened to that seven-field shape: it gets partial_detail: true instead of compact, and a leaner shape naming what is wrong and since when - collector, status, partial_detail, total_runs, errors, session_missing, abandoned, rows_stored, last_success, last_error, last_error_truncated, last_error_at, last_denied_at, denied_since_last_success, regressed_from_productive, regression_finding, output_finding, output_finding_truncated - rather than every field named earlier in this guide. Pass full_detail=true for every field on every row regardless of health or tier. collector_detail_note on the envelope names how many rows compacted, how many took the leaner shape, and how full_detail restores each. Run time (#4938): a collector that runs once a day or less often can have a run time, a fixed time of day on the monitored server's own clock. run_at is that time as 24-hour HH:MM, or null when the collector has none. next_run_utc is when the collector is next due, in UTC, or null when it has no run time or is disabled. It is the run time plus this server's fixed spread of under 60 minutes, so a fleet-wide run time does not start every server in the same minute, and a run may start up to 60 minutes after it. When next_run_utc equals the time of the read, the collector is due now and has not run for this slot yet. A day missed past those 60 minutes is skipped, never replayed, so a collector that skipped a day reads STALE before its next run (a daily collector goes stale after 36 hours). run_time_note says so: how long the collector has not run, the stale line it is past, and when the next run is due. On Lite it also names the slot, in the form run_at uses, and says Lite collects only while it is open. run_time_note is null when no day was skipped, and while the collector is due now or disabled. A server whose clock is not known yet reads the run time as UTC. A run time does not change the health bands, which stay on the shipped cadence, and frequency_minutes elsewhere in this payload is still the shipped cadence. A full row always carries run_at, next_run_utc and run_time_note, each null when the collector has no run time. A partial row (a collector that needs a look) and a compact row (a healthy collector with nothing to report) carry run_at and next_run_utc only when the collector has a run time, so a partial or compact row without them has none. A partial row carries run_time_note under the same condition, and a compact row never carries it, because a skipped day is not healthy.")]
+    [McpServerTool(Name = "get_collection_health"), Description("Per-collector 7-day health for a server. STOPPED (gate off) does not count as failing; rows_stored=0 is NOT a fault by itself — output_finding says whether it is a resting event-collector or a denial needing a grant. last_error is a sticky slot, not necessarily current: check last_error_at/denied_since_last_success. regressed_from_productive floors WARNING on an axis SEPARATE from failed_collector_count — never add them. alert_read_health uses a DIFFERENT since-restart window, not this one; zero there means none since restart, not none in 7 days. <<GUIDE>> A collector reads STOPPED rather than FAILING when it has attempted nothing at all — no success, no error, nothing — for longer than the FAILING cutoff, despite a history of runs: that is a collector whose gate (AppliesTo) flipped off for this target rather than one that keeps running and erroring, and it does not count toward a server's failing-collector total. A collector reads EXTENSION_MISSING when every attempt in the window was skipped because a PostgreSQL extension it declares is not installed on the target - last_error names the extension, CREATE EXTENSION (plus shared_preload_libraries and a restart where the message says so) is the remedy, never a grant, and an optional extension left uninstalled is a legitimate resting state rather than a fault. That last reading holds ONLY for a collector that never produced on this target, and regressed_from_productive is the field that tells you which one you are looking at: it is true when this collector WAS storing rows and has reported a named skip - EXTENSION_MISSING, PERMISSIONS or SESSION_MISSING - on every cycle since. That is a restart or an upgrade changing what the collector can read, which is a regression rather than rest, and it is not something the band can tell you on its own: the skip bands are reached only when the whole window holds no success, so a collector that regressed inside the last day still has a fresh success, reads HEALTHY on the ordinary staleness ladder, and is floored to WARNING by this flag alone. last_productive_at is when this collector last stored anything, rows_in_prior_7d is how much it stored over this seven-day window and is served only when the flag is true (only then is that figure entirely pre-regression, because a named skip stores nothing), and regression_finding is the sentence that puts the three facts in the order they happened. The flag is also true for the second regression class: a collector that WAS storing rows and has recorded SUCCESS with zero rows on its last three runs, which no skip word or staleness reading can show. A collector whose rows exist only while the target is busy (waiting_tasks, query_snapshots, running_jobs, job_history, procedure_stats, pg_lock_stats, pg_session_states) must also have gone 72 hours without a row, because an idle target legitimately returns nothing for that long, and query_store must have gone just over a day, its longest Query Store interval. get_fleet_overview counts the same rows per server as regressed_collector_count. That count is a SEPARATE AXIS from failed_collector_count and the two must never be added: one regression reads WARNING on its first day and FAILING once its success clock runs out, and is regressed on both. Each row also carries last_note/note_count: what a NON-failing run reported, e.g. an enumeration that came back with 0 items. For a note without counts, note_count equal to total_runs means the collector has been collecting nothing all window — not a fault (the target may be legitimately empty), but the reason a HEALTHY collector can still have no data; when last_note carries label=value counts it is the newest NOTED run's counts and never a window total, and note_count equal to total_runs then says only that every run measured itself. target_has_user_databases tells those two apart: true means the target DID have user databases in the same window, so an all-window empty enumeration is worth investigating (a login that cannot enter them, an exclusion filter that matched everything, a databases scope on the collector's schedule row that admits nothing - the last a Darling-only schedule knob); false means either no user databases or no inventory to go on. Each row also carries abandoned and abandon_rate_pct: cycles the 120-second whole-server wall-clock budget gave up on, which stored nothing and advanced no watermark. Unlike a yield, which retries, an abandoned cycle is collected data you do not have. A rate above 0.5% bands the collector WARNING, so a WARNING here may have nothing to do with errors - read abandoned beside errors to attribute it. Read last_error with care: it is a single slot carrying the newest ERROR, PERMISSIONS, or EXTENSION_MISSING message in the whole window, and a message in it is NOT evidence that the condition is current. Read last_error_at for when it happened, last_denied_at for when the newest DENIAL specifically happened, and denied_since_last_success for the derived answer - true means a denial is the collector's current state, false means every denial in the window predates a later success and the collector is reading fine now. Do not infer a live condition from last_error alone. Total abandonment still reads FAILING through staleness; the rate exists for the partial case, where a collector abandons some cycles and succeeds often enough to stay fresh, which otherwise read HEALTHY with errors 0 indefinitely. The sweep_pressure block is the server-level roll-up: it compares the collectors' combined execution demand (average duration amortized by cadence) against the minute the fastest cadence holds. SATURATED means the collection body cannot fit inside its cadence, so relaunches are skipped and the server collects at a multiple of its configured interval while every collector still reads healthy — heaviest_collectors names where that budget goes. That verdict is the SUSTAINED answer only. peak_cycle_risk is the separate single-sweep answer: peak_cycle_ms is what the body costs on the cycle where every scheduled cadence comes due together, and BODY_OVERRUN means that one body cannot fit the budget even when the verdict reads OK — the signature of one infrequent heavy collector, which amortization hides and heaviest_collectors therefore ranks out of sight. peak_collector names it, and peak_cycle_note explains it. Read both fields: a server can be OK/BODY_OVERRUN (a schedule-shape problem, fix by moving or splitting that collector) or SATURATED/BODY_OVERRUN (a capacity problem). Every collector row carries avg_duration_ms, p95_duration_ms and max_duration_ms, because a collector's runs are not always one population. Read the three together: avg close to p95 close to max is one population, avg far below p95 is two, and p95 far below max is one pathological run. peak_cycle_ms is built from p95 (floored at the mean, so it can never read lower than a mean-based figure) for exactly that reason, and peak_collector carries peak_run_ms beside avg_duration_ms so the gap is visible. p95_duration_ms is exact on Lite; on Darling it is the upper bound of its log-spaced duration bucket, up to about 47% above the exact p95, and the peak cycle charges the bucket's lower bound, which peak_cycle_note says. Those three still describe RUNS, and a collector that runs once per DATABASE writes one blended row, so no run-level statistic can say which database cost what. Up to six fan out from an enumeration on any SQL Server target (query_store, plan_correction, query_store_health, query_store_forced_plans in Darling only, index_object_stats, database_scoped_config); separately, eleven more fan out over a per-database connection loop when the target is Azure SQL DB, and pg_autovacuum_stats always does on PostgreSQL. The per-collector `fanout` block is that answer, null for a collector that does not fan out: `items` is how wide the fan-out was, `slowest`/`slowest_ms` name the dearest database and its cost on the window's worst run, `run_ms` is that whole run, `slowest_share_pct` is slowest_ms / run_ms as a percentage — the slowest item's share of the whole pass — and `dominance` is slowest_ms * items / run_ms, the slowest item against the MEAN item: 1.0 for a perfectly even fan-out, rising with concentration. The remediation decision routes through the SHARE, not through dominance: a low share means the cost is the fan-out's WIDTH — no single database is worth chasing, and bounded parallelism is the lever — while a high share means one database dominates the pass and a per-database schedule override or a stagger is what helps. Dominance is NOT that verdict, because its ceiling is items. A fixed threshold on dominance misreads exactly the widest fan-outs, where the cost lives. Dominance only reads as dominance when it approaches a meaningful fraction of items (share = dominance / items); it stays published as the evenness ratio, for continuity. Do not try to infer any of this from p95 versus avg — on a per-database collector that ratio is usually saturated by empty-versus-productive runs and says nothing about databases. Every field named so far describes what a collector SPENT; rows_stored, runs_with_rows and productive_run_pct are what it BOUGHT, counted over the same window as total_runs and the durations, so cost and output on a row always describe the same runs. Read them together for the readings that need different actions: rows_stored above zero is expensive AND productive; rows_stored zero with denied_since_last_success false, no faulted run and no note is a collector that read and found nothing, which for one that stores a row only when an event occurs (e.g. deadlocks, blocked_process_report, pg_blocking, pg_xmin_horizon) is the correct resting state and needs no action; rows_stored zero with denied_since_last_success true is a collector that could not read and needs a grant. output_finding says which zero reading applies and is null whenever rows_stored is positive. There are five, in the order they are decided: a current denial is the grant case; errors plus session_missing above zero means that many runs recorded a fault rather than a result, so on those runs the collector was UNABLE to read and the resting-state reading is withheld for the whole window (every run faulted is nothing read at all and needs action - the case an Azure SQL DB target produced when two collectors failed on every database every sweep and were recorded SUCCESS with a sentence saying they had read and found nothing); note_count above zero means the runs themselves recorded what they found, so the finding defers to last_note instead of assuming a category - which is what keeps a DELIBERATE zero distinguishable from a collector that quietly stopped storing rows; nothing on the row explaining the zero from an event collector is that collector at rest; and the same from a collector that is NOT event-triggered - a configuration or snapshot read such as database_scoped_config, which returns a row per setting per database - is its source coming back empty on every run, which is not a resting state and the finding says needs a look. The event-collector set is a closed list on the shared classifier, so a collector left off it gets the non-reassuring sentence rather than the reassuring one. query_store on a read-replica target is the deliberate case: it is not an event collector, and every run notes an empty enumeration because Query Store on a readable secondary is excluded by design. This is deliberately NOT a band. A verdict keyed on cost-plus-zero-rows would fire on the healthy quiet install rather than the blind one. These are NOT the hourly per-collector series Darling's get_collector_cost reports as total_rows - a separate series over that caller's own days_back and across every server at once, and Darling-only, so Lite has no twin of it; the top-level output_note names both windows and disclaims that one. rows_stored is also what a run STORED, never what the monitored engine counted, so a zero cannot tell a genuinely quiet source apart from a reader capturing nothing off a busy one - nothing on this surface measures that. One block on this response is deliberately NOT on the seven-day window: alert_read_health, which counts the alerting layer's OWN store reads that failed and were swallowed. A condition check that cannot read the store logs one line and skips - correctly, because firing on absent evidence would fabricate an alert and resolving on it would fabricate a recovery - and that skip is not a collector run, so it writes no collection_log row and reaches no other health surface: only a grep of the service log found the class. It matters out of proportion to the count because the alert pass runs on a much shorter store deadline than the collection sweep, so as store latency rises the alerting layer is the FIRST thing to fail and collection is the last - during one measured episode of store lock contention the service log's error rate rose 41 to 61 per hour, every line an alerting-side read, while collector failures over the same hours FELL from 23 to 2. Read server_read_failures beside server_alert_passes for this server (a pass is one alert evaluation pass containing many reads, so more failures than passes is ordinary and the pair is NOT a ratio; a Darling sweep runs two passes for a SQL Server target, three for a PostgreSQL one, and Lite runs one, so the denominator is comparable within a host and engine but not across them), instance_read_failures for the whole service (which also covers the fleet-scoped conditions that belong to no server and so appear in no per-server count: " + AlertReadFailureCounter.FleetScopedReads + "), fleet_read_failures for how many of that service total belong to no server at all - the figure that makes a nonzero service count readable from a server whose own count is zero, because those two populations take opposite actions: a blind fleet-scoped read means the store's own self-alerts went quiet and two of them are the reads whose alerts would say the store is in trouble, while one on another server is answered by reading this same block there, last_failure_read for which condition went blind most recently, last_failure_elapsed_ms for how long that read ran before it faulted - which is the term that says whose deadline ended it ONLY WHERE THE ALERT PASS SETS ONE. The Darling service does, on every store read; Lite's alerting reads go into its local store with no command deadline at all, so on Lite this is a plain duration that says a read became slow and nothing about who ended it. Where there is a deadline: an elapsed at or about it means this process stopped waiting while the statement was still running on the store, one well below that bound means the store returned a fault, and the exception text cannot make that distinction because a client-side deadline renders as a torn stream with no SQLSTATE exactly like a dropped connection. A figure well ABOVE the bound is a third reading: the failure was not a single bounded read, which each site's clock restart between consecutive awaits makes rare and which is expected only on the shared engine sweep entry, whose awaited operation is a whole alert pass - and last_failure_at to tell a healed episode from a live one: this count never ages out of a window, so a nonzero value with a stamp from days ago is history. Every count on this block carries its own newest-failure stamp, read name and elapsed, so none of them sits undated: last_failure_* are THIS server's, fleet_last_failure_* are the fleet-scoped conditions' and are attributable by construction, and instance_last_failure_* are the newest failure anywhere in this service whatever its scope - that last trio may therefore name a read on a server you did not ask about and makes no claim about which, which is why the fleet trio is reported separately rather than inferred from it. The third population is a subtraction: instance_read_failures minus server_read_failures minus fleet_read_failures is how many failed on OTHER servers, and that one has no stamp here by design - nothing holds a newest failure for it, and a count with nothing to date or name it is the gap the three trios close, so read this block on those servers to attribute it. retried_reads is the SECOND population and on the Darling service is where most of what this block used to count now lands: reads that crossed the 10 s alert-pass deadline once and succeeded on the single retry two seconds later - the store's write bands' cost, counted rather than blinding an alert. Every one of those would once have been a swallowed failure, so read the two together: retries rising with failures at zero is a store under write pressure whose alerting is intact, and both rising is a store where a second attempt twelve seconds later still found the band on, which wants the store's write schedule looked at rather than the reader's. A read that failed twice counts in both. It carries no stamp and no read name, deliberately: a retried read did not go blind, so there is no episode to date. instance_retried_reads is the same figure across the whole service, with no fleet part because nothing records a fleet-scoped retry today. On Lite both read zero as a property of the SKU and not of a quiet store: Lite's alerting reads carry no command deadline, so there is no deadline to cross and nothing to retry. counting_since is when this process began counting, early in its own startup - these are in-memory counts and a restart takes them to zero, so a zero means \"none since counting_since\" and NOT \"none in seven days\"; check the stamp before reading the zero as reassurance. Deliberately not persisted, because what it counts is a failure to READ the store. It does NOT count alerts that failed to DELIVER and makes no claim about them - that is get_alert_history's question. And deliberately not a band: any threshold would guess how many blind reads make alerting unhealthy, and a wrong guess here fails by saying nothing is wrong. The service block beside alert_read_health is the build-attribution read: nothing else on this surface says WHAT build is answering, so the question an operator watching an install actually asks - \"is the running service the build that carries fix X\" - is answered by version directly instead of by restart inference plus a merge-list lookup the watcher has no way to perform. version is the running build's informational version - the same read the Darling service's --version verb prints, with any SemVer build-metadata suffix stripped and the prerelease suffix KEPT, because the nightly stamp lives in the prerelease and one nightly differs from the next in nothing else; Lite has no version verb and reads the same attribute off its own app assembly, stamped from the same single declaration. counting_since remains the restart detector, and a restart is NOT a build: a crash-restart moves it exactly as an install does. started_at is the SAME instant counting_since carries, deliberately: one clock for one fact. compiled_schema_version is the schema rung this BUILD expects - the compiled constant, not a read of the store's migrated rung - so beside version it says what this build requires of the store it serves, whether or not that store has caught up. When a recent analysis pass could not read one of its fact families for this server, the payload also carries analysis_caveats (analysis_time, families_failed, families_total, entries[{family, read, outcome, message, failed_in_last_passes}]) — the analysis pass's own reads of the collectors' tables, a different layer from the collector rows; absent when the last 24 remembered passes were clean. Process memory: a service restart forgets. full_detail (#4198): every collector row above defaults to a compact shape - collector, status, compact, total_runs, rows_stored, avg_duration_ms, last_success - for a collector that is HEALTHY with zero errors, session_missing, extension_missing, permission_denied and abandoned runs this window, not regressed, and either stored rows or is a known event collector reading zero at rest. Any other row - failing, stale, stopped, erroring, denied, regressed, or a non-event collector's unexplained zero - is never dropped and never silently shortened to that seven-field shape: it gets partial_detail: true instead of compact, and a leaner shape naming what is wrong and since when - collector, status, partial_detail, total_runs, errors, session_missing, abandoned, rows_stored, last_success, last_error, last_error_truncated, last_error_at, last_denied_at, denied_since_last_success, regressed_from_productive, regression_finding, recovered_note, output_finding, output_finding_truncated - rather than every field named earlier in this guide. In a partial row a missing key means null, false or 0: only collector, status, partial_detail, total_runs and errors are always present, and a key shows only when its value is set. Pass full_detail=true for every field on every row regardless of health or tier. collector_detail_note on the envelope names how many rows compacted, how many took the leaner shape, and how full_detail restores each. Run time (#4938): a collector that runs once a day or less often can have a run time, a fixed time of day on the monitored server's own clock. run_at is that time as 24-hour HH:MM, or null when the collector has none. next_run_utc is when the collector is next due, in UTC, or null when it has no run time or is disabled. It is the run time plus this server's fixed spread of under 60 minutes, so a fleet-wide run time does not start every server in the same minute, and a run may start up to 60 minutes after it. When next_run_utc equals the time of the read, the collector is due now and has not run for this slot yet. A day missed past those 60 minutes is skipped, never replayed, so a collector that skipped a day reads STALE before its next run (a daily collector goes stale after 36 hours). run_time_note says so: how long the collector has not run, the stale line it is past, and when the next run is due. On Lite it also names the slot, in the form run_at uses, and says Lite collects only while it is open. run_time_note is null when no day was skipped, and while the collector is due now or disabled. A server whose clock is not known yet reads the run time as UTC. A run time does not change the health bands, which stay on the shipped cadence, and frequency_minutes elsewhere in this payload is still the shipped cadence. A full row always carries run_at, next_run_utc and run_time_note, each null when the collector has no run time. A partial row (a collector that needs a look) and a compact row (a healthy collector with nothing to report) carry run_at and next_run_utc only when the collector has a run time, so a partial or compact row without them has none. A partial row carries run_time_note under the same condition, and a compact row never carries it, because a skipped day is not healthy. skipped_cycles: slots skipped in 24 h; status unavailable, figures null if its read failed. get_collection_log: skipped_cycle_rows counts them. FLEET FORM (#6074): server_name \"*\" with collector_name gives that collector's newest SUCCESS and failure on every server (hours_back, default 24), servers it does not apply to under not_applicable. read_source (#6254): on the query_store row, where its newest run read from, e.g. \"replica 12, primary 2\"; absent otherwise.")]
     public static Task<string> GetCollectionHealth(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
         [Description("Return every field for every collector. Default compacts a HEALTHY collector with nothing to report; failing, stale, stopped, erroring, denied or regressed collectors always keep every field.")] bool full_detail = false,
         Microsoft.Extensions.Logging.ILogger? logger = null,
+        [Description("With server_name \"*\": the one collector to report on every server (e.g. query_store, wait_stats). Required then; ignored for one server.")] string? collector_name = null,
+        [Description("With server_name \"*\": hours of history, 1 to 168. Default 24. Ignored for one server (always 7 days).")] int? hours_back = null,
         CancellationToken cancellationToken = default) =>
-        GetCollectionHealthCoreAsync(postgres, server_name, full_detail, uncutText: false, logger, cancellationToken);
+        server_name is not null && server_name.Trim() == "*"
+            ? GetCollectionHealthFleetAsync(postgres, collector_name, hours_back ?? 24, cancellationToken)
+            : GetCollectionHealthCoreAsync(postgres, server_name, full_detail, uncutText: false, logger, cancellationToken);
+
+    /// <summary>The enabled servers and the engine facts the fleet liveness read needs to say which servers a collector does not apply to
+    /// (the same two columns <see cref="DarlingEngineCapability.ServerEngineSql"/> reads, for every enabled server at once).</summary>
+    internal const string FleetServersSql = @"
+SELECT server_id, server_name, display_name, sql_engine_edition, engine_kind
+FROM servers
+WHERE is_enabled
+ORDER BY server_name";
+
+    /// <summary>
+    /// #6074: <c>get_collection_health</c> with <c>server_name</c> "*": one collector's liveness on every enabled server in one call, built by
+    /// <see cref="CollectorFleetLiveness"/> from the one statement <see cref="CollectorFleetLiveness.LivenessSql"/> (one row per server, so the answer
+    /// is bounded by the fleet and not by the window). Two reads, each with the MCP deadline.
+    /// </summary>
+    private static async Task<string> GetCollectionHealthFleetAsync(
+        NpgsqlDataSource postgres, string? collector_name, int hours_back, CancellationToken cancellationToken)
+    {
+        if (CollectorFleetLiveness.ValidateCollector(collector_name) is { } badCollector) return badCollector;
+        var hoursError = McpHelpers.ValidateHoursBack(hours_back);
+        if (hoursError != null) return hoursError;
+
+        var collector = collector_name!.Trim();
+        try
+        {
+            var windowEnd = DateTime.UtcNow;
+            var windowStart = windowEnd.AddHours(-hours_back);
+            ReadScope.NoteWindow(windowStart, windowEnd);
+
+            var servers = new List<CollectorFleetLiveness.ServerFacts>();
+            await using (var command = postgres.CreateCommand(FleetServersSql))
+            {
+                command.CommandTimeout = McpCommandDeadlines.ReadSeconds;
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    servers.Add(new CollectorFleetLiveness.ServerFacts(
+                        reader.GetInt32(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2),
+                        reader.IsDBNull(3) ? CollectorEngineCapability.UnknownEngineEdition : reader.GetInt32(3),
+                        reader.IsDBNull(4) ? null : reader.GetString(4)));
+                }
+            }
+
+            if (servers.Count == 0)
+                return McpHelpers.Status("unavailable", "No enabled server is registered, so there is no fleet to report on.");
+
+            var runs = new List<CollectorFleetLiveness.RunFacts>();
+            await using (var command = postgres.CreateCommand(CollectorFleetLiveness.LivenessSql("collection_log")))
+            {
+                command.CommandTimeout = McpCommandDeadlines.ReadSeconds;
+                DarlingMcpReadParameters.AddText(command, collector);
+                DarlingMcpReadParameters.AddTimestamp(command, windowStart);
+                DarlingMcpReadParameters.AddTimestamp(command, windowEnd);
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    runs.Add(new CollectorFleetLiveness.RunFacts(
+                        reader.GetInt32(0),
+                        reader.IsDBNull(1) ? null : reader.GetDateTime(1),
+                        reader.IsDBNull(2) ? null : reader.GetDateTime(2),
+                        Convert.ToInt64(reader.GetValue(3), System.Globalization.CultureInfo.InvariantCulture),
+                        Convert.ToInt64(reader.GetValue(4), System.Globalization.CultureInfo.InvariantCulture),
+                        reader.IsDBNull(5) ? null : reader.GetString(5),
+                        reader.IsDBNull(6) ? null : reader.GetString(6)));
+                }
+            }
+
+            return CollectorFleetLiveness.Build(collector, hours_back, windowStart, windowEnd, servers, runs);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return McpHelpers.FormatError("get_collection_health", ex);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="GetCollectionHealth"/> with the skipped-slot read passed in, so a test can fail it without a store fault.
+    /// Not a tool: same parameters and output otherwise.
+    /// </summary>
+    internal static Task<string> GetCollectionHealthWithSkippedCycleRead(
+        NpgsqlDataSource postgres, string? server_name, Func<Task<SkippedCycleSummary>> skippedCycleRead, CancellationToken cancellationToken) =>
+        GetCollectionHealthCoreAsync(postgres, server_name, full_detail: false, uncutText: false, logger: null, cancellationToken, skippedCycleRead);
 
     /// <summary>
     /// The diagnostics bundle's read: the default shape with <c>last_error</c> and <c>output_finding</c> whole. The bundle
@@ -1618,7 +1930,8 @@ public sealed class DarlingMcpDataTools
         bool full_detail,
         bool uncutText,
         Microsoft.Extensions.Logging.ILogger? logger,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<Task<SkippedCycleSummary>>? skippedCycleRead = null)
     {
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
@@ -1642,8 +1955,12 @@ public sealed class DarlingMcpDataTools
                GetCollectionHealthMemoizedAsync), and that is why this is its own memo rather than a filter over
                that one. */
             var nowUtc = DateTime.UtcNow;
+            /* #5814: the window is fixed in code, so the tool notes it; the slow-read row and the read-latency band
+               (ReadWindowBand.FixedHours) both carry these 7 days. */
+            var windowStartUtc = nowUtc.AddHours(-ReadWindowBand.CollectionHealthHours);
+            ReadScope.NoteWindow(windowStartUtc, nowUtc);
             var (rows, collectionHealthAgeSeconds) = await DarlingDataReader.GetCollectionHealthMemoizedAsync(
-                postgres, resolved.ServerId, nowUtc.AddDays(-7), nowUtc, cancellationToken);
+                postgres, resolved.ServerId, windowStartUtc, nowUtc, cancellationToken);
             if (rows.Count == 0)
                 return McpHelpers.Status("unavailable", "No collection health data available.");
 
@@ -1679,7 +1996,7 @@ public sealed class DarlingMcpDataTools
                         ? (object)CompactCollectionHealthRow(r, runTime)
                         : (object)PartialCollectionHealthRow(r, runTime, uncutText ? int.MaxValue : ErrorMessagePreviewLength, uncutText ? int.MaxValue : OutputFindingPreviewLength);
             });
-            result = result.Concat(await DarlingGatedCollectorRows.AppendAsync(postgres, resolved.ServerId, resolved.ServerName, rows, cancellationToken));
+            result = result.Concat(await DarlingGatedCollectorRows.AppendAsync(postgres, resolved.ServerId, resolved.DisplayName, rows, cancellationToken));
             if (alwaysOnOff)
                 result = result.Concat(DarlingGatedCollectorRows.AlwaysOnOffRows(rows));
 
@@ -1818,7 +2135,7 @@ public sealed class DarlingMcpDataTools
                 /* The same string both WPF grids render, composed on this side so the web dashboard and
                    any other consumer cannot re-derive it differently. */
                 note_summary = CollectorHealthClassifier.FormatCollectionNote(
-                    r.LastNote, r.NoteCount, r.TotalRuns, r.CollectorName, r.TargetHasUserDatabases),
+                    r.LastNote, r.NoteCount, r.TotalRuns, r.CollectorName, r.TargetHasUserDatabases, r.RecoveredNote),
                 /* #2472: the per-database breakdown of a collector that fans out, null for one that does
                    not. Emitted as a nested object rather than sibling fields so a consumer cannot read a
                    slowest item without the width it has to be judged against — the parts only mean
@@ -1837,7 +2154,9 @@ public sealed class DarlingMcpDataTools
                 fanout = r.FanoutDominance is null ? null : new
                 {
                     items = r.FanoutItems,
-                    slowest = r.SlowestItem,
+                    /* #5813: a query_store database whose read the time budget ended is stored under its plain
+                       name (the column is an identity); the words are added here, from its budget-sized cost. */
+                    slowest = QueryStoreReadBudget.RenderSlowestItem(r.CollectorName, r.SlowestItem, r.SlowestItemMs),
                     slowest_ms = r.SlowestItemMs,
                     run_ms = r.SlowestRunDurationMs,
                     slowest_share_pct = Math.Round(r.FanoutSlowestSharePercent!.Value, 2),
@@ -1895,7 +2214,7 @@ public sealed class DarlingMcpDataTools
                        run costs 135% of one. Through the shared helper rather than re-derived here, so
                        the floor rule cannot drift between the two SKUs' tools. */
                     pct_of_sweep_budget_per_run = Math.Round(
-                        SweepPressureClassifier.PeakRunMs(r.AvgDurationMs, r.P95DurationMs) / SweepPressureClassifier.SweepBudgetMs * 100.0, 1)
+                        SweepPressureClassifier.PeakRunMs(r.AvgDurationMs, r.P95ChargedMs) / SweepPressureClassifier.SweepBudgetMs * 100.0, 1)
                 });
 
             /* #2446: the collector that owns the most of ONE sweep, which is a different collector from
@@ -1916,7 +2235,7 @@ public sealed class DarlingMcpDataTools
                 amortized_ms_per_minute = Math.Round(pressure.PeakCollectorAvgDurationMs / pressure.PeakCollectorFrequencyMinutes, 0),
                 pct_of_sweep_budget_per_run = Math.Round(pressure.PeakCollectorPeakRunMs / SweepPressureClassifier.SweepBudgetMs * 100.0, 1)
             };
-            var peakCycleNote = SweepPressureClassifier.FormatPeakCycleNote(pressure);
+            var peakCycleNote = WithP95Basis(SweepPressureClassifier.FormatPeakCycleNote(pressure), rows);
 
             /* #3013: the alerting layer's own store reads, which appear on no other health surface. A
                condition check that cannot read the store logs one line and skips — correctly, since firing
@@ -1929,14 +2248,34 @@ public sealed class DarlingMcpDataTools
                 resolved.ServerId.ToString(CultureInfo.InvariantCulture));
             var alertReadFinding = AlertReadFailureCounter.FormatFinding(alertReads);
 
+            /* #5735: the collection loop's skipped slots over the last 24 h, read fresh and OUTSIDE the one-minute
+               collector-health memo above (the rows are not collectors, so the collector half never carries them, and a
+               row just written must not show a minute late). One bounded range scan on the watermark index, at the same
+               read deadline as every other read in this tool. The block is the one supplementary figure in the payload
+               (the collector rows, the sweep verdict and the caveats are the answer), so a failed read degrades the block
+               to status "unavailable" with its figures null, rather than removing the whole payload from the tool an
+               operator reaches for when collection looks wrong. Cancellation still propagates. */
+            var skippedCycles = await ReadSkippedCyclesOrNullAsync(
+                skippedCycleRead ?? (() => SkippedCycleReader.GetSkippedCycleSummaryAsync(
+                    postgres, resolved.ServerId, commandTimeoutSeconds: McpCommandDeadlines.ReadSeconds, cancellationToken: cancellationToken)),
+                logger);
+
             /* #3691: wraps the whole payload rather than sitting in it as a property — McpHelpers.JsonOptions
                WRITES nulls, so a property would ship analysis_caveats: null on every clean answer — and it reads
                the process-wide ledger because the scheduled sweep builds a fresh analysis service per pass.
                A different layer from the collector rows above: 43 healthy collectors above a family the pass timed out reading. */
             var collectionCaveats = await DarlingCollectionCaveatReader.ReadAsync(postgres, resolved.ServerId, logger, cancellationToken);
-            var healthJson = JsonSerializer.Serialize(CollectionCaveatLedger.Shared.Attach(new
+            /* #6180: full_detail serves ~30 fields for every collector (52 KB measured), past the shared response target. The
+               collectors are cut from the end to fit it, whole rows only, and the reply says how many it kept and how to
+               get the compact form that carries them all. The reply is built per count so the caveats attached below count
+               against the budget too. */
+            var collectorRows = result.ToList();
+            /* #6254: the Query Store collector's newest read source, when it has one. Empty with the replica setting off, and then the
+               reply is the one it was before. Read after the memo like the run times above: it is a fact about the newest run. */
+            var readSources = await DarlingDataReader.ReadCollectionHealthReadSourcesAsync(postgres, resolved.ServerId, windowStartUtc, cancellationToken);
+            Func<int, string> healthReply = collectorCount => McpHelpers.WithCollectorReadSource(DarlingCollectionCaveatReader.AttachToJson(JsonSerializer.Serialize(CollectionCaveatLedger.Shared.Attach(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3453: the build-attribution read. Nothing else on the MCP surface says WHAT build is
                    answering: counting_since moving proves a RESTART (a crash-restart reads identically to
                    an install), and a capability fingerprint identifies a build only when the change in
@@ -2046,6 +2385,9 @@ public sealed class DarlingMcpDataTools
                     finding = alertReadFinding,
                     note = AlertReadFailureCounter.WindowNote
                 },
+                /* #5735: always present; zero is a real answer (status ok, count_24h 0, slots 0, the rest null), so a missing
+                   field never reads as "none". A failed read is status unavailable with every figure null. On this SKU a slot is one scheduled run of one collector. */
+                skipped_cycles = SkippedCyclesBlock(skippedCycles),
                 sweep_pressure = new
                 {
                     busy_ms_per_minute = Math.Round(pressure.BusyMsPerMinute, 0),
@@ -2088,8 +2430,15 @@ public sealed class DarlingMcpDataTools
                    describes what THIS response actually did instead of what the argument nominally requested. */
                 collector_detail_note = full_detail
                     ? "full_detail=true: every field is served for every collector below."
-                    : $"{compactCount} of {rows.Count} collector(s) below are HEALTHY with nothing to report (no errors, denials, session/extension-missing runs or abandoned cycles this window) and are compacted to collector/status/compact/total_runs/rows_stored/avg_duration_ms/last_success. {partialCount} need a look (failing, stale, stopped, erroring, denied, regressed, or an unexplained zero) and carry a leaner partial_detail shape instead of full detail. Pass full_detail=true for every field on every collector.",
-                collectors = result,
+                    : $"{compactCount} of {rows.Count} collector(s) below are HEALTHY with nothing to report (no errors, denials, session/extension-missing runs or abandoned cycles this window) and are compacted to collector/status/compact/total_runs/rows_stored/avg_duration_ms/last_success. {partialCount} need a look (failing, stale, stopped, erroring, denied, regressed, or an unexplained zero) and carry a leaner partial_detail shape instead of full detail: in a partial row a missing key means null, false or 0, and only collector, status, partial_detail, total_runs and errors are always present. Pass full_detail=true for every field on every collector.",
+                /* #6180: the response-size cut, observed (see healthReply above). Null note and false flag when every collector fit. */
+                truncated = collectorCount < collectorRows.Count,
+                collectors_returned = collectorCount,
+                collectors_total = collectorRows.Count,
+                size_note = collectorCount < collectorRows.Count
+                    ? $"{collectorRows.Count - collectorCount} of {collectorRows.Count} collector row(s) were left off the end to keep this answer within about 32 KB. Call again without full_detail: healthy collectors are then compacted and every collector fits."
+                    : null,
+                collectors = collectorRows.Take(collectorCount),
                 /* #3856: how old the collector half of this payload is, in whole seconds — the same field, the
                    same name and the same semantics get_fleet_overview has carried since #3735, because it is
                    now the same kind of reading: one 7-day scan per minute per host per server, shared by every
@@ -2102,14 +2451,61 @@ public sealed class DarlingMcpDataTools
                    nothing an existing consumer indexes by position moved — the same placement rule every
                    column of the statement behind it follows. */
                 collection_health_age_seconds = collectionHealthAgeSeconds
-            }, resolved.ServerId, McpHelpers.JsonOptions), McpHelpers.JsonOptions);
-            return DarlingCollectionCaveatReader.AttachToJson(healthJson, collectionCaveats);
+            }, resolved.ServerId, McpHelpers.JsonOptions), McpHelpers.JsonOptions), collectionCaveats), readSources);
+            return McpResponseBudget.FitPrefix(collectorRows.Count, healthReply).Json;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return McpHelpers.FormatError("get_collection_health", ex);
         }
     }
+
+    /// <summary>The <c>status</c> word of a <c>skipped_cycles</c> block that was read.</summary>
+    internal const string SkippedCyclesRead = "ok";
+
+    /// <summary>
+    /// The <c>status</c> word of a <c>skipped_cycles</c> block whose read failed: this server may have skipped slots and the
+    /// read could not say. Every figure on that block is then null, which is not the zero a real empty window reports.
+    /// </summary>
+    internal const string SkippedCyclesUnavailable = "unavailable";
+
+    /// <summary>
+    /// #5735: runs the skipped-slot read and returns null when it fails, so the caller can degrade the block instead of
+    /// losing the payload. Cancellation propagates (the caller asked to stop); every other failure is logged once and
+    /// swallowed, the way <see cref="DarlingCollectionCaveatReader"/> treats its own optional read.
+    /// </summary>
+    internal static async Task<SkippedCycleSummary?> ReadSkippedCyclesOrNullAsync(
+        Func<Task<SkippedCycleSummary>> read, Microsoft.Extensions.Logging.ILogger? logger)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        try
+        {
+            return await read();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogWarning(ex, "get_collection_health: the skipped-slot read failed, so the skipped_cycles block reports status {Status}.",
+                SkippedCyclesUnavailable);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// #5735: the <c>skipped_cycles</c> block of <c>get_collection_health</c>. A server whose loop stepped over
+    /// collection slots writes one <c>collection_cycle</c>/<c>SKIPPED</c> row (coalesced to one per five minutes). Zero is a
+    /// real answer (status ok, count_24h 0, slots_skipped_24h 0, the rest null); the block is always present. A read that
+    /// failed is <paramref name="s"/> null: status unavailable and every figure null, never a zero.
+    /// </summary>
+    internal static object SkippedCyclesBlock(SkippedCycleSummary? s) => new
+    {
+        status = s is null ? SkippedCyclesUnavailable : SkippedCyclesRead,
+        count_24h = s?.Count,
+        slots_skipped_24h = s?.SlotsSkipped,
+        last_at = s?.LastAtUtc?.ToString("o"),
+        last_slowest_step = s?.LastSlowestStep,
+        last_slowest_step_ms = s?.LastSlowestStepMs,
+        last_message = s?.LastMessage
+    };
 
     /// <summary>
     /// #4999: the collectors whose single-run cost the server's sequential pass pays: every row except those that
@@ -2125,10 +2521,29 @@ public sealed class DarlingMcpDataTools
 
     /// <summary>
     /// #4999: <see cref="SweepBodyRows"/> in the shape <see cref="SweepPressureClassifier.Compute"/> takes.
+    /// <para>#5810 review: the p95 it charges is <see cref="CollectorHealth.P95ChargedMs"/>, the bucket's lower bound when
+    /// the read bucketed it, so bucketing alone never raises <c>peak_cycle_risk</c> or moves the peak collector.</para>
     /// </summary>
     internal static IEnumerable<(string CollectorName, double AvgDurationMs, double P95DurationMs, int FrequencyMinutes)> SweepBodyCollectors(
         IEnumerable<CollectorHealth> rows) =>
-        SweepBodyRows(rows).Select(r => (r.CollectorName, r.AvgDurationMs, r.P95DurationMs, r.FrequencyMinutes));
+        SweepBodyRows(rows).Select(r => (r.CollectorName, r.AvgDurationMs, r.P95ChargedMs, r.FrequencyMinutes));
+
+    /// <summary>#5810 review: the sentence <c>peak_cycle_note</c> carries whenever a sweep-body collector's p95 came from
+    /// the rollup's duration buckets, so the peak-cycle fields name their basis.</summary>
+    internal const string P95BucketBasisSentence =
+        "p95 basis: each collector's p95 is a log-spaced duration bucket from the hourly rollup; p95_duration_ms shows the bucket's upper bound (up to about 47% above the exact value), and the peak cycle, peak_run_ms and pct_of_sweep_budget_per_run charge its lower bound, the least the exact p95 can be.";
+
+    /// <summary>#5810 review: <paramref name="note"/> with <see cref="P95BucketBasisSentence"/> appended when any
+    /// sweep-body row's p95 is bucketed (and not empty); the sentence alone when the peak cycle fits.</summary>
+    internal static string WithP95Basis(string note, IEnumerable<CollectorHealth> rows)
+    {
+        if (!SweepBodyRows(rows).Any(r => r.P95Bucketed && r.P95DurationMs > 0))
+        {
+            return note;
+        }
+
+        return string.IsNullOrEmpty(note) ? P95BucketBasisSentence : note + " " + P95BucketBasisSentence;
+    }
 
     /* #4198: the default-argument size cut for get_collection_health, which unlike a row-limited tool has no
        row to drop — every collector on the server is one row, and a health read must never hide one that is
@@ -2196,78 +2611,90 @@ public sealed class DarlingMcpDataTools
     /// <c>compact</c>, whose meaning is "healthy, nothing to report": CollectionHealthPayloadBudgetLiveTests and
     /// its Lite twin assert a row that needs a look never carries <c>compact</c>, specifically so a caller
     /// scanning for <c>compact != true</c> never skips it, and reusing that marker here would defeat that check
-    /// silently. full_detail=true restores every field named in the guide above, same as it does for a compact
+    /// silently. #5748: this row omits every key whose value is null, false or 0, so a missing key means exactly
+    /// that; the identity keys collector, status, partial_detail, total_runs and errors always stay. full_detail=true
+    /// restores every field named in the guide above, same as it does for a compact
     /// row. Field-for-field Lite's twin.</summary>
-    private static object PartialCollectionHealthRow(CollectorHealth r, CollectorRunTimeReading? runTime, int errorPreview, int findingPreview)
+    internal static Dictionary<string, object?> PartialCollectionHealthRow(CollectorHealth r, CollectorRunTimeReading? runTime, int errorPreview, int findingPreview)
     {
         /* OutputFinding recomputes FormatOutputFinding's sentence on every access -- read it once rather than
            twice (preview, then the truncated comparison). */
         var outputFinding = r.OutputFinding;
-        return runTime is null
-        ? new
+        /* #5748: a partial row names only the keys that say something. A key whose value is null, false or 0 is left
+           out, because spelling out ~10 such keys on every row that needs a look cost about a third of the answer, and
+           with every collector in that state the worst case passed the default budget as collectors were added. The
+           identity keys below are the exception and are always present: collector, status, partial_detail, total_runs
+           and errors (errors is 0 on a row that is partial for another reason, and that 0 is the answer). A missing key
+           therefore means null, false or 0; full_detail=true returns every field. This replaces #4198's follow-up rule
+           that every partial row carries the same keys so a reader can compare them: the comparison now reads a missing
+           key as its default. Field-for-field Lite's twin. */
+        var row = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
-            collector = r.CollectorName,
-            status = r.HealthStatus,
-            partial_detail = true,
-            total_runs = r.TotalRuns,
-            errors = r.ErrorCount,
-            /* #4198 follow-up: IsCollectionHealthCompactEligible fails a HEALTHY row on session-missing runs,
-               abandoned cycles, or a denial even after a later success -- and until now none of the three had a
-               field here, so a row failing the predicate ONLY on one of them carried partial_detail: true with
-               nothing in the shape saying why. Same names and formats FullCollectionHealthRow uses, so a caller
-               already reading the full shape does not learn a second vocabulary for the same facts. Always
-               emitted, not conditional on being the reason this row is partial -- McpHelpers.JsonOptions keeps
-               nulls, and a reader comparing partial rows across collectors needs the same keys on every one. */
-            session_missing = r.SessionMissingCount,
-            abandoned = r.AbandonedCount,
-            rows_stored = r.RowsStored,
-            last_success = r.LastSuccessTime?.ToString("o"),
-            last_error = McpHelpers.Truncate(r.LastError, errorPreview),
-            last_error_truncated = r.LastError is not null && r.LastError.Length > errorPreview,
-            last_error_at = r.LastErrorTime?.ToString("o"),
-            last_denied_at = r.LastDeniedTime?.ToString("o"),
-            denied_since_last_success = r.DeniedSinceLastSuccess,
-            regressed_from_productive = r.AnyRegression,
-            /* #4620: the flag used to ride here without the sentence that explains it, so a WARNING row
-               whose only issue was a regression said nothing about why. Whole, not previewed like
-               output_finding: both regression sentences are fixed templates around a count, an instant and
-               a status word (about 200 characters at most), and only a regressed row carries one at all. */
-            regression_finding = r.AnyRegressionFinding,
-            output_finding = McpHelpers.Truncate(outputFinding, findingPreview),
-            output_finding_truncated = outputFinding is not null && outputFinding.Length > findingPreview,
-        }
-        /* #4938: a partial row carries the run time only when the collector has one, like a compact row, so a collector with
-           none adds no bytes to a payload that is sized to sit under the default budget. A partial row without run_at and
-           next_run_utc has no run time. Lite's twin carries the same two fields under the same rule. run_time_note rides
-           under that condition too: only a collector with a run time can skip a day, so a partial row for a collector with
-           none has nothing to say and no key, and the note is null unless a day was skipped. A skipped day reads STALE or
-           worse, so its row is never a compact one: the note has no compact twin. The full row always carries it. */
-        : new
-        {
-            collector = r.CollectorName,
-            status = r.HealthStatus,
-            partial_detail = true,
-            total_runs = r.TotalRuns,
-            errors = r.ErrorCount,
-            session_missing = r.SessionMissingCount,
-            abandoned = r.AbandonedCount,
-            rows_stored = r.RowsStored,
-            last_success = r.LastSuccessTime?.ToString("o"),
-            last_error = McpHelpers.Truncate(r.LastError, errorPreview),
-            last_error_truncated = r.LastError is not null && r.LastError.Length > errorPreview,
-            last_error_at = r.LastErrorTime?.ToString("o"),
-            last_denied_at = r.LastDeniedTime?.ToString("o"),
-            denied_since_last_success = r.DeniedSinceLastSuccess,
-            regressed_from_productive = r.AnyRegression,
-            regression_finding = r.AnyRegressionFinding,
-            output_finding = McpHelpers.Truncate(outputFinding, findingPreview),
-            output_finding_truncated = outputFinding is not null && outputFinding.Length > findingPreview,
-            run_at = (string?)runTime.RunAt,
-            next_run_utc = runTime.NextRunUtcText,
-            run_time_note = runTime.SkippedDayNote,
+            ["collector"] = r.CollectorName,
+            ["status"] = r.HealthStatus,
+            ["partial_detail"] = true,
+            ["total_runs"] = r.TotalRuns,
+            ["errors"] = r.ErrorCount,
         };
+        /* #4198 follow-up: IsCollectionHealthCompactEligible fails a HEALTHY row on session-missing runs, abandoned
+           cycles, or a denial even after a later success, so each of the three has a field here for the row to say why
+           it is partial. Same names and formats FullCollectionHealthRow uses, so a caller already reading the full
+           shape does not learn a second vocabulary for the same facts. */
+        AddUnlessDefault(row, "session_missing", r.SessionMissingCount);
+        AddUnlessDefault(row, "abandoned", r.AbandonedCount);
+        AddUnlessDefault(row, "rows_stored", r.RowsStored);
+        AddUnlessDefault(row, "last_success", r.LastSuccessTime?.ToString("o"));
+        AddUnlessDefault(row, "last_error", McpHelpers.Truncate(r.LastError, errorPreview));
+        /* The two truncated flags are written as plain indexer assignments, the form McpPayloadContractCensusTests reads
+           a payload key from, so the census still sees these cut keys. */
+        if (r.LastError is not null && r.LastError.Length > errorPreview)
+            row["last_error_truncated"] = true;
+        AddUnlessDefault(row, "last_error_at", r.LastErrorTime?.ToString("o"));
+        AddUnlessDefault(row, "last_denied_at", r.LastDeniedTime?.ToString("o"));
+        AddUnlessDefault(row, "denied_since_last_success", r.DeniedSinceLastSuccess);
+        AddUnlessDefault(row, "regressed_from_productive", r.AnyRegression);
+        /* #4620: the flag used to ride here without the sentence that explains it, so a WARNING row whose only issue
+           was a regression said nothing about why. Whole, not previewed like output_finding: both regression
+           sentences are fixed templates around a count, an instant and a status word (about 200 characters at most),
+           and only a regressed row carries one at all. */
+        AddUnlessDefault(row, "regression_finding", r.AnyRegressionFinding);
+        /* #5646: the recovery sentence, with the last failure time. */
+        AddUnlessDefault(row, "recovered_note", r.RecoveredNote);
+        AddUnlessDefault(row, "output_finding", McpHelpers.Truncate(outputFinding, findingPreview));
+        if (outputFinding is not null && outputFinding.Length > findingPreview)
+            row["output_finding_truncated"] = true;
+        /* #4938: a partial row carries the run time only when the collector has one, like a compact row. A collector
+           with none has nothing to add, and the keys are omitted by the rule above anyway. run_time_note rides with
+           them: only a collector with a run time can skip a day, and the note is null unless a day was skipped. A
+           skipped day reads STALE or worse, so its row is never a compact one: the note has no compact twin. The full
+           row always carries it. */
+        if (runTime is not null)
+        {
+            AddUnlessDefault(row, "run_at", runTime.RunAt);
+            AddUnlessDefault(row, "next_run_utc", runTime.NextRunUtcText);
+            AddUnlessDefault(row, "run_time_note", runTime.SkippedDayNote);
+        }
+        return row;
     }
 
+    /// <summary>#5748: adds a partial row's key unless the value is null, false or 0. Three overloads rather than one
+    /// object check, so a number is compared as a number and a bool as a bool. Field-for-field Lite's twin.</summary>
+    private static void AddUnlessDefault(Dictionary<string, object?> row, string key, string? value)
+    {
+        if (value is not null) row[key] = value;
+    }
+
+    private static void AddUnlessDefault(Dictionary<string, object?> row, string key, bool value)
+    {
+        if (value) row[key] = true;
+    }
+
+    private static void AddUnlessDefault(Dictionary<string, object?> row, string key, long value)
+    {
+        if (value != 0) row[key] = value;
+    }
+
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_server_properties"), Description("Gets SQL Server instance properties: edition, version, CPU count, memory, socket/core topology, HADR, clustering, and the clock (utc_offset_minutes, time_zone_id). LATEST IS A TIME: the newest snapshot, not a window; captured_at is when it was collected, and on a stalled collector it is the only sign of staleness. time_zone_id is CURRENT_TIMEZONE_ID() (SQL Server 2022+/Azure SQL only); null means a pre-2022 engine, so only the offset in force at captured_at is known, and an instant across a DST transition from it can read an hour off. <<GUIDE>> Gets SQL Server instance properties: edition, version, CPU count, physical memory, socket/core topology, HADR status, clustering, and the server's clock: utc_offset_minutes is the UTC offset in force when the snapshot was collected, and time_zone_id is the engine's own time-zone name (CURRENT_TIMEZONE_ID(), SQL Server 2022+ and Azure SQL only) - a null time_zone_id means a pre-2022 engine, where only the offset is known and any instant on the far side of a DST transition from the snapshot is placed an hour off by that offset. Use for capacity planning and edition-aware recommendations. LATEST IS A TIME: this reads the newest properties snapshot, not a window, and captured_at is the instant it was collected - a core count or memory figure here is what the server reported AT that stamp, and on a server whose collector has stalled the stamp is the only thing that says how stale it is. ON AN AZURE SQL DATABASE (engine_edition 5) the host's hardware is not the database's allocation: hyperthread_ratio, socket_count, cores_per_socket and physical_memory_mb come back null with a hardware_note, cpu_count is the database's own scheduler count (it can be higher than its vCores), and service_objective with vcore_count says what the database is given.")]
     public static async Task<string> GetServerProperties(
         NpgsqlDataSource postgres,
@@ -2281,10 +2708,10 @@ public sealed class DarlingMcpDataTools
         {
             var row = await DarlingDataReader.GetLatestServerPropertiesAsync(postgres, resolved.ServerId, cancellationToken);
             if (row == null)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "server_properties", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "server_properties", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No server properties available. The properties collector may not have run yet.");
 
-            return ServerPropertiesPayload(resolved.ServerName, row);
+            return ServerPropertiesPayload(resolved.DisplayName, row);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -2446,7 +2873,7 @@ public sealed class DarlingMcpDataTools
     /// average). Field-for-field Lite's twin.</summary>
     internal const int OutputFindingPreviewLength = 200;
 
-    [McpServerTool(Name = "get_collection_log"), Description("Raw per-run collector log: duration split into monitored-server and store-write time, rows, status, error. NEWEST FIRST by default; min_duration_ms flips it to SLOWEST FIRST, ranked by cost. hours_back is the ask; oldest/newest_returned_collection_time bound what you actually got — under a min_duration_ms floor that is the cost-ranked sample's age, not reach. Filters apply before the cap; truncated/run_count reflect matches. status is the failure filter: an unknown value is refused, never silently empty. get_collection_health is the rollup; this is the underlying runs. <<GUIDE>> Gets the RAW per-run collection log for a server, NEWEST FIRST by default and SLOWEST FIRST whenever min_duration_ms is supplied: one row per collector run with its total duration, the part spent querying the monitored server, the part spent writing to the store, rows collected, status and any error. error_message is a preview by default (ErrorMessagePreviewLength characters, error_message_truncated marks a cut); full_text returns it whole (#4198). get_collection_health rolls seven days of these into a per-collector verdict; this is the underlying runs, which is what you need when the rollup says healthy and collection still looks wrong, or when you want to see what a collector was doing during a specific incident window. READ THE PAGE-SPAN FIELDS BEFORE CONCLUDING ANYTHING FROM THE ROWS. hours_back is the span you ASKED for; oldest_returned_collection_time and newest_returned_collection_time bound the page you GOT, and on a busy fleet those are wildly different — roughly 500 log rows a minute across 50 servers means a 24-hour request at the 200-row default is satisfied by about the last 25 seconds of activity. truncated says the cap bit; the two timestamps say what the page holds. THE TWO FIELDS MEAN DIFFERENT THINGS UNDER THE TWO ORDERINGS and the difference matters: under the default newest-first ordering the page is a contiguous slice of the window's tail, so oldest_returned_collection_time IS how far back this read reached; under a min_duration_ms floor the page is a cost-RANKED sample drawn from the whole window, so it tells you how old the slowest matching runs are and NOTHING about reach. Read order to know which you have. Neither field is a window floor: nothing here probes for the oldest row the window could have held. A read whose newest and oldest are seconds apart has told you nothing about the window you named, and raising limit does NOT fix it under the default ordering because the slow runs are not the recent ones — min_duration_ms is the knob for that, because supplying it ranks by duration instead of by time. All THREE filters are applied in SQL, BEFORE the cap, so truncated and run_count describe the MATCHING rows rather than the unfiltered window. order names which ordering you got, so a caller never has to infer it from the filters it sent. status IS THE FAILURE-HUNTING FILTER and the reason to reach for this tool during an incident: 'show me the failures' is the most common question asked of this log, and without it a caller pages the newest-first tail eyeballing status — which the page-span contract above explains cannot work, because a 200-row page on a busy fleet covers seconds and raising limit does not reach a failure that happened twenty minutes ago. Pass one of SUCCESS, SKIPPED, YIELDED, ABANDONED, ERROR, PERMISSIONS, EXTENSION_MISSING, SESSION_MISSING, WARNING (case-insensitive); an unknown value is REFUSED and the refusal names the whole set, rather than being applied as an equality filter that returns an empty page a caller would read as 'no failures'. get_collection_health is not this question's answer either: it carries one last_error per collector over a seven-day rollup, not the runs, their timestamps or their sequence — which is what says whether every collector failed at 03:41 or one collector failed all night. A status filter changes the page from a contiguous tail to a filtered one, so read the two page-span timestamps the same way you would under a duration floor. The filter you sent is echoed back as status_filter (not status, which on an empty result is the miss word instead), in the stored UPPERCASE spelling whatever case you sent. Also carries the phase decomposition where the run recorded one, as nested blocks that are null when the run took a path that does not report them — and a row carries at most ONE family. Server-scoped collectors fill sql_phases (open_ms, drain_ms, other_ms which is derived, watermark_ms) and drain (rows_read, bytes_read, last_read_ms, target_session_id). Per-database collectors that perform a deferred plan or statement-text fetch instead fill plan_fetch and/or text_fetch, each carrying probe_ms, target_ms, write_ms, ids_attempted and probe_ids summed across that run's databases. sweep_peer_max_ms is flat and present on every row: it is the slowest peer collector in the same sweep, the denominator for asking whether a slow run was slow alone or the whole sweep was. A null block means the run took the other path, not that the phase was free — most runs perform no deferred fetch at all. Divide target_ms by ids_attempted for the per-id target cost, probe_ms by probe_ids for the per-reference probe cost. CRITICAL for reading sql_duration_ms on a fetching collector: it is NOT purely target-side there. The deferred fetches run inside the driver's per-item SQL stopwatch and each one round-trips the MONITORING STORE to decide what plan XML and statement text are already held before writing back what came off the target, so the store's probe and write are billed to the column documented as the monitored server's. The probe is the largest single term in both fetches on this fleet — 55.4% of plan_fetch and 80.6% of text_fetch — and on one production run it was 107,334 ms of a 124,972 ms sql_duration_ms, 86%, against a plan-plus-text target time of 6,494 ms. sql_store_ms is that store share, derived from the two fetch blocks (probe_ms + write_ms of each) and null when no fetch ran. It is a FLOOR, not the whole: the per-item watermark refresh is also a store read inside the same stopwatch, the enumerated path records no watermark_ms, and that component is stored nowhere — so sql_duration_ms minus sql_store_ms is an UPPER bound on target-side time rather than the target-side time. store_duration_ms is not where the probe went either: it is the binary COPY of the collected rows and nothing else. Do NOT conclude a monitored server is slow from a large sql_duration_ms on query_store without reading sql_store_ms beside it. THE RESERVED server_name (fleet) READS THE FLEET-MAINTENANCE RUN-RECORDS instead of a monitored server's collector runs: the passes that iterate the whole fleet have no one server to attribute a run to, so they log under a sentinel that is not in the server list — data_retention for the daily purge, oversized_plan_sweep for the fifteen-minute oversized-plan backlog drain. Read those rows by their ABSENCE as much as their contents: every tick writes one whatever it found, including a tick that found an empty backlog and captured nothing, so rows_collected = 0 means the pass ran and had nothing to fetch while a MISSING row past the pass's cadence means the pass did not run at all. That is the only way to tell those two apart. error_message carries the tick's counts on a SUCCESS row (servers swept, plans claimed, captured, expired, fetch failures); sql_duration_ms is the time inside the monitored-server fetches and store_duration_ms the rest of the tick. These rows are excluded from get_collection_health and from get_fleet_overview by design — they are maintenance passes, not collectors, so a per-server staleness ladder does not apply to them. Five parameters carry more guidance than their 200-character cap allows; the rest of each below. collector_name: A name this server has never run returns the no-matches status rather than a quiet-window one. min_duration_ms: Applied in SQL before the cap. 0 is a real value: it admits every run and is how you ask for the whole window ranked by cost. A negative is refused. Omit for no floor and newest-first order. status: THE FAILURE FILTER — 'show me the failures' is what this log exists to answer, and paging the newest-first tail cannot reach a failure that is not recent. An unknown value is REFUSED, naming the accepted set, rather than applied as a filter that matches nothing. Omit for every status. server_name: Omitted, blank, or \"*\" reads the WHOLE FLEET (#4199) — every enabled server's runs, merged and ranked together, each row carrying server_name — instead of one server; this is different from the reserved name (fleet), which still reads the fleet-MAINTENANCE run-records and still requires being named exactly. limit: Default McpResponseBudget.CollectionLogPerServerDefaultLimit (58) for one server (#4198: sized so a default call stays under the shared response-size target on the wider SQL Server-target row shape). The fleet-wide form (server_name omitted or \"*\") defaults instead to McpResponseBudget.CollectionLogFleetDefaultLimit, sized the same way; pass limit explicitly for more rows either way.")]
+    [McpServerTool(Name = "get_collection_log"), Description("Raw per-run collector log: duration split into monitored-server and store-write time, rows, status, error. NEWEST FIRST by default; min_duration_ms flips it to SLOWEST FIRST, ranked by cost. hours_back is the ask; oldest/newest_returned_collection_time bound what you actually got — under a min_duration_ms floor that is the cost-ranked sample's age, not reach. Filters apply before the cap; truncated/run_count reflect matches. status is the failure filter: an unknown value is refused, never silently empty. get_collection_health is the rollup; this is the underlying runs. <<GUIDE>> Gets the RAW per-run collection log for a server, NEWEST FIRST by default and SLOWEST FIRST whenever min_duration_ms is supplied: one row per collector run with its total duration, the part spent querying the monitored server, the part spent writing to the store, rows collected, status and any error. error_message is a preview by default (ErrorMessagePreviewLength characters, error_message_truncated marks a cut); full_text returns it whole (#4198). get_collection_health rolls seven days of these into a per-collector verdict; this is the underlying runs, which is what you need when the rollup says healthy and collection still looks wrong, or when you want to see what a collector was doing during a specific incident window. READ THE PAGE-SPAN FIELDS BEFORE CONCLUDING ANYTHING FROM THE ROWS. hours_back is the span you ASKED for; oldest_returned_collection_time and newest_returned_collection_time bound the page you GOT, and on a busy fleet those are wildly different — roughly 500 log rows a minute across 50 servers means a 24-hour request at the 200-row default is satisfied by about the last 25 seconds of activity. truncated says the cap bit; the two timestamps say what the page holds. THE TWO FIELDS MEAN DIFFERENT THINGS UNDER THE TWO ORDERINGS and the difference matters: under the default newest-first ordering the page is a contiguous slice of the window's tail, so oldest_returned_collection_time IS how far back this read reached; under a min_duration_ms floor the page is a cost-RANKED sample drawn from the whole window, so it tells you how old the slowest matching runs are and NOTHING about reach. Read order to know which you have. Neither field is a window floor: nothing here probes for the oldest row the window could have held. A read whose newest and oldest are seconds apart has told you nothing about the window you named, and raising limit does NOT fix it under the default ordering because the slow runs are not the recent ones — min_duration_ms is the knob for that, because supplying it ranks by duration instead of by time. All THREE filters are applied in SQL, BEFORE the cap, so truncated and run_count describe the MATCHING rows rather than the unfiltered window. order names which ordering you got, so a caller never has to infer it from the filters it sent. status IS THE FAILURE-HUNTING FILTER and the reason to reach for this tool during an incident: 'show me the failures' is the most common question asked of this log, and without it a caller pages the newest-first tail eyeballing status — which the page-span contract above explains cannot work, because a 200-row page on a busy fleet covers seconds and raising limit does not reach a failure that happened twenty minutes ago. Pass one of SUCCESS, ANALYZED, SKIPPED, YIELDED, ABANDONED, ERROR, PERMISSIONS, EXTENSION_MISSING, SESSION_MISSING, WARNING (case-insensitive); an unknown value is REFUSED and the refusal names the whole set, rather than being applied as an equality filter that returns an empty page a caller would read as 'no failures'. get_collection_health is not this question's answer either: it carries one last_error per collector over a seven-day rollup, not the runs, their timestamps or their sequence — which is what says whether every collector failed at 03:41 or one collector failed all night. A status filter changes the page from a contiguous tail to a filtered one, so read the two page-span timestamps the same way you would under a duration floor. The filter you sent is echoed back as status_filter (not status, which on an empty result is the miss word instead), in the stored UPPERCASE spelling whatever case you sent. Also carries the phase decomposition where the run recorded one, as nested blocks that are null when the run took a path that does not report them — and a row carries at most ONE family. Server-scoped collectors fill sql_phases (open_ms, drain_ms, other_ms which is derived, watermark_ms) and drain (rows_read, bytes_read, last_read_ms, target_session_id). Per-database collectors that perform a deferred plan or statement-text fetch instead fill plan_fetch and/or text_fetch, each carrying probe_ms, target_ms, write_ms, ids_attempted and probe_ids summed across that run's databases. sweep_peer_max_ms is flat and present on every row: it is the slowest peer collector in the same sweep, the denominator for asking whether a slow run was slow alone or the whole sweep was. A null block means the run took the other path, not that the phase was free — most runs perform no deferred fetch at all. Divide target_ms by ids_attempted for the per-id target cost, probe_ms by probe_ids for the per-reference probe cost. Read sql_duration_ms on a fetching collector with care: it is NOT purely target-side there. The deferred fetches run inside the driver's per-item SQL stopwatch and each one round-trips the MONITORING STORE to decide what plan XML and statement text are already held before writing back what came off the target, so the store's probe and write are billed to the column documented as the monitored server's. Where this was measured, the probe is the largest single term in both fetches — 55.4% of plan_fetch and 80.6% of text_fetch — and on one production run it was 107,334 ms of a 124,972 ms sql_duration_ms, 86%, against a plan-plus-text target time of 6,494 ms. sql_store_ms is that store share, derived from the two fetch blocks (probe_ms + write_ms of each) and null when no fetch ran. It is a FLOOR, not the whole: the per-item watermark refresh is also a store read inside the same stopwatch, the enumerated path records no watermark_ms, and that component is stored nowhere — so sql_duration_ms minus sql_store_ms is an UPPER bound on target-side time rather than the target-side time. store_duration_ms is not where the probe went either: it is the binary COPY of the collected rows and nothing else. Do NOT conclude a monitored server is slow from a large sql_duration_ms on query_store without reading sql_store_ms beside it. THE RESERVED server_name (fleet) READS THE FLEET-MAINTENANCE RUN-RECORDS instead of a monitored server's collector runs: the passes that iterate the whole fleet have no one server to attribute a run to, so they log under a sentinel that is not in the server list — data_retention for the daily purge, oversized_plan_sweep for the fifteen-minute oversized-plan backlog drain. Read those rows by their ABSENCE as much as their contents: every tick writes one whatever it found, including a tick that found an empty backlog and captured nothing, so rows_collected = 0 means the pass ran and had nothing to fetch while a MISSING row past the pass's cadence means the pass did not run at all. That is the only way to tell those two apart. error_message carries the tick's counts on a SUCCESS row (servers swept, plans claimed, captured, expired, fetch failures); sql_duration_ms is the time inside the monitored-server fetches and store_duration_ms the rest of the tick. These rows are excluded from get_collection_health and from get_fleet_overview by design — they are maintenance passes, not collectors, so a per-server staleness ladder does not apply to them. Five parameters carry more guidance than their 200-character cap allows; the rest of each below. collector_name: A name this server has never run returns the no-matches status rather than a quiet-window one. min_duration_ms: Applied in SQL before the cap. 0 is a real value: it admits every run and is how you ask for the whole window ranked by cost. A negative is refused. Omit for no floor and newest-first order. status: THE FAILURE FILTER — 'show me the failures' is what this log exists to answer, and paging the newest-first tail cannot reach a failure that is not recent. The value is matched case-insensitively against the log's own stored vocabulary; ANALYZED is the scheduled analysis pass's own row (#5824), which only Darling writes. An unknown value is REFUSED, naming the accepted set, rather than applied as a filter that matches nothing. Omit for every status. server_name: Omitted, blank, or \"*\" reads the WHOLE FLEET (#4199) — every enabled server's runs, merged and ranked together, each row carrying server_name — instead of one server; this is different from the reserved name (fleet), which still reads the fleet-MAINTENANCE run-records and still requires being named exactly. limit: Default McpResponseBudget.CollectionLogPerServerDefaultLimit (58) for one server (#4198: sized so a default call stays under the shared response-size target on the wider SQL Server-target row shape). The fleet-wide form (server_name omitted or \"*\") defaults instead to McpResponseBudget.CollectionLogFleetDefaultLimit, sized the same way; pass limit explicitly for more rows either way. read_source (#6254): a Query Store run that read a replica carries where its rows came from, for example \"replica 12, primary 2\"; absent on every other run.")]
     public static async Task<string> GetCollectionLog(
         NpgsqlDataSource postgres,
         [Description("Server name or display name. Omit or pass \"*\" for the WHOLE FLEET (every enabled server's runs, merged; see tool guide) — differs from the reserved name (fleet).")] string? server_name = null,
@@ -2470,7 +2897,7 @@ public sealed class DarlingMcpDataTools
             positional C# caller changes meaning. This one is the log's own stored vocabulary, so it is a
             ValidateChoice parameter rather than free text.
         */
-        [Description("Limit to runs with this status, matched case-insensitively against the log's own vocabulary: SUCCESS, SKIPPED, YIELDED, ABANDONED, ERROR, PERMISSIONS, EXTENSION_MISSING, SESSION_MISSING, WARNING.")] string? status = null,
+        [Description("Limit to runs with this status (case-insensitive): SUCCESS, ANALYZED, SKIPPED, YIELDED, ABANDONED, ERROR, PERMISSIONS, EXTENSION_MISSING, SESSION_MISSING, WARNING.")] string? status = null,
         /*
             #4198, APPENDED for the reason collector_name and status were: every filter joins the end of
             this list so no positional C# caller changes meaning. error_message is the tool's one wide
@@ -2535,7 +2962,7 @@ public sealed class DarlingMcpDataTools
             otherwise discover a set the store's writers define.
         */
         var invalidStatus = McpHelpers.ValidateChoice(
-            status, EnumeratedCollectorDriver.CollectionLogStatuses, "status");
+            status, CollectionLogStatuses, "status");
         if (invalidStatus != null) return invalidStatus;
 
         /* ValidateUncappedWindow, deliberately NOT ValidateWindow. These three reads have never capped
@@ -2544,7 +2971,7 @@ public sealed class DarlingMcpDataTools
            than the default. What they no longer do is Math.Abs() a negative span (#3541 A13): a window that
            ends before it starts is a caller error, and flipping the sign answered a different question with
            nothing to say so. Refused, like every other unusable parameter here. */
-        var anchorError = McpHelpers.ValidateUncappedWindow(hours_back, as_of, out var windowEnd);
+        var anchorError = DarlingReadWindow.ValidateUncapped(hours_back, as_of, out var windowEnd);
         if (anchorError != null) return anchorError;
 
         try
@@ -2625,7 +3052,7 @@ public sealed class DarlingMcpDataTools
                 {
                     return McpHelpers.Status(
                         "unavailable",
-                        $"No collector runs have EVER been recorded for {resolved.ServerName}. This is not an empty window — collection has not run at all for this server. Check that the service is running and that the server is enabled for collection; get_collection_health will be equally empty until it does.");
+                        $"No collector runs have EVER been recorded for {resolved.DisplayName}. This is not an empty window — collection has not run at all for this server. Check that the service is running and that the server is enabled for collection; get_collection_health will be equally empty until it does.");
                 }
 
                 var emptyNotice = await ReadNoticeAsync();
@@ -2634,14 +3061,14 @@ public sealed class DarlingMcpDataTools
                 {
                     return McpHelpers.Status(
                         "empty",
-                        $"No collector runs on {resolved.ServerName} in the last {hours_back} hour(s) matched {McpHelpers.DescribeCollectionLogFilters(collector_name, min_duration_ms, status)}. This says nothing about the window as a whole — the filters were applied, so unfiltered runs may well exist. Drop them to see what the window holds, and check collector_name against the names get_collection_health lists, since it is matched exactly.", emptyNotice.AsHints());
+                        $"No collector runs on {resolved.DisplayName} in the last {hours_back} hour(s) matched {McpHelpers.DescribeCollectionLogFilters(collector_name, min_duration_ms, status)}. This says nothing about the window as a whole — the filters were applied, so unfiltered runs may well exist. Drop them to see what the window holds, and check collector_name against the names get_collection_health lists, since it is matched exactly.", emptyNotice.AsHints());
                 }
 
                 return McpHelpers.Status(
                     "empty",
                     McpHelpers.QuietUnlessCut(
                         emptyNotice.WindowTruncated, emptyNotice.EffectiveStart,
-                        factual: $"No collector runs recorded for {resolved.ServerName} in the last {hours_back} hour(s)",
+                        factual: $"No collector runs recorded for {resolved.DisplayName} in the last {hours_back} hour(s)",
                         coveredClaim: ". This server HAS collected before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent runs."),
                     emptyNotice.AsHints());
             }
@@ -2769,9 +3196,17 @@ public sealed class DarlingMcpDataTools
             });
 
             var notice = await ReadNoticeAsync();
+            /* #6180: a large limit (1000 measured at 70-86 KB) passes the shared response target, so the reply is built per page
+               size and the newest-first (or slowest-first) prefix that fits is served: whole runs only, with the page fields
+               (run_count, the returned-time span, truncated) describing the page actually served. */
+            var runRows = result.ToList();
+            string LogReply(int pageCount)
+            {
+            var pageRows = rows.Take(pageCount).ToList();
+            var cut = pageCount < rows.Count;
             var payload = new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* The span REQUESTED. Kept under its shipped name, and no longer the only span reported --
                    see the two timestamps below. */
                 hours_back = hours_back,
@@ -2780,9 +3215,15 @@ public sealed class DarlingMcpDataTools
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,
                 truncation_note = notice.TruncationNote,
-                run_count = rows.Count,
-                /* Observed by the over-fetch above, not inferred from the row count. */
-                truncated,
+                /* #5735, twin of Lite's #5731: a collector RUN is a row a collector wrote. The log page also shows the loop's own
+                   collection_cycle/SKIPPED rows (CollectionCycleRow: a late cycle's skipped slots; filterable with status = SKIPPED),
+                   which are not runs, so they are counted in skipped_cycle_rows and not here. #5824: nor is the analysis pass's
+                   analysis_pass row, which the page shows and neither count holds. The returned-time span fields below
+                   describe the PAGE, cycle rows included. */
+                run_count = pageRows.Count(r => CollectionCycleRow.IsCollectorRun(r.CollectorName)),
+                skipped_cycle_rows = pageRows.Count(r => r.CollectorName == CollectionCycleRow.CollectorName),
+                /* Observed by the over-fetch above, not inferred from the row count; also true when the size target cut the page. */
+                truncated = truncated || cut,
                 /*
                     #3287: the span this PAGE covers, beside the span requested.
 
@@ -2814,8 +3255,8 @@ public sealed class DarlingMcpDataTools
                     while the time-ordered test kept passing.
                 */
                 /* #4966: where the page's rows stop describes the window it covers, so it prints like effective_start (UTC, with the Z), and so does the newest bound (#5015); the rows' own times stay as the store holds them. */
-                oldest_returned_collection_time = McpHelpers.FormatEffectiveStart(rows.Min(r => r.CollectionTime)),
-                newest_returned_collection_time = McpHelpers.FormatEffectiveStart(rows.Max(r => r.CollectionTime)),
+                oldest_returned_collection_time = McpHelpers.FormatEffectiveStart(pageRows.Min(r => r.CollectionTime)),
+                newest_returned_collection_time = McpHelpers.FormatEffectiveStart(pageRows.Max(r => r.CollectionTime)),
                 /* Which ordering the page actually came back in. Stated rather than left to be inferred
                    from whether min_duration_ms was sent, because the first sentence of this tool's
                    description is the only other place that coupling is written down. */
@@ -2841,16 +3282,32 @@ public sealed class DarlingMcpDataTools
                     with.
                 */
                 status_filter = string.IsNullOrWhiteSpace(status) ? null : status.Trim().ToUpperInvariant(),
-                runs = result,
+                runs_returned = pageCount,
+                runs_total = rows.Count,
+                size_note = cut
+                    ? $"{rows.Count - pageCount} of the {rows.Count} run(s) this read selected were left off the end to keep this answer within about 32 KB. Ask for fewer rows (limit), a narrower window (hours_back or as_of), or one collector_name / status to read the rest in full."
+                    : null,
+                runs = runRows.Take(pageCount),
             };
-            var json = JsonSerializer.Serialize(payload, McpHelpers.JsonOptions);
+            var json = WithReadSource(JsonSerializer.Serialize(payload, McpHelpers.JsonOptions), pageRows.Select(r => r.ReadSource));
             return notice.IsUnavailable ? DarlingMcpWindowNotice.WithoutKeys(json) : json;
+            }
+
+            return McpResponseBudget.FitPrefix(rows.Count, LogReply).Json;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return McpHelpers.FormatError("get_collection_log", ex);
         }
     }
+
+    /// <summary>
+    /// #6254: adds <c>read_source</c> to the page's runs that have one, in page order. A run with none (every run of a server with the
+    /// Query Store replica setting off, and every run from before the setting existed) gets no key at all, so a page with no
+    /// <c>read_source</c> is byte-for-byte the page it was before. A page with none is returned as it is.
+    /// </summary>
+    internal static string WithReadSource(string json, IEnumerable<string?> readSources) =>
+        McpHelpers.WithRunsReadSource(json, readSources);
 
     /// <summary>
     /// The FLEET-WIDE form of <see cref="GetCollectionLog"/> (#4199): server_name omitted, blank or "*"
@@ -2878,10 +3335,10 @@ public sealed class DarlingMcpDataTools
         if (invalidFloor != null) return invalidFloor;
 
         var invalidStatus = McpHelpers.ValidateChoice(
-            status, EnumeratedCollectorDriver.CollectionLogStatuses, "status");
+            status, CollectionLogStatuses, "status");
         if (invalidStatus != null) return invalidStatus;
 
-        var anchorError = McpHelpers.ValidateUncappedWindow(hours_back, as_of, out var windowEnd);
+        var anchorError = DarlingReadWindow.ValidateUncapped(hours_back, as_of, out var windowEnd);
         if (anchorError != null) return anchorError;
 
         try
@@ -2973,27 +3430,41 @@ public sealed class DarlingMcpDataTools
                     ids_attempted = fr.Entry.TextFetchIdsAttempted,
                     probe_ids = fr.Entry.TextFetchProbeIds,
                 },
-            });
+            }).ToList();
 
-            return JsonSerializer.Serialize(new
+            /* #6180: a large limit passes the shared response target, so the page is cut to the newest (or slowest) whole runs
+               that fit, with the page fields describing what was served. */
+            return McpResponseBudget.FitPrefix(rows.Count, pageCount =>
+            {
+            var pageRows = rows.Take(pageCount).ToList();
+            var cut = pageCount < rows.Count;
+            return WithReadSource(JsonSerializer.Serialize(new
             {
                 /* No single `server`: `scope` is the fleet-form's own signal, so a client branching on
                    shape does not have to infer it from a null/absent field. */
                 scope = "fleet",
                 hours_back,
-                run_count = rows.Count,
-                truncated,
+                /* #5735: collector runs only; the collection_cycle/SKIPPED rows the page also shows are counted apart. #5824: the analysis_pass rows are in neither count. The returned-time span fields describe the page, cycle rows included. */
+                run_count = pageRows.Count(r => CollectionCycleRow.IsCollectorRun(r.Entry.CollectorName)),
+                skipped_cycle_rows = pageRows.Count(r => r.Entry.CollectorName == CollectionCycleRow.CollectorName),
+                truncated = truncated || cut,
                 /* #4966: where the page's rows stop describes the window it covers, so it prints like effective_start (UTC, with the Z), and so does the newest bound (#5015); the rows' own times stay as the store holds them. */
-                oldest_returned_collection_time = McpHelpers.FormatEffectiveStart(rows.Min(r => r.Entry.CollectionTime)),
-                newest_returned_collection_time = McpHelpers.FormatEffectiveStart(rows.Max(r => r.Entry.CollectionTime)),
+                oldest_returned_collection_time = McpHelpers.FormatEffectiveStart(pageRows.Min(r => r.Entry.CollectionTime)),
+                newest_returned_collection_time = McpHelpers.FormatEffectiveStart(pageRows.Max(r => r.Entry.CollectionTime)),
                 order = min_duration_ms is null
                     ? McpHelpers.CollectionLogOrderNewestFirst
                     : McpHelpers.CollectionLogOrderSlowestFirst,
                 collector_name = string.IsNullOrWhiteSpace(collector_name) ? null : collector_name.Trim(),
                 min_duration_ms,
                 status_filter = string.IsNullOrWhiteSpace(status) ? null : status.Trim().ToUpperInvariant(),
-                runs = result,
-            }, McpHelpers.JsonOptions);
+                runs_returned = pageCount,
+                runs_total = rows.Count,
+                size_note = cut
+                    ? $"{rows.Count - pageCount} of the {rows.Count} run(s) this read selected were left off the end to keep this answer within about 32 KB. Ask for fewer rows (limit), a narrower window (hours_back or as_of), or one server_name / collector_name / status to read the rest in full."
+                    : null,
+                runs = result.Take(pageCount),
+            }, McpHelpers.JsonOptions), pageRows.Select(r => r.Entry.ReadSource));
+            }).Json;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -3031,7 +3502,7 @@ public sealed class DarlingMcpDataTools
            than the default. What they no longer do is Math.Abs() a negative span (#3541 A13): a window that
            ends before it starts is a caller error, and flipping the sign answered a different question with
            nothing to say so. Refused, like every other unusable parameter here. */
-        var anchorError = McpHelpers.ValidateUncappedWindow(hours_back, as_of, out var windowEnd);
+        var anchorError = DarlingReadWindow.ValidateUncapped(hours_back, as_of, out var windowEnd);
         if (anchorError != null) return anchorError;
 
         try
@@ -3050,7 +3521,7 @@ public sealed class DarlingMcpDataTools
                     "nothing was waiting" reads as an all-clear, while the truth may be that the
                     waiting_tasks collector never ran. A caller told all-clear stops looking.
                 */
-                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "waiting_tasks", cancellationToken);
+                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "waiting_tasks", cancellationToken);
                 if (gated != null)
                 {
                     return gated;
@@ -3060,15 +3531,15 @@ public sealed class DarlingMcpDataTools
                 return everCollected
                     ? McpHelpers.Status(
                         "empty",
-                        $"Nothing was waiting on {resolved.ServerName} in the last {hours_back} hour(s). The collector HAS sampled this server, so this is a genuine all-clear for the window rather than missing data.")
+                        $"Nothing was waiting on {resolved.DisplayName} in the last {hours_back} hour(s). The collector has sampled this server, so this is a genuine all-clear for the window rather than missing data.")
                     : McpHelpers.Status(
                         "unavailable",
-                        $"No waiting-task samples have EVER been recorded for {resolved.ServerName}, so this is NOT an all-clear — there is nothing to read. Check that collection is running for this server before concluding it was quiet.");
+                        $"No waiting-task samples have EVER been recorded for {resolved.DisplayName}, so this is NOT an all-clear — there is nothing to read. Check that collection is running for this server before concluding it was quiet.");
             }
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back = hours_back,
                 /* #5244: the name for one database, "the chosen databases" for two or more, null for all. */
                 database_name = databases.Describe(),
@@ -3130,7 +3601,7 @@ public sealed class DarlingMcpDataTools
            than the default. What they no longer do is Math.Abs() a negative span (#3541 A13): a window that
            ends before it starts is a caller error, and flipping the sign answered a different question with
            nothing to say so. Refused, like every other unusable parameter here. */
-        var anchorError = McpHelpers.ValidateUncappedWindow(hours_back, as_of, out var windowEnd);
+        var anchorError = DarlingReadWindow.ValidateUncapped(hours_back, as_of, out var windowEnd);
         if (anchorError != null) return anchorError;
 
         try
@@ -3158,7 +3629,7 @@ public sealed class DarlingMcpDataTools
                     checked because either can be off alone, and the deadlock collector is separate from
                     both -- the verdict covers its series too.
                 */
-                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "blocked_process_report", cancellationToken);
+                var gated = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "blocked_process_report", cancellationToken);
                 if (gated != null)
                 {
                     return gated;
@@ -3178,14 +3649,14 @@ public sealed class DarlingMcpDataTools
                             /* #5244: with a database filter only the blocking half was limited to it (deadlocks are not
                                split by database here), so the sentence says exactly that instead of "no blocking". */
                             factual: databases.IsAll
-                                ? $"No blocking or deadlocks recorded for {resolved.ServerName} in the last {hours_back} hour(s)"
+                                ? $"No blocking or deadlocks recorded for {resolved.DisplayName} in the last {hours_back} hour(s)"
                                 : $"No blocking{DarlingMcpBlockingTools.ForChosenDatabases(databases)} "
-                                  + $"(and no deadlocks, which are not limited by database) recorded for {resolved.ServerName} in the last {hours_back} hour(s)",
+                                  + $"(and no deadlocks, which are not limited by database) recorded for {resolved.DisplayName} in the last {hours_back} hour(s)",
                             coveredClaim: ". The blocking collectors HAVE run successfully for this server, so the window is genuinely clear rather than blind."),
                         emptyNotice.AsHints())
                     : McpHelpers.Status(
                         "unavailable",
-                        $"The blocking collectors have NEVER run successfully for {resolved.ServerName}, so this is NOT a clean bill of health — nothing looked. Blocked-process reports need the XE session running, or the DMV blocking snapshot collector enabled; check those before concluding this server does not block.");
+                        $"The blocking collectors have NEVER run successfully for {resolved.DisplayName}, so this is NOT a clean bill of health — nothing looked. Blocked-process reports need the XE session running, or the DMV blocking snapshot collector enabled; check those before concluding this server does not block.");
             }
 
             /* #4966: one notice for two separate series; see BlockingStatsNoticeAsync. */
@@ -3196,7 +3667,7 @@ public sealed class DarlingMcpDataTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back = hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,

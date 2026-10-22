@@ -23,8 +23,8 @@
  * tool own that knob, and this page has no write affordance at all.
  */
 
-import { el, mount, apiGet, readTool, loadingStrip, errorStrip, emptyStrip, localTime, relTime, rollupTextId,
-         fmtInt, fmtMb, fmtPct, fmtBool, fmtText, bandClass, disclosure } from "../util.js";
+import { el, mount, apiGet, readTool, loadingStrip, errorStrip, emptyStrip, localTime, relTime, parseUtc, rollupTextId,
+         fmtInt, fmtMb, fmtMs, fmtPct, fmtBool, fmtText, bandClass, disclosure, localizeIsoText } from "../util.js";
 import { gridTable } from "../panels.js";
 import { pageRangePicker, windowOfSpec } from "../page-range.js";
 import { relativeSpec } from "../time-range.js";
@@ -190,7 +190,7 @@ function sweepDocument(d) {
 
   if (report.post_restart_window) {
     nodes.push(el("div", { class: "strip notice", role: "status" },
-      ["This sweep ran inside the post-restart settle window — fleet staleness here is classified startup-transient, not an outage."]));
+      ["This sweep ran inside the post-restart settle window — fleet staleness here is classified startup-transient, not an outage, except for a server that was already offline before the restart, which stays offline."]));
   }
 
   /* The header tiles: counts the document already carries. Built through ONE closure with the number
@@ -230,7 +230,7 @@ function sweepDocument(d) {
         { key: "server", label: "Server" },
         bandColumn("from", "From"),
         bandColumn("to", "To"),
-        { key: "reason", label: "Reason", wrap: true, display: (t) => t.reason || "—" },
+        { key: "reason", label: "Reason", wrap: true, localizeText: true, display: (t) => t.reason || "—" },
       ], transitions));
     }
     for (const [label, list] of [["New servers", changes.new_servers], ["Departed servers", changes.departed_servers]]) {
@@ -262,7 +262,7 @@ function sweepDocument(d) {
         { key: "server", label: "Server" },
         bandColumn("previous_band", "Previous", (v) => v.previous_band || "—"),
         bandColumn("band", "Band", (v) => v.band, (v) => v.band_changed),
-        { key: "reason", label: "Reason", wrap: true, display: (v) => v.reason || "—" },
+        { key: "reason", label: "Reason", wrap: true, localizeText: true, display: (v) => v.reason || "—" },
       ], verdicts)
     : emptyStrip("This sweep carries no per-server verdicts."));
 
@@ -297,7 +297,7 @@ function livenessBlock(d, lv) {
           + faults.map((f) => f.server + " (" + f.error + ")").join("; ") })
       : null,
     notes.length
-      ? el("ul", { class: "liveness-notes" }, notes.map((n) => el("li", { text: String(n) })))
+      ? el("ul", { class: "liveness-notes" }, notes.map((n) => el("li", { text: localizeIsoText(String(n)) })))
       : null,
   ]);
 }
@@ -475,6 +475,28 @@ async function renderStoreHost(box, opts) {
   renderStoreHostPayload(box, lastStoreHostPayload);
 }
 
+/** How old the stored store-size figure is at <c>nowMs</c>, in whole seconds (#5718 review). Derived from the
+    payload's <code>size_as_of</code> (the hourly sweep's naive-UTC metric_time) at RENDER time, because a poll
+    tick replays the cached payload every 60 s and a server-computed <code>size_age_seconds</code> would stand
+    still at its fetch-time value. Falls back to the server's figure only when size_as_of is absent or
+    unparseable; null when neither exists. Never negative (a browser clock behind the store's reads 0). */
+export function storeSizeAgeSeconds(store, nowMs) {
+  const asOf = store && store.size_as_of != null ? parseUtc(store.size_as_of) : null;
+  if (asOf) return Math.max(0, Math.round((nowMs - asOf.getTime()) / 1000));
+  return store && store.size_age_seconds != null ? store.size_age_seconds : null;
+}
+
+/** The "Store size" cell text: the figure and its age at <c>nowMs</c>, or why it is unavailable. */
+export function storeSizeText(store, nowMs) {
+  if (store.size_bytes == null) {
+    return "unavailable" + (store.size_unavailable_reason ? " (" + store.size_unavailable_reason + ")" : "");
+  }
+  const age = storeSizeAgeSeconds(store, nowMs);
+  /* #6245: the hourly sweep's figure is a catalog estimate (reads a little low); one sweep a day is exact. */
+  const form = store.size_estimated === true ? "hourly sweep estimate, " : "hourly sweep, ";
+  return fmtMb(bytesToMb(store.size_bytes)) + (age == null ? (store.size_estimated === true ? " (estimate)" : "") : " (" + form + fmtMs(age * 1000) + " old)");
+}
+
 /** The store host card's actual render, split out from the fetch above (#4214 round-1 review) so a poll tick
     can replay a previously fetched payload through the SAME render path a fresh fetch uses. */
 function renderStoreHostPayload(box, p) {
@@ -491,9 +513,13 @@ function renderStoreHostPayload(box, p) {
     [cellText("Data volume"), cellText(fmtMb(bytesToMb(vol.free_bytes)) + " free of " + fmtMb(bytesToMb(vol.total_bytes)) + " (" + fmtText(vol.filesystem) + ")" + (vol.note ? " — " + vol.note : ""))],
     [cellText("Managed store"), cellText(fmtBool(p.managed))],
     [cellText("PostgreSQL / TimescaleDB"), cellText(fmtText(store.postgres_version) + " / " + fmtText(store.timescale_version))],
-    [cellText("Store size"), cellText(fmtMb(bytesToMb(store.size_bytes)))],
+    /* #5718: the size is the hourly sweep's stored figure, so it says how old it is; a slow or refused read says
+       why the figure is missing instead of failing the whole card. */
+    [cellText("Store size"), cellText(storeSizeText(store, Date.now()))],
     [cellText("Lifetime buffer hit"), cellText(fmtPct(store.buffer_hit_ratio_percent))],
-    [cellText("Uncompressed chunks"), cellText(fmtInt(store.uncompressed_chunk_count) + " chunks, " + fmtMb(bytesToMb(store.uncompressed_chunk_bytes)) + " (" + fmtPct(store.uncompressed_chunk_percent_of_ram) + " of RAM)")],
+    [cellText("Uncompressed chunks"), cellText(store.uncompressed_chunk_bytes == null
+      ? "unavailable" + (store.uncompressed_unavailable_reason ? " (" + store.uncompressed_unavailable_reason + ")" : "")
+      : fmtInt(store.uncompressed_chunk_count) + " chunks, " + fmtMb(bytesToMb(store.uncompressed_chunk_bytes)) + " (" + fmtPct(store.uncompressed_chunk_percent_of_ram) + " of RAM)")],
   ]);
 
   const settingsBody = settings.length

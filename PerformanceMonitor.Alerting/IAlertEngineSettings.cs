@@ -68,6 +68,18 @@ public interface IAlertEngineSettings
     bool BlockingEnabled { get; }
     bool DeadlockEnabled { get; }
     bool PoisonWaitEnabled { get; }
+
+    /// <summary>
+    /// The Runnable Queue alert (#5641): runnable tasks per visible online scheduler, averaged over
+    /// <see cref="RunnableQueueEvaluator.WindowMinutes"/> minutes. ON by default, like Poison Wait.
+    /// </summary>
+    bool RunnableQueueEnabled { get; }
+
+    /// <summary>
+    /// The Client Timeouts alert (#5640): client attentions (a client cancelled or timed out a query) per minute, from the
+    /// attention collector's <c>attention_events</c>. OFF by default: the bars are a guess until checked against captured data.
+    /// </summary>
+    bool ClientTimeoutsEnabled { get; }
     bool LongRunningQueryEnabled { get; }
     bool TempDbSpaceEnabled { get; }
     bool LowDiskEnabled { get; }
@@ -96,7 +108,7 @@ public interface IAlertEngineSettings
     /// <summary>Fire when the selected CPU metric (see <see cref="CpuAlertMode"/>) is at/above this %.</summary>
     int CpuThresholdPercent { get; }
 
-    /// <summary>Fire when the rolling-window blocked-process-report count reaches this value (count-based; see class remarks).</summary>
+    /// <summary>Fire when the rolling-window blocking-WAIT count (one per blocked session, blocker and wait start, not one per blocked-process report; #5644) reaches this value (count-based; see class remarks).</summary>
     int BlockingCountThreshold { get; }
 
     /// <summary>
@@ -144,6 +156,43 @@ public interface IAlertEngineSettings
     /// knob's readers report it, the engine ignores it, and this comment is the record of why.
     /// </summary>
     int PoisonWaitThresholdMs { get; }
+
+    /// <summary>
+    /// Runnable Queue Warning bar (#5641): fire Warning when the window's average runnable tasks per scheduler is
+    /// at/above this. Shipped default <see cref="RunnableQueueEvaluator.DefaultWarningPerScheduler"/> (8). Both stores
+    /// apply <see cref="RunnableQueueEvaluator.ClampBars"/> on read: at least 1, and never above the Critical bar.
+    /// </summary>
+    int RunnableQueueWarningPerScheduler { get; }
+
+    /// <summary>
+    /// Runnable Queue Critical bar (#5641): Critical when the window's average is at/above this. Shipped default
+    /// <see cref="RunnableQueueEvaluator.DefaultCriticalPerScheduler"/> (16). Never below the Warning bar.
+    /// </summary>
+    int RunnableQueueCriticalPerScheduler { get; }
+
+    /// <summary>
+    /// Client Timeouts Warning FLOOR (#5640, #5736): fire Warning when attentions (client cancels and timeouts) per minute, averaged over
+    /// the covered span, are at/above max(this floor, <see cref="ClientTimeoutsWarningMultiple"/> x the server's baseline). Shipped default
+    /// <see cref="AttentionEvaluator.DefaultWarningPerMinute"/> (10). Both stores apply <see cref="AttentionEvaluator.ClampBars"/> on read: at least 1,
+    /// and never above the Critical floor.
+    /// </summary>
+    int ClientTimeoutsWarningPerMinute { get; }
+
+    /// <summary>
+    /// Client Timeouts Critical FLOOR (#5640, #5736): Critical when the rate is at/above max(this floor,
+    /// <see cref="ClientTimeoutsCriticalMultiple"/> x the server's baseline). Shipped default
+    /// <see cref="AttentionEvaluator.DefaultCriticalPerMinute"/> (60). Never below the Warning floor.
+    /// </summary>
+    int ClientTimeoutsCriticalPerMinute { get; }
+
+    /// <summary>Client Timeouts Warning multiple (#5736): the Warning bar is at least this many times the server's own baseline (the p99.9 of its
+    /// 3-minute average attention rate over the last 7 days). Shipped default <see cref="AttentionBaselineMath.DefaultWarningMultiple"/> (3).
+    /// At least 1, and never above the Critical multiple.</summary>
+    int ClientTimeoutsWarningMultiple { get; }
+
+    /// <summary>Client Timeouts Critical multiple (#5736): the Critical bar is at least this many times the baseline. Shipped default
+    /// <see cref="AttentionBaselineMath.DefaultCriticalMultiple"/> (10). Never below the Warning multiple.</summary>
+    int ClientTimeoutsCriticalMultiple { get; }
 
     /// <summary>Fire when a query's elapsed time is at/above this many minutes.</summary>
     int LongRunningQueryThresholdMinutes { get; }
@@ -317,6 +366,13 @@ public interface IAlertEngineSettings
     /// rows in these databases don't count toward thresholds). Compared case-insensitively.
     /// </summary>
     IReadOnlyList<string> ExcludedDatabases { get; }
+
+    /// <summary>
+    /// Mount points the Volume Free Space alert ignores (#6098), fleet-wide. Matched by
+    /// <see cref="VolumeExclusions"/>: the whole mount point, case-insensitive, a trailing <c>\</c> or <c>/</c>
+    /// on either side ignored. Excluded volumes are dropped before the breach test. Empty by default.
+    /// </summary>
+    IReadOnlyList<string> ExcludedVolumes { get; }
 
     /// <summary>Which CPU value the engine compares against <see cref="CpuThresholdPercent"/>.</summary>
     CpuAlertMode CpuAlertMode { get; }

@@ -112,6 +112,46 @@ public class ArchiveService
        pass makes progress whatever this is set to. A merge already running is not interrupted. */
     internal TimeSpan DailyCompactionPassBudget { get; set; } = TimeSpan.FromMinutes(5);
 
+    /* #5731: how long a periodic housekeeping step waits for the store's write lock before it skips its unit and
+       retries on a later pass. The lock is a ReaderWriterLockSlim, and a waiting writer makes every NEW reader wait,
+       so an unbounded wait behind one slow read held every collector off for as long as the read ran. Same number
+       as the #5371 CHECKPOINT and every other background store write (LocalDataService.WriteLockBudget); a test
+       sets a shorter one. Covers the per-table promote plus DELETE, the recovery of an interrupted export, the
+       compaction swap per group and the swap-journal replay. The size-triggered reset's three locks (the
+       unfinished-reset-export cleanup, the export of every table, and the promote/preserve/reset section) stay
+       unbounded on purpose: the reset must finish the job it started. The interrupted-work recovery INSIDE the reset is
+       unbounded too (RecoverInterruptedArchiveWorkAsync(unbounded: true)), because a journal it left behind
+       would have its rows exported a second time by the reset. Only the post-reset compaction stays on this
+       budget: a deferred compaction is idempotent and the next hourly pass merges the group. */
+    internal TimeSpan WriteLockBudget { get; set; } = LocalDataService.WriteLockBudget;
+
+    /* #5691: how long one read hold of the periodic export aims to last. A writer that queues while the export reads
+       waits for the hold to end, and every background writer gives up after WriteLockBudget, so a hold has to end well
+       inside that: half of it. A table whose rows fit in one hold of this length is exported in one hold, as before;
+       a bigger one (the backlog after Lite was closed for a while, or a table with large rows) is exported one time
+       slice per hold, the way compaction merges one group per lock (#5410). */
+    internal TimeSpan ExportReadHoldTarget => WriteLockBudget / 2;
+
+    /* #5691: rows the first hold of a table exports before any rate for that table has been measured. Each hold
+       measures the table's export rate, and the slices after it (and the table's first hold in later passes) are sized
+       from that rate to last ExportReadHoldTarget. Small on purpose: an overestimate costs one long hold, an
+       underestimate only a few short ones. A test sets a smaller number. */
+    internal long ExportSeedSliceRows { get; set; } = 10_000;
+
+    /* #5691: the most holds one table's export is cut into, so a range whose rows all share a few timestamps cannot
+       turn into thousands of tiny slices. */
+    private const int MaxExportSlices = 256;
+
+    /* #5691: rows per second each table's export ran at, measured per hold; sizes the next hold of the same table. */
+    private readonly Dictionary<string, double> _exportRowsPerSecond = new(StringComparer.Ordinal);
+
+    /* Fires with (table, slice, entered) right after the export takes a read hold (entered true) and right before it
+       releases it (false), on the exporting thread (#5691). A test records the holds and queues a writer inside one. */
+    internal Action<string, int, bool>? ExportReadHoldForTests { get; set; }
+
+    /* #5691: the rows older than the cutoff changed between a table's export and its promote; the table is skipped. */
+    private sealed class ArchiveExportStaleException(string message) : Exception(message);
+
     /* Replaces the minute-resolution file-name prefix, so a test can put two runs in different "minutes"
        without waiting for the clock. */
     internal string? TimestampForTests { get; set; }
@@ -141,6 +181,11 @@ public class ArchiveService
        not finish, and the run finishes or undoes that swap before merging anything. */
     private const string SwapJournalSuffix = ".swap";
 
+    /* The month (6 digits) or day (8 digits) and the table a swap journal's file name carries. One definition for the
+       deferred replay and the post-replay unresolved check, which must agree on the group they protect from the merge
+       (#5731); compiled once per process. */
+    private static readonly Regex s_swapJournalName = new(@"^(\d{8}|\d{6})_(.+)" + Regex.Escape(SwapJournalSuffix) + "$", RegexOptions.Compiled);
+
     /* One per table, written once a periodic export's .tmp is complete and before it is promoted, removed after the
        rows it archived are deleted (#4720). It holds the cutoff (UTC, round-trip format) and the final file name.
        Found at the start of a later run it means the previous run died somewhere in between: with the file at its
@@ -168,6 +213,18 @@ public class ArchiveService
                                           max+1 in C#, safe because every row is restored.
          server_tags / server_tag_map   : user choice (#4887), PK id / (server_id, tag_id), one row per tag and
                                           per tagging; bounded by what the user created.
+         query_tags / query_tag_assignments / query_tag_rules : user choice (#5989), PK id each; ids are max + 1 in C#
+                                          and every row is restored. query_tag_sightings and query_tag_map are derived
+                                          and rebuilt, so they are not kept.
+         notification_routes            : user choice (#5750), PK route_id; the destinations are in Credential Manager,
+                                          keyed by route id, so restoring the rows verbatim keeps them wired.
+         investigation_requests / _request_alerts / _reports / _journal / investigation_notes /
+         agent_environment_profiles : Level 1 investigations (#5820). The requests are what the route limits count
+                                          and the journal holds the once keys, so an empty pair would reopen and
+                                          re-journal; the reports, the approved notes and the profiles are answers and
+                                          a person's choices. They reference each other by request_id only, and all
+                                          six are kept together, so the verbatim restore keeps them consistent; their
+                                          max + 1 ids continue from the restored rows.
        The restore is BY NAME: ALTER-added columns (watermark_time, v31) sit last on old stores while the fresh
        schema may order them differently, and a positional restore would swap values or fail. */
     internal static readonly string[] PreservedConfigTables =
@@ -181,7 +238,17 @@ public class ArchiveService
         "collector_state",
         "analysis_muted",
         "server_tags",
-        "server_tag_map"
+        "server_tag_map",
+        "notification_routes",
+        "query_tags",
+        "query_tag_assignments",
+        "query_tag_rules",
+        "investigation_requests",
+        "investigation_request_alerts",
+        "investigation_reports",
+        "investigation_journal",
+        "investigation_notes",
+        "agent_environment_profiles"
     ];
 
     /* Tables eligible for archival with their time column. Catalog-driven: every collector table
@@ -214,14 +281,24 @@ public class ArchiveService
     /// then deletes the archived rows from the hot tables.
     /// Use hotDataDays for scheduled archival (default <see cref="HotDataDays"/>), or hotDataHours
     /// for size-triggered archival when the database is under space pressure.
+    /// <para>#5731: returns true when every table was archived and compaction left nothing behind for the lock
+    /// budget (<see cref="WriteLockBudget"/>), false when a unit was skipped because the write lock was not free in
+    /// time, a table's earlier journal could not be finished, or <paramref name="cancellationToken"/> stopped the
+    /// pass between tables. The caller then retries soon instead of waiting out the whole interval. A pass that
+    /// finds another one running returns true: that pass is doing the work. A COPY already running is not
+    /// interrupted; the token is checked between tables and before compaction.</para>
     /// </summary>
-    public async Task ArchiveOldDataAsync(int hotDataDays = HotDataDays, int? hotDataHours = null)
+    public async Task<bool> ArchiveOldDataAsync(int hotDataDays = HotDataDays, int? hotDataHours = null,
+        CancellationToken cancellationToken = default)
     {
-        if (!await s_archiveLock.WaitAsync(TimeSpan.Zero))
+        /* None, not the caller's token: a zero-wait probe, and a COPY already running is not interrupted either (#5731). */
+        if (!await s_archiveLock.WaitAsync(TimeSpan.Zero, CancellationToken.None))
         {
             _logger?.LogDebug("Archive operation already in progress, skipping");
-            return;
+            return true;
         }
+
+        var complete = true;
 
         IsArchiving = true;
         try
@@ -259,10 +336,24 @@ public class ArchiveService
 
            Exporting and promoting in separate lock scopes is safe here: the
            DELETE only removes rows older than cutoffDate, and collectors only
-           ever insert rows timestamped "now", so nothing archivable can be
-           written into the gap between the export and the DELETE. */
+           ever insert rows timestamped "now", so nothing archivable is
+           written into the gap between the export and the DELETE. #5691 split
+           the export into one read hold per table slice, which widens that gap,
+           so the write lock now checks it: the rows older than the cutoff must
+           still be exactly as many as the export wrote, or the table is skipped
+           this pass with nothing promoted and nothing deleted. */
         foreach (var (table, timeColumn) in ArchivableTables)
         {
+            /* #5731: stop between tables. A table already promoted stays promoted (the views are rebuilt below). */
+            if (cancellationToken.IsCancellationRequested)
+            {
+                complete = false;
+                _logger?.LogInformation("Archival stopped before {Table}: cancelled", table);
+                break;
+            }
+
+            /* The temp this table's export wrote, for the lock-timeout clause below to remove (#5731). */
+            string? exportedTemp = null;
             try
             {
                 /* A journal still here after the recovery above is one it could not finish. Exporting the table
@@ -270,6 +361,7 @@ public class ArchiveService
                 if (File.Exists(PendingArchivePath(table)))
                 {
                     _logger?.LogWarning("Skipping {Table}: the journal of an earlier interrupted export is still there and could not be finished", table);
+                    complete = false;
                     continue;
                 }
 
@@ -282,33 +374,15 @@ public class ArchiveService
                    A mid-COPY failure (OOM/disk-full/process kill) must not leave a truncated
                    parquet that matches the glob and breaks the archive view for the whole table. */
                 var tempParquetPath = parquetPath + ".tmp";
+                exportedTemp = tempParquetPath;
 
-                long rowCount;
-
-                /* Export under a read lock — runs alongside UI queries. */
-                using (_duckDb.AcquireReadLock())
+                /* Export under read locks, alongside UI queries: one hold per table, or one per time slice of a
+                   table too big for one hold (#5691). Each hold is released before the next is taken, so a writer
+                   that queued during one gets in before the next. */
+                var rowCount = await ExportTableAsync(table, timeColumn, cutoffDate, tempParquetPath);
+                if (rowCount == 0)
                 {
-                    using var readConnection = _duckDb.CreateConnection();
-                    await readConnection.OpenAsync();
-
-                    rowCount = await GetRowCountBeforeCutoff(readConnection, table, timeColumn, cutoffDate);
-                    if (rowCount == 0)
-                    {
-                        continue;
-                    }
-
-                    /* DuckDB keeps the partial file when a COPY fails partway through its query, and the move
-                       below never runs then, so nothing else would remove it: the hourly retry would add
-                       another partial file each time. */
-                    try
-                    {
-                        await ExportToParquet(readConnection, table, timeColumn, cutoffDate, tempParquetPath);
-                    }
-                    catch
-                    {
-                        try { File.Delete(tempParquetPath); } catch { /* best effort */ }
-                        throw;
-                    }
+                    continue;
                 }
 
                 /* The promote and the DELETE share one write lock (#4824). A view is the table UNION ALL its
@@ -327,8 +401,20 @@ public class ArchiveService
                    The DELETE modifies table data and the next CHECKPOINT reorganizes the file, so readers must
                    not be mid-query when that happens or they get "Reached the end of the file" errors; the move
                    and the DELETE are both fast, so the UI stall is short. */
-                using (_duckDb.AcquireWriteLock())
+                using (_duckDb.AcquireWriteLock(WriteLockBudget))
                 {
+                    /* #5691: the export ran under read locks that were released before this write lock, so a writer
+                       could get in between. The DELETE below removes every row older than the cutoff, so it must
+                       find exactly the rows the export wrote; a row older than the cutoff that was written (or
+                       removed) in that gap would otherwise be deleted without being archived. Throwing here leaves
+                       everything as it was: nothing promoted, the rows in the table, exported again next pass. */
+                    var rowsNow = await CountRowsBeforeCutoffAsync(table, timeColumn, cutoffDate);
+                    if (rowsNow != rowCount)
+                    {
+                        throw new ArchiveExportStaleException(
+                            $"{rowsNow} rows of {table} are older than the cutoff now, but the export wrote {rowCount}.");
+                    }
+
                     try
                     {
                         WritePendingArchive(table, cutoffDate, Path.GetFileName(parquetPath));
@@ -370,6 +456,32 @@ public class ArchiveService
                 TryDeletePendingArchive(table);
                 _logger?.LogInformation("Archived {Count} rows from {Table} to {Path}", rowCount, table, parquetPath);
             }
+            catch (StoreLockTimeoutException ex)
+            {
+                /* #5731: the write lock was not free within the budget, so nothing was promoted and no DELETE ran:
+                   the rows are still in the table and still go next pass. The export itself is done and unused;
+                   remove it, so the retry does not pile another file up beside it. Information, not Error: this is
+                   the designed answer to a busy store, and the caller retries in minutes. */
+                if (exportedTemp is not null)
+                {
+                    try { File.Delete(exportedTemp); } catch { /* best effort */ }
+                }
+
+                complete = false;
+                _logger?.LogInformation("Archival of {Table} skipped: {Message} The rows stay in the table and are archived on a later pass", table, ex.Message);
+            }
+            catch (ArchiveExportStaleException ex)
+            {
+                /* #5691: the table changed below the cutoff between the export and the DELETE. Nothing was promoted;
+                   drop the export and let the next pass export the table as it is then. */
+                if (exportedTemp is not null)
+                {
+                    try { File.Delete(exportedTemp); } catch { /* best effort */ }
+                }
+
+                complete = false;
+                _logger?.LogInformation("Archival of {Table} skipped: {Message} The rows stay in the table and are archived on a later pass", table, ex.Message);
+            }
             catch (Exception ex) when (ex is not SimulatedKillException)
             {
                 _logger?.LogError(ex, "Failed to archive table {Table}", table);
@@ -381,7 +493,14 @@ public class ArchiveService
            a view whose glob matches nothing fails every read of that table until the next hourly run. */
         try
         {
-            CompactParquetFiles();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                complete = false;
+            }
+            else if (!CompactParquetFiles())
+            {
+                complete = false;
+            }
         }
         finally
         {
@@ -393,6 +512,8 @@ public class ArchiveService
                 await _duckDb.CreateArchiveViewsAsync();
             }
         }
+
+        return complete;
         }
         finally
         {
@@ -434,9 +555,10 @@ public class ArchiveService
        reorganizes the file, so readers must not be mid-query when that happens. Returns the rows deleted.
        The export itself calls the Core form below, with its promote under the same lock (#4824); this one is for
        a caller with no promote to keep it with, the recovery of an interrupted export. */
-    private async Task<int> DeleteArchivedRowsAsync(string table, string timeColumn, DateTime cutoff)
+    private async Task<int> DeleteArchivedRowsAsync(string table, string timeColumn, DateTime cutoff, bool unbounded = false)
     {
-        using (_duckDb.AcquireWriteLock())
+        /* unbounded: the reset's recovery waits as long as the reset's own locks do (#5731). */
+        using (_duckDb.AcquireWriteLock(unbounded ? null : WriteLockBudget))
         {
             return await DeleteArchivedRowsCoreAsync(table, timeColumn, cutoff);
         }
@@ -545,17 +667,22 @@ public class ArchiveService
     /// anything. Called once at the start of every entry point that does, after the unfinished-reset-export
     /// cleanup (#4720).
     /// </summary>
-    private async Task RecoverInterruptedArchiveWorkAsync()
+    /// <param name="unbounded">
+    /// True for <c>ArchiveAllAndResetAsync</c> (#5731): the reset is the store's own exclusive section, and a journal
+    /// the recovery left behind would have the reset export its rows a second time. False for the scheduled pass,
+    /// which waits <see cref="WriteLockBudget"/> and re-checks the journal before it exports the table.
+    /// </param>
+    private async Task RecoverInterruptedArchiveWorkAsync(bool unbounded = false)
     {
         if (!Directory.Exists(_archivePath))
         {
             return;
         }
 
-        await RecoverPendingArchivesAsync();
+        await RecoverPendingArchivesAsync(unbounded);
 
         /* After the swap journals are replayed: a journal the replay could not finish still names temps it needs. */
-        ReplayCompactionSwapJournals();
+        ReplayCompactionSwapJournals(unbounded);
         RemoveStaleTempFiles();
     }
 
@@ -626,7 +753,7 @@ public class ArchiveService
     /// rows is harmless). If it does not, the promote never happened and the rows are still only in the table.
     /// Either way the journal goes, so the export below neither repeats an archived table nor loses one.
     /// </summary>
-    private async Task RecoverPendingArchivesAsync()
+    private async Task RecoverPendingArchivesAsync(bool unbounded)
     {
         foreach (var journalPath in Directory.GetFiles(_archivePath, "*" + PendingArchiveSuffix).Order(StringComparer.Ordinal))
         {
@@ -646,7 +773,7 @@ public class ArchiveService
                 var (cutoff, fileName) = pending.Value;
                 if (File.Exists(Path.Combine(_archivePath, fileName)))
                 {
-                    var deleted = await DeleteArchivedRowsAsync(table, timeColumn, cutoff);
+                    var deleted = await DeleteArchivedRowsAsync(table, timeColumn, cutoff, unbounded);
                     File.Delete(journalPath);
                     _logger?.LogInformation(
                         "Recovered the interrupted archive of {Table}: {File} was already written, so {Count} row(s) older than {Cutoff:o} were deleted from the table",
@@ -660,6 +787,12 @@ public class ArchiveService
                         table, fileName, cutoff);
                 }
             }
+            catch (StoreLockTimeoutException ex)
+            {
+                /* #5731: the write lock was not free within the budget. The journal stays, the table is skipped
+                   by the export below (which reports an incomplete pass), and the next pass finishes it. */
+                _logger?.LogInformation("Recovery of the interrupted archive journal {Journal} deferred: {Message} {Table} is skipped until the next pass", journalName, ex.Message, table);
+            }
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "Could not recover the interrupted archive journal {Journal}; {Table} is skipped until it can be", journalName, table);
@@ -667,27 +800,276 @@ public class ArchiveService
         }
     }
 
-    private static async Task<long> GetRowCountBeforeCutoff(DuckDBConnection connection, string table, string timeColumn, DateTime cutoff)
+    /// <summary>
+    /// Exports the rows of <paramref name="table"/> older than <paramref name="cutoff"/> to <paramref name="tempPath"/>
+    /// and returns how many it wrote; 0 means none, and then no file is written (#5691).
+    /// <para>Before #5691 one read hold covered the whole COPY of a table, however many rows it had: the first pass
+    /// after Lite had been closed for a day, or a table of large rows, could hold the store for longer than any
+    /// background writer waits (<see cref="WriteLockBudget"/>), and every write queued behind it gave up. Now the first
+    /// hold counts the rows and, when they fit in one hold of <see cref="ExportReadHoldTarget"/> at the table's
+    /// measured rate, exports them all in that hold, as before. Otherwise the rows are exported one time slice per
+    /// hold, each hold released before the next is taken, and the slices are merged into the one file outside the
+    /// store lock. The merge reads only the slice files, so it holds nothing a writer waits for.</para>
+    /// </summary>
+    private async Task<long> ExportTableAsync(string table, string timeColumn, DateTime cutoff, string tempPath)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"SELECT COUNT(*) FROM {table} WHERE {timeColumn} < $1";
-        cmd.Parameters.Add(new DuckDBParameter { Value = cutoff });
-        var result = await cmd.ExecuteScalarAsync();
-        return Convert.ToInt64(result);
+        var sliceRows = SliceRowsFor(table);
+        var slice = 0;
+        long total;
+        DateTime oldest;
+        DateTime newest;
+
+        /* The first hold counts, and exports too when the rows fit: the hourly pass finds about an hour of rows per
+           table, so it still takes one hold per table. */
+        using (_duckDb.AcquireReadLock())
+        {
+            ExportReadHoldForTests?.Invoke(table, slice, true);
+            try
+            {
+                using var connection = _duckDb.CreateConnection();
+                await connection.OpenAsync(CancellationToken.None);
+                var started = Stopwatch.GetTimestamp();
+
+                (total, oldest, newest) = await CountAndSpanBeforeCutoffAsync(connection, table, timeColumn, cutoff);
+                if (total == 0)
+                {
+                    return 0;
+                }
+
+                if (total <= sliceRows)
+                {
+                    await ExportRangeAsync(connection, table, timeColumn, lower: null, cutoff, tempPath);
+                    RecordExportRate(table, total, Stopwatch.GetElapsedTime(started));
+                    return total;
+                }
+            }
+            finally
+            {
+                ExportReadHoldForTests?.Invoke(table, slice, false);
+            }
+        }
+
+        /* Too many rows for one hold: cut [oldest, newest] into time slices sized for sliceRows each, assuming the rows
+           are spread evenly over it, then resize each next slice from how long the last hold took. The first slice has no
+           lower bound and the last ends at the cutoff, so together they cover exactly the rows the DELETE removes. */
+        var range = newest - oldest + TimeSpan.FromTicks(1);
+        var minWidth = TimeSpan.FromTicks(Math.Max(range.Ticks / MaxExportSlices, TimeSpan.TicksPerMillisecond));
+        var width = TimeSpan.FromTicks(Math.Max((long)(range.Ticks * ((double)sliceRows / total)), minWidth.Ticks));
+        var slicePaths = new List<string>();
+        long exported = 0;
+        DateTime? lower = null;
+        var upper = oldest;
+
+        try
+        {
+            while (true)
+            {
+                slice++;
+                upper += width;
+                var last = upper > newest || upper >= cutoff;
+                if (last)
+                {
+                    upper = cutoff;
+                }
+
+                var slicePath = $"{tempPath}.{slice:D3}.tmp";
+                long rows;
+                TimeSpan held;
+                using (_duckDb.AcquireReadLock())
+                {
+                    ExportReadHoldForTests?.Invoke(table, slice, true);
+                    try
+                    {
+                        using var connection = _duckDb.CreateConnection();
+                        await connection.OpenAsync(CancellationToken.None);
+                        var started = Stopwatch.GetTimestamp();
+
+                        rows = await CountRangeAsync(connection, table, timeColumn, lower, upper);
+                        if (rows > 0)
+                        {
+                            await ExportRangeAsync(connection, table, timeColumn, lower, upper, slicePath);
+                            slicePaths.Add(slicePath);
+                        }
+
+                        held = Stopwatch.GetElapsedTime(started);
+                    }
+                    finally
+                    {
+                        ExportReadHoldForTests?.Invoke(table, slice, false);
+                    }
+                }
+
+                exported += rows;
+                if (rows > 0)
+                {
+                    RecordExportRate(table, rows, held);
+                }
+
+                if (last)
+                {
+                    break;
+                }
+
+                /* Aim the next hold at the target, moving the width at most fourfold either way per slice. */
+                if (held > TimeSpan.Zero)
+                {
+                    var factor = Math.Clamp(ExportReadHoldTarget / held, 0.25, 4.0);
+                    width = TimeSpan.FromTicks(Math.Max((long)(width.Ticks * factor), minWidth.Ticks));
+                }
+
+                lower = upper;
+            }
+
+            if (exported == 0)
+            {
+                return 0;
+            }
+
+            if (slicePaths.Count == 1)
+            {
+                File.Move(slicePaths[0], tempPath);
+            }
+            else
+            {
+                MergeExportSlices(table, slicePaths, tempPath);
+            }
+
+            return exported;
+        }
+        catch
+        {
+            try { File.Delete(tempPath); } catch { /* best effort */ }
+            throw;
+        }
+        finally
+        {
+            foreach (var path in slicePaths)
+            {
+                try { File.Delete(path); } catch { /* best effort */ }
+            }
+        }
     }
 
-    private static async Task ExportToParquet(DuckDBConnection connection, string table, string timeColumn, DateTime cutoff, string filePath)
+    /* #5691: rows for a table's first hold: its measured rate times the target, or the seed before any rate. */
+    private long SliceRowsFor(string table) =>
+        _exportRowsPerSecond.TryGetValue(table, out var rate)
+            ? Math.Max(1, (long)(rate * ExportReadHoldTarget.TotalSeconds))
+            : ExportSeedSliceRows;
+
+    /* A hold shorter than a tenth of the target is mostly the fixed cost of opening and writing a file, so its rate
+       says only "fast", not how fast; it does not replace the estimate. */
+    private void RecordExportRate(string table, long rows, TimeSpan held)
     {
-        await WithRaisedCopyMemoryLimit(connection, async () =>
+        if (held < ExportReadHoldTarget / 10)
         {
-            using var cmd = connection.CreateCommand();
-            cmd.CommandText = $@"
+            return;
+        }
+
+        _exportRowsPerSecond[table] = rows / held.TotalSeconds;
+    }
+
+    private static async Task<(long Count, DateTime Oldest, DateTime Newest)> CountAndSpanBeforeCutoffAsync(
+        DuckDBConnection connection, string table, string timeColumn, DateTime cutoff)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*), MIN({timeColumn}), MAX({timeColumn}) FROM {table} WHERE {timeColumn} < $1";
+        cmd.Parameters.Add(new DuckDBParameter { Value = cutoff });
+        using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        var count = Convert.ToInt64(reader.GetValue(0), CultureInfo.InvariantCulture);
+        return count == 0 ? (0, cutoff, cutoff) : (count, reader.GetDateTime(1), reader.GetDateTime(2));
+    }
+
+    private static async Task<long> CountRangeAsync(
+        DuckDBConnection connection, string table, string timeColumn, DateTime? lower, DateTime upper)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*) FROM {table} WHERE {RangePredicate(timeColumn, lower)}";
+        AddRangeParameters(cmd, lower, upper);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+    }
+
+    /* The rows the DELETE would remove, counted under its write lock (#5691). */
+    private async Task<long> CountRowsBeforeCutoffAsync(string table, string timeColumn, DateTime cutoff)
+    {
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+        return await CountRangeAsync(connection, table, timeColumn, lower: null, cutoff);
+    }
+
+    /* $1 is the exclusive upper bound, $2 the inclusive lower one when there is one. */
+    private static string RangePredicate(string timeColumn, DateTime? lower) =>
+        lower is null ? $"{timeColumn} < $1" : $"{timeColumn} < $1 AND {timeColumn} >= $2";
+
+    private static void AddRangeParameters(DuckDBCommand cmd, DateTime? lower, DateTime upper)
+    {
+        cmd.Parameters.Add(new DuckDBParameter { Value = upper });
+        if (lower is not null)
+        {
+            cmd.Parameters.Add(new DuckDBParameter { Value = lower.Value });
+        }
+    }
+
+    private static async Task ExportRangeAsync(
+        DuckDBConnection connection, string table, string timeColumn, DateTime? lower, DateTime upper, string filePath)
+    {
+        /* DuckDB keeps the partial file when a COPY fails partway through its query, and nothing after a failed
+           export would remove it: the hourly retry would add another partial file each time. */
+        try
+        {
+            await WithRaisedCopyMemoryLimit(connection, async () =>
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = $@"
 COPY (
-    SELECT * FROM {table} WHERE {timeColumn} < $1
+    SELECT * FROM {table} WHERE {RangePredicate(timeColumn, lower)}
 ) TO '{EscapeSqlPath(filePath)}' ({ParquetCompaction.ArchiveCopyOptions})";
-            cmd.Parameters.Add(new DuckDBParameter { Value = cutoff });
-            await cmd.ExecuteNonQueryAsync();
-        });
+                AddRangeParameters(cmd, lower, upper);
+                await cmd.ExecuteNonQueryAsync();
+            });
+        }
+        catch
+        {
+            try { File.Delete(filePath); } catch { /* best effort */ }
+            throw;
+        }
+    }
+
+    /* #5691: the sliced export's merge settings and COPY: compaction's memory cap, thread count and row-group options
+       for the table, and every column. A test pins both against ParquetCompaction. */
+    internal static string BuildExportSliceMergePragma(string table, string spillDirSql) =>
+        ParquetCompaction.BuildPragma(ParquetCompaction.DefaultMemoryLimit, ParquetCompaction.ThreadsFor(table), spillDirSql);
+
+    internal static string BuildExportSliceMergeCopy(string table, IEnumerable<string> slicePaths, string outputPath)
+    {
+        var pathList = string.Join(", ", slicePaths.Select(p => $"'{EscapeSqlPath(p.Replace("\\", "/"))}'"));
+        return $"COPY (SELECT * FROM read_parquet([{pathList}])) TO '{EscapeSqlPath(outputPath)}' ({ParquetCompaction.BuildArchiveCopyOptions(ParquetCompaction.ArchiveRowGroupSize, ParquetCompaction.RowGroupBytesFor(table))})";
+    }
+    /* #5691: joins a sliced export's files into the one file the pass promotes, on an in-memory DuckDB of its own, so
+       it holds no store lock. Compaction's settings for the table (ParquetCompaction.BuildPragma, ThreadsFor and
+       RowGroupBytesFor), but every column: a sliced table is by construction one that did not fit a hold, which for the
+       plan-heavy tables means far more than the input #5393 measured running out of memory without the row-group byte
+       bound (ParquetCompaction.cs, the DailyBatchInputBytes measurements), so the bound and one thread are what keep this
+       merge under the cap. DuckDB takes ROW_GROUP_SIZE_BYTES only with preserve_insertion_order = false, so this file
+       has compaction's shape, not the archiver's: row groups that mix times, and for the plan-heavy tables 32 MiB groups
+       written on one thread. It prunes like a compacted file until the next compaction pass rewrites it; the memory
+       bound wins over read pruning on the one file that did not fit a hold. */
+    private void MergeExportSlices(string table, List<string> slicePaths, string outputPath)
+    {
+        var spillDir = Path.Combine(_archivePath, "duckdb_tmp");
+        Directory.CreateDirectory(spillDir);
+
+        using var connection = new DuckDBConnection("DataSource=:memory:");
+        connection.Open();
+        using (var pragma = connection.CreateCommand())
+        {
+            pragma.CommandText = BuildExportSliceMergePragma(table, spillDir.Replace("\\", "/"));
+            pragma.ExecuteNonQuery();
+        }
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = BuildExportSliceMergeCopy(table, slicePaths, outputPath);
+        cmd.ExecuteNonQuery();
     }
 
     private static string EscapeSqlPath(string path) => DuckDbInitializer.EscapeSqlPath(path);
@@ -715,8 +1097,10 @@ COPY (
     /// (#933). memory_limit is instance-level; concurrent operations briefly
     /// see the raised cap.
     ///
-    /// <para><b>internal rather than private</b> so the #1912 archive repair reuses this exact raise/restore
-    /// instead of carrying its own copy of the number. The floor is a KNOWN-BROKEN-BELOW-2GB constraint, not a
+    /// <para><b>internal rather than private</b> so the tests can reach this exact raise/restore. The #1912 / #5653
+    /// slice repair does NOT call it: it rewrites on its own DuckDB instance and reads only
+    /// <see cref="MainConnectionCopyMemoryLimit"/> for that instance's memory_limit, so it never raises or restores
+    /// the store connection's limit. The floor is a KNOWN-BROKEN-BELOW-2GB constraint, not a
     /// tuning preference — DuckDB pre-reserves ~99% of memory_limit the moment a parquet COPY begins, so a
     /// second literal drifting downward is precisely how it gets re-broken (#942 lowered it to 1GB on sound-
     /// looking reasoning and broke compaction; #952 put it back).</para>
@@ -755,7 +1139,7 @@ COPY (
     /// any journal to resolve, the resolving and the archive-view rebuild that follows it run under one write
     /// lock; with none, no lock is taken (#4720).
     /// </summary>
-    private (HashSet<string> AlreadyFolded, HashSet<(string Month, string Table)> UnresolvedGroups) ReplayCompactionSwapJournals()
+    private (HashSet<string> AlreadyFolded, HashSet<(string Month, string Table)> UnresolvedGroups, bool LockTimedOut) ReplayCompactionSwapJournals(bool unbounded = false)
     {
         /* Finish or undo any swap a previous run left behind (a crash, a kill, or a file it could not delete)
            before grouping, so this run starts from a consistent set of files. Inputs that an earlier swap
@@ -768,14 +1152,36 @@ COPY (
         var journalPaths = Directory.GetFiles(_archivePath, "*" + SwapJournalSuffix);
         if (journalPaths.Length == 0)
         {
-            return (alreadyFolded, unresolvedGroups);
+            return (alreadyFolded, unresolvedGroups, false);
         }
 
         /* Finishing a swap deletes the files the views read and undoing one moves them, so a reader in between
            finds the same missing rows or empty glob that the per-group swap in CompactParquetFiles explains
            (#4720). The lock is held to the end of the method, past the rebuild below, so no reader gets in
            between the two. */
-        using var writeLock = _duckDb.AcquireWriteLock();
+        IDisposable acquired;
+        try
+        {
+            acquired = _duckDb.AcquireWriteLock(unbounded ? null : WriteLockBudget);
+        }
+        catch (StoreLockTimeoutException ex)
+        {
+            /* #5731: nothing was resolved, so every journal's month (or day) stays out of this run's merge, exactly
+               as a journal that could not be finished does, and the next pass replays them. */
+            foreach (var journalPath in journalPaths)
+            {
+                var m = s_swapJournalName.Match(Path.GetFileName(journalPath));
+                if (m.Success)
+                {
+                    unresolvedGroups.Add((m.Groups[1].Value, m.Groups[2].Value));
+                }
+            }
+
+            _logger?.LogInformation("Resolving {Count} compaction swap journal(s) deferred: {Message} Their groups are left as they are and the next pass retries", journalPaths.Length, ex.Message);
+            return (alreadyFolded, unresolvedGroups, true);
+        }
+
+        using var writeLock = acquired;
         foreach (var journalPath in journalPaths)
         {
             var journalName = Path.GetFileName(journalPath);
@@ -804,7 +1210,7 @@ COPY (
             if (File.Exists(journalPath))
             {
                 /* The group's period is a month (6 digits) or, for a table merged per day, a day (8 digits). */
-                var m = Regex.Match(journalName, @"^(\d{8}|\d{6})_(.+)" + Regex.Escape(SwapJournalSuffix) + "$");
+                var m = s_swapJournalName.Match(journalName);
                 if (m.Success)
                 {
                     unresolvedGroups.Add((m.Groups[1].Value, m.Groups[2].Value));
@@ -826,7 +1232,7 @@ COPY (
             _logger?.LogError(ex, "Could not rebuild the archive views after resolving the compaction swaps; the rebuild at the end of the run covers them");
         }
 
-        return (alreadyFolded, unresolvedGroups);
+        return (alreadyFolded, unresolvedGroups, false);
     }
 
     /// <summary>
@@ -835,15 +1241,19 @@ COPY (
     /// (YYYYMMDD_tablename.parquet, and _ptNNN parts past the table's smaller batch budget).
     /// This keeps the archive directory small (~75 files for 3 months of 25 tables)
     /// and dramatically improves DuckDB read_parquet glob performance.
+    /// <para>#5731: returns false when the write lock was not free within <see cref="WriteLockBudget"/> for the
+    /// swap-journal replay or for a group's swap. The files of such a group are left as they were and the next
+    /// pass merges them.</para>
     /// </summary>
-    internal void CompactParquetFiles()
+    internal bool CompactParquetFiles()
     {
         if (!Directory.Exists(_archivePath))
         {
-            return;
+            return true;
         }
 
-        var (alreadyFolded, unresolvedGroups) = ReplayCompactionSwapJournals();
+        var (alreadyFolded, unresolvedGroups, journalReplayDeferred) = ReplayCompactionSwapJournals();
+        var lockTimeouts = journalReplayDeferred ? 1 : 0;
 
         /* A file a live .archive-pending journal names is not compacted. The journal means the run that wrote the
            file died before it deleted the archived rows, and recovery finishes that DELETE only while the file
@@ -1210,7 +1620,7 @@ COPY (
                    at once. Core, not CreateArchiveViewsAsync: this thread already holds the write lock and
                    the lock does not nest. Blocking on it is safe because DuckDB.NET's async calls complete
                    synchronously, so the thread that took the lock is the one that releases it. */
-                using (_duckDb.AcquireWriteLock())
+                using (_duckDb.AcquireWriteLock(WriteLockBudget))
                 {
                     var removed = SwapCompactionOutputs(month, table, sourcePaths, batchOutputs);
 
@@ -1243,6 +1653,17 @@ COPY (
                 {
                     _logger?.LogInformation("Compacted {Count} files into {Parts} part files for {Month}/{Table} (input too large for single batch)",
                         sourcePaths.Count, batches.Count, month, table);
+                }
+            }
+            catch (StoreLockTimeoutException ex)
+            {
+                /* #5731: the lock is taken before the swap touches anything, so the group's inputs are exactly as
+                   the merge found them. Drop its merged temps and leave the group for the next pass. */
+                lockTimeouts++;
+                _logger?.LogInformation("Compaction of {Month}/{Table} ({Count} files) deferred: {Message} The group is merged on a later pass", month, table, files.Count, ex.Message);
+                foreach (var (tempPath, _) in batchOutputs)
+                {
+                    try { File.Delete(tempPath); } catch { /* best effort */ }
                 }
             }
             catch (Exception ex)
@@ -1290,6 +1711,8 @@ COPY (
                     totalMerged, totalRemoved, remaining);
             }
         }
+
+        return lockTimeouts == 0;
     }
 
     /* A file already in its final monthly form: YYYYMM_table or YYYYMM_table_ptNNN, with or without the imported_
@@ -1662,6 +2085,7 @@ COPY (
            Null means a collection outlasted the drain timeout, and the right response is to DEFER. This is
            size-triggered, the store is a little over a soft threshold, and the next tick will try again;
            resetting on schedule matters far less than not resetting under a live collector. */
+        var gateHeld = Stopwatch.StartNew();
         var resetScope = await CollectionResetGate.TryBeginResetAsync();
 
         if (resetScope is null)
@@ -1686,10 +2110,26 @@ COPY (
         var promoted = new List<string>();
         var resetStarted = false;
         string? preId = null;
+        long exportedRows = 0;
+
+        /* #5733: the gate is released the moment the reset proper is done, not at the end of the method. Called from
+           the success path before compaction and again from the finally for every other exit; the second call finds
+           the flag set and does nothing, so the gate is released and the line logged exactly once on every path. */
+        var gateReleased = false;
+        void ReleaseCollectionGate()
+        {
+            if (gateReleased) return;
+            gateReleased = true;
+            resetScope.Dispose();
+            _logger?.LogInformation(
+                "Database reset held collection for {Seconds:F1} s ({Tables} tables, {Rows} rows)",
+                gateHeld.Elapsed.TotalSeconds, exports.Count, exportedRows);
+        }
+
         try
         {
             await RemoveUnfinishedResetExportsAndRefreshViewsAsync();
-            await RecoverInterruptedArchiveWorkAsync();
+            await RecoverInterruptedArchiveWorkAsync(unbounded: true);
 
             /* The reset exports every table and checkpoints; the same once-per-pass volume check (#5377). */
             _duckDb.WarnIfDataVolumeLow(LastCompactionLargestNeedBytes);
@@ -1715,6 +2155,18 @@ COPY (
                     try
                     {
                         BeforeTableExportForTests?.Invoke(table);
+
+                        /* #5731: a journal that survives the (unbounded) recovery above is one it could not finish: an
+                           earlier export's promoted file already holds this table's rows. Exporting the table again
+                           would put them in a second archive file, and every v_<table> read would count them twice;
+                           skipping the table and resetting anyway would drop them. So this attempt is abandoned like
+                           a failed export: every row stays in the database and the retry backoff applies. */
+                        if (File.Exists(PendingArchivePath(table)))
+                        {
+                            exportsSucceeded = false;
+                            _logger?.LogWarning("Skipping {Table}: the journal of an earlier interrupted export is still there and could not be finished; the database is not reset", table);
+                            break;
+                        }
 
                         /* Check row count */
                         using var countCmd = connection.CreateCommand();
@@ -1742,6 +2194,7 @@ COPY (
                             await exportCmd.ExecuteNonQueryAsync();
                         });
 
+                        exportedRows += rowCount;
                         _logger?.LogInformation("Archived {Count} rows from {Table}", rowCount, table);
                     }
                     catch (Exception ex)
@@ -1919,11 +2372,19 @@ COPY (
 
             _logger?.LogInformation("Database reset complete — archive views now serve all historical data from Parquet");
 
+            /* The reset proper is done: the database is fresh and initialized, so collection can write to it. The gate
+               is released here, before compaction (#5733). Compaction merges each month's new per-cycle files with
+               that month's existing merged file, so it grows through the month (seconds on the 1st, minutes by month
+               end), and while the gate was held across it every collection round sat waiting for it. s_archiveLock
+               and IsArchiving stay held to the end: compaction still must not run against periodic archival, and the
+               UI still reads this as archiving. */
+            ReleaseCollectionGate();
+
             /* Compact per-cycle files into monthly parquet files, then refresh the views over the result.
                This runs after the reset rather than before it, so the files the marker above names still
                exist under those names until the reset is through. The merges run on an in-memory DuckDB
-               connection and only touch files on disk, so they do not contend with the collectors now
-               writing to the fresh database; each group's swap and view rebuild briefly hold the write
+               connection and only touch files on disk; the collectors, no longer held by the gate, write to the
+               fresh database meanwhile, and each group's swap and view rebuild briefly hold the write
                lock (#4720). */
             _logger?.LogInformation("Compacting parquet files into monthly archives");
             try
@@ -1964,7 +2425,7 @@ COPY (
         finally
         {
             IsArchiving = false;
-            resetScope.Dispose();
+            ReleaseCollectionGate();
             s_archiveLock.Release();
         }
     }

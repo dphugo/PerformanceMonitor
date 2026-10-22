@@ -37,7 +37,9 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 ///
 /// <para>The matching is <see cref="DarlingMcpServerAdminTools.ResolveForRemoval"/>, the one rule
 /// <c>remove_server</c> and <c>mute_analysis_finding</c> apply, so a read and a write given the same
-/// name see the same candidates.</para>
+/// name see the same candidates. The one difference is a name that is one server's storage name and another's display
+/// name (#6230): a read keeps the stored name winning (<see cref="NameClash.StoredNameWins"/>, the default here), and a caller
+/// that changes state passes <see cref="NameClash.Refuse"/> to get both servers listed.</para>
 ///
 /// <para>One headless-only addition (#2339): the miss message also discloses the DECLARED PEER STORES, so a
 /// fleet split across several Darling boxes does not answer "unknown server" where the true answer is "the
@@ -87,10 +89,13 @@ ORDER BY server_name";
     /// degrades to an informative error string here — the tools' always-return-a-string
     /// contract holds instead of surfacing the MCP SDK's generic invocation error.
     /// </summary>
-    public static async Task<((int ServerId, string ServerName) resolved, string? error)> ResolveOrErrorAsync(
+    #pragma warning disable CA1068 // #6230: nameClash trails the token on purpose; putting it before would shift every positional caller.
+    public static async Task<((int ServerId, string ServerName, string DisplayName) resolved, string? error)> ResolveOrErrorAsync(
         NpgsqlDataSource postgres,
         string? serverName,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        NameClash nameClash = NameClash.StoredNameWins)
+    #pragma warning restore CA1068
     {
         var (servers, fault) = await LoadEnabledOrFaultAsync(postgres, cancellationToken);
         if (fault is not null)
@@ -98,7 +103,7 @@ ORDER BY server_name";
             return (default, fault);
         }
 
-        var answer = ResolveOrError(servers, serverName);
+        var answer = ResolveOrErrorForAnswer(servers, serverName, nameClash);
         if (answer.error is null)
         {
             /* #5097: the slow-read record names the server a read resolved; one site covers every server-scoped tool. */
@@ -107,6 +112,66 @@ ORDER BY server_name";
         }
 
         return answer;
+    }
+
+    /// <summary>
+    /// <see cref="ResolveOrErrorAsync"/> that also hands back the server's DISPLAY name (#6130), for a read whose answer names the
+    /// server. The storage name (<c>host:database:pg</c> on a PostgreSQL target) is what the collectors stamp on rows and what the
+    /// window probes match, so <c>ServerName</c> stays that; the answer's <c>server</c> field and its sentences use
+    /// <c>DisplayName</c>, which is what <c>list_servers</c> shows the caller as the server's name. A row with no display name
+    /// falls back to the storage name.
+    /// </summary>
+    public static Task<((int ServerId, string ServerName, string DisplayName) resolved, string? error)> ResolveOrErrorForAnswerAsync(
+        NpgsqlDataSource postgres,
+        string? serverName,
+        CancellationToken cancellationToken = default) =>
+        ResolveOrErrorAsync(postgres, serverName, cancellationToken);
+
+    /// <summary>The pure half of <see cref="ResolveOrErrorForAnswerAsync"/>, over an already-read registry.</summary>
+    internal static ((int ServerId, string ServerName, string DisplayName) resolved, string? error) ResolveOrErrorForAnswer(
+        IReadOnlyList<RegisteredServer> servers, string? serverName, NameClash nameClash = NameClash.StoredNameWins)
+    {
+        var (resolved, error) = ResolveOrError(servers, serverName, nameClash);
+        if (error != null)
+        {
+            return (default, error);
+        }
+
+        var row = servers.FirstOrDefault(s => s.ServerId == resolved.ServerId);
+        return ((resolved.ServerId, resolved.ServerName, AnswerNameOf(servers, row)), null);
+    }
+
+    /// <summary>
+    /// The name an answer shows for a server (#6179): the display name when exactly one enabled registry row carries it, otherwise the
+    /// connection key. Two registrations can share a display name (a blank name falls back to the host, so two Azure SQL Database
+    /// entries on one logical server with different <c>database</c> values both read as the host); the key is the one value that
+    /// names exactly one of them, so a caller who passes the answer's <c>server</c> back as <c>server_name</c> reaches that server
+    /// rather than the "matches N monitored servers" refusal. A row with no display name shows its key.
+    /// </summary>
+    internal static string AnswerNameOf(IReadOnlyList<RegisteredServer> servers, RegisteredServer? row)
+    {
+        if (row is null)
+        {
+            return string.Empty;
+        }
+
+        if (string.IsNullOrWhiteSpace(row.DisplayName))
+        {
+            return row.ServerName;
+        }
+
+        var display = row.DisplayName!;
+        var holders = 0;
+        foreach (var s in servers)
+        {
+            if (string.Equals(s.DisplayName?.Trim(), display.Trim(), StringComparison.OrdinalIgnoreCase)
+                || (string.IsNullOrWhiteSpace(s.DisplayName) && string.Equals(s.ServerName, display, StringComparison.OrdinalIgnoreCase)))
+            {
+                holders++;
+            }
+        }
+
+        return holders == 1 ? display : row.ServerName;
     }
 
     /// <summary>
@@ -131,9 +196,23 @@ ORDER BY server_name";
         {
             /* #4203: an abandoned request's cancellation must reach the caller as OperationCanceledException,
                not be folded into a fault sentence here — the web handler's own catch tells the two apart to
-               decide whether this is a quiet abandonment or a real registry-read failure. */
-            return (new List<RegisteredServer>(), $"{RegistryReadFaultPrefix}{ex.Message}");
+               decide whether this is a quiet abandonment or a real registry-read failure.
+
+               #5678: the caller's cancelled token decides it, not the type of the exception. Npgsql throws a connect
+               timeout (an NpgsqlException wrapping a TimeoutException) rather than OperationCanceledException when the
+               connect budget runs out before it looks at the token, so a cancelled caller on a stalled machine would
+               otherwise be told the registry could not be read. */
+            return FaultOrCancel(ex, cancellationToken);
         }
+    }
+
+    /// <summary>#5678: what a failed registry read becomes. A caller whose token has fired gets the cancellation, whatever type
+    /// the failure had; any other caller gets the fault sentence. Its own method so the rule is tested on a hand-built exception
+    /// and token, with no connection attempt whose timing the test would depend on.</summary>
+    internal static (List<RegisteredServer> Servers, string? Fault) FaultOrCancel(Exception ex, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return (new List<RegisteredServer>(), $"{RegistryReadFaultPrefix}{ex.Message}");
     }
 
     /// <summary>
@@ -163,7 +242,7 @@ ORDER BY server_name";
     /// auto-selection an omitted name gets on a single-server store. The sentinel has to be asked for by
     /// name, so no ordinary call can land on it by accident.</para>
     /// </summary>
-    public static async Task<((int ServerId, string ServerName) resolved, string? error)>
+    public static async Task<((int ServerId, string ServerName, string DisplayName) resolved, string? error)>
         ResolveOrErrorWithFleetSentinelAsync(
             NpgsqlDataSource postgres,
             string? serverName,
@@ -175,7 +254,7 @@ ORDER BY server_name";
            real server is a perfectly ordinary answer. */
         if (IsFleetSentinelName(serverName))
         {
-            return ((DarlingObservability.FleetServerId, DarlingObservability.FleetServerName), null);
+            return ((DarlingObservability.FleetServerId, DarlingObservability.FleetServerName, DarlingObservability.FleetServerName), null);
         }
 
         var (resolved, error) = await ResolveOrErrorAsync(postgres, serverName, cancellationToken).ConfigureAwait(false);
@@ -209,8 +288,9 @@ ORDER BY server_name";
     /// </summary>
     internal static ((int ServerId, string ServerName) resolved, string? error) ResolveOrError(
         IReadOnlyList<RegisteredServer> servers,
-        string? serverName) =>
-        ResolveOrError(servers, serverName, DarlingPeerDirectory.Current);
+        string? serverName,
+        NameClash nameClash = NameClash.StoredNameWins) =>
+        ResolveOrError(servers, serverName, DarlingPeerDirectory.Current, nameClash);
 
     /// <summary>
     /// The resolution rules over an EXPLICIT peer declaration — the pure form, so the miss message's peer
@@ -229,7 +309,8 @@ ORDER BY server_name";
     internal static ((int ServerId, string ServerName) resolved, string? error) ResolveOrError(
         IReadOnlyList<RegisteredServer> servers,
         string? serverName,
-        DarlingPeerDirectory.Snapshot peers)
+        DarlingPeerDirectory.Snapshot peers,
+        NameClash nameClash = NameClash.StoredNameWins)
     {
         if (string.IsNullOrWhiteSpace(serverName))
         {
@@ -239,7 +320,7 @@ ORDER BY server_name";
                 : (default, McpHelpers.Refusal("server_name", MissSentence(servers, serverName, peers)));
         }
 
-        var match = DarlingMcpServerAdminTools.ResolveForRemoval(servers, serverName, storageNameIgnoresCase: true);
+        var match = DarlingMcpServerAdminTools.ResolveForRemoval(servers, serverName, storageNameIgnoresCase: true, nameClash: nameClash);
 
         if (match.Candidates.Count == 1)
         {
@@ -358,7 +439,7 @@ ORDER BY server_name";
     /// Resolves a server AND the fingerprint name for it, in one registry read — the incident readers that
     /// accept a <c>dedup_key</c> need both, and reading the registry twice could disagree with itself.
     /// </summary>
-    public static async Task<((int ServerId, string ServerName, string FingerprintName, string? LegacyFingerprintName) resolved, string? error)>
+    public static async Task<((int ServerId, string ServerName, string FingerprintName, string? LegacyFingerprintName, string DisplayName) resolved, string? error)>
         ResolveWithFingerprintNameAsync(NpgsqlDataSource postgres, string? serverName, CancellationToken cancellationToken = default)
     {
         var (servers, fault) = await LoadEnabledOrFaultAsync(postgres, cancellationToken);
@@ -371,7 +452,7 @@ ORDER BY server_name";
     }
 
     /// <summary>The pure half of <see cref="ResolveWithFingerprintNameAsync"/>, over an already-read registry.</summary>
-    internal static ((int ServerId, string ServerName, string FingerprintName, string? LegacyFingerprintName) resolved, string? error)
+    internal static ((int ServerId, string ServerName, string FingerprintName, string? LegacyFingerprintName, string DisplayName) resolved, string? error)
         ResolveWithFingerprintName(IReadOnlyList<RegisteredServer> servers, string? serverName)
     {
         var (resolved, error) = ResolveOrError(servers, serverName);
@@ -387,7 +468,7 @@ ORDER BY server_name";
         var fingerprintName = row is null ? resolved.ServerName : FingerprintNameOf(row, shared);
         var legacyFingerprintName = row is null ? null : LegacyFingerprintNameOf(row, shared);
 
-        return ((resolved.ServerId, resolved.ServerName, fingerprintName, legacyFingerprintName), null);
+        return ((resolved.ServerId, resolved.ServerName, fingerprintName, legacyFingerprintName, AnswerNameOf(servers, row)), null);
     }
 
     /// <summary>Reads the enabled rows from the servers registry.</summary>

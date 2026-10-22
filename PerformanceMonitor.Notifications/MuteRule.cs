@@ -18,6 +18,13 @@ public class MuteRule
     public bool Enabled { get; set; } = true;
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime? ExpiresAtUtc { get; set; }
+
+    /// <summary>The moment the rule begins to apply (#6231), or null for a rule that applies from the moment it exists, which is
+    /// every rule stored before this field. A quiet window for planned work is a rule with a start in the future and an end: until
+    /// the start passes, <see cref="MatchesAt"/> declines every alert, so the rule is stored and listed but mutes nothing. Lite's
+    /// store does not persist it, so a Lite rule never carries one.</summary>
+    public DateTime? StartsAtUtc { get; set; }
+
     public string? Reason { get; set; }
 
     public string? ServerName { get; set; }
@@ -30,11 +37,46 @@ public class MuteRule
     /// field existed, so a stored rule keeps exactly the effect it had. Lite never sets it.</summary>
     public int? ServerId { get; set; }
 
+    /// <summary>The name of the ONE external alert source this rule covers (#5654), or null for a rule that is
+    /// not limited to a source. A source is a service that raises alerts through Darling's channels with
+    /// its own login; its name is the lower-case registry name, and it is compared ignoring case. A rule that
+    /// carries one matches only an alert from that source, so it never mutes a built-in alert and never mutes
+    /// another source. Null keeps the matching every rule had before this field existed: a rule without a source
+    /// still mutes an external alert when its other dimensions (server, metric, patterns) match. Lite never sets it.</summary>
+    public string? ExternalSource { get; set; }
+
+    /// <summary>Whether <paramref name="name"/> is a well-formed external source name (#5654):
+    /// <c>^[a-z][a-z0-9_]{1,30}$</c>, the shape the source registry's own check constraint holds every source name
+    /// to. The one check the MCP create/update tools and the web mute routes run on a rule's source, so none of
+    /// them can store a name the registry could never hold (a rule on such a name would mute nothing while
+    /// reading as if it muted something). Upper case is refused, not folded: a stored name is lower case, and
+    /// the refusal says so.</summary>
+    public static bool IsValidExternalSource(string? name)
+    {
+        if (name is null || name.Length < 2 || name.Length > 31) return false;
+        if (name[0] < 'a' || name[0] > 'z') return false;
+        for (var i = 1; i < name.Length; i++)
+        {
+            var c = name[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+        }
+        return true;
+    }
+
+    /// <summary>The refusal text for a source name <see cref="IsValidExternalSource"/> rejects.</summary>
+    public static string InvalidExternalSourceMessage(string? name) =>
+        $"'external_source' is not a valid source name (got '{name}'). A source name is 2 to 31 characters, lower case: a letter, then letters, digits or underscores (e.g. 'nagios').";
+
     public string? MetricName { get; set; }
     public string? DatabasePattern { get; set; }
     public string? QueryTextPattern { get; set; }
     public string? WaitTypePattern { get; set; }
     public string? JobNamePattern { get; set; }
+
+    /// <summary>Case-insensitive substring the alert's client application name must contain (#5640: mute
+    /// SSMS cancels while still alerting on an application's own timeouts). A rule with this pattern never
+    /// matches an alert that carries no client application, the same as every other text pattern.</summary>
+    public string? ClientAppPattern { get; set; }
 
     /// <summary>Whether the rule's bound has passed as of <paramref name="nowUtc"/>. The clock-taking form,
     /// so a caller that already holds an injected clock judges expiry on the SAME instant it judges
@@ -44,21 +86,41 @@ public class MuteRule
 
     public bool IsExpired => IsExpiredAt(DateTime.UtcNow);
 
+    /// <summary>Whether the rule's start (#6231) is still ahead of <paramref name="nowUtc"/>: the rule exists but does not apply yet.</summary>
+    public bool IsUpcomingAt(DateTime nowUtc) => StartsAtUtc.HasValue && nowUtc < StartsAtUtc.Value;
+
+    /// <summary>The rule's state at <paramref name="nowUtc"/> as one word: <c>disabled</c> (paused by hand, whatever its times),
+    /// <c>expired</c>, <c>upcoming</c> (its start is ahead) or <c>active</c>. The single place the word is decided, so the MCP read,
+    /// the web list and the Viewer cannot disagree about which a rule is.</summary>
+    public string StateAt(DateTime nowUtc) =>
+        IsExpiredAt(nowUtc) ? "expired"
+        : !Enabled ? "disabled"
+        : IsUpcomingAt(nowUtc) ? "upcoming"
+        : "active";
+
     public MuteRule Clone() => new()
     {
         Id = Id,
         Enabled = Enabled,
         CreatedAtUtc = CreatedAtUtc,
         ExpiresAtUtc = ExpiresAtUtc,
+        StartsAtUtc = StartsAtUtc,
         Reason = Reason,
         ServerName = ServerName,
         ServerId = ServerId,
+        ExternalSource = ExternalSource,
         MetricName = MetricName,
         DatabasePattern = DatabasePattern,
         QueryTextPattern = QueryTextPattern,
         WaitTypePattern = WaitTypePattern,
-        JobNamePattern = JobNamePattern
+        JobNamePattern = JobNamePattern,
+        ClientAppPattern = ClientAppPattern
     };
+
+    /// <summary>The Starts column (#6231): "At once" for a rule with no start, the local start time otherwise, marked while it is still ahead.</summary>
+    public string StartsDisplay => StartsAtUtc.HasValue
+        ? StartsAtUtc.Value.ToLocalTime().ToString("g") + (IsUpcomingAt(DateTime.UtcNow) ? " (not started)" : "")
+        : "At once";
 
     public string ExpiresDisplay => ExpiresAtUtc.HasValue
         ? (IsExpired ? "Expired" : ExpiresAtUtc.Value.ToLocalTime().ToString("g"))
@@ -78,6 +140,7 @@ public class MuteRule
     {
         var parts = new List<string>();
         if (MetricName != null) parts.Add(MetricName);
+        if (ExternalSource != null) parts.Add($"from {ExternalSource}");
         if (ServerId.HasValue)
             parts.Add(ServerName != null ? $"on {ServerName} (#{ServerId.Value})" : $"on server #{ServerId.Value}");
         else if (ServerName != null)
@@ -86,6 +149,7 @@ public class MuteRule
         if (QueryTextPattern != null) parts.Add($"query≈{QueryTextPattern}");
         if (WaitTypePattern != null) parts.Add($"wait≈{WaitTypePattern}");
         if (JobNamePattern != null) parts.Add($"job≈{JobNamePattern}");
+        if (ClientAppPattern != null) parts.Add($"app≈{ClientAppPattern}");
         return parts;
     }
 
@@ -132,7 +196,7 @@ public class MuteRule
     /// </summary>
     public bool MatchesAt(AlertMuteContext context, DateTime nowUtc)
     {
-        if (!Enabled || IsExpiredAt(nowUtc)) return false;
+        if (!Enabled || IsExpiredAt(nowUtc) || IsUpcomingAt(nowUtc)) return false;
 
         /* An id-keyed rule is decided on the id ALONE: the name is only the label the rule lists under, so a
            same-named sibling does not match and a renamed server does not escape. A context with no id never
@@ -143,6 +207,13 @@ public class MuteRule
         }
         else if (ServerName != null &&
             !string.Equals(ServerName, context.ServerName, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        /* A source rule is decided on the source ALONE for this dimension: a context with no source (every
+           built-in alert, and Lite's) never matches it. A rule without a source skips the test, so it keeps
+           muting an external alert on its other dimensions. */
+        if (ExternalSource != null &&
+            !string.Equals(ExternalSource, context.ExternalSource, StringComparison.OrdinalIgnoreCase))
             return false;
 
         if (MetricName != null && !NamesMetric(context.MetricName))
@@ -168,6 +239,11 @@ public class MuteRule
              !context.JobName.Contains(JobNamePattern, StringComparison.OrdinalIgnoreCase)))
             return false;
 
+        if (ClientAppPattern != null &&
+            (context.ClientAppName == null ||
+             !context.ClientAppName.Contains(ClientAppPattern, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
         return true;
     }
 }
@@ -181,11 +257,32 @@ public class AlertMuteContext
     /// id-keyed rule.</summary>
     public int? ServerId { get; set; }
 
+    /// <summary>The external alert source the alert came from (#5654), or null for an alert that did not come
+    /// from one. A rule with a <see cref="MuteRule.ExternalSource"/> matches only a context carrying that
+    /// source; a null here never matches it. Lite never sets it.</summary>
+    public string? ExternalSource { get; set; }
+
     public string MetricName { get; set; } = "";
     public string? DatabaseName { get; set; }
     public string? QueryText { get; set; }
     public string? WaitType { get; set; }
     public string? JobName { get; set; }
+
+    /// <summary>The source name inside an external alert's metric name (<c>External:&lt;source&gt;:&lt;key&gt;</c>,
+    /// #5654), or null for any other metric name. For a surface that holds the stored metric name and not the
+    /// drain's own record of the source (the viewer's alert rows). A source name holds no colon, so the first
+    /// colon after the prefix ends it.</summary>
+    public static string? ExternalSourceOf(string? metricName)
+    {
+        if (metricName is null || !metricName.StartsWith(AlertFamily.ExternalMetricPrefix, StringComparison.Ordinal))
+            return null;
+        var rest = metricName.AsSpan(AlertFamily.ExternalMetricPrefix.Length);
+        var colon = rest.IndexOf(':');
+        return colon > 0 ? rest[..colon].ToString() : null;
+    }
+    /// <summary>The client application the alert is about (the attention events' client_app_name), or null
+    /// when the alert has none. A rule with a <see cref="MuteRule.ClientAppPattern"/> never matches a null here (#5640).</summary>
+    public string? ClientAppName { get; set; }
 
     /// <summary>The longest query-text pattern a mute dialog pre-fills from an alert.</summary>
     public const int SeedQueryTextMax = 200;
@@ -245,6 +342,10 @@ public class AlertMuteContext
            could forge a label line. Skip it for custom alerts; their mute context is ServerName + MetricName. */
         if (metricName is not null && metricName.StartsWith("Custom:", StringComparison.Ordinal)) return;
 
+        /* #5654: an external alert's text is another service's. Its prose is one sanitized line, but a title that
+           begins "Database: x" would still read as a label line, so no dimension is pre-filled for it either. */
+        if (metricName is not null && metricName.StartsWith(AlertFamily.ExternalMetricPrefix, StringComparison.Ordinal)) return;
+
         System.Text.StringBuilder? queryBuilder = null;
         var lines = detailText.Split('\n');
 
@@ -266,6 +367,13 @@ public class AlertMuteContext
             {
                 FlushQuery(ref queryBuilder);
                 JobName = trimmed.Substring("Job Name: ".Length).Trim();
+            }
+            else if (ClientAppName == null && trimmed.StartsWith("Client Application: ", StringComparison.Ordinal))
+            {
+                /* #5640: the Client Timeouts alert lists its client applications top first, and the FIRST line is the one a
+                   mute dialog pre-fills (the same first-wins rule as Database). */
+                FlushQuery(ref queryBuilder);
+                ClientAppName = trimmed.Substring("Client Application: ".Length).Trim();
             }
             else if (QueryText == null && queryBuilder == null && TryExtractQueryValue(trimmed, out var qv))
             {

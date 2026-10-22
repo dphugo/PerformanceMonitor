@@ -42,6 +42,14 @@ public sealed class AlertEngineTests
         public bool BlockingEnabled { get; set; }
         public bool DeadlockEnabled { get; set; }
         public bool PoisonWaitEnabled { get; set; }
+        public bool RunnableQueueEnabled { get; set; }
+        public int RunnableQueueWarningPerScheduler { get; set; } = 8;
+        public int RunnableQueueCriticalPerScheduler { get; set; } = 16;
+        public bool ClientTimeoutsEnabled { get; set; }
+        public int ClientTimeoutsWarningPerMinute { get; set; } = 10;
+        public int ClientTimeoutsCriticalPerMinute { get; set; } = 60;
+        public int ClientTimeoutsWarningMultiple { get; set; } = 3;
+        public int ClientTimeoutsCriticalMultiple { get; set; } = 10;
         public bool LongRunningQueryEnabled { get; set; }
         public bool TempDbSpaceEnabled { get; set; }
         public bool LowDiskEnabled { get; set; }
@@ -96,6 +104,8 @@ public sealed class AlertEngineTests
         public int CooldownMinutes { get; set; } = 5;
         public List<string> ExcludedDatabasesList { get; } = new();
         public IReadOnlyList<string> ExcludedDatabases => ExcludedDatabasesList;
+        public List<string> ExcludedVolumesList { get; } = new();
+        public IReadOnlyList<string> ExcludedVolumes => ExcludedVolumesList;
         public CpuAlertMode CpuAlertMode { get; set; } = CpuAlertMode.TotalServer;
     }
 
@@ -107,6 +117,10 @@ public sealed class AlertEngineTests
            unfiltered — the seam contract is a dumb window sum; the engine does the thresholding. */
         public List<PoisonWaitAccumulation> PoisonWaits { get; } = new();
         public int PoisonWaitWindowMinutesAsked { get; private set; }
+        /* #5641: the collections the engine grades; whatever a test puts here comes back as is (newest first). */
+        public List<RunnableQueueSample> RunnableQueue { get; set; } = new();
+        public int RunnableQueueLookbackMinutesAsked { get; private set; }
+        public int RunnableQueueReads { get; private set; }
         public List<LongRunningQueryInfo> LongRunning { get; } = new();
         public List<VolumeFreeSpaceInfo> Volumes { get; } = new();
         public List<PvsPressureInfo> PvsDatabases { get; } = new();
@@ -151,14 +165,62 @@ public sealed class AlertEngineTests
             return Task.FromResult(new List<PoisonWaitAccumulation>(PoisonWaits));
         }
 
+        public AttentionWindow Attention { get; set; } = AttentionWindow.Empty;
+
+        public int AttentionLookbackMinutesAsked;
+
+        public int AttentionReads;
+
+        /* #5736: the baseline the engine asks for once a day per server, and how many times it was asked. */
+        public AttentionBaseline? AttentionBaseline { get; set; }
+
+        public int AttentionBaselineReads;
+
+        public bool AttentionBaselineThrows { get; set; }
+
+        public Task<AttentionBaseline?> GetAttentionBaselineAsync(string serverKey, DateTime nowUtc, CancellationToken cancellationToken = default)
+        {
+            AttentionBaselineReads++;
+            if (AttentionBaselineThrows)
+            {
+                throw new InvalidOperationException("baseline read failed");
+            }
+
+            return Task.FromResult(AttentionBaseline);
+        }
+
+        public Task<AttentionWindow> GetAttentionWindowAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default)
+
+        {
+
+            AttentionLookbackMinutesAsked = lookbackMinutes;
+
+            AttentionReads++;
+
+            return Task.FromResult(Attention);
+
+        }
+
+        
+
+        public Task<IReadOnlyList<RunnableQueueSample>> GetRunnableQueueSamplesAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default)
+        {
+            RunnableQueueLookbackMinutesAsked = lookbackMinutes;
+            RunnableQueueReads++;
+            return Task.FromResult<IReadOnlyList<RunnableQueueSample>>(new List<RunnableQueueSample>(RunnableQueue));
+        }
+
         /* #3495's degrade arm: the CPU card's fire-time maintenance probe rides this same seam, and the
            pin that a failed probe costs the annotation and never the alert needs a read that faults. */
         public bool ThrowOnLongRunningRead { get; set; }
 
+        /// <summary>#5641 round 1: whether the last active-session read asked for CPU order.</summary>
+        public bool LastLrqOrderedByCpu { get; set; }
+
         public Task<LongRunningQueryReadResult> GetLongRunningQueriesAsync(
             string serverKey, int thresholdMinutes, int maxResults,
             bool excludeSpServerDiagnostics, bool excludeWaitFor, bool excludeBackups, bool excludeMiscWaits, bool excludeCdc,
-            IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, CancellationToken cancellationToken = default)
+            IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, bool orderByCpu = false, CancellationToken cancellationToken = default)
         {
             if (ThrowOnLongRunningRead)
             {
@@ -167,13 +229,18 @@ public sealed class AlertEngineTests
 
             LastLrqArgs = (thresholdMinutes, maxResults, excludeSpServerDiagnostics, excludeWaitFor, excludeBackups, excludeMiscWaits, excludeCdc, excludedDatabases);
             LastLrqExclusions = exclusions;
+            LastLrqOrderedByCpu = orderByCpu;
             /* #3742: the database list is applied HERE, ahead of the cap, exactly as both SQL reads now apply it —
                the rule the reads' third flag spells (exact, case-insensitive, normalised, a row with no database
                name is kept) — so an engine-level pin can plant six excluded-database sessions ahead of one real
                one and see the real one on a page of five. */
             var excluded = LongRunningQueryExclusions.Normalize(excludedDatabases);
             bool InExcludedDatabase(LongRunningQueryInfo q) => LongRunningQueryExclusions.MatchesExact(q.DatabaseName, excluded);
-            var kept = LongRunning.Where(q => !exclusions.Excludes(q.ProgramName, q.LoginName) && !InExcludedDatabase(q)).Take(Math.Clamp(maxResults, 1, 1000)).ToList();
+            /* #5641 round 1: orderByCpu ranks by CPU ahead of the cap, as both SQL reads do (CPU, then elapsed, then session id). */
+            IEnumerable<LongRunningQueryInfo> source = orderByCpu
+                ? LongRunning.OrderByDescending(q => q.CpuTimeMs).ThenByDescending(q => q.ElapsedSeconds).ThenBy(q => q.SessionId)
+                : LongRunning;
+            var kept = source.Where(q => !exclusions.Excludes(q.ProgramName, q.LoginName) && !InExcludedDatabase(q)).Take(Math.Clamp(maxResults, 1, 1000)).ToList();
             /* Counts in SESSIONS (distinct session_id), split by arm through the shared Classify — a session matching
                both arms lands under ProgramPrefix, exactly as the two SQL scalars count it; the database arm is LAST,
                taken AND NOT either knob arm, as the third scalar counts it. */
@@ -412,6 +479,10 @@ public sealed class AlertEngineTests
            pin above builds an engine that counts nothing and no test can leak into another's totals or
            into the process-wide AlertReadFailureCounter.Shared. */
         public AlertReadFailureCounter? ReadFailures { get; set; }
+        /// <summary>#5715 part B: the alert-history reader that seeds the escalation tier; null (the default) leaves the engine memory-only.</summary>
+        public Func<EscalationSeedQuery, CancellationToken, Task<AlertSeverityLevel?>>? EscalationSeedReader { get; set; }
+        /// <summary>#5910: the threshold overrides; null (the default) is the engine before #5910, so every pin above is unchanged.</summary>
+        public IAlertThresholdOverrides? Overrides { get; set; }
 
         /* #3497: the Agent-job resolver seam, null by default so every pre-existing pin builds the
            pre-#3497 engine. Tests set AgentJobNames (the answer map), flip AgentJobResolverThrows for
@@ -441,7 +512,9 @@ public sealed class AlertEngineTests
             resolutionCallback: (r, _) => { Resolutions.Add(r); return Task.CompletedTask; },
             logger: null,
             utcNow: () => Now,
-            readFailures: ReadFailures);
+            readFailures: ReadFailures,
+            escalationSeedReader: EscalationSeedReader,
+            overrides: Overrides);
 
         /* #3282: every snapshot gets a DISTINCT, increasing CPU sample instant unless the test says
            otherwise, because that is the realistic case — the sweep sees a new ring-buffer sample each
@@ -482,7 +555,7 @@ public sealed class AlertEngineTests
         Source = source
     };
 
-    private static DeadlockAlertRow DeadlockRow(string database = "StackOverflow") => new()
+    internal static DeadlockAlertRow DeadlockRow(string database = "StackOverflow") => new()
     {
         VictimProcessId = "process1",
         VictimSqlText = "UPDATE Users SET Reputation = 1",
@@ -3715,9 +3788,9 @@ public sealed class AlertEngineTests
     {
         /* The RAW reader, deliberately: none of the anchors below spans a line break (the row is found by its
            prefix and searched with Contains, and a trailing '\r' on a CRLF checkout changes neither), so by
-           RepoFileAdoptionTests' own rule this file does not belong in s_lfReaders and must not read as if
+           RepoFile's rule for its line-ending-normalised read, this file does not need that read and must not read as if
            it did. */
-        var readme = ReadRepoFile("README.md");
+        var readme = ReadRepoFile("docs", "alerts.md"); // #5860: the alert catalog moved from the root README to this page
 
         var row = readme
             .Split('\n')
@@ -3837,7 +3910,7 @@ public sealed class AlertEngineTests
 
     /* ---------------- database file growth (#2349; #3539 A8c: the rise is MB per HOUR) ---------------- */
 
-    private static DatabaseFileGrowthInfo GrowingFile(double growthMb, double windowMinutes) => new()
+    internal static DatabaseFileGrowthInfo GrowingFile(double growthMb, double windowMinutes) => new()
     {
         DatabaseName = "tempdb", FileName = "tempdev", PhysicalName = @"D:\data\tempdev.mdf", FileTypeDesc = "ROWS",
         TotalSizeMb = 90_000, GrowthMb = growthMb, GrowthWindowMinutes = windowMinutes,
@@ -3919,12 +3992,12 @@ public sealed class AlertEngineTests
     /// <summary>Two consecutive hourly collections of <c>database_size_stats</c>, so the pins below replay the
     /// shape the issue describes rather than an invented one: a rise observed at the top of the hour, twelve
     /// five-minute cooldowns of re-reads against the same two rows, the next collection an hour later.</summary>
-    private static readonly DateTime HourlyCollection0 = new(2026, 9, 18, 6, 0, 0, DateTimeKind.Utc);
-    private static readonly DateTime HourlyCollection1 = HourlyCollection0.AddHours(1);
+    internal static readonly DateTime HourlyCollection0 = new(2026, 9, 18, 6, 0, 0, DateTimeKind.Utc);
+    internal static readonly DateTime HourlyCollection1 = HourlyCollection0.AddHours(1);
 
     /// <summary>A rise-only file (2% of a 4 TB volume — the level gate cannot see it) stamped with the collection
     /// that produced it. 20 GB in the 60-minute window is twice the default 10,240 MB/hr bar.</summary>
-    private static DatabaseFileGrowthInfo RiseOnlyFile(DateTime? observedAt, double growthMb = 20_480, string fileName = "tempdev")
+    internal static DatabaseFileGrowthInfo RiseOnlyFile(DateTime? observedAt, double growthMb = 20_480, string fileName = "tempdev")
     {
         var f = GrowingFile(growthMb, windowMinutes: 60);
         f.FileName = fileName;
@@ -3934,7 +4007,7 @@ public sealed class AlertEngineTests
 
     /// <summary>A level-only file: 80% of a small volume and not growing at all. The standing-level shape that
     /// re-fires on the cooldown by design.</summary>
-    private static DatabaseFileGrowthInfo LevelOnlyFile(DateTime? observedAt) => new()
+    internal static DatabaseFileGrowthInfo LevelOnlyFile(DateTime? observedAt) => new()
     {
         DatabaseName = "Sales", FileName = "Sales_log", PhysicalName = @"L:\log\Sales_log.ldf", FileTypeDesc = "LOG",
         TotalSizeMb = 400_000, GrowthMb = 0, GrowthWindowMinutes = 60,
@@ -4678,7 +4751,14 @@ public sealed class AlertEngineTests
             throw new InvalidOperationException("store down");
         public Task<List<PoisonWaitAccumulation>> GetPoisonWaitAccumulationAsync(string serverKey, int windowMinutes, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");
-        public Task<LongRunningQueryReadResult> GetLongRunningQueriesAsync(string serverKey, int thresholdMinutes, int maxResults, bool excludeSpServerDiagnostics, bool excludeWaitFor, bool excludeBackups, bool excludeMiscWaits, bool excludeCdc, IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, CancellationToken cancellationToken = default) =>
+        public Task<AttentionWindow> GetAttentionWindowAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("store down");
+        public Task<AttentionBaseline?> GetAttentionBaselineAsync(string serverKey, DateTime nowUtc, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("store down");
+        
+        public Task<IReadOnlyList<RunnableQueueSample>> GetRunnableQueueSamplesAsync(string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("store down");
+        public Task<LongRunningQueryReadResult> GetLongRunningQueriesAsync(string serverKey, int thresholdMinutes, int maxResults, bool excludeSpServerDiagnostics, bool excludeWaitFor, bool excludeBackups, bool excludeMiscWaits, bool excludeCdc, IReadOnlyList<string> excludedDatabases, LongRunningQueryExclusions exclusions, bool orderByCpu = false, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");
         public Task<List<VolumeFreeSpaceInfo>> GetVolumeFreeSpaceAsync(string serverKey, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");

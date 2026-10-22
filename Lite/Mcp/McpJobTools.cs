@@ -10,6 +10,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpJobTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_running_jobs"), Description("Gets currently running SQL Agent jobs with duration comparison. Shows each job's current duration vs its historical average and p95, flagging jobs that are running longer than usual. start_time is UTC, matching the captured_at on this payload (msdb records the Agent start in the monitored server's local clock; this read de-skews it), so start_time and current_duration_seconds agree. LATEST IS A TIME: this reads the newest running-jobs snapshot, not a window, and captured_at is the instant it was collected - a job listed here was running AT that stamp, and current_duration_seconds is how long it had been running AT that stamp, not now.")]
     public static async Task<string> GetRunningJobs(
         LocalDataService dataService,
@@ -34,20 +35,20 @@ public sealed class McpJobTools
             var rows = read.Jobs;
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "running_jobs")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "running_jobs")
                     /* #2546: the msdb case. "No running SQL Agent jobs found" is an affirmative claim about
                        the server's Agent, and it is the wrong one when the monitoring login was refused the
                        job tables — the collector runs, is denied, and records that denial with the GRANT to
                        issue. Reporting it here is the difference between "nothing is running" and "we cannot
                        see what is running". */
-                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.ServerName, "running_jobs")
+                    ?? await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "running_jobs")
                     /* #2559, and it must land on BOTH SKUs: the gate this reports on
                        (!IsAzureSqlDb && !IsAwsRds) lives in the shared collector definition, so both SKUs
                        report it identically. The dispatch half of #2559 removed HasMsdbAccess from that gate,
                        so a login without msdb access no longer lands here at all — it dispatches, is denied,
                        and the collector's own recorded PERMISSIONS outcome answers first. */
                     ?? await McpRuntimePrecondition.GatedOffStatusAsync(
-                        dataService, resolved.ServerId, resolved.ServerName, "running_jobs",
+                        dataService, resolved.ServerId, resolved.DisplayName, "running_jobs",
                         CollectorRuntimePrecondition.RunningJobsPossibleCauses)
                     /* The freshness bound (#1812): the collector's last good collection is older than three missed cycles, so
                        "no jobs found" would be a claim about now that the store cannot back (an offline server, a lost msdb
@@ -77,7 +78,7 @@ public sealed class McpJobTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3653: captured_at, the #3637 census's one spelling for a latest read's stamp - see
                    McpServerInfoTools.GetServerProperties for why it is a cut-over and not an alias. */
                 captured_at = rows[0].CollectionTime.ToString("o"),

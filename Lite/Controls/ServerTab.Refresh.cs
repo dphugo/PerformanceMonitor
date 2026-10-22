@@ -210,7 +210,7 @@ public partial class ServerTab : UserControl
 
             /* Always keep the alert badge current even when the Blocking tab is not visible.
                RefreshAlertCountsAsync reads this tab's own held UTC window (GetCurrentWindowUtc). */
-            if (MainTabControl.SelectedIndex != 8)
+            if (MainTabControl.SelectedIndex != BlockingTabIndex)
                 await RefreshAlertCountsAsync();
 
             /* #1591: same reasoning as the alert badge above — a permission-denied collector is only visible on the Collection
@@ -296,13 +296,13 @@ public partial class ServerTab : UserControl
         {
             case 0: await RefreshOverviewAsync(hoursBack, fromDate, toDate); break;
             case 1: await RefreshWaitStatsAsync(hoursBack, fromDate, toDate); break;
-            case 2: await RefreshQueriesAsync(hoursBack, fromDate, toDate, subTabOnly); break;
+            case QueriesTabIndex: await RefreshQueriesAsync(hoursBack, fromDate, toDate, subTabOnly); break;
             case 3: break; // Plan Viewer — no queries
             case 4: await RefreshCpuAsync(hoursBack, fromDate, toDate); break;
             case 5: await RefreshMemoryAsync(hoursBack, fromDate, toDate, subTabOnly); break;
             case 6: await RefreshFileIoAsync(hoursBack, fromDate, toDate); break;
             case 7: await RefreshTempDbAsync(hoursBack, fromDate, toDate); break;
-            case 8: await RefreshBlockingAsync(hoursBack, fromDate, toDate, subTabOnly); break;
+            case BlockingTabIndex: await RefreshBlockingAsync(hoursBack, fromDate, toDate, subTabOnly); break;
             case 9: await RefreshPerfmonAsync(hoursBack, fromDate, toDate); break;
             case 10: await RefreshRunningJobsAsync(hoursBack, fromDate, toDate); break;
             case 11: await RefreshConfigurationAsync(hoursBack, fromDate, toDate); break;
@@ -413,7 +413,7 @@ public partial class ServerTab : UserControl
                         UpdateQueryStoreDurationTrendChart(qsdt.Result, hoursBack, fromDate, toDate, disc.Result);
                         UpdateExecutionCountTrendChart(ect.Result, hoursBack, fromDate, toDate, disc.Result);
                         break;
-                    case 1: // Active Queries
+                    case ActiveQueriesSubTabIndex: // Active Queries
                         var snapshots = await Task.Run(() => _dataService.GetLatestQuerySnapshotsAsync(_serverId, hoursBack, fromDate, toDate, SelectedDatabaseFilter));
                         _querySnapshotsFilterMgr!.UpdateData(snapshots);
                         LiveSnapshotIndicator.Text = "";
@@ -425,8 +425,8 @@ public partial class ServerTab : UserControl
                             await RefreshWindowTruncatedBannerAsync(QueryWindowRelation.QuerySnapshots, ActiveQueriesWindowTruncatedBanner, windowStart4, windowEnd4);
                         }
                         break;
-                    case 2: // Top Queries by Duration
-                        var queryStats = await Task.Run(() => _dataService.GetTopQueriesByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter));
+                    case TopQueriesByDurationSubTabIndex: // Top Queries by Duration
+                        var queryStats = await Task.Run(() => QueryTagGrid.ReadAsync(_dataService, _serverId, _queryTagChoice, tags => _dataService.GetTopQueriesByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter, tags: tags)));
                         _queryStatsFilterMgr!.UpdateData(queryStats);
                         SetDefaultSortIfNone(QueryStatsGrid, "TotalElapsedMs", ListSortDirection.Descending);
                         _ = LoadQueryStatsSlicerAsync();
@@ -440,7 +440,7 @@ public partial class ServerTab : UserControl
                         }
                         break;
                     case 3: // Top Procedures by Duration
-                        var procStats = await Task.Run(() => _dataService.GetTopProceduresByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter));
+                        var procStats = await Task.Run(() => QueryTagGrid.ReadAsync(_dataService, _serverId, _queryTagChoice, tags => _dataService.GetTopProceduresByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter, tags: tags)));
                         _procStatsFilterMgr!.UpdateData(procStats);
                         SetDefaultSortIfNone(ProcedureStatsGrid, "TotalElapsedMs", ListSortDirection.Descending);
                         _ = LoadProcStatsSlicerAsync();
@@ -453,7 +453,7 @@ public partial class ServerTab : UserControl
                         }
                         break;
                     case 4: // Query Store by Duration
-                        var qsData = await Task.Run(() => _dataService.GetQueryStoreTopQueriesAsync(_serverId, hoursBack, 50, fromDate, toDate, SelectedDatabaseFilter));
+                        var qsData = await Task.Run(() => QueryTagGrid.ReadAsync(_dataService, _serverId, _queryTagChoice, tags => _dataService.GetQueryStoreTopQueriesAsync(_serverId, hoursBack, 50, fromDate, toDate, SelectedDatabaseFilter, tags: tags)));
                         _queryStoreFilterMgr!.UpdateData(qsData);
                         SetDefaultSortIfNone(QueryStoreGrid, "TotalDurationMs", ListSortDirection.Descending);
                         _ = LoadQueryStoreSlicerAsync();
@@ -487,9 +487,9 @@ public partial class ServerTab : UserControl
 
             /* Full refresh: load all sub-tabs */
             var snapshotsTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.Snapshots", () => Task.Run(() => _dataService.GetLatestQuerySnapshotsAsync(_serverId, hoursBack, fromDate, toDate, SelectedDatabaseFilter)));
-            var queryStatsTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.QueryStats", () => Task.Run(() => _dataService.GetTopQueriesByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter)));
-            var procStatsTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.ProcStats", () => Task.Run(() => _dataService.GetTopProceduresByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter)));
-            var queryStoreTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.QueryStore", () => Task.Run(() => _dataService.GetQueryStoreTopQueriesAsync(_serverId, hoursBack, 50, fromDate, toDate, SelectedDatabaseFilter)));
+            var queryStatsTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.QueryStats", () => Task.Run(() => QueryTagGrid.ReadAsync(_dataService, _serverId, _queryTagChoice, tags => _dataService.GetTopQueriesByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter, tags: tags))));
+            var procStatsTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.ProcStats", () => Task.Run(() => QueryTagGrid.ReadAsync(_dataService, _serverId, _queryTagChoice, tags => _dataService.GetTopProceduresByCpuAsync(_serverId, hoursBack, 50, fromDate, toDate, ServerClock, SelectedDatabaseFilter, tags: tags))));
+            var queryStoreTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.QueryStore", () => Task.Run(() => QueryTagGrid.ReadAsync(_dataService, _serverId, _queryTagChoice, tags => _dataService.GetQueryStoreTopQueriesAsync(_serverId, hoursBack, 50, fromDate, toDate, SelectedDatabaseFilter, tags: tags))));
             var planCorrectionTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.PlanCorrections", () => Task.Run(() => SafeQueryAsync(() => _dataService.GetPlanCorrectionsAsync(_serverId, hoursBack, fromDate, toDate, SelectedDatabaseFilter))));
             var queryDurationTrendTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.QueryDurationTrends", () => Task.Run(() => SafeQueryAsync(() => _dataService.GetQueryDurationTrendAsync(_serverId, hoursBack, fromDate, toDate, SelectedDatabaseFilter))));
             var procDurationTrendTask = Helpers.MethodProfiler.TimeAsync("QueryPerformance.ProcDurationTrends", () => Task.Run(() => SafeQueryAsync(() => _dataService.GetProcedureDurationTrendAsync(_serverId, hoursBack, fromDate, toDate, SelectedDatabaseFilter))));
@@ -967,7 +967,7 @@ public partial class ServerTab : UserControl
                             await RefreshWindowTruncatedBannerAsync(QueryWindowRelation.WaitingTasks, CurrentWaitsWindowTruncatedBanner, windowStart5, windowEnd5);
                         }
                         break;
-                    case 2: // Blocked Process Reports
+                    case BlockedProcessReportsSubTabIndex: // Blocked Process Reports
                         var bprRead = await Task.Run(() => _dataService.ReadRecentBlockedProcessReportsAsync(_serverId, hoursBack, fromDate, toDate, SelectedDatabaseFilter));
                         var bpr = bprRead.Rows;
                         using (Helpers.MethodProfiler.StartTiming("Locking.BindBlockedGrid"))
@@ -981,7 +981,7 @@ public partial class ServerTab : UserControl
                         }
                         await LoadBlockingSlicerAsync();
                         break;
-                    case 3: // Deadlocks
+                    case DeadlocksSubTabIndex: // Deadlocks
                         var dlr = await Task.Run(() => _dataService.GetRecentDeadlocksAsync(_serverId, hoursBack, fromDate, toDate));
                         var dlrDetails = await ParseDeadlocksOffUiThreadAsync(dlr);
                         using (Helpers.MethodProfiler.StartTiming("Locking.BindDeadlockGrid"))
@@ -1245,6 +1245,19 @@ public partial class ServerTab : UserControl
                page is the newest CollectionLogGridCap runs, a sliver of a long range, so the chart is not fed from it. */
             var collectorDurationTask = Helpers.MethodProfiler.TimeAsync("CollectionHealth.DurationTrends", () => Task.Run(() => SafeQueryAsync(() => _dataService.GetCollectorDurationTrendAsync(_serverId, hoursBack, fromDate, toDate, cancellationToken: ct), ct)));
 
+            /* #5643: the late cycles of the last 24 h, beside the grids' reads and independent of the range picker. A failed read
+               leaves the line saying nothing is known rather than the all-clear. */
+            var skippedCyclesTask = Task.Run(async () =>
+            {
+                try { return (SkippedCycleSummary?)await _dataService.GetSkippedCycleSummaryAsync(_serverId, cancellationToken: ct); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    AppLogger.Info("ServerTab", $"[{_server.DisplayName}] GetSkippedCycleSummaryAsync failed: {ex.Message}");
+                    return null;
+                }
+            });
+
             await System.Threading.Tasks.Task.WhenAll(collectionHealthTask, collectionLogTask, collectorDurationTask);
 
             /* #5371: a pass a newer request superseded while only one of the three reads was still running ends here: the replay
@@ -1258,6 +1271,7 @@ public partial class ServerTab : UserControl
             foreach (var row in collectionHealthTask.Result) row.Clock = tabClock;
             foreach (var row in collectionLogTask.Result) row.Clock = tabClock;
 
+            SkippedCyclesSummary.Text = (await skippedCyclesTask)?.SummaryLine(tabClock) ?? "Skipped cycles in 24 h: could not be read";
             _collectionHealthFilterMgr!.UpdateData(collectionHealthTask.Result);
             _collectionLogFilterMgr!.UpdateData(collectionLogTask.Result);
             UpdateCollectorDurationChart(collectorDurationTask.Result, hoursBack, fromDate, toDate);

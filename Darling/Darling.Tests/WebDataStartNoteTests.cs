@@ -128,7 +128,7 @@ public sealed class WebDataStartNoteTests
     /// <summary>The vacuum, horizon, slot and write tiles are listed over the table their tool reads. The freeze headroom and the
     /// checkpoint and WAL tables get a row every collection, so they keep the table's own start; the horizon holders, the autovacuum
     /// backlog and the slots store a row only while one exists, so they are probed on the collector's runs (the slot collector is
-    /// named pg_replication_slots and writes pg_replication_slot_stats). The horizon read's nothing-found word is no_holder.</summary>
+    /// named pg_replication_slots and writes pg_replication_slot_stats). The horizon read's nothing-found word is empty.</summary>
     [Fact]
     public void TheVacuumHorizonSlotAndWriteReads_AreListedOverTheirTables_AndTheSparseOnesAreProbedOnTheirCollectorsRuns()
     {
@@ -159,7 +159,7 @@ public sealed class WebDataStartNoteTests
             }
         }
 
-        Assert.Equal("no_holder", WebDataStartNote.NothingFoundStatusByRead["get_pg_xmin_horizon"]);
+        Assert.Equal("empty", WebDataStartNote.NothingFoundStatusByRead["get_pg_xmin_horizon"]);
         foreach (var read in new[] { "get_pg_wraparound_risk", "get_pg_autovacuum_health", "get_pg_replication_slots", "get_pg_write_stats" })
         {
             Assert.DoesNotContain(read, WebDataStartNote.NothingFoundStatusByRead.Keys);
@@ -354,8 +354,10 @@ public sealed class WebDataStartNoteTests
         }
 
         var util = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "util.js").ReplaceLineEndings("\n");
-        Assert.Contains("if (!desc || desc.windowNote === false || (desc.viz !== \"table\" && desc.viz !== \"stat\")) return null;", util, StringComparison.Ordinal);
-        Assert.Contains("if (!source || source.window_truncated !== true) return null;", util, StringComparison.Ordinal);
+        Assert.Contains("if (!desc || desc.windowNote === false) return null;", util, StringComparison.Ordinal);
+        Assert.Contains("if (desc.viz !== \"table\" && desc.viz !== \"stat\" && !chart) return null;", util, StringComparison.Ordinal);
+        // A chart draws only the row-capped note (#5644 W12), and only when the note names the oldest row shown.
+        Assert.Contains("if (typeof source.oldest_shown_utc !== \"string\") return null;", util, StringComparison.Ordinal);
         Assert.Contains("return sent;\n}", util, StringComparison.Ordinal);
     }
 
@@ -375,9 +377,22 @@ public sealed class WebDataStartNoteTests
         Assert.DoesNotContain(read, WebDataStartNote.TableByRead.Keys);
 
         var tabs = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "pages", "server-tabs.js").ReplaceLineEndings("\n");
-        var open = tabs.IndexOf("table(\n        \"" + title + "\",\n        \"" + read + "\",", StringComparison.Ordinal);
-        Assert.True(open >= 0, read + " is no longer a table() panel on a server tab");
-        var call = tabs[open..tabs.IndexOf("\n      ),", open, StringComparison.Ordinal)];
+        string call;
+        if (read == "get_query_heatmap")
+        {
+            /* #6293: the heatmap is a card of its own (pages/query-heatmap.js) that keeps `viz: "table"`, so windowFloorStrip still draws the note above its grid. */
+            var heat = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "pages", "query-heatmap.js").ReplaceLineEndings("\n");
+            var start = heat.IndexOf("renderPanel({", StringComparison.Ordinal);
+            Assert.True(start >= 0 && heat.IndexOf("read: \"" + read + "\"", start, StringComparison.Ordinal) > 0, read + " is no longer a panel on a server tab");
+            call = heat[start..heat.IndexOf("});", start, StringComparison.Ordinal)];
+            Assert.Contains("viz: \"table\"", call, StringComparison.Ordinal);
+        }
+        else
+        {
+            var open = tabs.IndexOf("table(\n        \"" + title + "\",\n        \"" + read + "\",", StringComparison.Ordinal);
+            Assert.True(open >= 0, read + " is no longer a table() panel on a server tab");
+            call = tabs[open..tabs.IndexOf("\n      ),", open, StringComparison.Ordinal)];
+        }
         Assert.DoesNotContain("truncation_note", call, StringComparison.Ordinal);
 
         var note = DarlingMcpWindowNotice.Build(
@@ -388,8 +403,10 @@ public sealed class WebDataStartNoteTests
         Assert.Equal(baselineTail, note.EndsWith("baseline_end.", StringComparison.Ordinal));
 
         var util = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "util.js").ReplaceLineEndings("\n");
-        Assert.Contains("if (!desc || desc.windowNote === false || (desc.viz !== \"table\" && desc.viz !== \"stat\")) return null;", util, StringComparison.Ordinal);
-        Assert.Contains("if (!source || source.window_truncated !== true) return null;", util, StringComparison.Ordinal);
+        Assert.Contains("if (!desc || desc.windowNote === false) return null;", util, StringComparison.Ordinal);
+        Assert.Contains("if (desc.viz !== \"table\" && desc.viz !== \"stat\" && !chart) return null;", util, StringComparison.Ordinal);
+        // A chart draws only the row-capped note (#5644 W12), and only when the note names the oldest row shown.
+        Assert.Contains("if (typeof source.oldest_shown_utc !== \"string\") return null;", util, StringComparison.Ordinal);
         Assert.Contains("return sent;\n}", util, StringComparison.Ordinal);
     }
 
@@ -837,7 +854,7 @@ public sealed class WebDataStartNoteTests
 
         /* #4966: the empty envelope carries the note too, drawn above its message, and a read's answer is composed in the
            browser's zone for the envelope as it is for rows. */
-        Assert.Contains("mount(body, [kept, windowFloorStrip(res.data, desc), emptyStrip(res.message)]);", panels, StringComparison.Ordinal);
+        Assert.Contains("mount(body, [kept, windowFloorStrip(res.data, desc), emptyStrip(emptyHeadline(desc, res))]);", panels, StringComparison.Ordinal);
         Assert.Contains("res.kind !== \"data\" && res.kind !== \"empty\"", util, StringComparison.Ordinal);
 
         Assert.Contains("windowFloorStrip(res.data, spec)", tabs, StringComparison.Ordinal);

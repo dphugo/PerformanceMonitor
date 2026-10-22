@@ -361,7 +361,7 @@ public partial class MainWindow : Window
 
         if (settings is null)
         {
-            ShowConnectionFailure("darling.json not found — copy darling.sample.json from the service and point DARLING_CONFIG at it.");
+            ShowConnectionFailure(ViewerConfigDiagnostics.ConfigNotFoundMessage);
             return;
         }
 
@@ -380,7 +380,18 @@ public partial class MainWindow : Window
             configLocation, settings.ConfiguredConnectionString, settings.Managed, configLocation.Directory);
 
         _storeConnectionString = settings.ConnectionString;
-        _dataService = new ViewerDataService(settings.ConnectionString, _connectionTimeoutSeconds);
+
+        /* A store string Npgsql cannot parse is a configuration problem to show and log here, not an exception to
+           let escape this async void handler: the unhandled-exception log would write the exception's message and
+           its inner exception, and Npgsql's text for a parse failure can quote part of the string. The text
+           shown and logged is the formatter's. */
+        if (!ViewerDataService.TryCreate(settings.ConnectionString, _connectionTimeoutSeconds, out var dataService, out var unusable))
+        {
+            ShowConnectionFailure(unusable);
+            return;
+        }
+
+        _dataService = dataService;
 
         try
         {
@@ -458,6 +469,8 @@ public partial class MainWindow : Window
            it surface load/dismiss/mute outcomes on the shared status bar. */
         AlertsHistoryContent.Initialize(_dataService);
         AlertsHistoryContent.StatusChanged += OnServerTabStatusChanged;
+        AlertsHistoryContent.FullChainOpener = FullChainOpenerFor;
+        AlertsHistoryContent.DetailWindowSizeStore = new AlertDetailWindow.SettingsSizeStore(_appSettingsStore);
 
         /* The Job History tab is a self-loading all-servers control (retained SQL Agent job-run history);
            give it the store and surface its load outcomes on the shared status bar. */
@@ -799,9 +812,12 @@ public partial class MainWindow : Window
     /// </summary>
     private static string ToastBody(ViewerAlertRow row)
     {
-        if (!string.IsNullOrEmpty(row.DetailText))
+        /* #5642: the trailing sample-age line is not a summary; a detail text that is only that line (CPU's)
+           falls through to the formatted value instead of toasting "Newest CPU sample: ...". */
+        var summaryText = AlertDetailText.StripSampleAge(row.DetailText ?? string.Empty);
+        if (!string.IsNullOrEmpty(summaryText))
         {
-            foreach (var line in row.DetailText.Split('\n'))
+            foreach (var line in summaryText.Split('\n'))
             {
                 var trimmed = line.Trim();
                 if (!string.IsNullOrEmpty(trimmed))
@@ -923,7 +939,22 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Double-click opens (or focuses) the selected server's per-server tab (Lite's rule).</summary>
-    private void ServerList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    private void ServerList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => OpenSelectedServerTab();
+
+    /// <summary>#5763: Enter on the server list opens the selected server's tab, through the same
+    /// <see cref="OpenSelectedServerTab"/> the double-click runs. The key is marked handled so the list does not
+    /// also beep or move the selection.</summary>
+    private void ServerList_KeyDown(object sender, KeyEventArgs e) =>
+        ServerListKeyboard.HandleKeyDown(e, OpenSelectedServerTab);
+
+    /// <summary>#6138: the Invoke (default action) an automation client sends a sidebar row selects it and runs the
+    /// same <see cref="OpenSelectedServerTab"/> the double-click and Enter run.</summary>
+    private void ServerList_ItemInvoked(object? sender, ItemInvokedEventArgs e) =>
+        ServerListKeyboard.HandleInvoke(ServerList, e.Item, OpenSelectedServerTab);
+
+    /// <summary>Opens (or focuses) the selected server's per-server tab: the one body behind the list's
+    /// double-click and its Enter key. A header row opens nothing.</summary>
+    private void OpenSelectedServerTab()
     {
         if (ServerList.SelectedItem is FleetServerRow row)
         {
@@ -943,7 +974,7 @@ public partial class MainWindow : Window
         try
         {
             _fleet.ToggleExpanded(header);
-            ServerList.ItemsSource = _fleet.Visible;
+            ServerListKeyboard.Rebind(ServerList, _fleet.Visible);
             ServerList.SelectedItem = _fleet.ResolveSelection(previousServerId);
             PersistCollapseState();
         }
@@ -1012,8 +1043,24 @@ public partial class MainWindow : Window
     /// </summary>
     private void ServerSearchBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
+        /* #5763: replacing the list's items drops its selection, so a filter keystroke would leave the sidebar on
+           no server. The server that was selected is found again BY ID among the rows still showing and re-selected
+           under the suppression guard (the tabs already show it, so there is nothing to reload); a server the
+           filter hides leaves the list with no selection, as before. */
+        var previousServerId = (ServerList.SelectedItem as FleetServerRow)?.Server.ServerId;
         _fleet.SetSearch(ServerSearchBox.Text);
-        ServerList.ItemsSource = _fleet.Visible;
+        _suppressSidebarSelection = true;
+        try
+        {
+            ServerListKeyboard.Rebind(ServerList, _fleet.Visible);
+            ServerList.SelectedItem = ServerListKeyboard.FindByIdentity(
+                _fleet.Visible.OfType<FleetServerRow>(), previousServerId, r => r.Server.ServerId);
+        }
+        finally
+        {
+            _suppressSidebarSelection = false;
+        }
+
         UpdateServerCountText();
     }
 
@@ -1081,7 +1128,7 @@ public partial class MainWindow : Window
             var previousSelection = (ServerList.SelectedItem as FleetServerRow)?.Server.ServerId;
             var previousRecoServer = (RecommendationsServerSelector.SelectedItem as DarlingServer)?.ServerId;
             _fleet.SetAll(servers);
-            ServerList.ItemsSource = _fleet.Visible;
+            ServerListKeyboard.Rebind(ServerList, _fleet.Visible);
             UpdateServerCountText();
 
             /* The sidebar's server after this load: the prior one after a server add/edit/remove
@@ -1205,6 +1252,10 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>#6136: the status bar names the tab that was just refreshed. Alert History, Job History and the other tabs that set no
+    /// text of their own kept reading "overview - refreshed ..." from the last Overview load.</summary>
+    private void StampRefreshed(string tabName) => StatusText.Text = $"{tabName} — refreshed {DateTime.Now:HH:mm:ss}";
+
     private async Task LoadVisibleTabAsync()
     {
         try
@@ -1222,12 +1273,15 @@ public partial class MainWindow : Window
                     break;
                 case TabItem tab when ReferenceEquals(tab, AlertsTab):
                     await AlertsHistoryContent.RefreshAlertsAsync();
+                    StampRefreshed("alert history");
                     break;
                 case TabItem tab when ReferenceEquals(tab, JobHistoryTabItem):
                     await JobHistoryContent.RefreshJobsAsync();
+                    StampRefreshed("job history");
                     break;
                 case TabItem tab when ReferenceEquals(tab, AvailabilityGroupsTabItem):
                     await RefreshAvailabilityGroupsAsync();
+                    StampRefreshed("availability groups");
                     break;
                 case TabItem tab when ReferenceEquals(tab, FinOpsTab):
                     /* The picker lists the servers known when LoadServersAsync last ran; a server added since
@@ -1248,6 +1302,7 @@ public partial class MainWindow : Window
                         }
                     }
                     await FinOpsContent.RefreshActiveSubTabAsync();
+                    StampRefreshed("finops");
                     break;
             }
         }
@@ -1766,12 +1821,29 @@ public partial class MainWindow : Window
         if (e.ClickCount == 2
             && sender is FrameworkElement { DataContext: ServerSummaryItem summary })
         {
-            /* Resolved against the whole fleet, so a card click still opens a filtered-out server. */
-            var server = _fleet.Find(summary.ServerId);
-            if (server is not null)
-            {
-                OpenServerTab(server);
-            }
+            OpenOverviewCard(summary);
+        }
+    }
+
+    /// <summary>#6138: the Invoke (default action) an automation client sends a card runs the same
+    /// <see cref="OpenOverviewCard"/> the double-click runs.</summary>
+    private void OverviewItemsControl_ItemInvoked(object? sender, ItemInvokedEventArgs e)
+    {
+        if (e.Item is ServerSummaryItem summary)
+        {
+            OpenOverviewCard(summary);
+        }
+    }
+
+    /// <summary>Opens (or focuses) the tab of the server an Overview card shows: the one body behind the card's
+    /// double-click and its Invoke.</summary>
+    private void OpenOverviewCard(ServerSummaryItem summary)
+    {
+        /* Resolved against the whole fleet, so a card click still opens a filtered-out server. */
+        var server = _fleet.Find(summary.ServerId);
+        if (server is not null)
+        {
+            OpenServerTab(server);
         }
     }
 
@@ -1784,11 +1856,37 @@ public partial class MainWindow : Window
     {
         if (sender is FrameworkElement { DataContext: FleetRankedServer ranked })
         {
-            var server = _fleet.Find(ranked.ServerId);
-            if (server is not null)
-            {
-                OpenServerTab(server);
-            }
+            OpenWorstServer(ranked);
+        }
+    }
+
+    /// <summary>#6138: Enter on a focused Needs Attention row opens its server's tab, as the click does.</summary>
+    private void FleetWorstServer_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: FleetRankedServer ranked })
+        {
+            ServerListKeyboard.HandleKeyDown(e, () => OpenWorstServer(ranked));
+        }
+    }
+
+    /// <summary>#6138: the Invoke (default action) an automation client sends a Needs Attention row runs the same
+    /// <see cref="OpenWorstServer"/> the click and Enter run.</summary>
+    private void FleetWorstServersList_ItemInvoked(object? sender, ItemInvokedEventArgs e)
+    {
+        if (e.Item is FleetRankedServer ranked)
+        {
+            OpenWorstServer(ranked);
+        }
+    }
+
+    /// <summary>Opens (or focuses) the tab of the server a Needs Attention row ranks: the one body behind the row's click,
+    /// its Enter key and its Invoke.</summary>
+    private void OpenWorstServer(FleetRankedServer ranked)
+    {
+        var server = _fleet.Find(ranked.ServerId);
+        if (server is not null)
+        {
+            OpenServerTab(server);
         }
     }
 
@@ -1851,7 +1949,8 @@ public partial class MainWindow : Window
                 insufficientData: analysisState?.InsufficientData == true,
                 insufficientDataMessage: analysisState?.Message,
                 windowEmpty: analysisState?.WindowEmpty == true,
-                windowEmptyMessage: analysisState?.Message).WithReplicaNote(replicaNote));
+                windowEmptyMessage: analysisState?.Message,
+                isPostgres: server.IsPostgres).WithReplicaNote(replicaNote));
 
         /* #4766: the status line's time and the zone named after it both come from the selected server's clock in
            the display mode now in force. It used to end in a fixed "(local)" on a time that follows the display
@@ -1861,6 +1960,9 @@ public partial class MainWindow : Window
             ? RecommendationsViewModel.FormatLastAnalyzed(
                 rows[0].Finding.AnalysisTime, ViewerTimeHelper.CurrentDisplayMode, serverClock)
             : string.Empty;
+        /* #6135: an offline server's findings are the last it collected; say so beside the time they came from. */
+        RecommendationsStatusText.Text = RecommendationsViewModel.WithOfflineNote(
+            RecommendationsStatusText.Text, server.CardStatus == ServerCollectionStatus.Offline);
         StatusText.Text = $"{server.DisplayName} — refreshed {DateTime.Now:HH:mm:ss}";
     }
 
@@ -2060,6 +2162,14 @@ public partial class MainWindow : Window
             return;
         }
 
+        /* #6134: the engine of the server the link opens decides the tab; a PostgreSQL server never gets a SQL Server one. */
+        var target = RecommendationDeepLink.Resolve(server.IsPostgres, card.Item.RootFactKey);
+        if (target == RecommendationLinkTarget.None)
+        {
+            RecommendationsStatusText.Text = "This PostgreSQL server has no view for that finding.";
+            return;
+        }
+
         var (fromUtc, toUtc) = card.DeepLinkWindowUtc();
         var serverTab = OpenServerTab(server);
         if (serverTab is null)
@@ -2069,12 +2179,57 @@ public partial class MainWindow : Window
 
         try
         {
-            await serverTab.DeepLinkToActiveQueriesAsync(fromUtc, toUtc);
+            if (target == RecommendationLinkTarget.SqlServerActiveQueries)
+            {
+                await serverTab.DeepLinkToActiveQueriesAsync(fromUtc, toUtc);
+            }
+            else
+            {
+                await serverTab.DeepLinkToPgActivityAsync(target, fromUtc, toUtc);
+            }
         }
         catch (Exception ex)
         {
             RecommendationsStatusText.Text = $"Open in Active Queries failed: {ex.Message}";
         }
+    }
+
+    /// <summary>
+    /// #5847: the Alert Details window's "open the full chain" action for a Blocking or Deadlocks alert: open (or focus)
+    /// the alert's server tab and show its Blocked Process Reports or Deadlocks grid over a window around the alert's
+    /// time, through the same open-tab path the Recommendations deep link uses. Null (no link) for any other alert, a
+    /// server no longer registered, or a PostgreSQL server, whose tab has no Blocking tab.
+    /// </summary>
+    private Action? FullChainOpenerFor(ViewerAlertRow row)
+    {
+        var view = AlertChainLink.ViewFor(row.MetricName);
+        if (view == AlertChainView.None)
+        {
+            return null;
+        }
+
+        var server = FindManagedServerById(row.ServerId);
+        if (server is null || server.IsPostgres)
+        {
+            return null;
+        }
+
+        var (fromUtc, toUtc) = AlertChainLink.WindowUtc(row.AlertTime);
+        return async () =>
+        {
+            try
+            {
+                var serverTab = OpenServerTab(server);
+                if (serverTab is not null)
+                {
+                    await serverTab.DeepLinkToIncidentAsync(view, fromUtc, toUtc);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnServerTabStatusChanged($"Opening the {view} view failed: {ex.Message}");
+            }
+        };
     }
 
     /// <summary>Finds a registered server by id in the Recommendations tab's own selector list (populated

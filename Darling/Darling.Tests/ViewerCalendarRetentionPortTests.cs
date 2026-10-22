@@ -31,7 +31,7 @@ namespace Darling.Tests;
 /// the viewer's row makes the MCP row's decision from the same facts, that the horizon it judges against is the
 /// horizon the MCP publishes and the purge enforces, and that a grey cell now says why it is grey.
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class ViewerCalendarRetentionPortTests
 {
     private static readonly DateTime Today = new(2026, 8, 19, 0, 0, 0, DateTimeKind.Utc);
@@ -251,7 +251,10 @@ public sealed class ViewerCalendarRetentionPortTests
         /* The viewer reads the aggregate's LAST column for presence, at the ordinal the MCP reader reads. */
         Assert.Contains("SignalSourcesPresent = reader.IsDBNull(13) ? 0 : Convert.ToInt32(reader.GetValue(13)),", viewer, StringComparison.Ordinal);
         Assert.Contains("SignalSourcesPresent = reader.IsDBNull(13) ? 0 : Convert.ToInt32(reader.GetValue(13)),", mcp, StringComparison.Ordinal);
-        Assert.EndsWith("AS signal_sources_present", DailySummarySql.RangeSql.Split("FROM day_spine")[0].TrimEnd(), StringComparison.Ordinal);
+        /* #5644: blocking_reports (the band's report count) was appended after it, at ordinal 14 and last. */
+        var projection = DailySummarySql.RangeSql.Split("FROM day_spine")[0].TrimEnd();
+        Assert.Contains("AS signal_sources_present,", projection, StringComparison.Ordinal);
+        Assert.EndsWith("AS blocking_reports", projection, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -285,7 +288,6 @@ public sealed class ViewerCalendarRetentionPortTests
 /// wrong state), and the fixture's rows for these servers are removed either way.
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class ViewerCalendarRetentionLivePostgresTests
 {
     private const int ServerId = -936537;

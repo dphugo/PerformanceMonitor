@@ -210,12 +210,21 @@ public sealed class CustomAlertEvaluator
 
         var builder = new StringBuilder(Math.Min(value.Length, maxLength));
         var pendingSpace = false;
-        foreach (var ch in value)
+        foreach (var rune in value.EnumerateRunes())
         {
-            var isBreakOrControl =
-                ch < ' ' || ch == (char)0x7F || ch == (char)0x85 || ch == '\u2028' || ch == '\u2029';
+            /* Characters that reorder or hide text are dropped outright: a right-to-left override or an invisible
+               character in a title would show a subject or card line other than the one stored (#5654). The test
+               runs on code points, so a character outside the Basic Multilingual Plane (the tag characters) is seen. */
+            if (IsInvisibleOrReordering(rune))
+            {
+                continue;
+            }
 
-            if (isBreakOrControl || ch == ' ')
+            var code = rune.Value;
+            var isBreakOrControl =
+                code < ' ' || code == 0x7F || code == 0x85 || code == 0x2028 || code == 0x2029;
+
+            if (isBreakOrControl || code == ' ')
             {
                 // Defer whitespace: emitted only before the next real char (drops leading + trailing runs).
                 pendingSpace = builder.Length > 0;
@@ -233,15 +242,37 @@ public sealed class CustomAlertEvaluator
                 pendingSpace = false;
             }
 
-            if (builder.Length >= maxLength)
+            /* A surrogate pair goes in whole or not at all, so the cap never leaves half of one. */
+            if (builder.Length + rune.Utf16SequenceLength > maxLength)
             {
                 break;
             }
 
-            builder.Append(ch);
+            builder.Append(rune.ToString());
         }
 
         return builder.ToString();
+    }
+
+    /// <summary>Every code point of the Unicode Format category (the bidirectional controls U+202A-202E and U+2066-2069,
+    /// the Arabic letter mark U+061C, the zero-width and mark characters U+200B-200F, U+2060-2064, U+FEFF, the tag
+    /// characters U+E0001 and U+E0020-E007F, and the rest), except the zero-width non-joiner U+200C and joiner U+200D,
+    /// which the spelling of Persian, Indic and emoji sequences needs; and the C1 controls (U+0080-009F except U+0085,
+    /// which the sanitizer already treats as a line break).</summary>
+    internal static bool IsInvisibleOrReordering(Rune rune)
+    {
+        var code = rune.Value;
+        if (code >= 0x80 && code <= 0x9F)
+        {
+            return code != 0x85;
+        }
+
+        if (code == 0x200C || code == 0x200D)
+        {
+            return false;
+        }
+
+        return Rune.GetUnicodeCategory(rune) == UnicodeCategory.Format;
     }
 
     /// <summary>Evaluates every enabled rule applicable to one server. Failure-isolated per rule.
@@ -681,8 +712,16 @@ public sealed class CustomAlertEvaluator
 
         try
         {
-            await _historyStore.RecordAlertAsync(DarlingSelfAlertEvaluator.BuildResolutionRecord(
-                new AlertResolution(serverKey, displayName, metricName, title, message)));
+            var resolution = new AlertResolution(serverKey, displayName, metricName, title, message);
+            /* #5825: a custom alert's clear follows the same setting as every other clear. */
+            if (_deliverer is IAlertResolutionSender sender)
+            {
+                await sender.DeliverResolutionAsync(resolution);
+            }
+            else
+            {
+                await _historyStore.RecordAlertAsync(DarlingSelfAlertEvaluator.BuildResolutionRecord(resolution));
+            }
         }
         catch (Exception ex)
         {
@@ -697,6 +736,9 @@ public sealed class CustomAlertEvaluator
     /// <summary>The reason a firing (rule, server) subject is force-resolved when the server has left the rule's
     /// scope, or has been removed from monitoring entirely (#3305).</summary>
     internal const string TeardownReasonOutOfScope = "the server is no longer in the rule's scope";
+
+    /// <summary>The reason a firing (rule, server) subject is force-resolved when its rule has passed its expiry (#6235).</summary>
+    internal const string TeardownReasonExpired = "the rule expired";
 
     /// <summary>The reason a firing (rule, server) subject is force-resolved when the rule is deleted (#3305).</summary>
     internal const string TeardownReasonDeleted = "the rule was deleted";
@@ -748,11 +790,18 @@ public sealed class CustomAlertEvaluator
     /// evaluator's in-memory no-data map is pruned lazily on its next cache refresh. The resolve is best-effort
     /// (its own failure isolation) so a resolve blip never blocks the delete the operator asked for.
     /// </summary>
-    public static async Task<CustomAlertRuleResult> ResolveAndDeleteRuleAsync(
-        NpgsqlDataSource postgres, long ruleId, ILogger? logger, CancellationToken cancellationToken)
-    {
-        var ruleStore = new CustomAlertRuleStore(postgres);
+    public static Task<CustomAlertRuleResult> ResolveAndDeleteRuleAsync(
+        NpgsqlDataSource postgres, long ruleId, ILogger? logger, CancellationToken cancellationToken) =>
+        ResolveAndDeleteRuleAsync(postgres, new CustomAlertRuleStore(postgres), ruleId, logger, cancellationToken);
 
+    /// <summary>
+    /// The same resolve-then-delete over <paramref name="ruleStore"/> (#5915): a Level 2 agent delete passes a store bound to
+    /// the gate's transaction, so the delete commits with the journal row. The resolution rows are written on their own
+    /// connections before the delete, as they always were, so they stand if that transaction is later abandoned.
+    /// </summary>
+    internal static async Task<CustomAlertRuleResult> ResolveAndDeleteRuleAsync(
+        NpgsqlDataSource postgres, CustomAlertRuleStore ruleStore, long ruleId, ILogger? logger, CancellationToken cancellationToken)
+    {
         var current = await ruleStore.GetAsync(ruleId, cancellationToken);
         if (current is CustomAlertRuleResult.Ok ok && ok.Rule is not null)
         {
@@ -777,7 +826,7 @@ public sealed class CustomAlertEvaluator
         // refresh under concurrent server sweeps is harmless (last writer wins; both compute the same list).
         if (DateTime.UtcNow - _cacheRefreshedUtc < _cacheTtl)
         {
-            return _cache;
+            return DropExpired(_cache);
         }
 
         var rows = ApplyEnabledCeiling(await _ruleStore.ListEnabledAsync(cancellationToken), _logger);
@@ -821,7 +870,18 @@ public sealed class CustomAlertEvaluator
         _cache = parsed;
         _brokenRules = broken;
         _cacheRefreshedUtc = DateTime.UtcNow;
-        return _cache;
+        return DropExpired(_cache);
+    }
+
+    /// <summary>
+    /// #6235: a rule past its expiry is not evaluated and does not fire. The store's read already leaves an expired rule out, but the
+    /// cache holds a rule for up to its TTL, so the expiry is checked again here against the clock on every read of the cache: a
+    /// rule that expires while it is cached stops at its expiry, not at the next refresh.
+    /// </summary>
+    private static IReadOnlyList<ParsedRule> DropExpired(IReadOnlyList<ParsedRule> rules)
+    {
+        var now = DateTime.UtcNow;
+        return rules.Any(r => r.Row.IsExpiredAt(now)) ? rules.Where(r => !r.Row.IsExpiredAt(now)).ToList() : rules;
     }
 
     /// <summary>
@@ -978,11 +1038,18 @@ public sealed class CustomAlertEvaluator
     /// </summary>
     internal static string? ClassifyStateTeardown(
         bool ruleEnabled, CustomAlertRuleDefinition? definition, IReadOnlySet<int>? tagServerIds,
-        int serverId, string? serverStorageName)
+        int serverId, string? serverStorageName, bool ruleExpired = false)
     {
         if (!ruleEnabled)
         {
             return TeardownReasonDisabled;
+        }
+
+        /* #6235: an expired rule is no longer evaluated, so an incident it left open would never resolve on its own, the
+           same orphan a disabled rule leaves. Disabled wins when both hold: the operator's switch is the stronger fact. */
+        if (ruleExpired)
+        {
+            return TeardownReasonExpired;
         }
 
         if (definition is null)
@@ -1053,7 +1120,7 @@ public sealed class CustomAlertEvaluator
             var storageName = monitoredServers.TryGetValue(row.ServerId, out var server) ? server.StorageName : null;
             var parsedRule = parsedById.TryGetValue(row.RuleId, out var pr) ? pr : null;
             var reason = ClassifyStateTeardown(
-                row.RuleEnabled, parsedRule?.Definition, parsedRule?.TagServerIds, row.ServerId, storageName);
+                row.RuleEnabled, parsedRule?.Definition, parsedRule?.TagServerIds, row.ServerId, storageName, row.RuleExpired);
             if (reason is null)
             {
                 continue;

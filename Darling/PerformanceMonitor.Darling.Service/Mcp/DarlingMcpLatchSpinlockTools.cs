@@ -68,7 +68,7 @@ public sealed class DarlingMcpLatchSpinlockTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(top);
         if (validation != null) return validation;
@@ -79,7 +79,7 @@ public sealed class DarlingMcpLatchSpinlockTools
             var rows = await DarlingLatchSpinlockReader.GetLatchStatsTopNAsync(
                 postgres, resolved.ServerId, now.AddHours(-hours_back), now, top, cancellationToken);
             if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "latch_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "latch_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No latch statistics available in the requested time range.");
 
             var latches = rows.Select(r => new
@@ -132,7 +132,7 @@ public sealed class DarlingMcpLatchSpinlockTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,
@@ -161,7 +161,7 @@ public sealed class DarlingMcpLatchSpinlockTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(top);
         if (validation != null) return validation;
@@ -172,7 +172,7 @@ public sealed class DarlingMcpLatchSpinlockTools
             var rows = await DarlingLatchSpinlockReader.GetSpinlockStatsTopNAsync(
                 postgres, resolved.ServerId, now.AddHours(-hours_back), now, top, cancellationToken);
             if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "spinlock_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "spinlock_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No spinlock statistics available in the requested time range.");
 
             var spinlocks = rows.Select(r => new
@@ -206,7 +206,7 @@ public sealed class DarlingMcpLatchSpinlockTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 effective_start = notice.EffectiveStart,
                 window_truncated = notice.WindowTruncated,

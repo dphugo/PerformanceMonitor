@@ -262,6 +262,7 @@ public partial class FinOpsTab
             FinOpsAvgCpuBar.Width = FinOpsP95CpuBar.Width = FinOpsMaxCpuBar.Width = 0;
             FinOpsMemoryUtilBar.Width = FinOpsMemoryRatioBar.Width = 0;
             FinOpsMemoryUtilText.Text = FinOpsMemoryRatioText.Text = "-";
+            FinOpsMemoryUtilText.ToolTip = FinOpsMemoryUtilBar.ToolTip = null;
             FinOpsPhysicalMemoryText.Text = FinOpsTargetMemoryText.Text = FinOpsTotalMemoryText.Text = FinOpsBufferPoolText.Text = "-";
             FinOpsClassificationExplanation.Text = "";
             FinOpsUtilizationContent.Visibility = Visibility.Collapsed;
@@ -274,9 +275,7 @@ public partial class FinOpsTab
         FinOpsUtilizationContent.Visibility = Visibility.Visible;
 
         /* An empty status is "no verdict" (no CPU sample in the window), not a blank label. */
-        FinOpsProvisioningStatusText.Text = string.IsNullOrEmpty(data.ProvisioningStatus) ? "No Data"
-            : data.ProvisioningStatus == ProvisioningVerdict.NotApplicable ? ProvisioningVerdict.NotApplicableLabel
-            : data.ProvisioningStatus.Replace("_", " ");
+        FinOpsProvisioningStatusText.Text = ProvisioningVerdict.StatusLabel(data.ProvisioningStatus, data.CpuSamples);
         switch (data.ProvisioningStatus)
         {
             case "RIGHT_SIZED":
@@ -318,6 +317,9 @@ public partial class FinOpsTab
         var stolenPct = FinOpsUtilizationFigures.StolenMemoryPct(data.TotalMemoryMb, data.BufferPoolMb);
         FinOpsMemoryUtilText.Text = $"{stolenPct:N0}%";
         SetBar(FinOpsMemoryUtilBar, FinOpsMemUtilFilled, FinOpsMemUtilEmpty, stolenPct);
+        /* A figure that reads amber or red says why (#6139); below amber there is nothing to say. */
+        var stolenNote = ProvisioningVerdict.StolenMemoryNote(stolenPct);
+        FinOpsMemoryUtilText.ToolTip = FinOpsMemoryUtilBar.ToolTip = stolenNote.Length == 0 ? null : stolenNote;
 
         /* Buffer Pool % = Buffer Pool / Physical Memory */
         var bpPct = FinOpsUtilizationFigures.BufferPoolPct(data.BufferPoolMb, data.PhysicalMemoryMb);
@@ -720,19 +722,28 @@ public partial class FinOpsTab
             return;
         }
 
-        var argsJson = ViewerDataService.BuildActualPlanArgs(hi.QueryHash, hi.DatabaseName);
+        /* #5639: an empty or all-zero hash names no particular query. The row holds a SAMPLE text, so the flow
+           reads the text the service will run (the latest stored text for the hash and database) and the
+           prompt, the modification check and the request's digest all use that text. */
+        if (!ViewerActualPlanFlow.TryCheckQueryStatsHash(Window.GetWindow(this)!, hi.QueryHash))
+        {
+            return;
+        }
+
         var label = $"Actual Plan - {hi.QueryHash}";
 
-        var planXml = await ViewerActualPlanFlow.RequestActualPlanAsync(
+        var capture = await ViewerActualPlanFlow.RequestActualPlanAsync(
             Window.GetWindow(this)!, _dataService, _server.ServerId, _server.DisplayName, hi.DatabaseName,
-            hi.FullQueryText, hi.QueryPlanXml, argsJson,
+            queryText: null, fetchPlanXml: null, argsJson: "",
             onStarted: () => System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait,
             onFinished: () => System.Windows.Input.Mouse.OverrideCursor = null,
-            System.Threading.CancellationToken.None);
+            System.Threading.CancellationToken.None,
+            queryStatsHash: hi.QueryHash);
 
-        if (planXml != null)
+        if (capture != null)
         {
-            PlanRequested?.Invoke(planXml, label, hi.FullQueryText);
+            /* The plan host gets the statement that ran, not the row's sample text. */
+            PlanRequested?.Invoke(capture.PlanXml, label, capture.QueryText);
         }
     }
 

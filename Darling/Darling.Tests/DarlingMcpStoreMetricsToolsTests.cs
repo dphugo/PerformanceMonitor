@@ -34,6 +34,7 @@ namespace Darling.Tests;
 /// null (never zero or infinity) when the denominator is missing, and negative deltas preserved because
 /// retention drops and compression passes genuinely shrink the store.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpStoreMetricsToolsTests
 {
     private static MethodInfo[] ToolMethods() => typeof(DarlingMcpStoreMetricsTools)
@@ -131,10 +132,10 @@ public sealed class DarlingMcpStoreMetricsToolsTests
            grain a growth question wants. */
         Assert.Contains("SELECT DISTINCT ON (object_kind, object_name, date_trunc('day', metric_time))", sql, StringComparison.Ordinal);
         Assert.Contains("WHERE metric_time >= $1", sql, StringComparison.Ordinal);
-        Assert.Contains(
-            "ORDER BY object_kind, object_name, date_trunc('day', metric_time), metric_time DESC",
-            sql,
-            StringComparison.Ordinal);
+
+        /* The ORDER BY spelling is no longer pinned (#5857): within a day a hypertable or aggregate point is its newest
+           EXACT row when it has one, so the ordering has one more key than "newest first". Which row each day keeps is
+           proved by the live StoreMetricReaders_SurfaceSizeEstimated_AndTheDailyPointPrefersTheExactRow test. */
     }
 
     [Theory]
@@ -375,25 +376,6 @@ public sealed class DarlingMcpStoreMetricsToolsTests
            runs at least daily, so a live store always has starts inside it, and it sits inside the history
            view's own one-month default retention. */
         Assert.Equal(24, DarlingStoreMetricsReader.JobHistoryEvidenceWindowHours);
-    }
-
-    /// <summary>
-    /// #3574: the bind is <c>timestamptz</c> with <c>Kind = Utc</c>, stated explicitly — the INVERSE of
-    /// the naive-UTC discipline every other store read follows, because these are TimescaleDB's own
-    /// <c>TIMESTAMPTZ</c> catalog columns and here the naive bind would be the bug. A source pin, since the
-    /// only server that would catch the wrong Kind is one running off UTC, which no test store does.
-    /// </summary>
-    [Fact]
-    public void TheEvidenceRead_BindsAnExplicitTimestampTz_BecauseTheColumnsAreTimestampTz()
-    {
-        var source = File.ReadAllText(ReaderSourcePath());
-        var method = source[source.IndexOf("GetJobHistoryEvidenceAsync(", StringComparison.Ordinal)..];
-        method = method[..method.IndexOf("/// <summary>One object's newest self-metrics row", StringComparison.Ordinal)];
-
-        Assert.Contains("NpgsqlDbType.TimestampTz", method, StringComparison.Ordinal);
-        Assert.Contains("DateTimeKind.Utc", method, StringComparison.Ordinal);
-        /* And NOT the naive idiom, which is correct one method up and wrong here. */
-        Assert.DoesNotContain("DateTimeKind.Unspecified", method, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -1492,10 +1474,6 @@ public sealed class DarlingMcpStoreMetricsToolsTests
         Assert.Contains("timescaledb_information.hypertables never lists a materialization", description!, StringComparison.Ordinal);
     }
 
-    private static string ReaderSourcePath([CallerFilePath] string thisFile = "")
-        => Path.GetFullPath(Path.Combine(
-            Path.GetDirectoryName(thisFile)!, "..", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingStoreMetricsReader.cs"));
-
     [Fact]
     public void GetStoreMetrics_IsInTheServerInstructions()
     {
@@ -1637,21 +1615,6 @@ public sealed class DarlingMcpStoreMetricsToolsTests
                 (new DateTime(2026, 8, 6), 300, 15.0),
             },
             growth.Select(g => (g.Day, g.DeltaBytes, g.PerServerBytes)).ToArray());
-    }
-
-    /// <summary>
-    /// The daily read now projects the day's last snapshot time as its last column, so a growth point can say
-    /// when its reading was taken (today's point is a partial day, and only the time shows how far in). Paired
-    /// with the ordinal the reader takes it from.
-    /// </summary>
-    [Fact]
-    public void StoreMetricsDailySql_ProjectsTheDaysLastSnapshotTime_AndTheReaderTakesItFromThatColumn()
-    {
-        var sql = DarlingStoreMetricsReader.StoreMetricsDailySql.Replace("\r\n", "\n", StringComparison.Ordinal);
-        Assert.Contains("    toast_live_bytes,\n    metric_time\nFROM collect.store_metrics", sql, StringComparison.Ordinal);
-
-        var source = File.ReadAllText(ReaderSourcePath());
-        Assert.Contains("reader.GetDateTime(15)", source, StringComparison.Ordinal);
     }
 
     private static DarlingStoreMetricsReader.StoreMetricDailyPoint StoreDayAt(

@@ -98,7 +98,7 @@ public sealed class DarlingMcpObjectStatsTools
                     {
                         return McpHelpers.StatusForDatabase(
                             "empty",
-                            $"No table size rows for {DescribeScope(databases)} on {resolved.ServerName} at the latest snapshot, "
+                            $"No table size rows for {DescribeScope(databases)} on {resolved.DisplayName} at the latest snapshot, "
                             + $"though the server has {anyOnServer:N0} index rows across its other databases. Check the database "
                             + $"{(databases.Names.Count == 1 ? "name" : "names")} against get_database_sizes: the filter matches exactly, "
                             + "and an excluded or renamed database looks identical to one with no tables.",
@@ -107,7 +107,7 @@ public sealed class DarlingMcpObjectStatsTools
                 }
 
                 return McpHelpers.WithDatabase(
-                           await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "index_object_stats", cancellationToken),
+                           await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "index_object_stats", cancellationToken),
                            databases.Describe())
                     ?? McpHelpers.StatusForDatabase("unavailable", "No object size data available. Index/object stats are collected daily.", databases.Describe());
             }
@@ -146,7 +146,7 @@ public sealed class DarlingMcpObjectStatsTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 database_name = databases.Describe(),
                 history = new
                 {
@@ -200,7 +200,7 @@ public sealed class DarlingMcpObjectStatsTools
         return notes.Count == 0 ? null : string.Join("; ", notes) + ".";
     }
 
-    [McpServerTool(Name = "get_index_usage"), Description("Per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classed Unused, Write-only, or Active. Unused/write-only sort first as drop candidates: on a server with many, results can be one database's unused indexes, hiding Active ones elsewhere. Counters reset at the last restart or index rebuild, so Write-only means no reads since then. last_user_access is UTC (de-skewed): compare directly with get_collection_log and list_servers. <<GUIDE>> Gets per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classifying each index as Unused, Write-only, or Active. Unused and write-only indexes are listed FIRST because they are drop candidates - which means that on a server with many unused indexes the row limit can be filled entirely by one database's unused indexes, hiding every Active index elsewhere. Pass database_name to ask about one database, which is almost always what you want; the response carries matching_index_count and truncated so a short answer is never mistaken for an absent one. Counters are cumulative since the last instance restart. last_user_access is UTC - the underlying sys.dm_db_index_usage_stats columns are in the monitored server's local clock and this read de-skews them - so it compares directly against get_collection_log and list_servers. Classification: Unused is zero seeks, scans and lookups AND zero updates; Write-only is zero of the first three but at least one update; everything else is Active. sys.dm_db_index_usage_stats also clears on an index rebuild and on a database detach/reattach, not only on an instance restart, so a heavily-used index that was just rebuilt can read as Unused until it accrues new activity - check the index's maintenance history before treating an Unused row as a drop candidate. Empty results are two different things here. If database_name is given and matches no rows there, but the server has index data in other databases, status is empty, not unavailable, with a note to check the name against get_database_sizes. If nothing matches anywhere on the server, whether or not database_name was given, the result is not_collected (if the engine's collection state says so) or unavailable instead - this tool never reports a truly empty server as empty. The note field says whether the answer is complete or truncated. Truncated means more indexes matched than the cap returned; every Active index that did not fit is among the omitted rows, since Active is never returned ahead of an Unused or write-only one, and if unused/write-only indexes alone outnumber the cap, none of them appear either - a truncated, all-Unused answer says nothing about how many Active indexes exist.")]
+    [McpServerTool(Name = "get_index_usage"), Description("Per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classed Unused, Write-only, or Active. Unused/write-only sort first as drop candidates: on a server with many, results can be one database's unused indexes, hiding Active ones elsewhere. Counters reset at the last restart or index rebuild, so Write-only means no reads since then. last_user_access is UTC (de-skewed): compare directly with get_collection_log and list_servers. <<GUIDE>> Gets per-index usage (seeks, scans, lookups, updates) from the latest daily snapshot, classifying each index as Unused, Write-only, or Active. Unused and write-only indexes are listed FIRST because they are drop candidates - which means that on a server with many unused indexes the row limit can be filled entirely by one database's unused indexes, hiding every Active index elsewhere. Pass database_name to ask about one database, which is almost always what you want; the response carries matching_index_count and truncated so a short answer is never mistaken for an absent one. Counters are cumulative since they were last cleared, which is not always the instance restart (see the caveat below). last_user_access is UTC - the underlying sys.dm_db_index_usage_stats columns are in the monitored server's local clock and this read de-skews them - so it compares directly against get_collection_log and list_servers. Classification: Unused is zero seeks, scans and lookups AND zero updates; Write-only is zero of the first three but at least one update; everything else is Active. That is the rule for a nonclustered index; a heap or a clustered index (the table itself, never a drop candidate) with no reads is Table not read, with reads it is Active. sys.dm_db_index_usage_stats clears on an instance restart, a database restore, a detach and attach, the database going offline, and (for that index) a rebuild, so a heavily-used index that was just rebuilt can read as Unused until it accrues new activity - check the index's maintenance history before treating an Unused row as a drop candidate. Empty results are two different things here. If database_name is given and matches no rows there, but the server has index data in other databases, status is empty, not unavailable, with a note to check the name against get_database_sizes. If nothing matches anywhere on the server, whether or not database_name was given, the result is not_collected (if the engine's collection state says so) or unavailable instead - this tool never reports a truly empty server as empty. The note field says whether the answer is complete or truncated. Truncated means more indexes matched than the cap returned; every Active index that did not fit is among the omitted rows, since Active is never returned ahead of an Unused or write-only one, and if unused/write-only indexes alone outnumber the cap, none of them appear either - a truncated, all-Unused answer says nothing about how many Active indexes exist.")]
     public static Task<string> GetIndexUsage(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -251,7 +251,7 @@ public sealed class DarlingMcpObjectStatsTools
                     {
                         return McpHelpers.Status(
                             "empty",
-                            $"No index usage rows for {scope} on {resolved.ServerName} at the "
+                            $"No index usage rows for {scope} on {resolved.DisplayName} at the "
                             + $"latest snapshot, though the server has {anyOnServer:N0} across its other "
                             + $"databases. Check the database {(databases.Names.Count == 1 ? "name" : "names")} against get_database_sizes — the filter "
                             + "matches exactly, and an excluded or renamed database looks identical to one "
@@ -259,7 +259,7 @@ public sealed class DarlingMcpObjectStatsTools
                     }
                 }
 
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "index_object_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "index_object_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No index usage data available. Index/object stats are collected daily.");
             }
 
@@ -288,7 +288,7 @@ public sealed class DarlingMcpObjectStatsTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 database_name = databases.Describe(),
                 returned_index_count = rows.Count,
                 matching_index_count = matching,
@@ -378,6 +378,7 @@ public sealed class DarlingMcpObjectStatsTools
         return await GetObjectLockingCoreAsync(postgres, server_name, limit, registryState, null, cancellationToken, databases, heat: true);
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_object_locking"), Description("Gets per-index locking and latch contention (row/page lock waits in ms, lock escalations, page-latch and page-IO-latch waits) from the latest daily snapshot, top contended objects first. Use to find tables/indexes driving blocking and contention. Counters are cumulative since the last instance restart. LATEST IS A TIME: this reads the newest index/object snapshot for the server, not a window, and captured_at is the instant it was collected - these are the databases and indexes that existed AT that stamp, and because object stats are collected DAILY the stamp can be most of a day old on a healthy server and older still on one whose collector has stalled.")]
     public static async Task<string> GetObjectLocking(
         NpgsqlDataSource postgres,
@@ -439,7 +440,7 @@ public sealed class DarlingMcpObjectStatsTools
                     && (await DarlingObjectStatsReader.GetIndexLockingAsync(postgres, resolved.ServerId, 1, cancellationToken)).Count > 0)
                 {
                     return McpHelpers.Status("empty",
-                        $"No lock/latch contention{inScope} on {resolved.ServerName} at the latest snapshot, though other databases on "
+                        $"No lock/latch contention{inScope} on {resolved.DisplayName} at the latest snapshot, though other databases on "
                         + $"the server have some. Check the database {(databases.Names.Count == 1 ? "name" : "names")} against get_database_sizes "
                         + "— the filter matches exactly, and an excluded or renamed database looks identical to one with no contention."
                         + (optimizedLockingNote is null ? "" : " " + optimizedLockingNote),
@@ -448,7 +449,7 @@ public sealed class DarlingMcpObjectStatsTools
                             : new { optimized_locking_note = optimizedLockingNote, separately_monitored_note = separatelyMonitoredNote });
                 }
 
-                var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "index_object_stats", cancellationToken);
+                var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "index_object_stats", cancellationToken);
                 if (notCollected is not null) return notCollected;
 
                 /* #5372 (r2 Low): a latest snapshot that holds index rows, none of them contended, is a TRUE negative: the
@@ -459,7 +460,7 @@ public sealed class DarlingMcpObjectStatsTools
                 {
                     return McpHelpers.Status("empty",
                         "No lock/latch contention" + (scope is null ? "" : $"{inScope} or in any other database")
-                        + $" on {resolved.ServerName} at the latest snapshot."
+                        + $" on {resolved.DisplayName} at the latest snapshot."
                         + (optimizedLockingNote is null ? "" : " " + optimizedLockingNote),
                         optimizedLockingNote is null && separatelyMonitoredNote is null
                             ? null
@@ -498,7 +499,7 @@ public sealed class DarlingMcpObjectStatsTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3880 (Erik's ruling on the judgment call #3878/#3879 recorded): captured_at, the #3637
                    census's one spelling for a latest read's stamp - see GetDatabaseSizes below, and
                    DarlingMcpDataTools.GetServerProperties for why it is a cut-over and not an alias. Every
@@ -553,13 +554,13 @@ public sealed class DarlingMcpObjectStatsTools
             if (row is null)
             {
                 return McpHelpers.Status("empty",
-                    $"No such index in the latest snapshot of {resolved.ServerName}: the page's database, schema, table and index "
+                    $"No such index in the latest snapshot of {resolved.DisplayName}: the page's database, schema, table and index "
                     + "names must match exactly, and an index dropped or renamed since the list was read is no longer there.");
             }
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = row.CollectionTime.ToString("o"),
                 detail = new
                 {
@@ -580,6 +581,7 @@ public sealed class DarlingMcpObjectStatsTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_database_sizes"), Description("Gets database file sizes, space usage, and volume free space. Shows each database file with total size, used space, auto-growth settings, and the underlying volume's capacity. Use for capacity planning and identifying space pressure. LATEST IS A TIME: this reads the newest size snapshot, not a window, and captured_at is the instant it was collected - a volume's free space here is what it was AT that stamp, and a file that grew since is not reflected until the next collection.")]
     public static Task<string> GetDatabaseSizes(
         NpgsqlDataSource postgres,
@@ -615,7 +617,7 @@ public sealed class DarlingMcpObjectStatsTools
                 {
                     return McpHelpers.StatusForDatabase(
                         "empty",
-                        $"No database size rows for {DescribeScope(databases)} on {resolved.ServerName} in the snapshot captured at "
+                        $"No database size rows for {DescribeScope(databases)} on {resolved.DisplayName} in the snapshot captured at "
                         + $"{snapshot:o}. Check the database {(databases.Names.Count == 1 ? "name" : "names")} against the server's "
                         + "unfiltered get_database_sizes: the filter matches exactly, and an excluded or renamed database looks identical "
                         + "to one with no files.",
@@ -623,12 +625,13 @@ public sealed class DarlingMcpObjectStatsTools
                 }
 
                 return McpHelpers.WithDatabase(
-                           await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "database_size_stats", cancellationToken),
+                           await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "database_size_stats", cancellationToken),
                            databases.Describe())
                     ?? McpHelpers.StatusForDatabase("unavailable", "No database size data available. The size collector may not have run yet.", databases.Describe());
             }
 
-            return DatabaseSizesPayload(resolved.ServerName, rows, databases.Describe());
+            var serverIsHyperscale = await DarlingEngineCapability.IsHyperscaleAsync(postgres, resolved.ServerId, cancellationToken);
+            return DatabaseSizesPayload(resolved.DisplayName, rows, databases.Describe(), serverIsHyperscale);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -647,8 +650,12 @@ public sealed class DarlingMcpObjectStatsTools
     /// <paramref name="databaseEcho"/> (#5244) is the <c>database_name</c> echo: the name, "the chosen databases", or null for
     /// every database; the key is always written.
     /// </summary>
-    internal static string DatabaseSizesPayload(string serverName, IReadOnlyList<DarlingObjectStatsReader.DatabaseSizeRow> rows, string? databaseEcho = null)
+    internal static string DatabaseSizesPayload(string serverName, IReadOnlyList<DarlingObjectStatsReader.DatabaseSizeRow> rows, string? databaseEcho = null, bool serverIsHyperscale = false)
     {
+        /* #6178: a data file's max size is a per-file cap on Hyperscale. The stored server properties say so when the read has
+           them; a log file with no size says so in the rows (and is the fallback when the properties are missing). */
+        var hyperscaleDatabases = HyperscaleLogSize.HyperscaleDatabases(
+            rows.Select(r => (r.DatabaseName, (string?)r.FileTypeDesc, r.TotalSizeMb is not null)), serverIsHyperscale);
         var databases = rows
             .GroupBy(r => r.DatabaseName)
             .Select(g =>
@@ -664,7 +671,8 @@ public sealed class DarlingMcpObjectStatsTools
                 };
                 if (g.Any(r => r.IsAzureSiblingRow))
                     database[AzureSiblingDatabaseSize.RowNoteKey] = AzureSiblingDatabaseSize.LogNote;
-                database["files"] = g.Select(FilePayload).ToList();
+                var hyperscale = hyperscaleDatabases.Contains(g.Key);
+                database["files"] = g.Select(r => FilePayload(r, hyperscale)).ToList();
                 return database;
             })
             .ToList();
@@ -675,7 +683,9 @@ public sealed class DarlingMcpObjectStatsTools
            same words. */
         var note = AzureSiblingDatabaseSize.DatabaseSizesNote(
             hasLogServiceFile: rows.Any(r => r.TotalSizeMb is null),
-            hasSiblingRow: rows.Any(r => r.IsAzureSiblingRow));
+            hasSiblingRow: rows.Any(r => r.IsAzureSiblingRow),
+            hasHyperscaleDataFileCap: rows.Any(r => !r.IsAzureSiblingRow
+                && HyperscaleLogSize.IsDataFileWithFileCap(r.FileTypeDesc, hyperscaleDatabases.Contains(r.DatabaseName), r.MaxSizeMb is > 0)));
         if (note is not null)
         {
             return JsonSerializer.Serialize(new
@@ -705,7 +715,7 @@ public sealed class DarlingMcpObjectStatsTools
 
     /// <summary>One file of a database in the payload. The note key is added to the one row another database on an
     /// Azure SQL Database server gets, and to no other.</summary>
-    private static Dictionary<string, object?> FilePayload(DarlingObjectStatsReader.DatabaseSizeRow r)
+    private static Dictionary<string, object?> FilePayload(DarlingObjectStatsReader.DatabaseSizeRow r, bool hyperscaleDatabase)
     {
         var file = new Dictionary<string, object?>
         {
@@ -716,7 +726,12 @@ public sealed class DarlingMcpObjectStatsTools
         };
         if (r.IsAzureSiblingRow)
             file[AzureSiblingDatabaseSize.RowNoteKey] = AzureSiblingDatabaseSize.LogNote;
+        else if (HyperscaleLogSize.IsDataFileWithFileCap(r.FileTypeDesc, hyperscaleDatabase, r.MaxSizeMb is > 0))
+            file[AzureSiblingDatabaseSize.RowNoteKey] = HyperscaleLogSize.DataFileMaxSizeNote;
         file["auto_growth_mb"] = r.AutoGrowthMb;
+        /* #5633 item 6: a file that grows by a percentage has no fixed MB step; is_percent_growth says which, growth_pct is the step. */
+        file["is_percent_growth"] = r.IsPercentGrowth;
+        file["growth_pct"] = r.GrowthPct;
         file["max_size_mb"] = r.MaxSizeMb;
         file["volume_mount_point"] = r.VolumeMountPoint;
         file["volume_total_mb"] = r.VolumeTotalMb;

@@ -126,6 +126,23 @@ namespace PerformanceMonitor.Common
         /// <summary>Process status (e.g. <c>suspended</c>).</summary>
         public string Status { get; init; } = string.Empty;
 
+        /// <summary>
+        /// Every execution-stack frame that carries a usable <c>sqlhandle</c>, in stack order (#6205), each with its
+        /// own statement range, procedure and line: the keys that locate this process's statements in the plan cache.
+        /// The first frame of the stack is the statement that was running; the frames after it are its callers. A
+        /// frame whose handle is all zeros (dynamic SQL, system contexts: no plan can be recovered from it) is left
+        /// out, but still counts in <see cref="DeadlockStackFrame.Position"/>. Empty when no frame has a usable handle.
+        /// </summary>
+        public IReadOnlyList<DeadlockStackFrame> StackFrames { get; init; } = Array.Empty<DeadlockStackFrame>();
+
+        /// <summary>
+        /// The <c>sqlhandle</c> (with <c>stmtstart</c>/<c>stmtend</c>) a deadlock graph can put on the
+        /// <c>&lt;process&gt;</c> element itself (#6205), which the plan lookups read besides the stack. <c>null</c> when
+        /// there is none, when it is all zeros, or when a frame in <see cref="StackFrames"/> already lists the same
+        /// handle with the same offsets.
+        /// </summary>
+        public DeadlockProcessHandle? ProcessHandle { get; init; }
+
         /// <summary>Layout position (ring placement), assigned by <see cref="DeadlockGraphLayout"/>.</summary>
         public double X { get; set; }
         public double Y { get; set; }
@@ -138,6 +155,37 @@ namespace PerformanceMonitor.Common
     /// cycles form. For a parallel <c>exchangeEvent</c> the waiter and owner can be the same process — a
     /// self-edge the layout draws as a small self-loop.
     /// </summary>
+    /// <summary>
+    /// One execution-stack frame of a deadlock process that carries a usable <c>sqlhandle</c> (#6205). A handle
+    /// covers a whole batch or procedure, so it names the statement only together with its <c>stmtstart</c> and
+    /// <c>stmtend</c> byte offsets (a missing start reads as 0 and a missing end as -1, "to the end of the batch",
+    /// as sp_HumanEventsBlockViewer reads them). <see cref="Position"/> is the 1-based place in the whole stack:
+    /// 1 is the statement that was running, higher numbers are its callers.
+    /// </summary>
+    public sealed record DeadlockStackFrame(
+        int Position, string SqlHandle, int StmtStart, int StmtEnd, string ProcName = "", int? Line = null)
+    {
+        /// <summary>The one-line text the Properties panel shows and copies for this frame.</summary>
+        public string Describe()
+        {
+            var text = $"{Position} ({(Position == 1 ? "running" : "caller")})  {SqlHandle}  stmtstart {StmtStart}, stmtend {StmtEnd}";
+            if (!string.IsNullOrEmpty(ProcName)) text += "  " + ProcName;
+            if (Line != null) text += " line " + Line;
+            return text;
+        }
+    }
+
+    /// <summary>
+    /// The sql_handle a deadlock graph puts on the <c>&lt;process&gt;</c> element itself (#6205), with that element's
+    /// statement range (a missing start reads as 0 and a missing end as -1). It is the process's own handle, not a
+    /// numbered execution-stack frame.
+    /// </summary>
+    public sealed record DeadlockProcessHandle(string SqlHandle, int StmtStart, int StmtEnd)
+    {
+        /// <summary>The one-line text the Properties panel shows and copies for this handle.</summary>
+        public string Describe() => $"process (own handle)  {SqlHandle}  stmtstart {StmtStart}, stmtend {StmtEnd}";
+    }
+
     public sealed class DeadlockWaitEdge
     {
         public string WaiterProcessId { get; init; } = string.Empty;

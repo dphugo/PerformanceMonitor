@@ -62,6 +62,7 @@ public sealed class DarlingDeployStaleFileTests
     private static readonly string[] s_functions =
     [
         "Test-DarlingRollbackBackupName",
+        "Get-DarlingServiceWrittenNames",
         "Format-DarlingBytes",
         "ConvertTo-DarlingManifestPath",
         "Join-DarlingInstallPath",
@@ -618,7 +619,8 @@ public sealed class DarlingDeployStaleFileTests
     {
         var script = InstallScript;
 
-        Assert.Contains("Get-ChildItem -LiteralPath $root -Filter 'darling.json.bak-*' -File -ErrorAction SilentlyContinue", script, StringComparison.Ordinal);
+        Assert.Contains("Get-ChildItem -LiteralPath $root -Force -File -ErrorAction SilentlyContinue", script, StringComparison.Ordinal);
+        Assert.Contains("Get-DarlingServiceWrittenRootFiles $root -BackupsOnly", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Get-ChildItem -Path $root", script, StringComparison.Ordinal);
     }
 
@@ -1068,22 +1070,7 @@ public sealed class DarlingDeployStaleFileTests
         File.WriteAllText(path, script);
         try
         {
-            var startInfo = new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -File \"{path}\"")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-
-            /* A parent pwsh (the CI runner's default shell) leaves its own module directories in PSModulePath,
-               and Windows PowerShell 5.1 then fails to find Microsoft.PowerShell.Utility cmdlets such as
-               Get-FileHash. The machine-level value is what an operator's own 5.1 session starts with (#4745). */
-            var machineModulePath = Environment.GetEnvironmentVariable("PSModulePath", EnvironmentVariableTarget.Machine);
-            if (!string.IsNullOrEmpty(machineModulePath))
-            {
-                startInfo.Environment["PSModulePath"] = machineModulePath;
-            }
+            var startInfo = WindowsPowerShellStartInfo.ForScript(path);
 
             using var process = Process.Start(startInfo);
             Assert.NotNull(process);

@@ -105,13 +105,17 @@ public sealed class ServerPasswordFromRequestTests : IDisposable
 
     private sealed class UntouchedDefinitions : Core.IServerDefinitions
     {
+        public Task<List<Core.RegisteredTarget>> LoadTargetsAsync(CancellationToken cancellationToken) => Task.FromResult(new List<Core.RegisteredTarget>());
+
+        public Task<int?> ScopedAgentRouteAsync(int serverId, CancellationToken cancellationToken) => Task.FromResult<int?>(null);
+
         public Task<List<string>> LoadStorageKeysAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("the store must not be opened for a refused request");
 
         public Task<string?> ReadStorageKeyAsync(int serverId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("the store must not be read for a refused request");
 
-        public Task<int> InsertAsync(Core.ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, CancellationToken cancellationToken) =>
+        public Task<int> InsertAsync(Core.ParsedServerEntry entry, string? encryptedPassword, string? actualStorageKey, Core.HeldCheck? heldCheck, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("nothing may be written for a refused request");
     }
 
@@ -214,7 +218,7 @@ public sealed class ServerPasswordFromRequestTests : IDisposable
         public Task<List<string>> LoadOtherStorageKeysAsync(int serverId, CancellationToken cancellationToken) => Task.FromResult(new List<string>());
 
         public Task<Core.ServerEditWrite> WriteAsync(
-            int serverId, DateTime expectedModifiedAt, IReadOnlyList<Core.EditColumnValue> sets, string? newStorageKey, string? actualStorageKey, CancellationToken cancellationToken)
+            int serverId, DateTime expectedModifiedAt, IReadOnlyList<Core.EditColumnValue> sets, string? newStorageKey, string? actualStorageKey, Core.HeldCheck? heldCheck, CancellationToken cancellationToken)
         {
             Writes++;
             if (sets.FirstOrDefault(s => s.Column == "encrypted_password") is { } secret)
@@ -297,7 +301,7 @@ public sealed class ServerPasswordFromRequestTests : IDisposable
         var row = store.Row;
         var binding = PasswordBinding.ForServer(ServerConnectionIdentity.FromStoredColumns(
             row.Host, row.Port, row.Engine, row.Database, row.ReadOnlyIntent, row.Auth, row.Username, row.EncryptMode,
-            row.TrustServerCertificate, row.MultiSubnetFailover));
+            row.TrustServerCertificate, row.MultiSubnetFailover, null));
         Assert.Equal(Typed, TestKeyRings.Healthy.Open(store.StoredSecret!, binding));
         Assert.Equal(Typed, probe.Last!.Password);
         Assert.DoesNotContain(Typed, answer, StringComparison.Ordinal);
@@ -433,7 +437,7 @@ public sealed class ServerPasswordFromRequestTests : IDisposable
 
     /// <summary>The stored row the tested server (<see cref="Tested"/>) matches on every setting.</summary>
     private static ServerConnectionIdentity StoredRow(string host, int port = 0) =>
-        ServerConnectionIdentity.FromStoredColumns(host, port, "sqlserver", null, false, "sql", "monitor", "Mandatory", false, false);
+        ServerConnectionIdentity.FromStoredColumns(host, port, "sqlserver", null, false, "sql", "monitor", "Mandatory", false, false, null);
 
     private sealed class StoredAddresses
     {

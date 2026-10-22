@@ -7,6 +7,7 @@
  */
 
 using System;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -32,14 +33,14 @@ SELECT /* PerformanceMonitorLite */
     max_workers_count = osi.max_workers_count,
     scheduler_count = osi.scheduler_count,
     cpu_count = osi.cpu_count,
-    total_runnable_tasks_count = SUM(dos.runnable_tasks_count),
-    total_work_queue_count = SUM(dos.work_queue_count),
-    total_current_workers_count = SUM(dos.current_workers_count),
-    avg_runnable_tasks_count = CONVERT(decimal(38,2), AVG(CONVERT(decimal(38,2), dos.runnable_tasks_count))),
-    total_active_request_count = MAX(wg.active_request_count),
-    total_queued_request_count = MAX(wg.queued_request_count),
-    total_blocked_task_count = MAX(wg.blocked_task_count),
-    total_active_parallel_thread_count = MAX(wg.active_parallel_thread_count),
+    total_runnable_tasks_count = sched.total_runnable_tasks_count,
+    total_work_queue_count = sched.total_work_queue_count,
+    total_current_workers_count = sched.total_current_workers_count,
+    avg_runnable_tasks_count = sched.avg_runnable_tasks_count,
+    total_active_request_count = wg.active_request_count,
+    total_queued_request_count = wg.queued_request_count,
+    total_blocked_task_count = wg.blocked_task_count,
+    total_active_parallel_thread_count = wg.active_parallel_thread_count,
     runnable_request_count = r.runnable_count,
     total_request_count = CONVERT(integer, r.total_count),
     runnable_percent = r.runnable_pct,
@@ -48,7 +49,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN SUM(dos.current_workers_count) >= (osi.max_workers_count * 0.90)
+                WHEN sched.total_current_workers_count >= (osi.max_workers_count * 0.90)
                 THEN 1
                 ELSE 0
             END
@@ -58,7 +59,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN SUM(dos.runnable_tasks_count) >= osi.cpu_count
+                WHEN sched.total_runnable_tasks_count >= osi.cpu_count
                 THEN 1
                 ELSE 0
             END
@@ -68,7 +69,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN MAX(wg.blocked_task_count) >= 10
+                WHEN wg.blocked_task_count >= 10
                 THEN 1
                 ELSE 0
             END
@@ -78,7 +79,7 @@ SELECT /* PerformanceMonitorLite */
         (
             bit,
             CASE
-                WHEN MAX(wg.queued_request_count) >= osi.cpu_count
+                WHEN wg.queued_request_count >= osi.cpu_count
                 THEN 1
                 ELSE 0
             END
@@ -98,23 +99,31 @@ SELECT /* PerformanceMonitorLite */
         ),
     total_node_count = CONVERT(integer, nodes.total_nodes),
     nodes_online_count = nodes.online_nodes,
-    offline_cpu_count = nodes.offline_cpus,
+    offline_cpu_count = CONVERT(integer, offline_cpus.offline_cpu_count),
     offline_cpu_warning =
         CONVERT
         (
             bit,
             CASE
-                WHEN
-                (
-                    SELECT COUNT_BIG(*)
-                    FROM sys.dm_os_schedulers AS dos_offline
-                    WHERE dos_offline.is_online = 0
-                ) > 0
+                WHEN offline_cpus.offline_cpu_count > 0
                 THEN 1
                 ELSE 0
             END
         )
-FROM sys.dm_os_schedulers AS dos
+FROM
+(
+    /*The scheduler aggregate stands alone with no grouping, so it is exactly one row whatever the plan does with the
+      single-row pieces cross joined below. It used to share one grouping with them (#5710): a piece read again per
+      scheduler row could return a moving value, and the schedulers fell into several groups, one stored row each.*/
+    SELECT
+        total_runnable_tasks_count = SUM(dos.runnable_tasks_count),
+        total_work_queue_count = SUM(dos.work_queue_count),
+        total_current_workers_count = SUM(dos.current_workers_count),
+        avg_runnable_tasks_count = CONVERT(decimal(38,2), AVG(CONVERT(decimal(38,2), dos.runnable_tasks_count)))
+    FROM sys.dm_os_schedulers AS dos
+    WHERE dos.status = N'VISIBLE ONLINE'
+    HAVING COUNT_BIG(*) > 0 /*no VISIBLE ONLINE scheduler writes no row (as before #5710), not one all-NULL row*/
+) AS sched
 CROSS JOIN sys.dm_os_sys_info AS osi
 CROSS JOIN sys.dm_os_sys_memory AS osm
 CROSS JOIN
@@ -125,23 +134,22 @@ CROSS JOIN
             SUM
             (
                 CASE
-                    WHEN n.node_state_desc = N'ONLINE'
-                    THEN 1
-                    ELSE 0
-                END
-            ),
-        offline_cpus =
-            SUM
-            (
-                CASE
-                    WHEN n.node_state_desc <> N'ONLINE'
+                    WHEN n.node_state_desc NOT LIKE N'OFFLINE%'
                     THEN 1
                     ELSE 0
                 END
             )
     FROM sys.dm_os_nodes AS n
-    WHERE n.node_id <> 32767 /*Exclude DAC node*/
+    WHERE n.node_state_desc NOT LIKE N'%DAC%' /*Exclude the DAC node by its state, not by node_id (#5656)*/
 ) AS nodes
+CROSS JOIN
+(
+    /*Offline CPUs are user schedulers SQL Server has taken offline; the warning flag reads this same count*/
+    SELECT
+        offline_cpu_count = COUNT_BIG(*)
+    FROM sys.dm_os_schedulers AS dos_offline
+    WHERE dos_offline.status = N'VISIBLE OFFLINE'
+) AS offline_cpus
 CROSS JOIN
 (
     SELECT
@@ -185,20 +193,6 @@ OUTER APPLY
     AND   der.session_id <> @@SPID
     AND   der.status NOT IN (N'background', N'sleeping')
 ) AS r
-WHERE dos.status = N'VISIBLE ONLINE'
-GROUP BY
-    osi.max_workers_count,
-    osi.scheduler_count,
-    osi.cpu_count,
-    r.runnable_count,
-    r.total_count,
-    r.runnable_pct,
-    osm.total_physical_memory_kb,
-    osm.available_physical_memory_kb,
-    osm.system_memory_state_desc,
-    nodes.total_nodes,
-    nodes.online_nodes,
-    nodes.offline_cpus
 OPTION(RECOMPILE);";
 
     [Fact]
@@ -210,6 +204,104 @@ OPTION(RECOMPILE);";
         Assert.Null(CpuSchedulerStatsCollector.Instance.WatermarkColumn);
         Assert.Equal("cpu_scheduler_stats", CpuSchedulerStatsCollector.Instance.Name);
         Assert.Equal("cpu_scheduler_stats", CpuSchedulerStatsCollector.Instance.TargetTable);
+    }
+
+    /* #5710: a collection must be ONE row. The scheduler aggregate used to share one GROUP BY with columns of the
+       single-row DMV pieces (sys.dm_os_sys_memory, sys.dm_exec_requests, ...). The plan read some of those pieces
+       once per scheduler row, so a value that moved between reads split the schedulers into several groups and
+       the collector stored several rows per collection. Now the aggregate is its own derived table with no GROUP
+       BY (an aggregate without GROUP BY always returns exactly one row), cross joined only to single-row pieces,
+       and the outer query has no GROUP BY at all. */
+    [Fact]
+    public void Query_AggregatesSchedulersInADerivedTableWithNoGroupBy_SoACollectionIsOneRow()
+    {
+        var sql = CpuSchedulerStatsCollector.Instance.BuildQuery(CollectorTestContext.Make(new RecordingCollectorDeltaCalculator())).Text;
+
+        /* No GROUP BY anywhere: the only aggregates are scalar ones (the scheduler derived table, node, offline-CPU,
+           workload-group and request pieces), each of which returns exactly one row by itself. */
+        Assert.DoesNotContain("GROUP BY", sql);
+
+        /* The scheduler aggregate is one derived table, aliased and read by the select list under its own name,
+           and the VISIBLE ONLINE filter sits inside it (the outer query has no WHERE of its own). */
+        var derivedStart = sql.IndexOf("FROM\r\n(", StringComparison.Ordinal);
+        if (derivedStart < 0)
+        {
+            derivedStart = sql.IndexOf("FROM\n(", StringComparison.Ordinal);
+        }
+
+        Assert.True(derivedStart > 0, "the FROM clause must open with the scheduler derived table");
+        var derivedEnd = sql.IndexOf(") AS sched", derivedStart, StringComparison.Ordinal);
+        Assert.True(derivedEnd > derivedStart, "the scheduler derived table must be aliased sched");
+        var derived = sql[derivedStart..derivedEnd];
+        Assert.Contains("SUM(dos.runnable_tasks_count)", derived);
+        Assert.Contains("AVG(CONVERT(decimal(38,2), dos.runnable_tasks_count))", derived);
+        Assert.Contains("FROM sys.dm_os_schedulers AS dos", derived);
+        Assert.Contains("WHERE dos.status = N'VISIBLE ONLINE'", derived);
+
+        /* #5712 review: a scalar aggregate over zero rows is ONE all-NULL row, and ReadAsync's GetInt32(3) throws on it.
+           HAVING COUNT_BIG(*) > 0 (still no GROUP BY) makes an instance with no VISIBLE ONLINE scheduler write no row,
+           as before the derived table. */
+        Assert.Contains("HAVING COUNT_BIG(*) > 0", derived);
+        Assert.True(
+            derived.IndexOf("WHERE dos.status", StringComparison.Ordinal) < derived.IndexOf("HAVING COUNT_BIG(*) > 0", StringComparison.Ordinal),
+            "HAVING follows the VISIBLE ONLINE filter inside the derived table");
+
+        /* Outside the derived table sys.dm_os_schedulers is read only for the offline-CPU count, and no column
+           of a single-row piece is aggregated again. */
+        var outside = sql[..derivedStart] + sql[derivedEnd..];
+        Assert.DoesNotContain("dos.", outside.Replace("dos_offline.", string.Empty));
+        Assert.DoesNotContain("SUM(dos", outside);
+        Assert.DoesNotContain("MAX(wg.", sql);
+        Assert.DoesNotContain("\nWHERE dos.status", sql);
+        Assert.Contains("total_runnable_tasks_count = sched.total_runnable_tasks_count", sql);
+        Assert.Contains("avg_runnable_tasks_count = sched.avg_runnable_tasks_count", sql);
+    }
+
+    /* #5656: the shared collector SQL and the Dashboard's install/17 script both counted the DAC node as
+       an offline node (it was filtered by node_id, but the DAC node's id is 64), matched "online" with an
+       exact N'ONLINE' (so ONLINE DAC, IDLE and the combined states read as offline), and reported nodes as
+       "offline CPUs" while the warning flag counted schedulers. Pin both copies so they cannot drift back. */
+    [Theory]
+    [InlineData("collector")]
+    [InlineData("install")]
+    public void NodeAndOfflineCpuCounts_UseStateRulesAndOneSchedulerPredicate(string copy)
+    {
+        var sql = copy == "collector"
+            ? CpuSchedulerStatsCollector.Instance.BuildQuery(CollectorTestContext.Make(new RecordingCollectorDeltaCalculator())).Text
+            : CollectionSelect(File.ReadAllText(FindRepoFile(Path.Combine("install", "17_collect_cpu_scheduler_stats.sql"))));
+
+        /* The DAC node is left out by its state, never by a node_id; "online" is every state except OFFLINE. */
+        Assert.Contains("n.node_state_desc NOT LIKE N'%DAC%'", sql);
+        Assert.Contains("n.node_state_desc NOT LIKE N'OFFLINE%'", sql);
+        Assert.DoesNotContain("32767", sql);
+        Assert.DoesNotContain("node_id <>", sql);
+        Assert.DoesNotContain("node_state_desc = N'ONLINE'", sql);
+        Assert.DoesNotContain("node_state_desc <> N'ONLINE'", sql);
+
+        /* Offline CPUs are counted from the user schedulers SQL Server took offline, once, and the warning
+           flag reads that same count (no second is_online = 0 subquery that can disagree with it). */
+        Assert.Equal(1, CountOccurrences(sql, "= N'VISIBLE OFFLINE'"));
+        Assert.DoesNotContain("is_online", sql);
+        Assert.Contains("offline_cpu_count = CONVERT(integer, offline_cpus.offline_cpu_count)", sql);
+        Assert.Contains("WHEN offline_cpus.offline_cpu_count > 0", sql);
+        Assert.DoesNotContain("nodes.offline_cpus", sql);
+    }
+
+    [Fact]
+    public void InstallScript_DebugMessage_NamesOfflineCpusNotNodes()
+    {
+        var sql = File.ReadAllText(FindRepoFile(Path.Combine("install", "17_collect_cpu_scheduler_stats.sql")));
+        Assert.Contains("Offline CPUs detected: %d offline CPUs", sql);
+        Assert.DoesNotContain("offline nodes", sql);
+    }
+
+    /* The collection_log row is what an operator reads back after the fact, and the count no longer counts nodes. */
+    [Fact]
+    public void InstallScript_CollectionLogText_NamesOfflineCpusNotNodes()
+    {
+        var sql = File.ReadAllText(FindRepoFile(Path.Combine("install", "17_collect_cpu_scheduler_stats.sql")));
+        Assert.Contains("N'CRITICAL: Offline CPUs detected'", sql);
+        Assert.DoesNotContain("in NUMA nodes", sql);
     }
 
     [Fact]
@@ -326,5 +418,46 @@ OPTION(RECOMPILE);";
 
         /* Point-in-time snapshot — no delta calculator interaction at all. */
         Assert.Empty(deltas.Calls);
+    }
+
+    /* The install proc's collection SELECT, from its first select-list column to its OPTION(RECOMPILE). The
+       whole-file DoesNotContain checks (32767, is_online) belong to this slice, not to the rest of the proc. Both
+       anchors are asserted, so a rename cannot leave an empty slice that passes every DoesNotContain. */
+    private static string CollectionSelect(string installScript)
+    {
+        const string startAnchor = "max_workers_count = osi.max_workers_count";
+        const string endAnchor = "OPTION(RECOMPILE);";
+        var start = installScript.IndexOf(startAnchor, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"install/17 no longer contains the collection SELECT start anchor: {startAnchor}");
+        var end = installScript.IndexOf(endAnchor, start, StringComparison.Ordinal);
+        Assert.True(end > start, $"install/17 no longer contains {endAnchor} after the collection SELECT start");
+        return installScript.Substring(start, end + endAnchor.Length - start);
+    }
+
+    private static int CountOccurrences(string text, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+        return count;
+    }
+
+    private static string FindRepoFile(string relativePath)
+    {
+        var dir = AppContext.BaseDirectory;
+        for (var i = 0; i < 8 && dir is not null; i++)
+        {
+            var candidate = Path.Combine(dir, relativePath);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+            dir = Path.GetDirectoryName(dir);
+        }
+        throw new FileNotFoundException($"Could not locate {relativePath} walking up from {AppContext.BaseDirectory}");
     }
 }

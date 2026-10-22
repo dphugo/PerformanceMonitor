@@ -79,9 +79,11 @@ public sealed class ViewerOverviewSqlTests
         Assert.Contains("total_current_workers_count", sql, StringComparison.Ordinal);
         Assert.Contains("total_runnable_tasks_count", sql, StringComparison.Ordinal);
         Assert.Contains("total_work_queue_count", sql, StringComparison.Ordinal);
-        Assert.Contains("WHERE server_id = $1", sql, StringComparison.Ordinal);
-        Assert.Contains("ORDER BY collection_time DESC", sql, StringComparison.Ordinal);
-        Assert.Contains("LIMIT 1", sql, StringComparison.Ordinal);
+        Assert.Contains("server_id = $1", sql, StringComparison.Ordinal);
+        /* #5710: the newest collection's rows are combined (summed workers and runnable tasks), not one row picked. */
+        Assert.Contains("MAX(collection_time)", sql, StringComparison.Ordinal);
+        Assert.Contains("GROUP BY server_id, collection_time", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("LIMIT 1", sql, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -99,7 +101,9 @@ public sealed class ViewerOverviewSqlTests
         Assert.Contains("server_id = $1", sql, StringComparison.Ordinal);
         /* #3895: every WINDOWED read carries the partition-column floor, and the two "ever" reads none — a
            floor would change what "newest event ever" answers. */
-        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(sql, @"event_time >= \$2 AND collection_time >= \$3\)").Count);
+        /* #5644 W1: the two windowed reads are now the two wait CTEs' sources (count and worst wait both come off
+           the CTEs), each closed by the CTE's subquery parenthesis. */
+        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(sql, @"event_time >= \$2 AND collection_time >= \$3\)").Count);
         Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(sql, @"\(SELECT MAX\(event_time\)\s+FROM \w+\s+WHERE server_id = \$1\)").Count);
     }
 

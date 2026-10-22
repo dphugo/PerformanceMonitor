@@ -91,7 +91,8 @@ public sealed class DuckDbAlertHistoryStore : IAlertHistoryStore
 INSERT INTO config_alert_log (alert_time, server_id, server_name, metric_name, current_value, threshold_value, alert_sent, notification_type, send_error, muted, detail_text, context_json)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
 
-            command.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = DateTime.UtcNow });
+            /* #5632: a caller that stamped the row's time (AlertHistoryRecord.AlertTimeUtc) gets that instant, as Darling's store does. */
+            command.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = record.AlertTimeUtc ?? DateTime.UtcNow });
             command.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = serverId });
             command.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = record.ServerName });
             command.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = record.MetricName });
@@ -338,6 +339,81 @@ AND   metric_name = $2"
             AppLogger.Error("AnalysisNotify", $"Could not read persisted analysis cooldown: {ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// #5715 part B: the tier of the newest fire row inside the window, null when a resolution row is as new or newer.
+    /// See <see cref="IAlertHistoryStore.GetLastFiredTierAsync"/>. A failed read THROWS (no catch here): the engine
+    /// logs it and retries on the next sweep, and "could not read" must not look like "no history".
+    /// </summary>
+    public async Task<AlertSeverityLevel?> GetLastFiredTierAsync(
+        string serverId, string metricName, string resolutionMetricName, DateTime sinceUtc, bool countMuted = true,
+        AlertSeverityLevel? tierWhenRowCarriesNone = null, DateTime? untilUtc = null)
+    {
+        /* Same identity scope as GetLastEmailSentUtcAsync (#3456). */
+        var sid = AlertHistoryServerIdentity.SeedScope(serverId);
+        if (sid is null) return null;
+
+        var duckDb = _duckDb;
+        if (duckDb == null)
+        {
+            var dbPath = App.DatabasePath;
+            if (string.IsNullOrEmpty(dbPath)) return null;
+            duckDb = new DuckDbInitializer(dbPath);
+        }
+
+        using var readLock = duckDb.AcquireReadLock();
+        using var connection = duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        /* v_config_alert_log = live UNION ALL archive (#4887), so a reset cannot hide a fire or a resolution. */
+        using var fireCommand = connection.CreateCommand();
+        fireCommand.CommandText = @"
+SELECT alert_time, context_json
+FROM v_config_alert_log
+WHERE server_id = $1
+AND   metric_name = $2
+AND   alert_time >= $3"
+            + (untilUtc is null ? "" : "\nAND   alert_time < $4")
+            + AlertHistoryEscalationSeed.KeepUnlessEveryChannelFailedFilter
+            + (countMuted ? "" : AlertHistoryEscalationSeed.ExcludeMutedFilter)
+            + "\nORDER BY alert_time DESC\nLIMIT 1";
+        fireCommand.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = sid.Value });
+        fireCommand.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = metricName });
+        fireCommand.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = AlertHistoryEscalationSeed.TruncateToMicroseconds(sinceUtc) });
+        if (untilUtc is { } until)
+        {
+            /* #5715 round 1: exclusive, microsecond like the column; a row at or after the engine start is this process's own. */
+            fireCommand.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = AlertHistoryEscalationSeed.TruncateToMicroseconds(until) });
+        }
+
+        DateTime? fireAt = null;
+        string? contextJson = null;
+        using (var reader = await fireCommand.ExecuteReaderAsync())
+        {
+            if (await reader.ReadAsync())
+            {
+                fireAt = DateTime.SpecifyKind(reader.GetDateTime(0), DateTimeKind.Utc);
+                contextJson = reader.IsDBNull(1) ? null : reader.GetString(1);
+            }
+        }
+
+        if (fireAt is null) return null;
+
+        using var resolutionCommand = connection.CreateCommand();
+        resolutionCommand.CommandText = @"
+SELECT MAX(alert_time)
+FROM v_config_alert_log
+WHERE server_id = $1
+AND   metric_name = $2";
+        resolutionCommand.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = sid.Value });
+        resolutionCommand.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = resolutionMetricName });
+        var resolved = await resolutionCommand.ExecuteScalarAsync();
+        DateTime? resolvedAt = resolved == null || resolved == DBNull.Value
+            ? null
+            : DateTime.SpecifyKind(Convert.ToDateTime(resolved), DateTimeKind.Utc);
+
+        return AlertHistoryEscalationSeed.Resolve(fireAt, contextJson, resolvedAt, tierWhenRowCarriesNone);
     }
 
     /// <summary>

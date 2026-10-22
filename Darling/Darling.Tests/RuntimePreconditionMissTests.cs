@@ -34,7 +34,6 @@ namespace Darling.Tests;
 /// only property that matters: that a state somebody can fix is never reported as one they cannot, and the
 /// reverse.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class CollectorRuntimePreconditionTests
 {
     private const string Server = "precondition-probe";
@@ -495,7 +494,7 @@ public sealed class CollectorRuntimePreconditionTests
     {
         var sql = Regex.Replace(DarlingRuntimePrecondition.CollectorLastRunSql, @"\s+", " ");
         Assert.Contains(
-            "( SELECT collection_time FROM collection_log WHERE server_id = $1 ORDER BY collection_time ASC LIMIT 1 ) AS server_first_collected",
+            "( SELECT collection_time FROM collection_log WHERE server_id = $1 AND " + CollectionCycleRow.NotCycleRowSql + " ORDER BY collection_time ASC LIMIT 1 ) AS server_first_collected",
             sql, StringComparison.Ordinal);
         Assert.DoesNotContain("MIN(", sql, StringComparison.OrdinalIgnoreCase);
 
@@ -915,7 +914,7 @@ public sealed class CollectorRuntimePreconditionTests
 /// on an engine that can never have the surface would re-introduce the defect #2511 closed, one layer down.
 /// Nothing in the type system enforces that, and a <c>??</c> chain is trivially reorderable.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class RuntimePreconditionReadWiringTests
 {
     private const string DarlingMcp = "Darling/PerformanceMonitor.Darling.Service/Mcp";
@@ -939,6 +938,8 @@ public sealed class RuntimePreconditionReadWiringTests
     private static readonly Regex QueryStoreCall = new(
         @"RuntimePrecondition\.QueryStoreStatusAsync\(", RegexOptions.Compiled);
 
+    private static readonly Regex CollectorConst = new(@"private const string (\w+) = ""([a-z_0-9]+)"";", RegexOptions.Compiled);
+
     /// <summary>tool name → the collector names its miss path asks the precondition question about.</summary>
     private static SortedDictionary<string, SortedSet<string>> WiredReads(string mcpDirectory)
     {
@@ -949,9 +950,17 @@ public sealed class RuntimePreconditionReadWiringTests
             var source = File.ReadAllText(file).Replace("\r\n", "\n", StringComparison.Ordinal);
             var marks = ToolMark.Matches(source);
 
+            /* A tool class names its collector once, in a private const (#5640: get_client_timeouts reads `Collector`, not a
+               literal). The scan resolves it the way EngineCapabilityReadWiringTests does; reading the identifier itself made
+               'Collector' look like a catalog name that does not exist. */
+            var consts = CollectorConst.Matches(source)
+                .ToDictionary(m => m.Groups[1].Value, m => m.Groups[2].Value, StringComparer.Ordinal);
+
             foreach (Match call in PreconditionCall.Matches(source))
             {
-                var collector = call.Groups[1].Success ? call.Groups[1].Value : call.Groups[2].Value;
+                var collector = call.Groups[1].Success
+                    ? call.Groups[1].Value
+                    : consts.TryGetValue(call.Groups[2].Value, out var resolved) ? resolved : call.Groups[2].Value;
                 var owner = marks.Where(m => m.Index < call.Index).LastOrDefault();
                 Assert.True(owner is not null, $"{Path.GetFileName(file)}: a precondition call sits outside any MCP tool");
 
@@ -1041,6 +1050,21 @@ public sealed class RuntimePreconditionReadWiringTests
                     "the collection_log has no rows under that name, so the branch is dead and silently so");
             }
         }
+    }
+
+    /// <summary>
+    /// #5640: <c>get_client_timeouts</c> asks the precondition question about the attention collector's catalog name in both SKUs. The scan
+    /// resolves the tool class's private const, so this is the name the collection_log really holds rows under, not the identifier.
+    /// </summary>
+    [Theory]
+    [InlineData(DarlingMcp)]
+    [InlineData(LiteMcp)]
+    public void GetClientTimeouts_AsksThePreconditionQuestionAboutTheAttentionCollector(string mcpDirectory)
+    {
+        var wired = WiredReads(mcpDirectory);
+
+        Assert.True(wired.TryGetValue("get_client_timeouts", out var collectors), $"get_client_timeouts has no precondition call under {mcpDirectory}");
+        Assert.Equal(new[] { AttentionCollector.Instance.Name }, collectors!.ToArray());
     }
 
     /// <summary>
@@ -1176,7 +1200,6 @@ public sealed class RuntimePreconditionReadWiringTests
 /// everyone.</para>
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class RuntimePreconditionMissLivePostgresTests
 {
     private const string DeniedServerName = "darling-precondition-denied";

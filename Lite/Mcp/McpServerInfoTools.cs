@@ -9,6 +9,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpServerInfoTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_server_properties"), Description("Gets SQL Server instance properties: edition, version, CPU count, memory, socket/core topology, HADR, clustering, and the clock (utc_offset_minutes, time_zone_id). LATEST IS A TIME: the newest snapshot, not a window; captured_at is when it was collected, and on a stalled collector it is the only sign of staleness. time_zone_id is CURRENT_TIMEZONE_ID() (SQL Server 2022+/Azure SQL only); null means a pre-2022 engine, so only the offset in force at captured_at is known, and an instant across a DST transition from it can read an hour off. <<GUIDE>> Gets SQL Server instance properties: edition, version, CPU count, physical memory, socket/core topology, HADR status, clustering, and the server's clock: utc_offset_minutes is the UTC offset in force when the snapshot was collected, and time_zone_id is the engine's own time-zone name (CURRENT_TIMEZONE_ID(), SQL Server 2022+ and Azure SQL only) - a null time_zone_id means a pre-2022 engine, where only the offset is known and any instant on the far side of a DST transition from the snapshot is placed an hour off by that offset. Use for capacity planning and edition-aware recommendations. LATEST IS A TIME: this reads the newest properties snapshot, not a window, and captured_at is the instant it was collected - a core count or memory figure here is what the server reported AT that stamp, and on a server whose collector has stalled the stamp is the only thing that says how stale it is. ON AN AZURE SQL DATABASE (engine_edition 5) the host's hardware is not the database's allocation: hyperthread_ratio, socket_count, cores_per_socket and physical_memory_mb come back null with a hardware_note, cpu_count is the database's own scheduler count (it can be higher than its vCores), and service_objective with vcore_count says what the database is given.")]
     public static async Task<string> GetServerProperties(
         LocalDataService dataService,
@@ -22,10 +23,10 @@ public sealed class McpServerInfoTools
         {
             var row = await dataService.GetLatestServerPropertiesAsync(resolved.ServerId);
             if (row == null)
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "server_properties")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "server_properties")
                     ?? McpHelpers.Status("unavailable", "No server properties available. The properties collector may not have run yet.");
 
-            return ServerPropertiesPayload(resolved.ServerName, row);
+            return ServerPropertiesPayload(resolved.DisplayName, row);
         }
         catch (Exception ex)
         {
@@ -84,6 +85,7 @@ public sealed class McpServerInfoTools
         return ServerHardwareScope.ScopeServerPropertiesPayload(scoped, row.VcoreCount).ToJsonString(McpHelpers.JsonOptions);
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_database_sizes"), Description("Gets database file sizes, space usage, and volume free space. Shows each database file with total size, used space, auto-growth settings, and the underlying volume's capacity. Use for capacity planning and identifying space pressure. LATEST IS A TIME: this reads the newest size snapshot, not a window, and captured_at is the instant it was collected - a volume's free space here is what it was AT that stamp, and a file that grew since is not reflected until the next collection.")]
     public static async Task<string> GetDatabaseSizes(
         LocalDataService dataService,
@@ -106,19 +108,20 @@ public sealed class McpServerInfoTools
                    collection: the probe is the same newest-snapshot read, unfiltered (Darling's twin words it the same). */
                 if (names != null && await dataService.GetLatestDatabaseSizeStatsAsync(resolved.ServerId) is { Count: > 0 } snapshot)
                     return McpHelpers.StatusForDatabase("empty",
-                        $"No database size rows for {McpDatabaseSelection.Scope(names)} on {resolved.ServerName} in the snapshot captured at "
+                        $"No database size rows for {McpDatabaseSelection.Scope(names)} on {resolved.DisplayName} in the snapshot captured at "
                         + $"{snapshot[0].CollectionTime:o}. Check the database name against the server's unfiltered get_database_sizes: the filter "
                         + "matches exactly, and an excluded or renamed database looks identical to one with no files.",
                         McpDatabaseSelection.Describe(names));
 
                 /* #5244: every answer shape says which database it was limited to (null for every database). */
                 return McpHelpers.WithDatabase(
-                           await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "database_size_stats"),
+                           await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "database_size_stats"),
                            McpDatabaseSelection.Describe(names))
                     ?? McpHelpers.StatusForDatabase("unavailable", "No database size data available. The size collector may not have run yet.", McpDatabaseSelection.Describe(names));
             }
 
-            return DatabaseSizesPayload(resolved.ServerName, rows, McpDatabaseSelection.Describe(names));
+            var serverIsHyperscale = await McpEngineCapability.IsHyperscaleAsync(dataService, resolved.ServerId);
+            return DatabaseSizesPayload(resolved.DisplayName, rows, McpDatabaseSelection.Describe(names), serverIsHyperscale);
         }
         catch (Exception ex)
         {
@@ -136,8 +139,12 @@ public sealed class McpServerInfoTools
     /// and the top-level note says it too. No other row has the key. Darling's twin gives the same words and shape.
     /// <paramref name="databaseEcho"/> (#5244) is the <c>database_name</c> echo (the name, or null for every database); the key is always written.
     /// </summary>
-    internal static string DatabaseSizesPayload(string serverName, IReadOnlyList<DatabaseSizeStatsRow> rows, string? databaseEcho = null)
+    internal static string DatabaseSizesPayload(string serverName, IReadOnlyList<DatabaseSizeStatsRow> rows, string? databaseEcho = null, bool serverIsHyperscale = false)
     {
+        /* #6178: a data file's max size is a per-file cap on Hyperscale. The stored server properties say so when the read has
+           them; a log file with no size says so in the rows (and is the fallback when the properties are missing). */
+        var hyperscaleDatabases = HyperscaleLogSize.HyperscaleDatabases(
+            rows.Select(r => (r.DatabaseName, (string?)r.FileTypeDesc, r.TotalSizeMb is not null)), serverIsHyperscale);
         var databases = rows
             .GroupBy(r => r.DatabaseName)
             .Select(g =>
@@ -153,7 +160,8 @@ public sealed class McpServerInfoTools
                 };
                 if (g.Any(r => r.IsAzureSiblingRow))
                     database[AzureSiblingDatabaseSize.RowNoteKey] = AzureSiblingDatabaseSize.LogNote;
-                database["files"] = g.Select(FilePayload).ToList();
+                var hyperscale = hyperscaleDatabases.Contains(g.Key);
+                database["files"] = g.Select(r => FilePayload(r, hyperscale)).ToList();
                 return database;
             })
             .ToList();
@@ -163,7 +171,9 @@ public sealed class McpServerInfoTools
            the two, so every other server's shape is unchanged. */
         var note = AzureSiblingDatabaseSize.DatabaseSizesNote(
             hasLogServiceFile: rows.Any(r => r.TotalSizeMb is null),
-            hasSiblingRow: rows.Any(r => r.IsAzureSiblingRow));
+            hasSiblingRow: rows.Any(r => r.IsAzureSiblingRow),
+            hasHyperscaleDataFileCap: rows.Any(r => !r.IsAzureSiblingRow
+                && HyperscaleLogSize.IsDataFileWithFileCap(r.FileTypeDesc, hyperscaleDatabases.Contains(r.DatabaseName), r.MaxSizeMb is > 0)));
         if (note is not null)
         {
             return JsonSerializer.Serialize(new
@@ -191,7 +201,7 @@ public sealed class McpServerInfoTools
 
     /// <summary>One file of a database in the payload. The note key is added to the one row another database on an
     /// Azure SQL Database server gets, and to no other.</summary>
-    private static Dictionary<string, object?> FilePayload(DatabaseSizeStatsRow r)
+    private static Dictionary<string, object?> FilePayload(DatabaseSizeStatsRow r, bool hyperscaleDatabase)
     {
         var file = new Dictionary<string, object?>
         {
@@ -202,7 +212,12 @@ public sealed class McpServerInfoTools
         };
         if (r.IsAzureSiblingRow)
             file[AzureSiblingDatabaseSize.RowNoteKey] = AzureSiblingDatabaseSize.LogNote;
+        else if (HyperscaleLogSize.IsDataFileWithFileCap(r.FileTypeDesc, hyperscaleDatabase, r.MaxSizeMb is > 0))
+            file[AzureSiblingDatabaseSize.RowNoteKey] = HyperscaleLogSize.DataFileMaxSizeNote;
         file["auto_growth_mb"] = r.AutoGrowthMb;
+        /* #5633 item 6: a file that grows by a percentage has no fixed MB step; is_percent_growth says which, growth_pct is the step. */
+        file["is_percent_growth"] = r.IsPercentGrowth;
+        file["growth_pct"] = r.GrowthPct;
         file["max_size_mb"] = r.MaxSizeMb;
         file["volume_mount_point"] = r.VolumeMountPoint;
         file["volume_total_mb"] = r.VolumeTotalMb;

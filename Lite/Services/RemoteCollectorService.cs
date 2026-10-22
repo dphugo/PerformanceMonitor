@@ -7,6 +7,7 @@
  */
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
@@ -37,10 +38,11 @@ public class CollectorHealthEntry
 
     /*
      * Set when a collector hits a non-transient permission error
-     * (SQL errors 229 / 297 / 300). The scheduler skips the collector
-     * for the rest of the app session so we don't churn the log with
-     * identical denials every interval. Cleared on app restart — if
-     * permissions get granted later, the next launch retries once.
+     * (SQL errors 229 / 297 / 300), cleared by its next success. While the
+     * same denial repeats the scheduler tries the collector less often
+     * (RefusedCollectorBackoff, #6186) so we don't churn the log with
+     * identical denials every interval, and never stops trying for good:
+     * a permission granted later is picked up at the next try.
      */
     public bool IsPermissionRestricted { get; set; }
 
@@ -228,6 +230,9 @@ public partial class RemoteCollectorService
         /// </summary>
         public string? HostNote { get; set; }
 
+        /// <summary>#6254: this run's <c>collection_log.read_source</c> (where Query Store was read); null when the server has no replica set.</summary>
+        public string? ReadSource { get; set; }
+
         /// <summary>
         /// The labelled counts the DEFINITION measured on the target this cycle (#3161), copied off
         /// <see cref="CollectorContext.Measurements"/> when the run reaches its storage phase. Empty for
@@ -254,6 +259,7 @@ public partial class RemoteCollectorService
         public void ResetNote()
         {
             HostNote = null;
+            ReadSource = null;
             Measurements.Clear();
         }
 
@@ -342,6 +348,7 @@ public partial class RemoteCollectorService
         InstallIdStore? installIdStore = null)
     {
         _duckDb = duckDb;
+        s_queryTagFlushDb = duckDb;
         _serverManager = serverManager;
         _scheduleManager = scheduleManager;
         _logger = logger;
@@ -408,6 +415,7 @@ public partial class RemoteCollectorService
             var keys = _collectorHealth.Keys.Where(k => k.ServerId == serverId).ToList();
             foreach (var key in keys)
                 _collectorHealth.Remove(key);
+            _refusedBackoffs.TryRemove(serverId, out _);
         }
     }
 
@@ -424,6 +432,8 @@ public partial class RemoteCollectorService
                 .ToList();
             foreach (var key in keys)
                 _collectorHealth.Remove(key);
+            foreach (var backedOffServer in _refusedBackoffs.Keys.Where(k => !activeServerIds.Contains(k)).ToList())
+                _refusedBackoffs.TryRemove(backedOffServer, out _);
         }
     }
 
@@ -448,16 +458,22 @@ public partial class RemoteCollectorService
             {
                 entry.LastSuccessTime = DateTime.UtcNow;
                 entry.ConsecutiveErrors = 0;
+                entry.IsPermissionRestricted = false;
+                GetRefusedBackoff(serverId).Record(collectorName, refused: false, null, DateTime.UtcNow, TimeSpan.Zero);
             }
             else if (status == "PERMISSIONS")
             {
                 /* Permission errors are not transient — don't count as failures
                    (which would show FAILING) but don't count as success either.
                    Record the error message so the user can see what's wrong,
-                   and flag the collector so the scheduler stops retrying for
-                   the rest of the app session. */
+                   and flag the collector so the scheduler backs off from it
+                   (#6186): the same denial run after run is tried less often,
+                   up to hourly, and the first success or a different answer
+                   restores the normal interval. */
                 entry.LastErrorMessage = errorMessage;
                 entry.IsPermissionRestricted = true;
+                GetRefusedBackoff(serverId).Record(
+                    collectorName, refused: true, errorMessage, DateTime.UtcNow, RefusalInterval(serverId, collectorName));
             }
             else if (status == "YIELDED")
             {
@@ -481,13 +497,40 @@ public partial class RemoteCollectorService
             {
                 entry.LastErrorMessage = errorMessage;
                 entry.ConsecutiveErrors++;
+                /* A different answer from the server: the refusal streak ends. */
+                GetRefusedBackoff(serverId).Record(collectorName, refused: false, null, DateTime.UtcNow, TimeSpan.Zero);
             }
         }
     }
 
+    /* #6186: per server, the collectors the server keeps refusing with the same answer and when each is tried next. In memory:
+       a restart tries every collector once at its normal interval. */
+    private readonly ConcurrentDictionary<int, RefusedCollectorBackoff> _refusedBackoffs = new();
+
+    internal RefusedCollectorBackoff GetRefusedBackoff(int serverId) =>
+        _refusedBackoffs.GetOrAdd(serverId, static _ => new RefusedCollectorBackoff());
+
+    /// <summary>The collector's normal interval on this server, for its refusal backoff; one minute when the schedule does not say.</summary>
+    private TimeSpan RefusalInterval(int serverId, string collectorName)
+    {
+        var minutes = _scheduleManager is not null && _serverManager is not null
+            ? _scheduleManager.GetFrequencyForStorageServer(_serverManager, serverId, collectorName)
+            : null;
+        return TimeSpan.FromMinutes(CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes(minutes ?? 1));
+    }
+
     /// <summary>
-    /// Returns true if a collector has hit a permission denial this session
-    /// and should be skipped without re-running. See <see cref="CollectorHealthEntry.IsPermissionRestricted"/>.
+    /// #6186: true while a collector the server has refused with the same answer run after run is waiting out its backoff, so
+    /// the sweep skips it without a run or a log row. False after the wait, and after its first success or a different answer.
+    /// </summary>
+    internal bool IsCollectorBackedOff(int serverId, string collectorName) =>
+        _refusedBackoffs.TryGetValue(serverId, out var backoff)
+        && backoff.Streak(collectorName) > RefusedCollectorBackoff.FreeRefusals
+        && backoff.IsBackedOff(collectorName, DateTime.UtcNow, RefusalInterval(serverId, collectorName));
+
+    /// <summary>
+    /// Returns true if a collector's last run was a permission denial, until its next success.
+    /// See <see cref="CollectorHealthEntry.IsPermissionRestricted"/>.
     /// </summary>
     private bool IsCollectorPermissionRestricted(int serverId, string collectorName)
     {
@@ -625,6 +668,9 @@ public partial class RemoteCollectorService
         {
             return;
         }
+
+        /* #5990: the query-tag map, once per round: rebuilt when the rules moved, otherwise extended for new sightings. */
+        await RunQueryTagMapPassAsync(cancellationToken);
 
         await RunPostCollectionCheckpointAsync(LocalDataService.WriteLockBudget, cancellationToken);
     }
@@ -783,11 +829,11 @@ public partial class RemoteCollectorService
                 return;
             }
 
-            // Skip collectors that have already hit a non-transient permission denial
-            // this session. Flag is in-memory — next app start retries once (see #857).
-            if (IsCollectorPermissionRestricted(GetServerId(server), collectorName))
+            // Back off collectors the server keeps refusing with the same permission denial (#857, #6186):
+            // tried less often, not every interval, and never stopped for good.
+            if (IsCollectorBackedOff(GetServerId(server), collectorName))
             {
-                AppLogger.Debug("Collector", $"Skipping collector '{collectorName}' for server '{server.DisplayName}' - permission denied this session");
+                AppLogger.Debug("Collector", $"Skipping collector '{collectorName}' for server '{server.DisplayName}' - permission denied repeatedly, backing off");
                 return;
             }
 
@@ -805,6 +851,10 @@ public partial class RemoteCollectorService
             else if (collectorName == "deadlocks")
             {
                 await EnsureDeadlockXeSessionAsync(server, engineEdition, cancellationToken);
+            }
+            else if (collectorName == "attention")
+            {
+                await EnsureAttentionXeSessionAsync(server, engineEdition, cancellationToken);
             }
 
             rowsCollected = collectorName switch
@@ -833,6 +883,7 @@ public partial class RemoteCollectorService
                 "waiting_tasks" => await CollectWaitingTasksAsync(server, cancellationToken),
                 "dmv_blocking_snapshot" => await CollectDmvBlockingSnapshotAsync(server, cancellationToken),
                 "blocked_process_report" => await CollectBlockedProcessReportsAsync(server, cancellationToken),
+                "attention" => await CollectAttentionAsync(server, cancellationToken),
                 "long_query_completions" => await CollectLongQueryCompletionsAsync(server, cancellationToken),
                 "database_scoped_config" => await CollectDatabaseScopedConfigAsync(server, cancellationToken),
                 "query_store_health" => await CollectQueryStoreHealthAsync(server, cancellationToken),
@@ -1037,7 +1088,7 @@ public partial class RemoteCollectorService
         }
 
         // Log the collection attempt
-        await LogCollectionAsync(GetServerId(server), server.DisplayName, collectorName, startTime, status, errorMessage, rowsCollected, telemetry.SqlMs, telemetry.StorageMs, telemetry.Fanout);
+        await LogCollectionAsync(GetServerId(server), server.DisplayName, collectorName, startTime, status, errorMessage, rowsCollected, telemetry.SqlMs, telemetry.StorageMs, telemetry.Fanout, telemetry.ReadSource);
     }
 
     /// <summary>
@@ -1073,12 +1124,54 @@ public partial class RemoteCollectorService
     /// <summary>
     /// Logs a collection attempt to the collection_log table.
     /// </summary>
-    private async Task LogCollectionAsync(int serverId, string serverName, string collectorName, DateTime startTime, string status, string? errorMessage, int rowsCollected, long sqlMs = 0, long duckDbMs = 0, FanoutCost? fanout = null)
+    private Task LogCollectionAsync(int serverId, string serverName, string collectorName, DateTime startTime, string status, string? errorMessage, int rowsCollected, long sqlMs = 0, long duckDbMs = 0, FanoutCost? fanout = null, string? readSource = null)
+        => WriteCollectionLogRowAsync(serverId, serverName, collectorName, startTime,
+            (int)(DateTime.UtcNow - startTime).TotalMilliseconds, status, errorMessage, rowsCollected,
+            (int)sqlMs, (int)duckDbMs, fanout, readSource);
+
+    /// <summary>
+    /// #5643: records that the collection loop skipped slots, one <c>collection_log</c> row per enabled server, through
+    /// the same writer every collector row uses. The row is not a collector run: <c>collector_name</c> is
+    /// <see cref="CollectionCycleSkip.CollectorName"/>, <c>status</c> is <see cref="CollectionCycleSkip.Status"/>,
+    /// <c>fanout_item_count</c> carries the slots skipped and <c>slowest_item</c> the slowest step. Both timing splits are
+    /// NULL and no rows were collected. A failed write is the writer's own logged failure, and nothing here throws but a
+    /// stop: a cycle that is already late must not be stopped by the record of it.
+    /// </summary>
+    /// <param name="cycleStampUtc">The late cycle's own start: the stamp the wait returned, when the loop noticed the gap. The row is stamped there, not at the previous cycle, so a gap of any length stays inside the 24-hour surfaces for 24 hours after it ends. The message carries the gap's other end.</param>
+    internal async Task LogSkippedCycleAsync(DateTime cycleStampUtc, CycleSkipReport report, CancellationToken cancellationToken)
     {
         try
         {
-            var durationMs = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
+            if (LocalDatabaseIsDown())
+            {
+                return;
+            }
 
+            /* Registered like a collection: the row is a collection_log write, and a reset landing under it would fail it
+               the way #2594's did. */
+            using var collectionScope = await CollectionResetGate.BeginCollectionAsync(cancellationToken);
+
+            foreach (var server in _serverManager.GetEnabledServers())
+            {
+                await WriteCollectionLogRowAsync(GetServerId(server), server.DisplayName, CollectionCycleSkip.CollectorName,
+                    cycleStampUtc, report.CycleMs, CollectionCycleSkip.Status, report.Message, 0, sqlMs: null, duckDbMs: null,
+                    new FanoutCost(report.SlotsSkipped, report.SlowestStep, report.SlowestStepMs));
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn("Collector", $"Could not record the skipped collection slots: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private async Task WriteCollectionLogRowAsync(int serverId, string serverName, string collectorName, DateTime startTime, int durationMs, string status, string? errorMessage, int rowsCollected, int? sqlMs, int? duckDbMs, FanoutCost? fanout, string? readSource = null)
+    {
+        try
+        {
             /* Read lock (#4343): a plain append of a new row with a generated id cannot collide with
                another writer (DuckDbInitializer's own rule), but this runs every collection cycle for
                every collector, so with the sentinel live an unlocked connection can attach to an instance
@@ -1089,8 +1182,8 @@ public partial class RemoteCollectorService
 
             using var command = connection.CreateCommand();
             command.CommandText = @"
-                INSERT INTO collection_log (log_id, server_id, server_name, collector_name, collection_time, duration_ms, status, error_message, rows_collected, sql_duration_ms, duckdb_duration_ms, fanout_item_count, slowest_item, slowest_item_ms)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+                INSERT INTO collection_log (log_id, server_id, server_name, collector_name, collection_time, duration_ms, status, error_message, rows_collected, sql_duration_ms, duckdb_duration_ms, fanout_item_count, slowest_item, slowest_item_ms, read_source)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
 
             command.Parameters.Add(new DuckDBParameter { Value = GenerateCollectionId() });
             command.Parameters.Add(new DuckDBParameter { Value = serverId });
@@ -1101,8 +1194,8 @@ public partial class RemoteCollectorService
             command.Parameters.Add(new DuckDBParameter { Value = status });
             command.Parameters.Add(new DuckDBParameter { Value = errorMessage ?? (object)DBNull.Value });
             command.Parameters.Add(new DuckDBParameter { Value = rowsCollected });
-            command.Parameters.Add(new DuckDBParameter { Value = (int)sqlMs });
-            command.Parameters.Add(new DuckDBParameter { Value = (int)duckDbMs });
+            command.Parameters.Add(new DuckDBParameter { Value = sqlMs.HasValue ? sqlMs.Value : (object)DBNull.Value });
+            command.Parameters.Add(new DuckDBParameter { Value = duckDbMs.HasValue ? duckDbMs.Value : (object)DBNull.Value });
 
             /* All three NULL together or all three set (#2472): a slowest item with no count cannot be
                turned into the dominance ratio the columns exist for, so half an answer is worse than none.
@@ -1111,6 +1204,8 @@ public partial class RemoteCollectorService
             command.Parameters.Add(new DuckDBParameter { Value = fanout.HasValue ? fanout.Value.ItemCount : (object)DBNull.Value });
             command.Parameters.Add(new DuckDBParameter { Value = fanout.HasValue ? fanout.Value.SlowestItem : (object)DBNull.Value });
             command.Parameters.Add(new DuckDBParameter { Value = fanout.HasValue ? fanout.Value.SlowestItemMs : (object)DBNull.Value });
+
+            command.Parameters.Add(new DuckDBParameter { Value = readSource ?? (object)DBNull.Value });
 
             await command.ExecuteNonQueryAsync();
 
@@ -1292,7 +1387,9 @@ public partial class RemoteCollectorService
         {
             MarkMasterInaccessible(serverId);
 
-            return FallbackDatabaseList(server, targetDb, reason: $"master DB inaccessible (SQL error {ex.Number})");
+            return FallbackDatabaseList(
+                server, targetDb, reason: $"master DB inaccessible (SQL error {ex.Number})",
+                errorNumber: ex.Number, serverMessage: ex.Message);
         }
     }
 
@@ -1371,22 +1468,20 @@ public partial class RemoteCollectorService
     /// interesting event is forming the verdict, not re-reading it — logging both would put four lines
     /// a minute in the log of a #857 user whose setup is working exactly as intended.
     /// </param>
-    internal static List<string> FallbackDatabaseList(ServerConnection server, string? targetDb, string reason, bool quiet = false)
+    internal static List<string> FallbackDatabaseList(
+        ServerConnection server, string? targetDb, string reason, bool quiet = false,
+        int? errorNumber = null, string? serverMessage = null)
     {
         var fallback = SingleDbOrEmpty(targetDb);
 
         if (fallback.Count == 0)
         {
-            /* #5498: the firewall comes first. 40615 means the server's firewall did not allow the client's IP
-               address, which a server-level block causes; a missing Database setting never does. The
-               set-a-Database advice is only the fix for the master-only case (a login allowed into a user
-               database but not master). Text only: the fallback itself is unchanged. */
-            throw new InvalidOperationException(
-                $"{reason}, and this connection has no target database to fall back to " +
-                $"(it resolves to master). If the error is 40615, the Azure firewall did not allow this " +
-                $"client's IP address: add a firewall rule for it, either a server-level rule or a database-level rule in master. " +
-                $"If this login can open a user database but not master, set a Database for " +
-                $"'{server.DisplayName}' so database-scoped collectors have something to read.");
+            /* #5498: the firewall comes first. #5647: 40615 means the server's firewall did not allow the
+               client's IP address, which a missing Database setting never causes, so the message leads with the
+               firewall and then offers the set-a-Database fix for a client allowed only by a database-level rule
+               in a user database. Text only: the fallback itself is unchanged. */
+            throw new InvalidOperationException(AzureMasterFallbackMessage.Build(
+                reason, errorNumber, serverMessage, server.DisplayName, "Database"));
         }
 
         if (quiet)
@@ -1574,7 +1669,7 @@ public partial class RemoteCollectorService
     /// Creates a SQL connection to a remote server.
     /// Throws InvalidOperationException if an interactive sign-in was cancelled by the user.
     /// </summary>
-    protected async Task<SqlConnection> CreateConnectionAsync(ServerConnection server, CancellationToken cancellationToken)
+    protected async Task<SqlConnection> CreateConnectionAsync(ServerConnection server, CancellationToken cancellationToken, bool replica = false)
     {
         /* Serialize authentication for any mode that can put a window in front of the user, so two
            collectors starting together cannot raise two prompts. Asked about the mode, not tested
@@ -1600,7 +1695,11 @@ public partial class RemoteCollectorService
                 }
             }
 
-            var connectionString = _serverManager.CredentialResolver.GetConnectionString(server);
+            /* #6254: the Query Store replica connection is this same open with the replica host and read-only intent. */
+            var connectionString = replica
+                ? ServerConnection.ResolveQueryStoreReplicaConnectionString(server, _serverManager.CredentialResolver.CredentialService, _serverManager.ProfileLookup)
+                    ?? throw new InvalidOperationException("No Query Store replica is set for this server.")
+                : _serverManager.CredentialResolver.GetConnectionString(server);
 
             var builder = new SqlConnectionStringBuilder(connectionString)
             {

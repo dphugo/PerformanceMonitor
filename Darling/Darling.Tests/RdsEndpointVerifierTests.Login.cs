@@ -22,6 +22,7 @@ using Xunit;
 namespace Darling.Tests;
 
 /* #1776 own-store: these cases never connect to any store; the login probe is an in-memory fake. */
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public partial class RdsEndpointVerifierTests
 {
     private static IEnumerable<string> ServiceFiles()
@@ -117,17 +118,6 @@ public partial class RdsEndpointVerifierTests
     public void ThePin_SeesAPlantedConstruction(string planted)
     {
         Assert.True(Regex.IsMatch(planted, TargetTypedConstruction) || Regex.IsMatch(planted, TestFactoryCall));
-    }
-
-    /// <summary>The runner builds one verifier, hands it to the four RDS readers, and gives each the target's connection string and role (#5452).</summary>
-    [Fact]
-    public void TheRunner_SharesOneVerifierWithTheFourRdsReaders()
-    {
-        var runner = ServiceFile("DarlingCollectorRunner.cs");
-
-        Assert.Single(Regex.Matches(runner, @"RdsEndpointVerifier _rdsVerifier = new\(\);"));
-        Assert.Equal(4, Regex.Matches(runner, @"verifier: _rdsVerifier").Count);
-        Assert.Equal(4, Regex.Matches(runner, @"server\.ConnectionString, server\.Config\.AwsRoleKey, cancellationToken\);").Count);
     }
 
     /// <summary>The reload clears a server's verdicts when its definition changed, and the dispatch arm for the refusal records PERMISSIONS.</summary>

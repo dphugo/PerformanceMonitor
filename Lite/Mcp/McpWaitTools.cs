@@ -35,7 +35,7 @@ public sealed class McpWaitTools
             var rows = await dataService.GetWaitStatsAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd, limit: limit + 1);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "wait_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "wait_stats")
                     ?? McpHelpers.Status("unavailable", "No wait stats data available for the specified time range.");
             }
 
@@ -63,7 +63,7 @@ public sealed class McpWaitTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where the data starts, always present (false and null when the store covered the window). No
                    effective_hours_back: this payload carries a page `truncated`. */
@@ -111,7 +111,7 @@ public sealed class McpWaitTools
                     wants somebody to look at collection, and widening will never fill it. Same words as
                     Darling's twin.
                 */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "wait_stats");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "wait_stats");
                 if (gated != null)
                 {
                     return gated;
@@ -120,15 +120,15 @@ public sealed class McpWaitTools
                 return await dataService.HasAnyWaitStatAsync(resolved.ServerId)
                     ? McpHelpers.Status(
                         "empty",
-                        $"No wait types recorded for {resolved.ServerName} in the last {hours_back} hour(s). This server HAS collected wait stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
+                        $"No wait types recorded for {resolved.DisplayName} in the last {hours_back} hour(s). This server HAS collected wait stats before, so this window is genuinely quiet rather than broken — widen hours_back to find the most recent samples.")
                     : McpHelpers.Status(
                         "unavailable",
-                        $"No wait stats have EVER been recorded for {resolved.ServerName}. This is not an empty window — nothing has been stored for this server at all. Delta wait stats need a SECOND collection cycle before the first row exists, so on a newly added server this clears itself; otherwise check that collection is running and that the server is enabled.");
+                        $"No wait stats have EVER been recorded for {resolved.DisplayName}. This is not an empty window — nothing has been stored for this server at all. Delta wait stats need a SECOND collection cycle before the first row exists, so on a newly added server this clears itself; otherwise check that collection is running and that the server is enabled.");
             }
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 wait_types = types
             }, McpHelpers.JsonOptions);
@@ -170,7 +170,7 @@ public sealed class McpWaitTools
                    the miss path, so either order keeps the property that matters — but a permanently gated
                    engine takes this branch on every call, forever, and the probe below could never tell it
                    anything. Asking first makes that case one query instead of two. */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "wait_stats");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "wait_stats");
                 if (gated != null)
                 {
                     return gated;
@@ -179,16 +179,9 @@ public sealed class McpWaitTools
                 /* Same shape as get_perfmon_trend: tell the caller whether the wait type is just
                    unknown here vs. nothing collected at all, and hand back the ones that do have data. */
                 var collected = await dataService.GetDistinctWaitTypesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
-                if (collected.Count == 0)
-                    return McpHelpers.Status(
-                        "unavailable",
-                        $"No trend data for wait type '{wait_type}'. No wait stats have been collected for this server in the last {hours_back}h yet " +
-                        "(the collector may not have run, or delta wait stats need a second collection cycle).");
-
-                return McpHelpers.Status(
-                    "not_collected",
-                    $"No trend data for wait type '{wait_type}'. It may not be a wait type observed on this server in this window — see hints.collected_wait_types for the {collected.Count} that have data.",
-                    new { collected_wait_types = collected });
+                /* #6446: the collector skips the ignored (benign) waits, so only those are never collected; a wait type it would
+                   store that had no waiting in the window is empty, not not_collected. The hint stays for a typo. */
+                return TrendPayloads.WaitTrendMiss(wait_type, hours_back, IgnoredWaitTypes.Load(), collected);
             }
 
             /* #3653 A5: wait_stats is the first identity-epoch carrier, so this is the trend whose step a restart
@@ -197,7 +190,7 @@ public sealed class McpWaitTools
             var discontinuities = await dataService.GetBaselineDiscontinuitiesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
 
             return TrendPayloads.WaitTrend(
-                resolved.ServerName, wait_type, hours_back, points, bucketMinutes, bucket_minutes is not null,
+                resolved.DisplayName, wait_type, hours_back, points, bucketMinutes, bucket_minutes is not null,
                 budget.AutoPoints, BaselineDiscontinuities.ToPayload(discontinuities));
         }
         catch (Exception ex)
@@ -206,7 +199,7 @@ public sealed class McpWaitTools
         }
     }
 
-    [McpServerTool(Name = "get_waiting_tasks"), Description("Gets recently captured waiting tasks — queries that were actively waiting on a resource at collection time — NEWEST CAPTURE FIRST, longest wait first within a capture. Shows session ID, wait type, duration, blocking session, and database. Complements get_wait_stats by showing individual waiting queries rather than aggregated stats. <<GUIDE>> THE PAGE IS BOUNDED BY limit, NOT BY hours_back: tasks_returned is how many rows you got, truncated says the window held more than limit, and oldest_returned_collection_time / newest_returned_collection_time bound the page — under newest-first ordering the oldest stamp IS how far back this read reached, and one busy capture can fill the whole page by itself. Raise limit or narrow hours_back when truncated is true. When the store did not cover the whole window, effective_start, window_truncated and truncation_note say where its data starts.")]
+    [McpServerTool(Name = "get_waiting_tasks"), Description("Gets recently captured waiting tasks — queries that were actively waiting on a resource at collection time — NEWEST CAPTURE FIRST, longest wait first within a capture. Shows session ID, wait type, duration, blocking session, and database. Complements get_wait_stats by showing individual waiting queries rather than aggregated stats. <<GUIDE>> ONE ROW PER SESSION AND WAIT TYPE in each capture: thread_count is the parallel threads rolled into it, and intra_query_parallelism true means some of those threads wait on their own query's other threads (a parallel query's exchange waits), which is not a blocker; blocking_session_id is only ever ANOTHER session. wait_duration_ms, resource_description and blocking_session_id are all the LONGEST-waiting thread's (never a mix), and blocking_session_ids lists every distinct blocker other than the session itself, only when the threads have more than one. THE PAGE IS BOUNDED BY limit, NOT BY hours_back: tasks_returned is how many rows you got, truncated says the window held more than limit, and oldest_returned_collection_time / newest_returned_collection_time bound the page — under newest-first ordering the oldest stamp IS how far back this read reached, and one busy capture can fill the whole page by itself. Raise limit or narrow hours_back when truncated is true. When the store did not cover the whole window, effective_start, window_truncated and truncation_note say where its data starts.")]
     public static async Task<string> GetWaitingTasks(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -253,7 +246,7 @@ public sealed class McpWaitTools
                 /* #5244: a filtered miss still asks whether the collector ever ran first (never collected stays
                    not_collected), and only then says the CHOSEN database had none, in Darling's words: it is not a
                    verdict on the databases nobody read. */
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "waiting_tasks")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "waiting_tasks")
                     ?? McpHelpers.Status("empty",
                         database == null
                             ? "No waiting tasks captured in the specified time range."
@@ -270,7 +263,14 @@ public sealed class McpWaitTools
                 session_id = r.SessionId,
                 wait_type = r.WaitType,
                 wait_duration_ms = r.WaitDurationMs,
+                /* #5633 item 18: one row per session and wait type per snapshot; the parallel threads of a query waiting on
+                   their own query are flagged, never reported as the session blocking itself. */
+                thread_count = r.ThreadCount,
+                intra_query_parallelism = r.IntraQueryParallelism,
                 blocking_session_id = r.BlockingSessionId,
+                /* #5633 review L-a: the distinct blockers other than the session itself, present only when the threads have more than one;
+                   blocking_session_id, resource_description and wait_duration_ms are the longest-waiting thread's. */
+                blocking_session_ids = r.BlockingSessionIds,
                 database_name = r.DatabaseName,
                 resource_description = r.ResourceDescription,
                 collection_time = r.CollectionTime.ToString("o")
@@ -278,7 +278,7 @@ public sealed class McpWaitTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3541 A3: the envelope was bare — server and rows, no window, no count, no bound. Now the
                    span requested, the page described as a page, and the span the page covers, on Darling's
                    names. */

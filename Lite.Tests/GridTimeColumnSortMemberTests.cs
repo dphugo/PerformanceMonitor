@@ -47,6 +47,7 @@ namespace PerformanceMonitorLite.Tests;
 /* The behaviour check installs ServerTimeHelper.ActiveServerClock and CurrentDisplayMode, process-wide mutable statics;
    the class joins the collection every other class that writes them uses. */
 [Collection("server-time-helper")]
+[Trait("Stage", "Guard")]
 public sealed class GridTimeColumnSortMemberTests : IDisposable
 {
     private readonly ServerClock _savedClock = ServerTimeHelper.ActiveServerClock;
@@ -76,6 +77,8 @@ public sealed class GridTimeColumnSortMemberTests : IDisposable
         { "Controls/ServerTab.xaml", "PlanCorrectionGrid", "ExecuteActionInitiatedTimeLocal", Name(typeof(PlanCorrectionRow)), "ExecuteActionInitiatedTime" },
         { "Controls/ServerTab.xaml", "PlanCorrectionGrid", "RevertActionInitiatedTimeLocal", Name(typeof(PlanCorrectionRow)), "RevertActionInitiatedTime" },
         { "Controls/ServerTab.xaml", "BlockedProcessReportGrid", "EventTimeLocal", Name(typeof(BlockedProcessReportRow)), "EventTime" },
+        { "Controls/ServerTab.xaml", "BlockedProcessReportGrid", "BlockingLoginTimeLocal", Name(typeof(BlockedProcessReportRow)), "BlockingLoginTime" },
+        { "Controls/ServerTab.xaml", "BlockedProcessReportGrid", "BlockingLastRequestEndTimeLocal", Name(typeof(BlockedProcessReportRow)), "BlockingLastRequestEndTime" },
         { "Controls/ServerTab.xaml", "DeadlockGrid", "DeadlockTimeLocal", Name(typeof(DeadlockProcessDetail)), "DeadlockTime" },
         { "Controls/ServerTab.xaml", "AutomaticTuningGrid", "CollectionTimeLocal", Name(typeof(AutomaticTuningRow)), "CollectionTime" },
         /* #4966: the Collected column of every grid that draws the newest snapshot: the snapshot's collection (or capture) time, sorted by the stored instant. */
@@ -121,8 +124,8 @@ public sealed class GridTimeColumnSortMemberTests : IDisposable
 
         /* The row's own DateTime, a stored server wall clock (no UTC member exists for these): msdb job history, the running
            job's start, the plan cache's creation, cached and last-execution times, the open transaction's begin time. */
-        { "Controls/JobHistoryTab.xaml", "JobHistoryDataGrid", "RunTimeLocal", Name(typeof(JobHistoryRow)), "RunDateTime" },
-        { "Controls/JobHistoryTab.xaml", "JobHistoryDataGrid", "LastSuccessfulRunLocal", Name(typeof(JobHistoryRow)), "LastSuccessfulRun" },
+        { "Controls/JobHistoryTab.xaml", "JobHistoryDataGrid", "RunTimeLocal", Name(typeof(JobHistoryRow)), "RunDateTimeUtc" },
+        { "Controls/JobHistoryTab.xaml", "JobHistoryDataGrid", "LastSuccessfulRunLocal", Name(typeof(JobHistoryRow)), "LastSuccessfulRunUtc" },
         { "Controls/ServerTab.xaml", "RunningJobsGrid", "StartTimeLocal", Name(typeof(RunningJobRow)), "StartTime" },
         { "Controls/ServerTab.xaml", "QueryStatsGrid", "LastExecutionTimeLocal", Name(typeof(QueryStatsRow)), "LastExecutionTime" },
         { "Controls/ServerTab.xaml", "QueryStatsGrid", "CreationTimeLocal", Name(typeof(QueryStatsRow)), "CreationTime" },
@@ -316,6 +319,7 @@ public sealed class GridTimeColumnSortMemberTests : IDisposable
     private static readonly Dictionary<(string File, string Grid, string Property), string> NotTimeColumns = new()
     {
         { ("Controls/ServerTab.xaml", "QuerySnapshotsGrid", "ElapsedTimeFormatted"), "a duration (how long the request has run), not a time" },
+        { ("Windows/ManageQueryTagsWindow.xaml", "AssignGrid", "CreatedBy"), "the name of who made the assignment, not a time" },
         { ("Windows/WaitDrillDownWindow.xaml", "ResultsDataGrid", "ElapsedTimeFormatted"), "a duration (how long the request has run), not a time" },
         { ("Controls/ServerTab.xaml", "BlockedProcessReportGrid", "WaitTimeFormatted"), "a wait duration in ms, not a time; it sorts by WaitTimeMs" },
         { ("Controls/ServerTab.xaml", "DeadlockGrid", "WaitTimeFormatted"), "a wait duration in ms, not a time; it sorts by WaitTime" },

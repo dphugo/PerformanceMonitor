@@ -149,6 +149,11 @@ public sealed class StoreConfigProvider
                 await WarnAboutFileVersusStoreAsync(connection, config, cancellationToken);
             }
 
+            /* #6262: the one setting darling.json still owns after the seed. It has its own failure scope, so a refusal there
+               never stops the service row below from being seeded. */
+            await SyncRemediationLoginsAsync(connection, config, cancellationToken);
+            await SyncHypotheticalIndexLoginsAsync(connection, config, cancellationToken);
+
             /* LAST — its presence marks the seed complete (the reload gate keys on config_version). */
             if (await CountAsync(connection, "config_service", cancellationToken) == 0)
             {
@@ -161,6 +166,356 @@ public sealed class StoreConfigProvider
                 "Could not seed the config store from darling.json — running on the file config; the store will seed on a later start: {Message}",
                 ex.Message);
         }
+    }
+
+    /// <summary>One registry row as the login sync reads it: the slot, the connection the row names (the one raw-row mapping every other comparison uses) and <c>modified_at</c>, the token the write is conditional on.</summary>
+    internal sealed record StoredLoginRow(int Id, string Name, string? Username, string? Secret, DateTime ModifiedAt, ServerConnectionIdentity Identity);
+
+    /// <summary>One change <see cref="PlanRemediationSync"/> or <see cref="PlanHypotheticalIndexSync"/> found: the registry row to write, what it becomes, the verb for the log, and the <c>modified_at</c> the row had when it was read.</summary>
+    internal sealed record RemediationSyncChange(int ServerId, string Name, string? Username, string? Secret, string Action, DateTime ExpectedModifiedAt, ServerConnectionIdentity Identity);
+
+    /// <summary>Why a sync pass left a file entry's login alone.</summary>
+    internal enum LoginSyncSkipReason
+    {
+        /// <summary>The entry has one of the login's two keys and not the other.</summary>
+        HalfLogin,
+
+        /// <summary>The entry and the registry do not pair one to one: two entries claim a row, or a name matches more than one row.</summary>
+        AmbiguousPairing,
+
+        /// <summary>The row the entry pairs with names another connection (host, port, engine or any other setting the connection rule compares).</summary>
+        ConnectionDiffers,
+
+        /// <summary>The secret is a shape the code that connects with this login refuses.</summary>
+        SecretShapeRefused,
+    }
+
+    /// <summary>A file entry whose login a sync pass did not write, and why. <see cref="Detail"/> is the secret's shape for a refused shape and empty otherwise; it is never a value.</summary>
+    internal sealed record LoginSyncSkip(string Name, LoginSyncSkipReason Reason, string Detail);
+
+    /// <summary>What a sync pass will write and what it left alone.</summary>
+    internal sealed record LoginSyncPlan(IReadOnlyList<RemediationSyncChange> Changes, IReadOnlyList<LoginSyncSkip> Skips);
+
+    /// <summary>Which of a registered server's two login slots a sync pass writes, how the file's keys map onto it, and which secret shapes the code that connects with the slot accepts.</summary>
+    private sealed record LoginSlot(
+        string Label, string UserColumn, string SecretColumn, string UserKey, string SecretKey,
+        Func<MonitoredServer, string?> FileUser, Func<MonitoredServer, string?> FileSecret, Func<string, bool> AcceptsSecret);
+
+    /* The remediation connection (ResolveRemediationPassword) opens an env:/file: reference, a sealed value or a DPAPI blob; a plain
+       password has no arm there, so it is not copied into the store. */
+    private static readonly LoginSlot RemediationSlot = new(
+        "Remediation login", "remediation_username", "remediation_encrypted_password",
+        "remediationUsername", "remediationEncryptedPassword",
+        s => s.RemediationUsername, s => s.RemediationEncryptedPassword, DarlingSecrets.RemediationSecretAccepted);
+
+    /* The index-test connection (ResolveHypotheticalIndexPassword) takes an env:/file: reference and nothing else. */
+    private static readonly LoginSlot HypotheticalIndexSlot = new(
+        "Hypothetical-index login", "hypothetical_index_username", "hypothetical_index_encrypted_password",
+        "hypotheticalIndexUsername", "hypotheticalIndexEncryptedPassword",
+        s => s.HypotheticalIndexUsername, s => s.HypotheticalIndexEncryptedPassword, DarlingSecretSource.IsReference);
+
+    /// <summary>
+    /// #6262: on every start, a darling.json entry that names BOTH keys of a server's remediation login sets or replaces that
+    /// registered server's slot. Anything else leaves the slot alone: an entry with neither key (the registry may hold a login that
+    /// was set directly in the store, the only way to change one on an existing server before this sync) and an entry with one key
+    /// (logged, so the half login is not silent). Turning a server's actions off is done with its action switches, not by removing keys.
+    /// A server that is not in the file is never touched. The sync runs as the store owner, so the store's own checks do not apply;
+    /// it therefore writes only to a row that pairs with exactly one entry and names the same connection as that entry, and only if
+    /// the row has not changed since it was read. Logs one line per change that names the server and the slot's shape, never the
+    /// login or the secret. A failing row is warned with its server name and the start goes on.
+    /// </summary>
+    internal Task SyncRemediationLoginsAsync(
+        NpgsqlConnection connection, DarlingConfig config, CancellationToken ct, Func<CancellationToken, Task>? afterRead = null) =>
+        SyncLoginSlotAsync(connection, config, RemediationSlot, afterRead, ct);
+
+    /// <summary>
+    /// #6262: the same sync, with the same rule, for the PostgreSQL "Test an index" login (#6170). The README documents an owner-role
+    /// UPDATE on the store row as a way to set this pair, so a file without the keys must not undo that. The secret is written as the
+    /// file has it, so the same-reference check that lets darling.json name one of Darling's own files for this server
+    /// (<c>HypotheticalIndexEncryptedPasswordDeclaredByFile</c>) keeps matching, and only an <c>env:</c> or <c>file:</c> reference is
+    /// written, the one shape the check accepts.
+    /// </summary>
+    internal Task SyncHypotheticalIndexLoginsAsync(
+        NpgsqlConnection connection, DarlingConfig config, CancellationToken ct, Func<CancellationToken, Task>? afterRead = null) =>
+        SyncLoginSlotAsync(connection, config, HypotheticalIndexSlot, afterRead, ct);
+
+    private async Task SyncLoginSlotAsync(
+        NpgsqlConnection connection, DarlingConfig config, LoginSlot slot, Func<CancellationToken, Task>? afterRead, CancellationToken ct)
+    {
+        LoginSyncPlan plan;
+        try
+        {
+            var stored = new List<StoredLoginRow>();
+            using (var read = new NpgsqlCommand(
+                $"SELECT server_id, name, {slot.UserColumn}, {slot.SecretColumn}, modified_at, {ServerConnectionIdentity.StoredColumns} "
+                + "FROM config_monitored_servers",
+                connection) { CommandTimeout = ServiceCommandDeadlines.BootstrapSeconds })
+            await using (var reader = await read.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    stored.Add(new StoredLoginRow(
+                        reader.GetInt32(0), reader.IsDBNull(1) ? "" : reader.GetString(1),
+                        reader.IsDBNull(2) ? null : reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3),
+                        reader.GetDateTime(4),
+                        ServerConnectionIdentity.FromStoredColumns(
+                            reader.IsDBNull(5) ? null : reader.GetString(5), reader.IsDBNull(6) ? null : reader.GetInt32(6),
+                            reader.IsDBNull(7) ? null : reader.GetString(7), reader.IsDBNull(8) ? null : reader.GetString(8),
+                            !reader.IsDBNull(9) && reader.GetBoolean(9), reader.IsDBNull(10) ? null : reader.GetString(10),
+                            reader.IsDBNull(11) ? null : reader.GetString(11), reader.IsDBNull(12) ? null : reader.GetString(12),
+                            !reader.IsDBNull(13) && reader.GetBoolean(13), !reader.IsDBNull(14) && reader.GetBoolean(14),
+                            reader.IsDBNull(15) ? null : reader.GetString(15))));
+                }
+            }
+
+            plan = PlanLoginSync(config.Servers, stored, slot);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogSyncFailure(slot, null, ex);
+            return;
+        }
+
+        foreach (var skip in plan.Skips)
+        {
+            LogSkip(slot, skip);
+        }
+
+        if (afterRead is not null)
+        {
+            await afterRead(ct);
+        }
+
+        foreach (var change in plan.Changes)
+        {
+            try
+            {
+                /* The write holds only while the row still has the modified_at AND the connection it was read with. modified_at alone
+                   is not enough: a raw UPDATE of the host does not bump it, and when such a transaction commits while this statement
+                   waits on the row lock, PostgreSQL re-checks the WHERE against the new row version. With the connection columns in
+                   the WHERE a moved row matches nothing, and the next start plans again. Each column is compared the way
+                   ServerConnectionIdentity.FromStoredColumns maps it (NULL becomes the empty text, 0 or false). */
+                using var write = new NpgsqlCommand(
+                    $"UPDATE config_monitored_servers SET {slot.UserColumn} = $2, {slot.SecretColumn} = $3, modified_at = $4 "
+                    + "WHERE server_id = $1 AND modified_at = $5 "
+                    + "AND COALESCE(host, '') = $6 AND COALESCE(port, 0) = $7 AND COALESCE(engine, '') = $8 "
+                    + "AND COALESCE(database, '') = $9 AND COALESCE(read_only_intent, false) = $10 AND COALESCE(auth, '') = $11 "
+                    + "AND COALESCE(username, '') = $12 AND COALESCE(encrypt_mode, '') = $13 "
+                    + "AND COALESCE(trust_server_certificate, false) = $14 AND COALESCE(multi_subnet_failover, false) = $15",
+                    connection) { CommandTimeout = ServiceCommandDeadlines.BootstrapSeconds };
+                write.Parameters.AddWithValue(change.ServerId);
+                AddNullableText(write, change.Username);
+                AddNullableText(write, change.Secret);
+                write.Parameters.AddWithValue(Naive(DateTime.UtcNow));
+                write.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = change.ExpectedModifiedAt });
+                var read = change.Identity;
+                write.Parameters.AddWithValue(read.Host ?? "");
+                write.Parameters.AddWithValue(read.Port);
+                write.Parameters.AddWithValue(read.Engine ?? "");
+                write.Parameters.AddWithValue(read.Database ?? "");
+                write.Parameters.AddWithValue(read.ReadOnlyIntent);
+                write.Parameters.AddWithValue(read.Auth ?? "");
+                write.Parameters.AddWithValue(read.Username ?? "");
+                write.Parameters.AddWithValue(read.EncryptMode ?? "");
+                write.Parameters.AddWithValue(read.TrustServerCertificate);
+                write.Parameters.AddWithValue(read.MultiSubnetFailover);
+                if (await write.ExecuteNonQueryAsync(ct) > 0)
+                {
+                    _logger?.LogInformation(
+                        "{Slot} for server '{Server}' {Action} from darling.json (secret: {Shape}).",
+                        slot.Label, change.Name, change.Action, DarlingSecrets.RemediationSlotShape(change.Secret));
+                }
+                else
+                {
+                    _logger?.LogWarning(
+                        "{Slot} for server '{Server}' not applied: the registry row changed after it was read. The next start plans it again.",
+                        slot.Label, change.Name);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                LogSyncFailure(slot, change.Name, ex);
+            }
+        }
+    }
+
+    private void LogSkip(LoginSlot slot, LoginSyncSkip skip)
+    {
+        switch (skip.Reason)
+        {
+            case LoginSyncSkipReason.HalfLogin:
+                _logger?.LogWarning(
+                    "{Slot} for server '{Server}' not changed: darling.json has only one of {UserKey} and {SecretKey}, so the registry keeps what it has. Set both keys to change the login.",
+                    slot.Label, skip.Name, slot.UserKey, slot.SecretKey);
+                break;
+            case LoginSyncSkipReason.AmbiguousPairing:
+                _logger?.LogWarning(
+                    "{Slot} for server '{Server}' not applied: it does not pair with one registered server (two entries claim the same row, or the name matches more than one). Give each server its own id and name.",
+                    slot.Label, skip.Name);
+                break;
+            case LoginSyncSkipReason.ConnectionDiffers:
+                _logger?.LogWarning(
+                    "{Slot} for server '{Server}' not applied: the registered server connects differently from its darling.json entry. Update the entry.",
+                    slot.Label, skip.Name);
+                break;
+            default:
+                _logger?.LogWarning(
+                    "{Slot} for server '{Server}' not applied: the secret is a {Shape}, which the login's connection refuses. Use an env:NAME or file:/path reference.",
+                    slot.Label, skip.Name, skip.Detail);
+                break;
+        }
+    }
+
+    private void LogSyncFailure(LoginSlot slot, string? server, Exception ex)
+    {
+        /* The exception's message is deliberately not logged: a PostgreSQL error can carry a row's values (a constraint's DETAIL
+           line), and the row holds a secret reference. The type and the SQLSTATE say what happened without repeating any of it. */
+        var sqlState = (ex as PostgresException ?? ex.InnerException as PostgresException)?.SqlState ?? "none";
+        if (server is null)
+        {
+            _logger?.LogWarning(
+                "Could not sync the {Slot} from darling.json to the registry; the registry keeps what it has (error: {ErrorType}, SQLSTATE {SqlState}).",
+                slot.Label.ToLowerInvariant() + "s", ex.GetType().Name, sqlState);
+        }
+        else
+        {
+            _logger?.LogWarning(
+                "Could not sync the {Slot} for server '{Server}' from darling.json to the registry; the registry keeps what it has and the other servers go on (error: {ErrorType}, SQLSTATE {SqlState}).",
+                slot.Label.ToLowerInvariant(), server, ex.GetType().Name, sqlState);
+        }
+    }
+
+    /// <summary>The pure half of <see cref="SyncRemediationLoginsAsync"/> (see <see cref="PlanLoginSync"/> for the rules).</summary>
+    internal static LoginSyncPlan PlanRemediationSync(IEnumerable<MonitoredServer>? fileServers, IReadOnlyList<StoredLoginRow> stored) =>
+        PlanLoginSync(fileServers, stored, RemediationSlot);
+
+    /// <summary>The pure half of <see cref="SyncHypotheticalIndexLoginsAsync"/>: the same pairing and checks, with the index-test slot's accepted shapes.</summary>
+    internal static LoginSyncPlan PlanHypotheticalIndexSync(IEnumerable<MonitoredServer>? fileServers, IReadOnlyList<StoredLoginRow> stored) =>
+        PlanLoginSync(fileServers, stored, HypotheticalIndexSlot);
+
+    /// <summary>
+    /// Pairs file entries with registered servers one to one, then lists the entries whose login the registry should take. Pairing never
+    /// guesses: an entry takes the row with its server id; only an entry with no such row looks at the name, and only among rows that
+    /// no entry claimed by id. A row claimed by two entries, or a name that matches more than one row, pairs nobody. A paired entry
+    /// is written only if it names both keys, the row names the same connection (<see cref="ServerConnectionIdentity.Differ"/>, the rule
+    /// <see cref="BackfillSecretFromFile"/> and <see cref="MarkSlotsTheFileDeclares"/> apply) and its secret is a shape the slot's
+    /// connection code accepts. An entry with neither key, or a pair that already holds the file's login, is not listed.
+    /// </summary>
+    private static LoginSyncPlan PlanLoginSync(IEnumerable<MonitoredServer>? fileServers, IReadOnlyList<StoredLoginRow> stored, LoginSlot slot)
+    {
+        var changes = new List<RemediationSyncChange>();
+        var skips = new List<LoginSyncSkip>();
+        var file = (fileServers ?? Enumerable.Empty<MonitoredServer>()).Where(s => s is not null).ToList();
+        var pairs = PairEntries(file, stored);
+
+        for (var i = 0; i < file.Count; i++)
+        {
+            var entry = file[i];
+            var user = string.IsNullOrWhiteSpace(slot.FileUser(entry)) ? null : slot.FileUser(entry);
+            var secret = string.IsNullOrWhiteSpace(slot.FileSecret(entry)) ? null : slot.FileSecret(entry);
+            if (user is null && secret is null)
+            {
+                continue;
+            }
+
+            if (user is null || secret is null)
+            {
+                skips.Add(new LoginSyncSkip(entry.DisplayName, LoginSyncSkipReason.HalfLogin, ""));
+                continue;
+            }
+
+            var (row, ambiguous) = pairs[i];
+            if (ambiguous)
+            {
+                skips.Add(new LoginSyncSkip(entry.DisplayName, LoginSyncSkipReason.AmbiguousPairing, ""));
+                continue;
+            }
+
+            if (row is null)
+            {
+                continue;
+            }
+
+            if (ServerConnectionIdentity.Differ(ConnectionIdentityOf(entry), row.Identity))
+            {
+                skips.Add(new LoginSyncSkip(entry.DisplayName, LoginSyncSkipReason.ConnectionDiffers, ""));
+                continue;
+            }
+
+            if (!slot.AcceptsSecret(secret))
+            {
+                skips.Add(new LoginSyncSkip(entry.DisplayName, LoginSyncSkipReason.SecretShapeRefused, DarlingSecrets.RemediationSlotShape(secret)));
+                continue;
+            }
+
+            var heldUser = string.IsNullOrWhiteSpace(row.Username) ? null : row.Username;
+            var heldSecret = string.IsNullOrWhiteSpace(row.Secret) ? null : row.Secret;
+            if (string.Equals(user, heldUser, StringComparison.Ordinal) && string.Equals(secret, heldSecret, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var action = heldUser is null && heldSecret is null ? "set" : "changed";
+            changes.Add(new RemediationSyncChange(row.Id, row.Name ?? string.Empty, user, secret, action, row.ModifiedAt, row.Identity));
+        }
+
+        return new LoginSyncPlan(changes, skips);
+    }
+
+    /// <summary>One entry per file entry, in order: the row it pairs with (id first, then name among rows no entry claimed by id), or whether it is ambiguous.</summary>
+    private static (StoredLoginRow? Row, bool Ambiguous)[] PairEntries(List<MonitoredServer> file, IReadOnlyList<StoredLoginRow> stored)
+    {
+        var rows = new StoredLoginRow?[file.Count];
+        var ambiguous = new bool[file.Count];
+        var byId = new bool[file.Count];
+        var claimedById = new HashSet<int>();
+
+        for (var i = 0; i < file.Count; i++)
+        {
+            var candidates = stored.Where(s => s.Id == file[i].ServerId).ToList();
+            if (candidates.Count == 1)
+            {
+                rows[i] = candidates[0];
+                byId[i] = true;
+                claimedById.Add(candidates[0].Id);
+            }
+            else if (candidates.Count > 1)
+            {
+                ambiguous[i] = true;
+                byId[i] = true;
+            }
+        }
+
+        for (var i = 0; i < file.Count; i++)
+        {
+            var name = file[i].DisplayName;
+            if (byId[i] || string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            var candidates = stored.Where(s => !claimedById.Contains(s.Id) && string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (candidates.Count == 1)
+            {
+                rows[i] = candidates[0];
+            }
+            else if (candidates.Count > 1)
+            {
+                ambiguous[i] = true;
+            }
+        }
+
+        /* A row two entries claim (the same id twice in the file, or two entries with one name) is nobody's. */
+        foreach (var claimants in Enumerable.Range(0, file.Count).Where(i => rows[i] is not null).GroupBy(i => rows[i]!.Id).Where(g => g.Count() > 1).ToList())
+        {
+            foreach (var i in claimants)
+            {
+                rows[i] = null;
+                ambiguous[i] = true;
+            }
+        }
+
+        return Enumerable.Range(0, file.Count).Select(i => (rows[i], ambiguous[i])).ToArray();
     }
 
     /// <summary>
@@ -420,7 +775,7 @@ public sealed class StoreConfigProvider
         using var command = new NpgsqlCommand(@"
 SELECT server_id, name, host, database, auth, username, encrypt_mode, trust_server_certificate,
        read_only_intent, multi_subnet_failover, excluded_databases, monthly_cost_usd,
-       alert_delivery_mode_override, engine, port, is_enabled, aws_role_arn
+       alert_delivery_mode_override, engine, port, is_enabled, aws_role_arn, query_store_replica
 FROM config_monitored_servers", connection) { CommandTimeout = ServiceCommandDeadlines.BootstrapSeconds };
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -447,6 +802,8 @@ FROM config_monitored_servers", connection) { CommandTimeout = ServiceCommandDea
                     Port = reader.IsDBNull(14) ? 0 : reader.GetInt32(14),
                     /* #5452: the role is compared; the external ID beside it is not read at all (a stored secret). */
                     AwsRoleArn = reader.IsDBNull(16) ? null : reader.GetString(16),
+                    /* V213 (#6254): compared, because it decides where Query Store is read and which saved password opens. */
+                    QueryStoreReplica = reader.IsDBNull(17) ? null : reader.GetString(17),
                 },
                 /* NOT NULL DEFAULT TRUE in the table, so the guard is for a store mid-migration; an unknown
                    enablement reads as ENABLED, which is the direction that keeps the drift visible. */
@@ -792,6 +1149,15 @@ FROM config_monitored_servers", connection) { CommandTimeout = ServiceCommandDea
                 Json(store.MultiSubnetFailover),
                 StringComparison.Ordinal,
                 true);
+            /* #6254: where Query Store is read from. It is a field of the connection identity and bound into a sealed password when set,
+               so a difference touches the password backfill as a connection setting does. */
+            AddDrift(
+                drift,
+                "queryStoreReplica",
+                NoneIfBlank(QueryStoreReplicaSetting.Normalize(file.QueryStoreReplica) ?? ""),
+                NoneIfBlank(QueryStoreReplicaSetting.Normalize(store.QueryStoreReplica) ?? ""),
+                StringComparison.Ordinal,
+                true);
         }
 
         AddDrift(
@@ -983,8 +1349,8 @@ FROM config_monitored_servers", connection) { CommandTimeout = ServiceCommandDea
         /* config_version starts at 0; the four desired-state seed writes below bump it via the trigger,
            so the worker's post-seed baseline read reflects the seeded state and triggers no spurious reload. */
         using var command = new NpgsqlCommand(@"
-INSERT INTO config_service (id, paused, capture_plans, query_store_backfill_enabled, query_store_text_budget_mb, max_concurrent_sweeps, plan_xml_compression, mcp_enabled, mcp_port, web_enabled, web_port, plan_content_retention_days, compose_statement_timeout_seconds, config_version, updated_at, updated_by)
-VALUES (1, FALSE, $1, $7, $8, $9, $10, $2, $3, $4, $5, $11, $12, 0, $6, 'seed')
+INSERT INTO config_service (id, paused, capture_plans, query_store_backfill_enabled, query_store_text_budget_mb, max_concurrent_sweeps, plan_xml_compression, mcp_enabled, mcp_port, web_enabled, web_port, plan_content_retention_days, compose_statement_timeout_seconds, query_store_fetch_top_n, config_version, updated_at, updated_by)
+VALUES (1, FALSE, $1, $7, $8, $9, $10, $2, $3, $4, $5, $11, $12, $13, 0, $6, 'seed')
 ON CONFLICT (id) DO NOTHING", connection) { CommandTimeout = ServiceCommandDeadlines.BootstrapSeconds };
         command.Parameters.AddWithValue(config.CapturePlans);
         command.Parameters.AddWithValue(config.Mcp.Enabled);
@@ -1002,6 +1368,7 @@ ON CONFLICT (id) DO NOTHING", connection) { CommandTimeout = ServiceCommandDeadl
         command.Parameters.AddWithValue(NormalizePlanXmlCompression(config.PlanXmlCompression));
         command.Parameters.AddWithValue(ClampPlanContentRetentionDays(config.PlanContentRetentionDays));
         command.Parameters.AddWithValue(ClampComposeStatementTimeoutSeconds(config.ComposeStatementTimeoutSeconds));
+        command.Parameters.AddWithValue(ClampQueryStoreFetchTopN(config.QueryStoreFetchTopN));
         await command.ExecuteNonQueryAsync(ct);
     }
 
@@ -1057,11 +1424,15 @@ INSERT INTO config_alert_settings (
     pg_deadlock_count_threshold, pg_blocking_count_threshold,
     fleet_sweep_enabled, fleet_sweep_interval_minutes,
     self_disk_free_warn_gb,
-    long_running_query_excluded_program_name_prefixes, long_running_query_excluded_logins)
+    long_running_query_excluded_program_name_prefixes, long_running_query_excluded_logins,
+    runnable_queue_enabled, runnable_queue_warning_per_scheduler, runnable_queue_critical_per_scheduler,
+    client_timeouts_enabled, client_timeouts_warning_per_minute, client_timeouts_critical_per_minute,
+    excluded_volumes,
+    client_timeouts_warning_multiple, client_timeouts_critical_multiple)
 VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
         $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42,
         $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63,
-        $64, $65, $66, $67, $68, $69, $70)
+        $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79)
 ON CONFLICT (id) DO NOTHING", connection) { CommandTimeout = ServiceCommandDeadlines.BootstrapSeconds };
         command.Parameters.AddWithValue(a.Enabled);
         command.Parameters.AddWithValue(a.CpuEnabled);
@@ -1085,7 +1456,7 @@ ON CONFLICT (id) DO NOTHING", connection) { CommandTimeout = ServiceCommandDeadl
         command.Parameters.AddWithValue(a.FailedJobEnabled);
         command.Parameters.AddWithValue(a.FailedJobLookbackMinutes);
         command.Parameters.AddWithValue(a.CooldownMinutes);
-        AddTextArray(command, a.ExcludedDatabases);
+        AddTextArray(command, ExcludedDatabaseNames.Normalize(a.ExcludedDatabases));
         command.Parameters.AddWithValue(an.Enabled);
         command.Parameters.AddWithValue(an.IntervalMinutes);
         command.Parameters.AddWithValue(an.NotificationsEnabled);
@@ -1164,6 +1535,23 @@ ON CONFLICT (id) DO NOTHING", connection) { CommandTimeout = ServiceCommandDeadl
            AUTHORITY logins) — the same values the rung's column DEFAULT gives a pre-rung row. */
         AddTextArray(command, LongRunningQueryExclusions.Normalize(a.LongRunningQueryExcludedProgramNamePrefixes));
         AddTextArray(command, LongRunningQueryExclusions.Normalize(a.LongRunningQueryExcludedLogins));
+        /* #5641, bound in the same order the V177 columns were appended. Seeded RAW like every sibling: the clamp
+           (Warning at least 1, Critical never below Warning) lives on DarlingAlertSettings. */
+        command.Parameters.AddWithValue(a.RunnableQueueEnabled);
+        command.Parameters.AddWithValue(a.RunnableQueueWarningPerScheduler);
+        command.Parameters.AddWithValue(a.RunnableQueueCriticalPerScheduler);
+        /* #5640, bound in the same order the V179 columns were appended. Seeded RAW like every sibling: the clamp lives on
+           DarlingAlertSettings. The switch seeds FALSE (darling.json's default): the alert ships off. */
+        command.Parameters.AddWithValue(a.ClientTimeoutsEnabled);
+        command.Parameters.AddWithValue(a.ClientTimeoutsWarningPerMinute);
+        command.Parameters.AddWithValue(a.ClientTimeoutsCriticalPerMinute);
+        /* #6098, bound last in the same order the V200 column was appended. Seeded through the shared normaliser (trim,
+           blanks dropped, a trailing separator ignored when de-duplicating) so the store holds the list the engine will
+           apply and get_alert_settings reports back. */
+        AddTextArray(command, VolumeExclusions.Normalize(a.ExcludedVolumes));
+        /* #5736, bound last in the same order the V211 columns were appended. Seeded RAW like every sibling: the clamp lives on DarlingAlertSettings. */
+        command.Parameters.AddWithValue(a.ClientTimeoutsWarningMultiple);
+        command.Parameters.AddWithValue(a.ClientTimeoutsCriticalMultiple);
         await command.ExecuteNonQueryAsync(ct);
     }
 
@@ -1243,8 +1631,9 @@ INSERT INTO config_monitored_servers (
     server_id, name, host, database, auth, username, encrypted_password, encrypt_mode,
     trust_server_certificate, read_only_intent, multi_subnet_failover, excluded_databases,
     monthly_cost_usd, capture_plans, alert_delivery_mode_override, engine, port, is_enabled, plan_force_bot_enabled,
-    remediation_username, remediation_encrypted_password, aws_role_arn, aws_external_id, created_at, modified_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, $14, $16, $17, TRUE, FALSE, $18, $19, $20, $21, $15, $15)
+    remediation_username, remediation_encrypted_password, aws_role_arn, aws_external_id,
+    hypothetical_index_username, hypothetical_index_encrypted_password, query_store_replica, created_at, modified_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, $14, $16, $17, TRUE, FALSE, $18, $19, $20, $21, $22, $23, $24, $15, $15)
 ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout = ServiceCommandDeadlines.BootstrapSeconds };
             /* THE ALLOCATION SITE. A darling.json entry has no StoredServerId, so this is the derivation —
                and this is where it is minted and made permanent. When new rows stop being hash-keyed
@@ -1290,6 +1679,13 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
             var seedRole = AwsRoleSettings.Normalize(server.AwsRoleArn);
             AddNullableText(command, seedRole);
             AddNullableText(command, seedRole is null ? null : AwsRoleSettings.Normalize(server.AwsExternalId));
+            /* V203 (#6170): the hypothetical-index login, seeded like the remediation login. NULL for every server nobody set one up on,
+               and then the check is refused on it. */
+            AddNullableText(command, server.HypotheticalIndexUsername);
+            AddNullableText(command, server.HypotheticalIndexEncryptedPassword);
+            /* V213 (#6254): the Query Store replica, trimmed with blank as NULL. NULL is every server nobody set one on: Query Store is then read
+               from the server itself. A password sealed for this entry was sealed for this setting (PasswordBinding.ForServer). */
+            AddNullableText(command, QueryStoreReplicaSetting.Normalize(server.QueryStoreReplica));
             await command.ExecuteNonQueryAsync(ct);
         }
 
@@ -1318,7 +1714,7 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
         {
             await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
 
-            var (paused, capturePlans, backfillEnabled, textBudgetMb, maxSweeps, planXmlCompression, mcpEnabled, mcpPort, webEnabled, webPort, planContentRetentionDays, composeStatementTimeoutSeconds, configVersion) = await ReadServiceRowAsync(connection, cancellationToken);
+            var (paused, capturePlans, backfillEnabled, textBudgetMb, maxSweeps, planXmlCompression, mcpEnabled, mcpPort, webEnabled, webPort, planContentRetentionDays, composeStatementTimeoutSeconds, queryStoreFetchTopN, configVersion) = await ReadServiceRowAsync(connection, cancellationToken);
             var (alerts, analysis) = await ReadAlertSettingsAsync(connection, cancellationToken);
 
             /* #3712: analysis.uncorroboratedRoute is the FILE half of a two-source knob whose STORE half
@@ -1371,7 +1767,7 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
             /* #3598 (V131): the routes layered over that row, read on the same privileged connection for the
                same reason — four of its five destination columns are the same bearer secrets. Zero rows is the
                ordinary state and resolves to the parent row exactly. */
-            var routes = await ReadNotificationRoutesAsync(connection, cancellationToken);
+            var routes = await ReadNotificationRoutesAsync(connection, _logger, cancellationToken);
 
             var servers = await ReadMonitoredServersAsync(connection, bootstrap, cancellationToken, pins);
 
@@ -1417,6 +1813,7 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
                 QueryStoreTextBudgetMb = textBudgetMb,
                 PlanContentRetentionDays = planContentRetentionDays,
                 ComposeStatementTimeoutSeconds = composeStatementTimeoutSeconds,
+                QueryStoreFetchTopN = queryStoreFetchTopN,
                 MaxConcurrentSweeps = maxSweeps,
                 PlanXmlCompression = planXmlCompression,
                 McpEnabled = mcpEnabled,
@@ -1487,6 +1884,13 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
     /* #2357: the compose statement_timeout bounds WORK -- a LIMIT bounds output, a group-by scans and sorts
        before it -- so it is clamped rather than trusted. A floor of 5s keeps the backstop meaningful; a
        ceiling of 600s keeps a hand-edited absurdity from turning "hard backstop" into "no backstop". */
+    /// <summary>
+    /// #6211: the Query Store fetch top-N, clamped on read like its siblings. Zero or less is the documented "fetch every new plan" value and is
+    /// kept as 0; anything above <see cref="QueryStoreFetchSelection.MaxTopN"/> reads as that ceiling.
+    /// </summary>
+    internal static int ClampQueryStoreFetchTopN(int value) =>
+        value <= 0 ? 0 : Math.Min(value, QueryStoreFetchSelection.MaxTopN);
+
     internal const int MinComposeStatementTimeoutSeconds = 5;
     internal const int MaxComposeStatementTimeoutSeconds = 600;
 
@@ -1500,18 +1904,18 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
     internal static string NormalizePlanXmlCompression(string? value) =>
         string.Equals(value?.Trim(), "none", StringComparison.OrdinalIgnoreCase) ? "none" : "gzip";
 
-    private static async Task<(bool Paused, bool CapturePlans, bool QueryStoreBackfillEnabled, int QueryStoreTextBudgetMb, int MaxConcurrentSweeps, string PlanXmlCompression, bool McpEnabled, int McpPort, bool WebEnabled, int WebPort, int PlanContentRetentionDays, int ComposeStatementTimeoutSeconds, long ConfigVersion)>
+    private static async Task<(bool Paused, bool CapturePlans, bool QueryStoreBackfillEnabled, int QueryStoreTextBudgetMb, int MaxConcurrentSweeps, string PlanXmlCompression, bool McpEnabled, int McpPort, bool WebEnabled, int WebPort, int PlanContentRetentionDays, int ComposeStatementTimeoutSeconds, int QueryStoreFetchTopN, long ConfigVersion)>
         ReadServiceRowAsync(NpgsqlConnection connection, CancellationToken ct)
     {
         using var command = new NpgsqlCommand(
-            "SELECT paused, capture_plans, query_store_backfill_enabled, query_store_text_budget_mb, max_concurrent_sweeps, plan_xml_compression, mcp_enabled, mcp_port, web_enabled, web_port, plan_content_retention_days, compose_statement_timeout_seconds, config_version FROM config_service WHERE id = 1", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
+            "SELECT paused, capture_plans, query_store_backfill_enabled, query_store_text_budget_mb, max_concurrent_sweeps, plan_xml_compression, mcp_enabled, mcp_port, web_enabled, web_port, plan_content_retention_days, compose_statement_timeout_seconds, query_store_fetch_top_n, config_version FROM config_service WHERE id = 1", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
         using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
         {
             /* Row missing (unseeded) — treat as defaults; capture and backfill stay on, the memory
                knobs reproduce the pre-V59 compile-time constants (64 MB budget, 4-wide sweep), and
                plan content keeps the V75 default 21-day horizon. */
-            return (false, true, true, 64, 4, "gzip", false, 5152, false, 5153, 21, 15, 0);
+            return (false, true, true, 64, 4, "gzip", false, 5152, false, 5153, 21, 15, QueryStoreFetchSelection.DefaultTopN, 0);
         }
 
         return (reader.GetBoolean(0), reader.GetBoolean(1), reader.GetBoolean(2),
@@ -1520,7 +1924,7 @@ ON CONFLICT (server_id) DO NOTHING", connection, transaction) { CommandTimeout =
             reader.GetBoolean(6), reader.GetInt32(7),
             reader.GetBoolean(8), reader.GetInt32(9),
             ClampPlanContentRetentionDays(reader.GetInt32(10)),
-            ClampComposeStatementTimeoutSeconds(reader.GetInt32(11)), reader.GetInt64(12));
+            ClampComposeStatementTimeoutSeconds(reader.GetInt32(11)), ClampQueryStoreFetchTopN(reader.GetInt32(12)), reader.GetInt64(13));
     }
 
     private static async Task<(AlertsConfig Alerts, AnalysisConfig Analysis)> ReadAlertSettingsAsync(NpgsqlConnection connection, CancellationToken ct)
@@ -1550,7 +1954,11 @@ SELECT enabled, cpu_enabled, cpu_threshold_percent, cpu_mode, blocking_enabled, 
        fleet_sweep_enabled, fleet_sweep_interval_minutes,
        self_disk_free_warn_gb,
        long_running_query_excluded_program_name_prefixes, long_running_query_excluded_logins,
-       analysis_uncorroborated_route
+       analysis_uncorroborated_route,
+       runnable_queue_enabled, runnable_queue_warning_per_scheduler, runnable_queue_critical_per_scheduler,
+       client_timeouts_enabled, client_timeouts_warning_per_minute, client_timeouts_critical_per_minute,
+       excluded_volumes,
+       client_timeouts_warning_multiple, client_timeouts_critical_multiple
 FROM config_alert_settings WHERE id = 1", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
         using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
@@ -1691,6 +2099,26 @@ FROM config_alert_settings WHERE id = 1", connection) { CommandTimeout = Service
                operator excluded would page again while get_alert_settings still showed the list. */
             LongRunningQueryExcludedProgramNamePrefixes = ReadTextArray(reader, 67),
             LongRunningQueryExcludedLogins = ReadTextArray(reader, 68),
+            /* #5641 (V177): the Runnable Queue switch and its two bars, appended after the route knob at ordinals 70-72.
+               Same reachability rule as every appended knob: ApplyToConfig replaces config.Alerts wholesale, so a column
+               selected but not read here -- or read but not selected -- would reset the knob on every worker start. */
+            RunnableQueueEnabled = reader.GetBoolean(70),
+            RunnableQueueWarningPerScheduler = reader.GetInt32(71),
+            RunnableQueueCriticalPerScheduler = reader.GetInt32(72),
+            /* #5640 (V179): the Client Timeouts switch and its two bars, appended after the Runnable Queue pair at ordinals
+               73-75. Same reachability rule as every appended knob: ApplyToConfig replaces config.Alerts wholesale, so a
+               column selected but not read here -- or read but not selected -- would reset the knob on every worker start. */
+            ClientTimeoutsEnabled = reader.GetBoolean(73),
+            ClientTimeoutsWarningPerMinute = reader.GetInt32(74),
+            ClientTimeoutsCriticalPerMinute = reader.GetInt32(75),
+            /* #6098 (V200): the Volume Free Space alert's excluded mount points, appended last at ordinal 76. Same
+               reachability rule as every appended knob: ApplyToConfig replaces config.Alerts wholesale, so a column
+               selected but not read here -- or read but not selected -- would reset the list on every worker start
+               and a volume an operator excluded would page again while get_alert_settings still showed it. */
+            ExcludedVolumes = ReadTextArray(reader, 76),
+            /* #5736 (V211): the relative Client Timeouts bars' multiples, appended at 77-78 (same reachability rule as every appended knob). */
+            ClientTimeoutsWarningMultiple = reader.GetInt32(77),
+            ClientTimeoutsCriticalMultiple = reader.GetInt32(78),
         };
         var analysis = new AnalysisConfig
         {
@@ -1715,13 +2143,30 @@ FROM config_alert_settings WHERE id = 1", connection) { CommandTimeout = Service
         return (alerts, analysis);
     }
 
+    /// <summary>
+    /// How far the database's clock is ahead of this machine's, read once (#5998). The previous signing key's window end is written
+    /// on the database's clock, so the send compares it on that clock: the reader adds this to its own now. The read is timed around
+    /// its own round trip, so the midpoint is the instant the database answered.
+    /// </summary>
+    internal static async Task<TimeSpan> ReadDatabaseClockAheadAsync(NpgsqlConnection connection, CancellationToken ct)
+    {
+        var before = DateTime.UtcNow;
+        using var command = new NpgsqlCommand("SELECT now()", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
+        var databaseNow = (DateTime)(await command.ExecuteScalarAsync(ct))!;
+        var after = DateTime.UtcNow;
+        return databaseNow.ToUniversalTime() - (before + (after - before) / 2);
+    }
+
     private static async Task<(SmtpConfig Smtp, WebhooksConfig Webhooks)> ReadNotificationAsync(NpgsqlConnection connection, CancellationToken ct)
     {
+        var clockAhead = await ReadDatabaseClockAheadAsync(connection, ct);
         using var command = new NpgsqlCommand(@"
 SELECT smtp_host, smtp_port, smtp_use_ssl, smtp_username, smtp_encrypted_password, smtp_from_address,
        smtp_recipients, email_cooldown_minutes, teams_url, teams_proxy, slack_url, slack_proxy,
        generic_url, generic_headers, generic_body_template, generic_proxy,
-       pagerduty_routing_key, pagerduty_use_eu_region, pagerduty_proxy, pagerduty_auto_resolve
+       pagerduty_routing_key, pagerduty_use_eu_region, pagerduty_proxy, pagerduty_auto_resolve,
+       slack_send_resolutions, teams_send_resolutions, generic_send_resolutions, email_send_resolutions,
+       signing_key, previous_signing_key, previous_signing_key_until
 FROM config_notification WHERE id = 1", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
         using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
@@ -1739,6 +2184,8 @@ FROM config_notification WHERE id = 1", connection) { CommandTimeout = ServiceCo
             From = reader.GetString(5),
             To = reader.GetString(6),
             EmailCooldownMinutes = reader.GetInt32(7),
+            /* V187 (#5825): appended after V166's column, like it. */
+            SendResolutions = reader.GetBoolean(23),
         };
         var webhooks = new WebhooksConfig
         {
@@ -1755,6 +2202,13 @@ FROM config_notification WHERE id = 1", connection) { CommandTimeout = ServiceCo
             PagerDutyProxy = reader.GetString(18),
             /* V166: appended last — the only addition that cannot re-map an existing column's ordinal. */
             PagerDutyAutoResolve = reader.GetBoolean(19),
+            SlackSendResolutions = reader.GetBoolean(20),
+            TeamsSendResolutions = reader.GetBoolean(21),
+            GenericSendResolutions = reader.GetBoolean(22),
+            /* V193 (#5998): the generic URL's signing keys, sealed. DarlingWebhookSecrets.Open opens them. */
+            GenericSigning = new WebhookSigningKeys(
+                reader.GetString(24), reader.GetString(25), reader.IsDBNull(26) ? null : reader.GetFieldValue<DateTime>(26),
+                clockAhead),
         };
         return (smtp, webhooks);
     }
@@ -1776,7 +2230,8 @@ FROM config_notification WHERE id = 1", connection) { CommandTimeout = ServiceCo
 SELECT name, host, database, auth, username, encrypted_password, encrypt_mode, trust_server_certificate,
        read_only_intent, multi_subnet_failover, excluded_databases, monthly_cost_usd, alert_delivery_mode_override,
        engine, port, server_id, plan_force_bot_enabled, remediation_username, remediation_encrypted_password,
-       aws_role_arn, aws_external_id
+       aws_role_arn, aws_external_id, hypothetical_index_username, hypothetical_index_encrypted_password,
+       query_store_replica
 FROM config_monitored_servers WHERE is_enabled = TRUE
 ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
         using var reader = await command.ExecuteReaderAsync(ct);
@@ -1950,6 +2405,11 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
                has pointed at a role, and it means the process's own credentials. */
             AwsRoleArn = reader.IsDBNull(19) ? null : reader.GetString(19),
             AwsExternalId = reader.IsDBNull(20) ? null : reader.GetString(20),
+            /* V203 (#6170): the hypothetical-index login. Nullable with no default: NULL is the shipped state and means the check is refused. */
+            HypotheticalIndexUsername = reader.IsDBNull(21) ? null : reader.GetString(21),
+            HypotheticalIndexEncryptedPassword = reader.IsDBNull(22) ? null : reader.GetString(22),
+            /* V213 (#6254): the Query Store replica. Nullable with no default: NULL is the shipped state and reads from the server itself. */
+            QueryStoreReplica = reader.IsDBNull(23) ? null : reader.GetString(23),
         };
 
         /* #5366: the identity a sealed password is bound to is the row's own text, read through the one raw-row mapping
@@ -1957,7 +2417,8 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
         server.StoredIdentity = ServerConnectionIdentity.FromStoredColumns(
             reader.GetString(1), reader.IsDBNull(14) ? null : reader.GetInt32(14), reader.IsDBNull(13) ? null : reader.GetString(13),
             reader.IsDBNull(2) ? null : reader.GetString(2), reader.GetBoolean(8), reader.GetString(3),
-            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetString(6), reader.GetBoolean(7), reader.GetBoolean(9));
+            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetString(6), reader.GetBoolean(7), reader.GetBoolean(9),
+            reader.IsDBNull(23) ? null : reader.GetString(23));
 
         BackfillSecretFromFile(server, bootstrap);
         MarkSlotsTheFileDeclares(server, bootstrap);
@@ -1968,7 +2429,7 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
     internal static ServerConnectionIdentity ConnectionIdentityOf(MonitoredServer server) =>
         ServerConnectionIdentity.FromStoredColumns(
             server.Host, server.Port, server.Engine, server.Database, server.ReadOnlyIntent, server.Auth, server.Username,
-            server.EncryptMode, server.TrustServerCertificate, server.MultiSubnetFailover);
+            server.EncryptMode, server.TrustServerCertificate, server.MultiSubnetFailover, server.QueryStoreReplica);
 
     /// <summary>
     /// Copies the darling.json secret into a server built from a store row that carries none, when exactly one file entry
@@ -2037,36 +2498,162 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
             {
                 server.RemediationEncryptedPasswordDeclaredByFile = true;
             }
+
+            /* #6170: the same rule for the hypothetical-index login: the row must name the login the file declared the reference for. */
+            if (declared.HypotheticalIndexEncryptedPasswordDeclaredByFile
+                && string.Equals(declared.HypotheticalIndexUsername ?? string.Empty, server.HypotheticalIndexUsername ?? string.Empty, StringComparison.Ordinal)
+                && DarlingSecrets.DeclaresSecretText(server.HypotheticalIndexEncryptedPassword)
+                && string.Equals(declared.HypotheticalIndexEncryptedPassword, server.HypotheticalIndexEncryptedPassword, StringComparison.Ordinal))
+            {
+                server.HypotheticalIndexEncryptedPasswordDeclaredByFile = true;
+            }
         }
     }
 
     /// <summary>The routes SELECT, public-const so the viewer's writer and the tests can pin column parity
     /// against it the way <c>NotificationColumns</c> is pinned against <see cref="ReadNotificationAsync"/>.
     /// Ordered by <c>route_id</c> so "first matching route wins" in the resolver is a statement about the
-    /// table rather than about row order.</summary>
+    /// table rather than about row order. The scope columns (V181, #5750) come last: they are stored as written and
+    /// expanded to a server set by <see cref="ReadNotificationRoutesAsync"/>, never by SQL. The agent channel's five columns
+    /// (V184, #5632) follow them: the level <see cref="NotificationRouter.ResolveAgent"/> reads, and the route's limits.</summary>
     public const string NotificationRoutesSelectSql =
-        "SELECT route_id, metric_match, teams_url, slack_url, generic_url, pagerduty_routing_key, smtp_recipients, enabled "
+        "SELECT route_id, metric_match, teams_url, slack_url, generic_url, pagerduty_routing_key, smtp_recipients, enabled, scope_server_id, scope_tag_id, "
+        + "agent_level, agent_max_per_hour, agent_max_per_day, agent_lease_minutes, agent_expiry_minutes, send_resolutions, "
+        + NotificationRouteSigningColumns + ", fallback_route_id "
         + "FROM config_notification_routes ORDER BY route_id";
 
-    private static async Task<IReadOnlyList<NotificationRoute>> ReadNotificationRoutesAsync(NpgsqlConnection connection, CancellationToken ct)
+    /// <summary>A route's signing key columns (V193, #5998), last in both the service's and the viewer's route SELECT.</summary>
+    public const string NotificationRouteSigningColumns = "signing_key, previous_signing_key, previous_signing_key_until";
+
+    /// <summary>The registry's server ids: every server a route's scope can name (#5750). The desired-state table, whose
+    /// <c>server_id</c> is the key an alert carries as <c>AlertOutcome.ServerKey</c>.</summary>
+    public const string RouteScopeServersSql = "SELECT server_id FROM config_monitored_servers";
+
+    /// <summary>The tag tree (#5750): every tag and its parent (NULL for a root).</summary>
+    public const string RouteScopeTagsSql = "SELECT id, parent_id FROM server_tags";
+
+    /// <summary>The server-to-tag assignments (#5750).</summary>
+    public const string RouteScopeTagMapSql = "SELECT server_id, tag_id FROM server_tag_map";
+
+    /// <summary>
+    /// The three inputs <see cref="NotificationRouteScopeExpander.Expand"/> needs, read from the store (#5750): the known server ids,
+    /// the tag parent map and the server-to-tags map. <see cref="ReadRouteScopeInputsAsync"/> is the single read of them, so a parity
+    /// pin can call it directly. <see cref="TagsReadable"/> is false when the tag tables could not be read: the tag maps are then
+    /// empty and <see cref="ExpandRoutes"/> leaves a tag-scoped route unexpanded (it matches nothing).
+    /// </summary>
+    public sealed record RouteScopeInputs(
+        IReadOnlyCollection<int> KnownServerIds,
+        IReadOnlyDictionary<int, int?> TagParents,
+        IReadOnlyDictionary<int, IReadOnlyCollection<int>> ServerTags,
+        bool TagsReadable);
+
+    /// <summary>
+    /// Reads <see cref="RouteScopeInputs"/>. A failed server read propagates (the whole view load already shares that failure
+    /// handling). A failed tag read is caught and logged and reported through <see cref="RouteScopeInputs.TagsReadable"/>:
+    /// the tag tables are a side read, and a transient failure there must narrow what a route matches, never widen it.
+    /// </summary>
+    public static async Task<RouteScopeInputs> ReadRouteScopeInputsAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken ct)
     {
-        var routes = new List<NotificationRoute>();
-        using var command = new NpgsqlCommand(NotificationRoutesSelectSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
-        using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        var known = new HashSet<int>();
+        using (var command = new NpgsqlCommand(RouteScopeServersSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds })
+        using (var reader = await command.ExecuteReaderAsync(ct))
         {
-            routes.Add(new NotificationRoute(
-                reader.GetInt32(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.GetString(3),
-                reader.GetString(4),
-                reader.GetString(5),
-                reader.GetString(6),
-                reader.GetBoolean(7)));
+            while (await reader.ReadAsync(ct))
+            {
+                known.Add(reader.GetInt32(0));
+            }
         }
 
-        return routes;
+        var parents = new Dictionary<int, int?>();
+        var serverTags = new Dictionary<int, HashSet<int>>();
+        try
+        {
+            using (var command = new NpgsqlCommand(RouteScopeTagsSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds })
+            using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    parents[reader.GetInt32(0)] = reader.IsDBNull(1) ? null : reader.GetInt32(1);
+                }
+            }
+
+            using (var command = new NpgsqlCommand(RouteScopeTagMapSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds })
+            using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var serverId = reader.GetInt32(0);
+                    if (!serverTags.TryGetValue(serverId, out var tags))
+                    {
+                        serverTags[serverId] = tags = new HashSet<int>();
+                    }
+
+                    tags.Add(reader.GetInt32(1));
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogWarning("Could not read the server tags — tag-scoped notification routes match nothing until the next config reload: {Message}", ex.Message);
+            return new RouteScopeInputs(known, new Dictionary<int, int?>(), new Dictionary<int, IReadOnlyCollection<int>>(), false);
+        }
+
+        return new RouteScopeInputs(known, parents, serverTags.ToDictionary(p => p.Key, p => (IReadOnlyCollection<int>)p.Value), true);
+    }
+
+    /// <summary>
+    /// Expands the stored routes with the given inputs (#5750). When the tag tables were unreadable, a tag-scoped route is returned
+    /// unexpanded (so it matches nothing: fail closed, and not marked orphaned, since the tag may still exist).
+    /// </summary>
+    public static IReadOnlyList<NotificationRoute> ExpandRoutes(IReadOnlyList<NotificationRoute> routes, RouteScopeInputs inputs) =>
+        NotificationRouteScopeExpander.Expand(routes, inputs.KnownServerIds, inputs.TagParents, inputs.ServerTags, inputs.TagsReadable);
+
+    internal static async Task<IReadOnlyList<NotificationRoute>> ReadNotificationRoutesAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken ct)
+    {
+        var routes = new List<NotificationRoute>();
+        var clockAhead = await ReadDatabaseClockAheadAsync(connection, ct);
+        using (var command = new NpgsqlCommand(NotificationRoutesSelectSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds })
+        using (var reader = await command.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                routes.Add(new NotificationRoute(
+                    reader.GetInt32(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.GetString(4),
+                    reader.GetString(5),
+                    reader.GetString(6),
+                    reader.GetBoolean(7))
+                {
+                    ScopeServerId = reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                    ScopeTagId = reader.IsDBNull(9) ? null : reader.GetInt32(9),
+                    AgentLevel = reader.IsDBNull(10) ? null : reader.GetInt16(10),
+                    AgentMaxPerHour = reader.GetInt32(11),
+                    AgentMaxPerDay = reader.GetInt32(12),
+                    AgentLeaseMinutes = reader.GetInt32(13),
+                    AgentExpiryMinutes = reader.GetInt32(14),
+                    /* V187 (#5825): null follows the channel's setting. */
+                    SendResolutions = reader.IsDBNull(15) ? null : reader.GetBoolean(15),
+                    /* V193 (#5998): the route's own generic URL's signing keys, sealed. */
+                    GenericSigning = new WebhookSigningKeys(
+                        reader.GetString(16), reader.GetString(17), reader.IsDBNull(18) ? null : reader.GetFieldValue<DateTime>(18),
+                        clockAhead),
+                    /* V193 (#6003, D8): where an unclaimed, expired investigation request goes instead. */
+                    FallbackRouteId = reader.IsDBNull(19) ? null : reader.GetInt32(19),
+                });
+            }
+        }
+
+        /* #5750: a scoped route that is never expanded matches nothing, so every route this loader returns goes through the
+           expander. A store with no scoped route skips the three extra reads: the fleet-wide routes come back as they are. */
+        if (!routes.Exists(r => r.IsScoped))
+        {
+            return routes;
+        }
+
+        return ExpandRoutes(routes, await ReadRouteScopeInputsAsync(connection, logger, ct));
     }
 
     /// <summary>
@@ -2096,7 +2683,8 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
                 reader.GetString(1),
                 reader.IsDBNull(2) ? null : reader.GetInt32(2),
                 reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                reader.GetBoolean(4),
+                /* V206 (#6227): NULL = inherit (the fleet row, then the shipped default); ScheduleOverride.Enabled is already nullable. */
+                reader.IsDBNull(4) ? null : reader.GetBoolean(4),
                 /* V125 (#3477): NULL and an empty array are DIFFERENT readings here and both must
                    survive the round trip — NULL falls through the layering, an explicit empty array
                    is "no scope at this level" and stops it. Collapsing them at read time would make
@@ -2211,6 +2799,8 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
         config.QueryStoreBackfillEnabled = view.QueryStoreBackfillEnabled;
         config.QueryStoreTextBudgetMb = view.QueryStoreTextBudgetMb;
         config.PlanContentRetentionDays = view.PlanContentRetentionDays;
+        /* #6211: provider-read each cycle by the runner, so a store change reaches the next run without a restart. */
+        config.QueryStoreFetchTopN = view.QueryStoreFetchTopN;
         /* #2357's effective timeout is NOT taken from here: startup role provisioning reads
            config_service.compose_statement_timeout_seconds straight out of the store and bakes it into
            ALTER ROLE viewer/mcp SET statement_timeout, so a change reaches the live roles on the next
@@ -2468,7 +3058,7 @@ ORDER BY name", connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoo
 
     /// <summary>A retention override is honored only when &gt;= 1 day; 0/negative would invert the purge
     /// cutoff and delete everything, so it degrades to "no override" (fall through to the default).</summary>
-    private static int? ValidRetention(int? days) => days is int v && v >= 1 ? v : null;
+    private static int? ValidRetention(int? days) => days is int v && v >= 1 ? Math.Min(v, CollectorScheduleDefaults.MaxRetentionDays) : null;
 
     /* ---------------- helpers ---------------- */
 
@@ -2551,6 +3141,12 @@ public sealed class StoreConfigView
     /// <summary>The V75 plan-content horizon (#2316): days a stored plan XML outlives its last sighting.
     /// 0 = disabled (the fact-coupled dimension horizon stands alone).</summary>
     public int PlanContentRetentionDays { get; init; } = 21;
+
+    /// <summary>
+    /// #6211: plans per database-hour and metric whose Query Store text and plan XML are fetched (config_service, V209), already clamped.
+    /// 0 = every new plan, the behaviour before the setting.
+    /// </summary>
+    public int QueryStoreFetchTopN { get; init; } = QueryStoreFetchSelection.DefaultTopN;
 
     /// <summary>
     /// The per-session <c>statement_timeout</c> for the viewer and mcp roles, in seconds (#2357). Read

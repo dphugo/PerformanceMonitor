@@ -55,7 +55,7 @@ public sealed class DarlingMcpConfigHistoryTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -70,14 +70,14 @@ public sealed class DarlingMcpConfigHistoryTools
             if (changes.Count == 0)
             {
                 /* Decide not_collected first: it carries no notice, so probing before it would throw the probe away. */
-                var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "server_config", cancellationToken);
+                var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "server_config", cancellationToken);
                 if (notCollected is not null)
                 {
                     return notCollected;
                 }
 
                 var emptyNotice = await ReadNoticeAsync(postgres, "server_config", resolved.ServerName, windowStart, windowEndNaive, emptyAnswer: true, logger, cancellationToken);
-                return NoChanges(resolved.ServerName, hours_back, DistinctCaptures(snapshots.Select(s => s.CaptureTime)), emptyNotice);
+                return NoChanges(resolved.DisplayName, hours_back, DistinctCaptures(snapshots.Select(s => s.CaptureTime)), emptyNotice);
             }
 
             var notice = await ReadNoticeAsync(postgres, "server_config", resolved.ServerName, windowStart, windowEndNaive, emptyAnswer: false, logger, cancellationToken);
@@ -95,7 +95,7 @@ public sealed class DarlingMcpConfigHistoryTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: the window floor, always present on a data answer. */
                 effective_start = notice.EffectiveStart,
@@ -144,7 +144,7 @@ public sealed class DarlingMcpConfigHistoryTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -157,7 +157,7 @@ public sealed class DarlingMcpConfigHistoryTools
             {
                 /* Decide not_collected first: it carries no notice, so probing before it would throw the probe away. */
                 var notCollected = McpHelpers.WithDatabase(
-                    await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "database_config", cancellationToken),
+                    await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "database_config", cancellationToken),
                     databases.Describe());
                 if (notCollected is not null)
                 {
@@ -166,7 +166,7 @@ public sealed class DarlingMcpConfigHistoryTools
 
                 var emptyNotice = await ReadNoticeAsync(postgres, "database_config", resolved.ServerName, windowStart, windowEndNaive, emptyAnswer: true, logger, cancellationToken);
                 return McpHelpers.WithDatabase(
-                    NoChanges(resolved.ServerName, hours_back, DistinctCaptures(snapshots.Select(s => s.CaptureTime)), emptyNotice, DatabaseScopeText(databases)),
+                    NoChanges(resolved.DisplayName, hours_back, DistinctCaptures(snapshots.Select(s => s.CaptureTime)), emptyNotice, DatabaseScopeText(databases)),
                     databases.Describe())!;
             }
 
@@ -182,7 +182,7 @@ public sealed class DarlingMcpConfigHistoryTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: the window floor, always present on a data answer. */
                 effective_start = notice.EffectiveStart,
@@ -214,7 +214,7 @@ public sealed class DarlingMcpConfigHistoryTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -222,18 +222,23 @@ public sealed class DarlingMcpConfigHistoryTools
             var windowEndNaive = NaiveUtc(windowEnd);
             var windowStart = windowEndNaive.AddHours(-hours_back);
             var snapshots = await DarlingConfigHistoryReader.GetTraceFlagSnapshotsAsync(postgres, resolved.ServerId, cancellationToken);
-            var changes = ConfigChangeDiff.DiffTraceFlagChanges(snapshots, windowStart, UpperEdge(as_of, windowEndNaive));
+            /* #5633 item 19: a successful run that stored no row is an empty snapshot, so the LAST flag being turned off is a change. */
+            var emptyRuns = await DarlingCollectorRunFactsReader.ReadEmptyTraceFlagRunsAsync(postgres, resolved.ServerId, windowStart, windowEndNaive, cancellationToken);
+            var changes = ConfigChangeDiff.DiffTraceFlagChanges(snapshots, emptyRuns, windowStart, UpperEdge(as_of, windowEndNaive));
             if (changes.Count == 0)
             {
                 /* Decide not_collected first: it carries no notice, so probing before it would throw the probe away. */
-                var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "trace_flags", cancellationToken);
+                var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "trace_flags", cancellationToken);
                 if (notCollected is not null)
                 {
                     return notCollected;
                 }
 
                 var emptyNotice = await ReadNoticeAsync(postgres, "trace_flags", resolved.ServerName, windowStart, windowEndNaive, emptyAnswer: true, logger, cancellationToken);
-                return NoChanges(resolved.ServerName, hours_back, DistinctCaptures(snapshots.Select(s => s.CaptureTime)), emptyNotice);
+                /* #5633 item 19: a successful run that stored zero rows IS the collector saying no flag is on; only a collector that has not
+                   run (or stored rows) really has "fewer than two snapshots". */
+                var runFacts = await DarlingCollectorRunFactsReader.ReadAsync(postgres, resolved.ServerId, "trace_flags", null, windowEndNaive, cancellationToken);
+                return NoTraceFlagChanges(resolved.DisplayName, hours_back, DistinctCaptures(snapshots.Select(s => s.CaptureTime)), emptyNotice, runFacts);
             }
 
             var notice = await ReadNoticeAsync(postgres, "trace_flags", resolved.ServerName, windowStart, windowEndNaive, emptyAnswer: false, logger, cancellationToken);
@@ -251,7 +256,7 @@ public sealed class DarlingMcpConfigHistoryTools
 
             var json = JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: the window floor, always present on a data answer. */
                 effective_start = notice.EffectiveStart,
@@ -270,6 +275,7 @@ public sealed class DarlingMcpConfigHistoryTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_database_scoped_config"), Description("Gets database-scoped configuration settings (sys.database_scoped_configurations). Shows MAXDOP, legacy CE, parameter sniffing, and other per-database settings. LATEST IS A TIME: captured when the collector connects, not on a schedule - captured_at is the instant these settings are as of.")]
     public static Task<string> GetDatabaseScopedConfig(
         NpgsqlDataSource postgres,
@@ -298,7 +304,7 @@ public sealed class DarlingMcpConfigHistoryTools
         {
             var snapshot = await DarlingConfigHistoryReader.GetLatestDatabaseScopedConfigAsync(postgres, resolved.ServerId, cancellationToken);
             if (snapshot.IsEmpty)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "database_scoped_config", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "database_scoped_config", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         "No database-scoped configuration data available. The config collector may not have run yet.");
@@ -321,7 +327,7 @@ public sealed class DarlingMcpConfigHistoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3541 A10: the connect-time capture these settings are as of. */
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 database_count = grouped.Count,
@@ -334,6 +340,7 @@ public sealed class DarlingMcpConfigHistoryTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_query_store_health"), Description("Per-database Query Store health: actual/desired state (desired READ_WRITE, actual READ_ONLY = the storage-cap failure). query_capture_mode (churn knob): ALL (2016/17 default) churns most; AUTO (2019+ default) skips minor ones; CUSTOM tunes AUTO; NONE stops new capture. wait_stats_capture_mode: ON default, OFF empties per-query waits. null on either: pre-rung row, or pre-2017 engine for wait_stats - never OFF. No verdict rendered. No rows = unavailable or not_collected; an unmatched database_name gives database_count 0. LATEST IS A TIME: captured_at is the newest hourly capture. <<GUIDE>> Gets per-database Query Store health (sys.database_query_store_options): actual vs desired state, readonly_reason (decoded), storage used vs cap, cleanup mode and thresholds, the runtime-stats interval length, and — the two trailing fields on every row since V137 / Lite v64 — query_capture_mode and wait_stats_capture_mode. The classic silent failure is desired READ_WRITE with actual READ_ONLY after the storage cap hit — check this when Query Store data looks stale or missing. CAPTURE MODE IS THE PLAN-CHURN KNOB: query_capture_mode is the one option on this row that names a plan-churn factory. ALL captures every query the engine compiles, one-off ad hoc statements included — on an ad hoc workload each distinct text is a new query with a new plan, so the store fills toward max_storage_size_mb, size-based cleanup cycles, and the READ_ONLY cap hit that readonly_reason decodes follows; ALL was the engine default on SQL Server 2016 and 2017. AUTO skips insignificant queries (the engine's own thresholds over a day: fewer than 30 executions, under 1 s of compile CPU and under 100 ms of execution CPU) and has been the default since SQL Server 2019 and on Azure SQL Database. CUSTOM (2019+) is AUTO with operator-set thresholds — the capture_policy_* knobs, which this row does not collect, so CUSTOM here says the thresholds were tuned, not to what. NONE stops capturing NEW queries while the store keeps collecting compile and runtime statistics for the ones it already holds. wait_stats_capture_mode ON (the default) records per-plan wait statistics into every runtime-stats interval, at a per-execution bookkeeping cost and more store bytes per interval; OFF saves both and leaves the store's per-query wait view empty. Both are the DMV's *_desc spelling verbatim. null means the row predates the V137 rung or, for wait_stats_capture_mode, the engine is older than SQL Server 2017 (the column does not exist there) — never OFF. Consumed by the Viewer's Query Store grid and, next, by get_query_store_clutter as its churn × ALL 'switch to AUTO' arm; this tool reports the modes and renders no verdict on them. Collected hourly; OFF is recorded as OFF (an absent database means not collected, never off). LATEST IS A TIME: this is the newest hourly capture, and captured_at is its instant.")]
     public static Task<string> GetQueryStoreHealth(
         NpgsqlDataSource postgres,
@@ -362,7 +369,7 @@ public sealed class DarlingMcpConfigHistoryTools
         {
             var snapshot = await DarlingConfigHistoryReader.GetLatestQueryStoreHealthAsync(postgres, resolved.ServerId, cancellationToken);
             if (snapshot.IsEmpty)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store_health", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store_health", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         "No Query Store health data available. The query_store_health collector runs hourly (SQL Server 2016+); a server with no rows either predates Query Store or has not completed a cycle yet.");
@@ -397,7 +404,7 @@ public sealed class DarlingMcpConfigHistoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 database_count = result.Count,
                 databases = result
@@ -429,6 +436,33 @@ public sealed class DarlingMcpConfigHistoryTools
             notice.IsUnavailable
                 ? (object)new { server = serverName, snapshot_count = snapshotCount }
                 : (object)new { server = serverName, snapshot_count = snapshotCount, effective_start = notice.EffectiveStart, window_truncated = notice.WindowTruncated, truncation_note = notice.TruncationNote });
+
+    /// <summary>
+    /// #5633 item 19: the empty answer of <c>get_trace_flag_changes</c>. When the trace_flags collector's newest successful run stored zero
+    /// rows, no flag is on (<c>DBCC TRACESTATUS(-1)</c> lists only flags that are), and that is what the answer says instead of "fewer than
+    /// two snapshots". Otherwise it is <see cref="NoChanges"/> unchanged. <c>snapshot_count</c> stays what it always was: captures that
+    /// listed a flag.
+    /// </summary>
+    internal static string NoTraceFlagChanges(string serverName, int hoursBack, int snapshotCount, McpWindowNotice notice, CollectorRunFacts runFacts)
+    {
+        var none = runFacts.NoTraceFlagsEnabled();
+        if (none is null)
+        {
+            return NoChanges(serverName, hoursBack, snapshotCount, notice);
+        }
+
+        /* A run that finds no flag stores no rows; the diff reads each successful empty run as an empty capture, so a flag turned off shows as a
+           change at that run's time. Reaching this answer means none falls in the window: say that rather than imply an earlier flag is still on. */
+        var message = snapshotCount == 0
+            ? none + " No trace flag has ever been captured as enabled, so there is nothing to diff."
+            : none + " Earlier captures listed a flag, and a successful run that finds none counts as an empty capture, so a flag turned off shows as a change at that run's time; none falls in this window.";
+        return McpHelpers.Status(
+            "empty",
+            message,
+            notice.IsUnavailable
+                ? (object)new { server = serverName, snapshot_count = snapshotCount }
+                : (object)new { server = serverName, snapshot_count = snapshotCount, effective_start = notice.EffectiveStart, window_truncated = notice.WindowTruncated, truncation_note = notice.TruncationNote });
+    }
 
     /// <summary>#5245: keeps the rows whose database is one of the chosen ones (ordinal, ignoring case: the match these two
     /// reads always made against one name); every row for <see cref="DatabaseFilter.All"/>.</summary>

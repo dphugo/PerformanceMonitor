@@ -47,6 +47,17 @@ public enum ReadOutcome
     Limit,
     FallbackRaw,
     GateFailed,
+
+    /// <summary>#5506 part 3: the time a heavy read waited for an admission slot, recorded as one extra sample beside the
+    /// read's own outcome. Not a read: the long-read table and the read percentiles leave it out.</summary>
+    QueueWait,
+
+    /// <summary>#5506 part 3: a read refused because the long-read slots and their queue were full.</summary>
+    Busy,
+
+    /// <summary>#5506 part 3: a read answered from the read cache, or by joining an identical read already running. Its
+    /// elapsed time is the caller's own. Not a store read: the long-read table leaves it out.</summary>
+    CacheHit,
 }
 
 /// <summary>
@@ -86,6 +97,9 @@ public sealed class ReadLatencyAccumulator
         ReadOutcome.Limit => "limit",
         ReadOutcome.FallbackRaw => "fallback_raw",
         ReadOutcome.GateFailed => "gate_failed",
+        ReadOutcome.QueueWait => "queue_wait",
+        ReadOutcome.Busy => "busy",
+        ReadOutcome.CacheHit => "cache_hit",
         _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "No stored label for this read outcome."),
     };
 
@@ -109,22 +123,46 @@ public sealed class ReadLatencyAccumulator
         public long Count;
         public long TotalMs;
         public long MaxMs;
+        public int MaxInFlight;
+        public long WaitTotalMs;
         public readonly long[] BucketCounts = new long[s_bucketCount];
+
+        /* #5793: the distinct callers of the key in the hour, cleared by the hourly drain. Capped at MaxDistinctCallers
+           values: past the cap a new caller is not added, so the stored count reads "at least 1,000" and one key's set
+           never grows past a few tens of kilobytes however many sessions read it. */
+        public HashSet<string>? Callers;
     }
 
-    private readonly ConcurrentDictionary<(ReadSurface Surface, string Route, ReadOutcome Outcome), Bucket> _buckets = new();
+    /// <summary>The most distinct callers one key keeps in one hour (#5793). A busier key stores this number, a floor.</summary>
+    internal const int MaxDistinctCallers = 1_000;
+
+    /* #5506: the window band is part of the key, so a 1-hour read and a 7-day read of one route keep separate histograms. */
+    private readonly ConcurrentDictionary<(ReadSurface Surface, string Route, ReadOutcome Outcome, string WindowBand), Bucket> _buckets = new();
 
     /// <summary>Record one finished read. Thread-safe: web and compose reads run concurrently. <paramref
     /// name="route"/> is never the caller's free text — every call site passes a bounded-cardinality label
     /// (the <c>/api/read/&lt;name&gt;</c> tool name, or a fixed panel/view-kind label for compose).</summary>
     public void Record(ReadSurface surface, string route, ReadOutcome outcome, long elapsedMs)
+        => Record(surface, route, outcome, elapsedMs, ReadWindowBand.None, 0, 0);
+
+    /// <summary>Records one read (#5506): its window band (<see cref="ReadWindowBand"/>), how many other reads were in
+    /// progress when it started (the key keeps the hour's maximum) and the time it waited for a store connection (the key
+    /// keeps the hour's sum).</summary>
+    internal void Record(ReadSurface surface, string route, ReadOutcome outcome, long elapsedMs, string? windowBand, int inFlightAtStart, long waitMs)
+        => Record(surface, route, outcome, elapsedMs, windowBand, inFlightAtStart, waitMs, null);
+
+    /// <summary>Records one read with its caller (#5793): the finished caller string from <see cref="ReadCaller"/>, never
+    /// the request. The key keeps the hour's set of distinct callers, up to <see cref="MaxDistinctCallers"/>. A null caller
+    /// adds nothing to the set.</summary>
+    internal void Record(ReadSurface surface, string route, ReadOutcome outcome, long elapsedMs, string? windowBand, int inFlightAtStart, long waitMs, string? caller)
     {
         if (string.IsNullOrEmpty(route))
         {
             return;
         }
 
-        var bucket = _buckets.GetOrAdd((surface, route, outcome), static _ => new Bucket());
+        var band = string.IsNullOrEmpty(windowBand) ? ReadWindowBand.None : windowBand;
+        var bucket = _buckets.GetOrAdd((surface, route, outcome, band), static _ => new Bucket());
         var clampedMs = Math.Max(elapsedMs, 0);
         var bucketIndex = BucketIndexFor(clampedMs);
 
@@ -137,6 +175,19 @@ public sealed class ReadLatencyAccumulator
                 bucket.MaxMs = clampedMs;
             }
             bucket.BucketCounts[bucketIndex]++;
+            if (inFlightAtStart > bucket.MaxInFlight)
+            {
+                bucket.MaxInFlight = inFlightAtStart;
+            }
+            bucket.WaitTotalMs += Math.Max(waitMs, 0);
+            if (!string.IsNullOrEmpty(caller))
+            {
+                bucket.Callers ??= new HashSet<string>(StringComparer.Ordinal);
+                if (bucket.Callers.Count < MaxDistinctCallers)
+                {
+                    bucket.Callers.Add(caller);
+                }
+            }
         }
     }
 
@@ -157,7 +208,26 @@ public sealed class ReadLatencyAccumulator
     }
 
     internal sealed record DrainedLatency(
-        ReadSurface Surface, string Route, ReadOutcome Outcome, long Count, long TotalMs, long MaxMs, long[] BucketCounts);
+        ReadSurface Surface, string Route, ReadOutcome Outcome, long Count, long TotalMs, long MaxMs, long[] BucketCounts,
+        string WindowBand = ReadWindowBand.None, int MaxInFlight = 0, long WaitTotalMs = 0, int DistinctCallers = 0);
+
+    /// <summary>#5506 part 3: a copy of the unflushed rows, leaving them in place (the long-read table reads them).</summary>
+    internal IReadOnlyList<DrainedLatency> Snapshot()
+    {
+        var rows = new List<DrainedLatency>();
+        foreach (var (key, bucket) in _buckets)
+        {
+            lock (bucket)
+            {
+                rows.Add(new DrainedLatency(
+                    key.Surface, key.Route, key.Outcome, bucket.Count, bucket.TotalMs, bucket.MaxMs,
+                    (long[])bucket.BucketCounts.Clone(), key.WindowBand, bucket.MaxInFlight, bucket.WaitTotalMs,
+                    bucket.Callers?.Count ?? 0));
+            }
+        }
+
+        return rows;
+    }
 
     /// <summary>Drain every accumulated bucket and RESET the window (<c>TryRemove</c>), so the next hour
     /// starts clean and an hour with no reads writes nothing — exactly <see cref="CollectorCostAccumulator.Drain"/>'s
@@ -178,7 +248,8 @@ public sealed class ReadLatencyAccumulator
             {
                 rows.Add(new DrainedLatency(
                     key.Surface, key.Route, key.Outcome, bucket.Count, bucket.TotalMs, bucket.MaxMs,
-                    (long[])bucket.BucketCounts.Clone()));
+                    (long[])bucket.BucketCounts.Clone(), key.WindowBand, bucket.MaxInFlight, bucket.WaitTotalMs,
+                    bucket.Callers?.Count ?? 0));
             }
         }
 
@@ -202,18 +273,24 @@ public sealed class ReadLatencyAccumulator
        refuses a jagged bigint[][] parameter ("use a multidimensional array instead"), and every drained
        key's own bucket_counts is a single flat bigint[], which binds cleanly as its own parameter. The row
        count here is bounded by (surface × route × outcome) actually hit in the hour — at most a few hundred,
-       never one per read — so a handful of round trips is the right shape for this table's real size. */
+       never one per read — so a handful of round trips is the right shape for this table's real size.
+
+       distinct_callers (#5793) takes the greater of the two counts: two partial flushes of one hour cannot union sets
+       that were never stored, so a mid-hour restart keeps the larger count, a floor of the hour's real number. */
     private const string InsertSql = @"
 INSERT INTO collect.read_latency
 (
-    metric_time, surface, route, outcome,
-    run_count, total_ms, max_ms, bucket_counts
+    metric_time, surface, route, outcome, window_band,
+    run_count, total_ms, max_ms, bucket_counts, max_in_flight, wait_total_ms, distinct_callers
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (metric_time, surface, route, outcome) DO UPDATE SET
+VALUES ($1, $2, $3, $4, $9, $5, $6, $7, $8, $10, $11, $12)
+ON CONFLICT (metric_time, surface, route, outcome, window_band) DO UPDATE SET
     run_count = collect.read_latency.run_count + EXCLUDED.run_count,
     total_ms = collect.read_latency.total_ms + EXCLUDED.total_ms,
     max_ms = GREATEST(collect.read_latency.max_ms, EXCLUDED.max_ms),
+    max_in_flight = GREATEST(collect.read_latency.max_in_flight, EXCLUDED.max_in_flight),
+    wait_total_ms = collect.read_latency.wait_total_ms + EXCLUDED.wait_total_ms,
+    distinct_callers = GREATEST(collect.read_latency.distinct_callers, EXCLUDED.distinct_callers),
     bucket_counts = (
         SELECT array_agg(a + b ORDER BY ord)
         FROM unnest(collect.read_latency.bucket_counts) WITH ORDINALITY AS x(a, ord)
@@ -239,6 +316,10 @@ WHERE metric_time < $1";
             insert.Parameters.AddWithValue(row.TotalMs);
             insert.Parameters.AddWithValue(row.MaxMs);
             insert.Parameters.AddWithValue(row.BucketCounts);
+            insert.Parameters.AddWithValue(row.WindowBand);
+            insert.Parameters.AddWithValue(row.MaxInFlight);
+            insert.Parameters.AddWithValue(row.WaitTotalMs);
+            insert.Parameters.AddWithValue(row.DistinctCallers);
             await insert.ExecuteNonQueryAsync(cancellationToken);
         }
 
@@ -246,6 +327,6 @@ WHERE metric_time < $1";
         retention.Parameters.AddWithValue(metricTimeUtc.AddDays(-RetentionDays));
         await retention.ExecuteNonQueryAsync(cancellationToken);
 
-        logger?.LogDebug("read_latency flush wrote {Rows} surface+route+outcome rows", drained.Count);
+        logger?.LogDebug("read_latency flush wrote {Rows} surface+route+outcome+band rows", drained.Count);
     }
 }

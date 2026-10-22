@@ -77,8 +77,117 @@ WHERE server_id = $1";
             return null;
         }
 
+        return Envelope(serverName, engineEdition, engineKind, collectorName);
+    }
+
+    /// <summary>
+    /// #6439: the <c>not_collected</c> envelope for the tempdb file I/O read on an Azure SQL Database, or <c>null</c> on any other
+    /// engine. <c>file_io_stats</c> runs there, but the database sees only its own files, so a tempdb row never exists and no
+    /// collector setting can make one. The sentence carries the same engine-gate mark and engine name as
+    /// <see cref="NotCollectedStatusAsync"/>'s, so the web page shows the same plain "Azure SQL Database does not have this
+    /// data." line as its other Azure panels instead of sending the reader to check collection.
+    /// </summary>
+    public static async Task<string?> TempDbFileIoNotCollectedStatusAsync(
+        NpgsqlDataSource postgres,
+        int serverId,
+        string serverName,
+        CancellationToken cancellationToken = default) =>
+        TempDbFileIoNotCollectedStatus(serverName, await EngineEditionAsync(postgres, serverId, cancellationToken));
+
+    /// <summary>The pure half of <see cref="TempDbFileIoNotCollectedStatusAsync"/>: the envelope for this engine edition, or <c>null</c>.</summary>
+    internal static string? TempDbFileIoNotCollectedStatus(string serverName, int engineEdition) =>
+        engineEdition == CollectorEngineCapability.AzureSqlDatabaseEngineEdition
+            ? McpHelpers.Status(
+                "not_collected",
+                $"{serverName} runs on {CollectorEngineCapability.DescribeEngineEdition(engineEdition)} (EngineEdition {engineEdition}). " +
+                "The file I/O collector runs there, but an Azure SQL Database sees only its own database's files, so this server " +
+                "has no tempdb file I/O rows, and never will. " +
+                "This is a permanent engine capability gap, not a collection outage: checking collection health, " +
+                "enabling a collector or starting a capture cannot change it.")
+            : null;
+
+    /// <summary>The <c>not_collected</c> envelope for this engine and collector, or <c>null</c> when the collector can run there.</summary>
+    private static string? Envelope(string serverName, int engineEdition, string? engineKind, string collectorName)
+    {
         var message = CollectorEngineCapability.NotCollectedMessage(serverName, engineEdition, engineKind, collectorName);
         return message is null ? null : McpHelpers.Status("not_collected", message);
+    }
+
+    /// <summary>#6178: every registered server, enabled or not: the fleet a read with no server named would have covered.</summary>
+    public const string RegisteredServersSql = @"
+SELECT server_id, server_name
+FROM servers
+ORDER BY server_name";
+
+    /// <summary>
+    /// #6178: the <c>not_collected</c> envelope for a read that covers every registered server and found nothing, when
+    /// <paramref name="collectorName"/> cannot run on ANY of them (a fleet of only Azure SQL Databases). It asks
+    /// <see cref="NotCollectedStatusAsync"/> about each server and returns the first envelope, which names the engine and the
+    /// collector (for a fleet of several, the first server). It returns <c>null</c> when at least one server could have had the
+    /// data, or when the fleet cannot be read or is empty, so the caller keeps its own <c>empty</c> answer.
+    /// </summary>
+    public static async Task<string?> FleetNotCollectedStatusAsync(
+        NpgsqlDataSource postgres,
+        string collectorName,
+        CancellationToken cancellationToken = default)
+    {
+        var servers = new System.Collections.Generic.List<(int ServerId, string ServerName)>();
+        try
+        {
+            await using var command = postgres.CreateCommand(RegisteredServersSql);
+            command.CommandTimeout = McpCommandDeadlines.ReadSeconds;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                servers.Add((reader.GetInt32(0), reader.GetString(1)));
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+
+        string? first = null;
+        foreach (var (serverId, serverName) in servers)
+        {
+            /* The same answer NotCollectedStatusAsync gives one server; a registry read that fails makes no claim. */
+            string? envelope;
+            try
+            {
+                var (engineEdition, engineKind) = await ReadServerEngineAsync(postgres, serverId, cancellationToken);
+                envelope = Envelope(serverName, engineEdition, engineKind, collectorName);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return null;
+            }
+
+            if (envelope is null) return null;
+            first ??= envelope;
+        }
+
+        return first;
+    }
+
+    /// <summary>
+    /// #6178: whether the newest stored server properties say this server's database is on Azure SQL Database Hyperscale (the
+    /// stored edition or an <c>HS_</c> service objective). A missing row or a failed read is false, so the caller falls back to
+    /// reading Hyperscale from its own rows. A cancellation still propagates.
+    /// </summary>
+    public static async Task<bool> IsHyperscaleAsync(
+        NpgsqlDataSource postgres,
+        int serverId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var row = await DarlingDataReader.GetLatestServerPropertiesAsync(postgres, serverId, cancellationToken);
+            return row is not null && HyperscaleLogSize.IsHyperscaleTier(row.Edition, row.ServiceObjective);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

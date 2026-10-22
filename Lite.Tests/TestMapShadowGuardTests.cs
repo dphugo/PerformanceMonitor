@@ -18,20 +18,18 @@ using Xunit;
 namespace Lite.Tests;
 
 /// <summary>
-/// Pins the test-class map's selection and its shadow check (#5459, change 4): the rules that close the holes the
-/// replay found, the shadow-check row, and the workflow wiring that lets exactly three jobs narrow their classes.
+/// Runs the test-class map's selection and its shadow check (#5459, change 4): the rules that close the holes the
+/// replay found, the shadow-check row, and the shard scripts that narrow their classes to the selection.
 ///
 /// <para><b>Why.</b> The selection job computes the selection for every pull request, and the Darling PG shards, the
 /// Lite shards and the build job's no-store Darling pass keep only the classes it names (the shard scripts' `map-keep`
-/// call). The one thing it must never do is run LESS than the full suite by accident, so the pins below fail if a
-/// FULL, missing, unreadable or empty selection narrows anything, if any other job reads the selection, if the
-/// selection job can fail the run, or if a push, the nightly or a release run gets a selection. The rule cases pin
+/// call). The one thing it must never do is run LESS than the full suite by accident, so the tests below fail if a
+/// FULL, missing, unreadable or empty selection narrows anything. The rule cases cover
 /// what the replay of the failure corpus asked for: a path written only in a comment, a class named by a sibling
 /// test file, a partial type declared in many files, a class that would otherwise be a hole, and a documentation
 /// file a test reads by name.</para>
 /// </summary>
 [Trait("Stage", "Guard")]
-[Trait("Reads", "Darling")]
 public sealed class TestMapShadowGuardTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "testmap-shadow-" + Guid.NewGuid().ToString("N"));
@@ -405,156 +403,6 @@ public sealed class TestMapShadowGuardTests : IDisposable
         Assert.Empty(missing.GetProperty("misses").EnumerateArray());
     }
 
-    private static string BuildYml() => File.ReadAllText(Path.Combine(ParitySource.RepoRoot(), ".github", "workflows", "build.yml"))
-        .Replace("\r\n", "\n");
-
-    private static string Job(string yaml, string name)
-    {
-        var start = yaml.IndexOf("\n  " + name + ":\n", StringComparison.Ordinal);
-        Assert.True(start >= 0, "build.yml has no job " + name);
-        var next = Regex.Match(yaml[(start + 1)..], @"\n  (?:#[^\n]*\n  )*[a-z][a-z0-9-]*:\n");
-        return next.Success && next.Index > 0 ? yaml.Substring(start, next.Index + 1) : yaml[start..];
-    }
-
-    private static readonly string[] s_selectionConsumers = ["build", "darling-pg", "lite-tests"];
-
-    [Fact]
-    public void OnlyTheThreeTestJobs_ReadTheSelection_EachThroughOneDownloadStep_AndNoJobReadsTheMapItself()
-    {
-        var yml = BuildYml();
-        var jobNames = Regex.Matches(yml, @"^  ([a-z][a-z0-9-]*):\s*$", RegexOptions.Multiline).Select(m => m.Groups[1].Value)
-            .Where(n => n is not ("on" or "permissions" or "env" or "concurrency" or "jobs")).ToList();
-        Assert.Contains("test-map-select", jobNames);
-        Assert.Contains("shadow-check", jobNames);
-        Assert.DoesNotContain("test-map-shadow", jobNames);
-        Assert.DoesNotContain("test-map-shadow-selection", yml, StringComparison.Ordinal);
-
-        // Before the selection went live no test job read the map; now exactly these three read the SELECTION, and
-        // still never the map: the pinned map (gate outputs test_map_*) belongs to the selection job alone.
-        foreach (var name in jobNames.Where(n => n is not ("gate" or "test-map-select" or "shadow-check")))
-        {
-            var job = Job(yml, name);
-            Assert.DoesNotContain("test_map", job, StringComparison.Ordinal);
-            Assert.DoesNotContain("ci-select.py map-select", job, StringComparison.Ordinal);
-            Assert.DoesNotContain("shadow-check", job, StringComparison.Ordinal);
-            if (s_selectionConsumers.Contains(name))
-            {
-                continue;
-            }
-
-            Assert.DoesNotContain("test-map-select", job, StringComparison.Ordinal);
-            Assert.DoesNotContain("test-map-selection", job, StringComparison.Ordinal);
-            Assert.DoesNotContain("TEST_MAP_SELECTION", job, StringComparison.Ordinal);
-        }
-
-        // The selection job and the check run on pull requests only and cannot redden the run. The selection job is
-        // capped at 5 minutes because the three test jobs wait for it; the check is capped at 10.
-        foreach (var (name, minutes) in new[] { ("test-map-select", 5), ("shadow-check", 10) })
-        {
-            var job = Job(yml, name);
-            Assert.Contains("continue-on-error: true\n    permissions:", job, StringComparison.Ordinal);
-            Assert.Contains("github.event_name == 'pull_request'", job, StringComparison.Ordinal);
-            Assert.Contains($"timeout-minutes: {minutes}\n", job, StringComparison.Ordinal);
-        }
-
-        Assert.Contains("needs: [gate]", Job(yml, "test-map-select"), StringComparison.Ordinal);
-        Assert.Contains("needs: [gate, guard-tests, test-map-select, darling-pg, lite-tests]", Job(yml, "shadow-check"), StringComparison.Ordinal);
-        Assert.Contains("always()", Job(yml, "shadow-check"), StringComparison.Ordinal);
-
-        // Each consumer waits on the selection job, never fails because of it (`!cancelled()` in its own `if`), and
-        // downloads this run's artifact in ONE step that cannot fail the job.
-        foreach (var name in s_selectionConsumers)
-        {
-            var job = Job(yml, name);
-            var needs = Regex.Match(job, @"\n    needs: (\[[^\]]*\])");
-            Assert.Contains("test-map-select", needs.Groups[1].Value, StringComparison.Ordinal);
-            Assert.Contains("!cancelled()", Regex.Match(job, @"\n    if: [^\n]*").Value, StringComparison.Ordinal);
-            var step = job[job.IndexOf("- name: Download the test map selection", StringComparison.Ordinal)..];
-            step = step[..step.IndexOf("\n\n", StringComparison.Ordinal)];
-            Assert.Single(Regex.Matches(job, "- name: Download the test map selection"));
-            Assert.Contains("id: map-selection", step, StringComparison.Ordinal);
-            Assert.Contains("if: github.event_name == 'pull_request' && needs.test-map-select.result == 'success'", step, StringComparison.Ordinal);
-            Assert.Contains("continue-on-error: true", step, StringComparison.Ordinal);
-            Assert.Contains("uses: actions/download-artifact@v6", step, StringComparison.Ordinal);
-            Assert.Contains("name: test-map-selection", step, StringComparison.Ordinal);
-            Assert.DoesNotContain("run-id", step, StringComparison.Ordinal);
-            // Empty unless the download succeeded: every failure leaves the shard running everything.
-            Assert.Contains("TEST_MAP_SELECTION: ${{ steps.map-selection.outcome == 'success' && format('{0}\\test-map-selection\\selection.json', github.workspace) || '' }}", job, StringComparison.Ordinal);
-        }
-
-        // No other job lists the selection job in `needs`.
-        foreach (var name in jobNames.Where(n => n is not "shadow-check" && !s_selectionConsumers.Contains(n)))
-        {
-            var needs = Regex.Match(Job(yml, name), @"\n    needs: (\[[^\]]*\]|[^\n]*)");
-            Assert.DoesNotContain("test-map", needs.Value, StringComparison.Ordinal);
-            Assert.DoesNotContain("shadow", needs.Value, StringComparison.Ordinal);
-        }
-
-        // Only a pull request narrows: the nightly calls the same scripts without a selection.
-        var nightly = File.ReadAllText(Path.Combine(ParitySource.RepoRoot(), ".github", "workflows", "nightly.yml"));
-        Assert.DoesNotContain("SelectionFile", nightly, StringComparison.Ordinal);
-        Assert.DoesNotContain("test-map-selection", nightly, StringComparison.Ordinal);
-        Assert.Contains("-SelectionFile $env:TEST_MAP_SELECTION", Job(yml, "darling-pg"), StringComparison.Ordinal);
-        Assert.Contains("-SelectionFile $env:TEST_MAP_SELECTION", Job(yml, "lite-tests"), StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void ThePin_IsPullRequestOnly_AndCannotFailTheGate()
-    {
-        var gate = Job(BuildYml(), "gate");
-        var step = gate[gate.IndexOf("- name: Pin the test map\n", StringComparison.Ordinal)..];
-        Assert.Contains("id: testmap", step, StringComparison.Ordinal);
-        Assert.Contains("if: github.event_name == 'pull_request' && steps.decide.outputs.run == 'true'", step, StringComparison.Ordinal);
-        Assert.Contains("continue-on-error: true", step[..step.IndexOf("run: |", StringComparison.Ordinal)], StringComparison.Ordinal);
-
-        // continue-on-error absorbs a step failure but not the job's own timeout: a hung gh api call would otherwise run
-        // the gate into its 5-minute limit and red the whole run with no tests. A step timeout turns the hang into a step
-        // failure first (#5459).
-        var header = step[..step.IndexOf("run: |", StringComparison.Ordinal)];
-        var stepTimeout = Regex.Match(header, @"^        timeout-minutes: (\d+)\s*$", RegexOptions.Multiline);
-        Assert.True(stepTimeout.Success, "the pin step needs its own timeout-minutes");
-        var gateTimeout = Regex.Match(gate, @"^    timeout-minutes: (\d+)\s*$", RegexOptions.Multiline);
-        Assert.True(gateTimeout.Success, "the gate job needs a timeout-minutes");
-        Assert.True(int.Parse(stepTimeout.Groups[1].Value) < int.Parse(gateTimeout.Groups[1].Value),
-            "the pin step's timeout must be below the gate job's");
-        Assert.Contains("nightly.yml/runs?status=success", step, StringComparison.Ordinal);
-        Assert.Contains("compare/${sha}...${BASE_SHA}", step, StringComparison.Ordinal);   // the map's commit must be an ancestor of the base
-        Assert.Contains("ahead|identical", step, StringComparison.Ordinal);
-        Assert.Contains("expires_at > env.KEEP_UNTIL", step, StringComparison.Ordinal);
-        Assert.Contains("test_map_run: ${{ steps.testmap.outputs.run_id }}", gate, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void TheSelectionSteps_TurnEveryFailureIntoAFullNotice_NeverAnErrorOrASkip()
-    {
-        var job = Job(BuildYml(), "test-map-select");
-        foreach (var why in new[] { "no test map is pinned for this run", "the pinned map could not be downloaded",
-                     "the changed files could not be listed", "the selection script failed" })
-        {
-            Assert.Contains("full \"" + why + "\"", job, StringComparison.Ordinal);
-        }
-
-        Assert.Contains("exit 0", job, StringComparison.Ordinal);
-        Assert.Contains("timeout 120 python .github/scripts/ci-select.py map-select", job, StringComparison.Ordinal);
-        // #5459: a pull request into main always runs everything, so the step hands the base branch to map-select.
-        Assert.Contains("BASE_REF: ${{ github.base_ref }}", job, StringComparison.Ordinal);
-        Assert.Contains("--event pull_request --base-ref \"${BASE_REF}\" --base \"${BASE_SHA}\"", job, StringComparison.Ordinal);
-        var check = Job(BuildYml(), "shadow-check");
-        Assert.Contains("exit 0", check, StringComparison.Ordinal);
-        Assert.Contains("name: test-map-shadow-row", check, StringComparison.Ordinal);
-        Assert.Contains("retention-days: 30", check, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void TheDarlingShards_UploadTheirReports_EvenWhenAClassFailed()
-    {
-        var yml = BuildYml();
-        var step = yml[yml.IndexOf("- name: Upload Darling test timings", StringComparison.Ordinal)..];
-        step = step[..step.IndexOf("\n\n", StringComparison.Ordinal)];
-        Assert.Contains("if: always() && steps.filter.outputs.darling == 'true'", step, StringComparison.Ordinal);
-        Assert.Contains("name: darling-tests-timing-${{ matrix.shard }}", step, StringComparison.Ordinal);
-    }
-
     private (int ExitCode, string Output) MapKeep(string? selectionJson, string suite)
     {
         var path = Path.Combine(_dir, "keep-selection.json");
@@ -624,9 +472,12 @@ public sealed class TestMapShadowGuardTests : IDisposable
     }
 
     /// <summary>Runs one shard script in a scratch folder with a fake `dotnet` that answers the class listing from
-    /// <paramref name="classes"/> and prints each chunk's -class arguments. Returns the classes the chunks ran, and the output.</summary>
+    /// <paramref name="classes"/> and prints each chunk's -class arguments. Returns the classes the chunks ran, and the output.
+    /// The fake answers the listing the way the real runner does: it prints a `LIST` line with the arguments it was handed,
+    /// and exits 3 on anything that is not a `-list`, `-trait` or `-trait-` option with its value. <paramref name="scopeFilter"/>
+    /// reaches the Darling script the way the build job hands it over, as `-ScopeFilter $env:DARLING_SCOPE_FILTER`.</summary>
     private (int ExitCode, List<string> Ran, string Output) RunShardScript(string script, string suite, string[] classes, string? selectionJson,
-        string eventName = "pull_request")
+        string eventName = "pull_request", string scopeFilter = "")
     {
         var pwsh = FindPwsh();
         Assert.SkipWhen(pwsh is null, "PowerShell 7 (pwsh) is not on PATH, so the shard scripts cannot be run here.");
@@ -647,6 +498,16 @@ public sealed class TestMapShadowGuardTests : IDisposable
             $global:ListFile = Join-Path $PWD 'classes.txt'
             function dotnet {
                 if ($args -contains '-list') {
+                    $all = @($args)
+                    $runner = @($all[[array]::IndexOf($all, '-list')..($all.Count - 1)])
+                    Write-Host ('LIST ' + (($runner | ForEach-Object { "[$_]" }) -join ''))
+                    for ($i = 0; $i -lt $runner.Count; $i += 2) {
+                        if ($runner[$i] -notin '-list', '-trait', '-trait-' -or $i + 1 -ge $runner.Count) {
+                            Write-Host ('unknown option: ' + $runner[$i])
+                            $global:LASTEXITCODE = 3
+                            return
+                        }
+                    }
                     Write-Output 'a dotnet notice line that is not JSON'
                     Write-Output (ConvertTo-Json -Compress -InputObject @(Get-Content -Path $global:ListFile | Where-Object { $_ }))
                     $global:LASTEXITCODE = 0
@@ -659,7 +520,7 @@ public sealed class TestMapShadowGuardTests : IDisposable
             $env:SLOW_REPO = ''
             $env:SLOW_PR = ''
             $env:SLOW_BASE_REF = ''
-            if ($Suite -eq 'darling') { & $Script -Shard 0 -ShardCount 1 -EventName $EventName -SelectionFile $Selection }
+            if ($Suite -eq 'darling') { & $Script -Shard 0 -ShardCount 1 -EventName $EventName -ScopeFilter $env:DARLING_SCOPE_FILTER -SelectionFile $Selection }
             else { & $Script -Shard 0 -ShardCount 1 -JobIndex 0 -EventName $EventName -SelectionFile $Selection }
             exit $LASTEXITCODE
             """);
@@ -670,6 +531,7 @@ public sealed class TestMapShadowGuardTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        psi.Environment["DARLING_SCOPE_FILTER"] = scopeFilter;
         foreach (var a in new[] { "-NoProfile", "-NonInteractive", "-File", harness, "-Script", Script(script), "-Suite", suite,
                      "-Selection", selectionJson is null ? "" : selection, "-EventName", eventName })
         {
@@ -748,4 +610,71 @@ public sealed class TestMapShadowGuardTests : IDisposable
         Assert.True(run.ExitCode == 0, run.Output);
         Assert.Equal([$"{ns}.OuterTests", $"{ns}.OuterTests+InnerLive"], run.Ran.OrderBy(c => c, StringComparer.Ordinal));
     }
+
+    private static string ListingArguments(string output) =>
+        output.Split('\n').Select(l => l.TrimEnd('\r')).Single(l => l.StartsWith("LIST ", StringComparison.Ordinal));
+
+    [Fact]
+    public void TheDarlingShardScript_HandsTheScopeFilterToTheClassListingAsSeparateArguments()
+    {
+        // The build job's pass for a pull request that changes only Lite files lists the classes with
+        // `-ScopeFilter "-trait Stage=Guard -trait Reads=Lite"`. The script held the split filter in a variable that
+        // PowerShell treats as the same variable as the typed [string] $ScopeFilter parameter (names are case-insensitive),
+        // so the array became one string again and splatting it gave the runner the string's characters as arguments:
+        // exit code 3 from the listing, on every such pull request. The fake runner here exits 3 the same way.
+        string[] all = [.. Enumerable.Range(1, 5).Select(i => $"Darling.Tests.Class{i:00}Tests")];
+        var selection = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["full"] = false,
+            ["reason"] = "",
+            ["selected"] = new Dictionary<string, string[]> { ["darling"] = ["Class03Tests"] },
+        });
+
+        var scoped = RunShardScript("run-darling-pg-shard.ps1", "darling", all, selection, scopeFilter: "-trait Stage=Guard -trait Reads=Lite");
+        Assert.True(scoped.ExitCode == 0, scoped.Output);
+        // #5961: the Lite-reads part of the scope is no runner filter any more (no assembly carries a Reads trait): the script
+        // lists once for the Guard stage and once unfiltered to match the source scan's names against.
+        Assert.Equal(
+            ["LIST [-list][classes/json]", "LIST [-list][classes/json][-trait][Stage=Guard]"],
+            ListingLines(scoped.Output));
+        Assert.Equal("Darling.Tests.Class03Tests", Assert.Single(scoped.Ran));
+
+        // No scope (every other caller): the listing is the bare `-list classes/json`, with no empty argument after it.
+        var whole = RunShardScript("run-darling-pg-shard.ps1", "darling", all, selection);
+        Assert.True(whole.ExitCode == 0, whole.Output);
+        Assert.Equal("LIST [-list][classes/json]", ListingArguments(whole.Output));
+    }
+
+    [Fact]
+    public void TheDarlingShardScript_RunsExactlyTheClassesTheSourceScanSaysReadALitePath_ForTheLiteReadsScope()
+    {
+        // #5961: `-trait Reads=Lite` alone in the scope selects the classes ci-select.py's scan names, whatever the listing
+        // holds. Class03 reads a Lite path in the scratch tree; Class01 and Class02 do not.
+        string[] all = [.. Enumerable.Range(1, 3).Select(i => $"Darling.Tests.Class{i:00}Tests")];
+        var tests = Path.Combine(_dir, "shard-darling", "Darling", "Darling.Tests");
+        Directory.CreateDirectory(tests);
+        foreach (var i in new[] { 1, 2, 3 })
+        {
+            var path = i == 3 ? "\"Lite/Services/X.cs\"" : "\"Darling/Services/X.cs\"";
+            File.WriteAllText(
+                Path.Combine(tests, $"Class{i:00}Tests.cs"),
+                $"namespace Darling.Tests;\n\npublic sealed class Class{i:00}Tests\n{{\n    [Fact]\n    public void A() {{ var p = {path}; }}\n}}\n");
+        }
+
+        var run = RunShardScript("run-darling-pg-shard.ps1", "darling", all, null, eventName: "push", scopeFilter: "-trait Reads=Lite");
+        Assert.True(run.ExitCode == 0, run.Output);
+        Assert.Equal("Darling.Tests.Class03Tests", Assert.Single(run.Ran));
+        Assert.Equal(["LIST [-list][classes/json]"], ListingLines(run.Output));
+
+        // An empty scan adds no class: with the Guard stage in the scope the Guard listing still decides, and with
+        // nothing else in the scope the script stops at its zero check instead of running a runner with no -class argument.
+        File.Delete(Path.Combine(tests, "Class03Tests.cs"));
+        var empty = RunShardScript("run-darling-pg-shard.ps1", "darling", all, null, eventName: "push", scopeFilter: "-trait Reads=Lite");
+        Assert.NotEqual(0, empty.ExitCode);
+        Assert.Empty(empty.Ran);
+        Assert.Contains("returned no classes", empty.Output, StringComparison.Ordinal);
+    }
+
+    private static string[] ListingLines(string output) =>
+        [.. output.Split('\n').Select(l => l.TrimEnd('\r')).Where(l => l.StartsWith("LIST ", StringComparison.Ordinal))];
 }

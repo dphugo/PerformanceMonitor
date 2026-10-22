@@ -53,7 +53,7 @@ public sealed class ProvisioningTrendRow
     };
 
     public string DayDisplay => Day.ToString("ddd MM/dd");
-    public string StatusDisplay => Status == ProvisioningVerdict.NotApplicable ? ProvisioningVerdict.NotApplicableLabel : Status.Replace("_", " ");
+    public string StatusDisplay => ProvisioningVerdict.StatusLabel(Status);
 }
 
 /// <summary>Pool-level memory-grant vs used efficiency per day (Optimization sub-tab).</summary>
@@ -97,11 +97,13 @@ public sealed class TopResourceConsumerRow
     public decimal PctIo { get; set; }
     public long TotalCpuTimeMs { get; set; }
     public decimal AvgIoMb { get; set; }
+    /// <summary>The by-average rows' CPU per execution, unrounded (#5644 W4).</summary>
+    public decimal AvgCpuMs { get; set; }
 
     public static TopResourceConsumerRow From(PerformanceMonitor.Darling.Storage.FinOps.TopResourceConsumer d) => new()
     {
         DatabaseName = d.DatabaseName, CpuTimeMs = d.CpuTimeMs, ExecutionCount = d.ExecutionCount, IoTotalMb = d.IoTotalMb,
-        PctCpu = d.PctCpu, PctIo = d.PctIo, TotalCpuTimeMs = d.TotalCpuTimeMs, AvgIoMb = d.AvgIoMb
+        PctCpu = d.PctCpu, PctIo = d.PctIo, TotalCpuTimeMs = d.TotalCpuTimeMs, AvgIoMb = d.AvgIoMb, AvgCpuMs = d.AvgCpuMs
     };
 }
 
@@ -599,6 +601,10 @@ public sealed class ServerPropertyRow
     public decimal MonthlyCost { get; set; }
     public decimal AnnualCost => FinOpsCost.Annual(MonthlyCost);
 
+    /// <summary>The uptime in seconds, the sort key of the Uptime column (#6086): <see cref="UptimeDisplay"/> is text, which sorts
+    /// "10d" before "2d". Null when the start time is unknown.</summary>
+    public double? UptimeSeconds => SqlServerStartTime is { } start ? (DateTime.Now - start).TotalSeconds : null;
+
     public string UptimeDisplay
     {
         get
@@ -611,7 +617,7 @@ public sealed class ServerPropertyRow
     public string HadrDisplay => IsHadrEnabled.HasValue ? (IsHadrEnabled.Value ? "Yes" : "No") : "";
     public string ClusteredDisplay => IsClustered.HasValue ? (IsClustered.Value ? "Yes" : "No") : "";
     public string AgReplicaRoleDisplay => string.Equals(AgReplicaRole, "Standalone", StringComparison.OrdinalIgnoreCase) ? "—" : AgReplicaRole;
-    public string ProvisioningDisplay => ProvisioningStatus == ProvisioningVerdict.NotApplicable ? ProvisioningVerdict.NotApplicableLabel : ProvisioningStatus?.Replace("_", " ") ?? "";
+    public string ProvisioningDisplay => string.IsNullOrEmpty(ProvisioningStatus) ? "" : ProvisioningVerdict.StatusLabel(ProvisioningStatus);
 
     /// <summary>License-limit warning for Standard edition (CPU/RAM caps). Same math as Lite.</summary>
     public string? LicenseWarning => FinOpsInventoryFigures.LicenseWarning(Edition, EngineEdition, _cpuCount, _physicalMemoryMb);

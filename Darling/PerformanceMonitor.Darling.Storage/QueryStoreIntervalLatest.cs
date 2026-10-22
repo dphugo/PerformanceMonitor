@@ -255,6 +255,7 @@ WITH
         last_execution_time,
         is_forced_plan,
         force_failure_count,
+        avg_rowcount,
         query_text
     )
     SELECT DISTINCT ON (" + BatchIdentityColumns + @")
@@ -274,6 +275,7 @@ WITH
         s.last_execution_time,
         s.is_forced_plan,
         s.force_failure_count,
+        s.avg_rowcount,
         s.query_text
     FROM collect.query_store_stats AS s
     WHERE s.server_id = $1
@@ -295,6 +297,7 @@ WITH
         last_execution_time = EXCLUDED.last_execution_time,
         is_forced_plan = EXCLUDED.is_forced_plan,
         force_failure_count = EXCLUDED.force_failure_count,
+        avg_rowcount = EXCLUDED.avg_rowcount,
         query_text = EXCLUDED.query_text
     WHERE (EXCLUDED.collection_time, EXCLUDED.execution_count) > (t.collection_time, t.execution_count)
     RETURNING 1
@@ -477,7 +480,7 @@ WHERE t.server_id = $1;";
     /// requires every swallowing catch there to record a failure, which is right for a read that leaves a fact empty and
     /// wrong for one that falls back to a read that is whole.</para>
     /// </summary>
-    public static async Task<List<DateOnly>> ReadBuiltDaysAsync(
+    public static async Task<List<PlanRegressionDaily.BuiltDay>> ReadBuiltDaysAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction? transaction,
         int serverId,
@@ -487,7 +490,7 @@ WHERE t.server_id = $1;";
         Func<Exception, bool> isExpectedAbandon,
         CancellationToken cancellationToken)
     {
-        var days = new List<DateOnly>();
+        var days = new List<PlanRegressionDaily.BuiltDay>();
         try
         {
             await using var cmd = new NpgsqlCommand(PlanRegressionDaily.BuiltDaysSql, connection, transaction) { CommandTimeout = commandTimeoutSeconds };
@@ -496,7 +499,8 @@ WHERE t.server_id = $1;";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
-                days.Add(reader.GetFieldValue<DateOnly>(0));
+                days.Add(new PlanRegressionDaily.BuiltDay(
+                    reader.GetFieldValue<DateOnly>(0), reader.IsDBNull(1) ? null : reader.GetDateTime(1)));
             }
 
             return days;
@@ -507,7 +511,7 @@ WHERE t.server_id = $1;";
                 ex,
                 "PLAN_REGRESSION built-days read failed for server {ServerId}; reading the interval table on its exact bounds",
                 serverId);
-            return new List<DateOnly>();
+            return new List<PlanRegressionDaily.BuiltDay>();
         }
     }
 

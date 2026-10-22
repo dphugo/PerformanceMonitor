@@ -55,6 +55,25 @@ public sealed class ProvisioningSerializationTests
     }
 
     [Fact]
+    public void TheViewerReplay_SkipsOnlyTheSubmitFunctionRevoke_AndGradesEveryOtherFunctionStatementItCanRun()
+    {
+        /* The batch writes the submission function's REVOKE (#5654) as exactly this one statement, so the exact match skips it. */
+        Assert.Contains(ViewerGrantReplay.BatchStatements(), s => s == ViewerGrantReplay.SubmitFunctionRevoke);
+
+        var statements = ViewerGrantReplay.StatementsFor("replay_role_5654", "scratch_5654");
+        Assert.DoesNotContain(statements, x => x.Contains("submit_external_alert", StringComparison.Ordinal));
+
+        /* Only that statement and the EXECUTE grants on functions the batch creates later are skipped; any other function
+           GRANT or REVOKE is replayed, so the live tests grade it. */
+        Assert.True(ViewerGrantReplay.CannotReplayOnScratchStore(ViewerGrantReplay.SubmitFunctionRevoke));
+        Assert.True(ViewerGrantReplay.CannotReplayOnScratchStore("GRANT EXECUTE ON FUNCTION config.record_custom_alert_resolution(integer, text, text, text) TO viewer, mcp"));
+        Assert.False(ViewerGrantReplay.CannotReplayOnScratchStore("REVOKE ALL ON FUNCTION config.submit_external_alert(text) FROM viewer"));
+        Assert.False(ViewerGrantReplay.CannotReplayOnScratchStore(ViewerGrantReplay.SubmitFunctionRevoke + ", other_role"));
+        Assert.False(ViewerGrantReplay.CannotReplayOnScratchStore("REVOKE ALL ON FUNCTION config.edit_monitored_server(text) FROM viewer"));
+        Assert.False(ViewerGrantReplay.CannotReplayOnScratchStore("GRANT ALL ON FUNCTION config.edit_monitored_server(text) TO viewer"));
+    }
+
+    [Fact]
     public void TheReplayRetarget_QuotesTheScratchName_AndLeavesEveryOtherStatementAlone()
     {
         Assert.Equal("GRANT CONNECT ON DATABASE \"a\"\"b\"", ViewerGrantReplay.OnDatabase("GRANT CONNECT ON DATABASE darling", "a\"b"));
@@ -73,7 +92,7 @@ public sealed class ProvisioningSerializationTests
            unserialized, so each renderer is built into exactly one command, inside the helper's call. */
         Assert.Matches(new Regex(@"ExecuteSerializedAsync\(connection, async \(transaction, token\) =>\s*\{(?:(?!ExecuteNonQueryAsync).)*?return new NpgsqlCommand\(\s*BuildProvisioningSql\(.*?connection, transaction\) \{ CommandTimeout = [^}]*\};\s*\}, logger, cancellationToken\);", RegexOptions.Singleline, TimeSpan.FromSeconds(5)), source);
         Assert.Matches(new Regex(@"new NpgsqlCommand\(\s*BuildComposeStatementTimeoutSql\(.*?CommandTimeout = [^}]*\};\s*await ExecuteSerializedAsync\(\s*command, logger, cancellationToken, lockWait: TimeSpan\.FromSeconds\(ServiceCommandDeadlines\.SerialLoopSeconds\)\);", RegexOptions.Singleline, TimeSpan.FromSeconds(5)), source);
-        Assert.Matches(new Regex(@"ExecuteSerializedAsync\(connection, async \(transaction, token\) =>\s*\{\s*alreadyInPlace = await ServerPasswordRulesAreInPlaceAsync\(connection, transaction, token\);.*?new NpgsqlCommand\(BuildServerPasswordRulesSql\(""config""\), connection, transaction\)\s*\{\s*CommandTimeout = [^}]*\};\s*\}, logger, cancellationToken\);", RegexOptions.Singleline, TimeSpan.FromSeconds(5)), source);
+        Assert.Matches(new Regex(@"ExecuteSerializedAsync\(connection, async \(transaction, token\) =>\s*\{\s*alreadyInPlace = await ServerPasswordRulesAreInPlaceAsync\(connection, transaction, token\);.*?new NpgsqlCommand\(BuildServerPasswordRulesSql\(""config""\) \+ BuildEditMonitoredServerFunctionsSql\(""config""\), connection, transaction\)\s*\{\s*CommandTimeout = [^}]*\};\s*\}, logger, cancellationToken\);", RegexOptions.Singleline, TimeSpan.FromSeconds(5)), source);
 
         foreach (var renderer in new[] { "BuildProvisioningSql", "BuildComposeStatementTimeoutSql", "BuildServerPasswordRulesSql" })
         {

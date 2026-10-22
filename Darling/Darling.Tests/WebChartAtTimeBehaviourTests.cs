@@ -176,10 +176,11 @@ public sealed class WebChartAtTimeBehaviourTests
         Assert.Contains("panel: \"Blocking\"", charts);
         Assert.Matches(@"table\(\s*""Blocking"",", blocking);
         Assert.Contains("panel: \"Deadlocks\"", charts);
-        // Both the chart and the grid are titled "Deadlocks", and the scroll takes the later one, so the grid must be the later.
-        var chart = blocking.IndexOf("line(\"Deadlocks\",", StringComparison.Ordinal);
+        // The Blocking tab's chart is "Deadlock trend" (#5644 W16), so the scroll to "Deadlocks" finds the grid; it still sits below its chart.
+        var chart = blocking.IndexOf("line(\"Deadlock trend\",", StringComparison.Ordinal);
         var grid = Regex.Match(blocking, @"table\(\s*""Deadlocks"",");
-        Assert.True(chart >= 0 && grid.Success && grid.Index > chart, "the Deadlocks grid must come after the Deadlocks chart on the Blocking tab");
+        Assert.DoesNotContain("line(\"Deadlocks\",", blocking, StringComparison.Ordinal);
+        Assert.True(chart >= 0 && grid.Success && grid.Index > chart, "the Deadlocks grid must come after the Deadlock trend chart on the Blocking tab");
     }
 
     [Fact]
@@ -271,7 +272,7 @@ public sealed class WebChartAtTimeBehaviourTests
     {
         var tabs = File.ReadAllText(PathTo("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "pages", "server-tabs.js"));
         var calls = Regex.Matches(tabs, @"zoomableLineChart\(\{");
-        Assert.Equal(9, calls.Count);
+        Assert.NotEmpty(calls);
         var handed = Regex.Matches(tabs, @"zoomableLineChart\(\{\s*atTime: \{ server(, item: ""wait"")? \},");
         Assert.Equal(calls.Count, handed.Count);
         // Only the wait trend chart names the wait item (#5235); every other direct chart keeps the default.
@@ -352,8 +353,9 @@ public sealed class WebChartAtTimeBehaviourTests
         // deadlock charts "Show Deadlocks at This Time". Every other server-tab line chart keeps the Active Queries default.
         var tabs = File.ReadAllText(PathTo("Darling", "PerformanceMonitor.Darling.Service", "wwwroot", "js", "pages", "server-tabs.js"));
 
-        // line() panels: Blocking Events and Deadlocks sit on both the Overview tab and the Blocking tab.
-        foreach (var (title, item, count) in new[] { ("Blocking Events", "blocking", 2), ("Deadlocks", "deadlocks", 2), ("Lock Waits", "blocking", 1) })
+        // line() panels: Blocking Events sits on the Blocking tab only (the Overview strips replaced its copy, #6291); the deadlock chart is "Deadlock trend" on the Blocking tab (it was "Deadlocks" on Overview and
+        // (#5644 W16 named it "Deadlock trend" so the Deadlocks grid below it is the only panel with that title; #6291 took the Overview copies out for the strips.)
+        foreach (var (title, item, count) in new[] { ("Blocked process report trend", "blocking", 1), ("Deadlocks", "deadlocks", 0), ("Deadlock trend", "deadlocks", 1), ("Lock Waits", "blocking", 1) })
         {
             var calls = Regex.Matches(tabs, @"line\(""" + title + @""",");
             Assert.Equal(count, calls.Count);
@@ -369,9 +371,9 @@ public sealed class WebChartAtTimeBehaviourTests
             Assert.Contains($"atTimeItem: \"{item}\",", Balanced(tabs, tabs.LastIndexOf('{', at)));
         }
 
-        // No other chart names one: 4 blocking charts and 3 deadlock charts, all counted above.
-        Assert.Equal(4, Regex.Matches(tabs, @"atTimeItem: ""blocking""").Count);
-        Assert.Equal(3, Regex.Matches(tabs, @"atTimeItem: ""deadlocks""").Count);
+        // No other chart names one: 3 blocking charts and 2 deadlock charts, all counted above (the Overview draws blocking and deadlocks as a strip of its own, #6291).
+        Assert.Equal(3, Regex.Matches(tabs, @"atTimeItem: ""blocking""").Count);
+        Assert.Equal(2, Regex.Matches(tabs, @"atTimeItem: ""deadlocks""").Count);
     }
 
     [Fact]

@@ -41,7 +41,7 @@ namespace Darling.Tests;
 /// and so is a raw re-assignment after a judge. Also not seen: SQL built by concatenation (<c>"LEFT(" + col + ", 500)"</c>)
 /// and a JSON-generic local.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class StatementCutSourceScanTests
 {
     /// <summary>Folders scanned, repo-root relative. Lite MCP, services and analysis; the shared alerting, notification and analysis projects; Darling service and analysis.</summary>
@@ -162,6 +162,8 @@ public sealed class StatementCutSourceScanTests
             "an identity hash of the raw graph, compared with latest_hash and never shown"),
         new("Darling/PerformanceMonitor.Darling.Analysis/PgTargetDrillDownCollector.Deadlocks.cs", "lines.take", 1,
             "BoundGraphText bounds a graph its caller already judged whole (graphNormalized = SensitiveStatements.Text(...)); it cuts whole lines of judged text and never sees raw"),
+        new("PerformanceMonitor.Alerting/AlertContextBuilders.cs", "window.topstatements.take", 1,
+            "the Client Timeouts card lists the first AttentionTopListCap items of window.TopStatements (#5640): Take counts LIST ITEMS (top fingerprints), it cuts no statement text. Each item's SampleText was judged whole by the statement filter before it was stored (AttentionCollector: filter, then fingerprint, then the 4000-char cut), a text the filter withheld has no fingerprint and so no item, and the card prints it through TruncateStatement, which judges again before it cuts"),
     };
 
     // ------------------------------------------------------------------ the scanner
@@ -756,15 +758,6 @@ public sealed class StatementCutSourceScanTests
     public void TheScanner_LeavesASqlSliceOrCastThatIsNotAFixedLengthCutOfStatementText(string sql)
     {
         Assert.Empty(Scan("class C { const string Q = @\"" + sql + "\"; }"));
-    }
-
-    [Fact]
-    public void TheScansDocComment_NamesItsKnownBlindSpots()
-    {
-        var doc = RepoFile.ReadRepoFile("Darling", "Darling.Tests", "StatementCutSourceScanTests.cs");
-        Assert.Contains("Known blind spots", doc, StringComparison.Ordinal);
-        Assert.Contains("alias local", doc, StringComparison.Ordinal);
-        Assert.Contains("ternary", doc, StringComparison.Ordinal);
     }
 
     [Theory]

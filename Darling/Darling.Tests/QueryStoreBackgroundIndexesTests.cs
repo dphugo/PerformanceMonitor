@@ -81,6 +81,7 @@ public sealed class QueryStoreBackgroundIndexesTests
             ("PgFactCollector.PlanRegressionDailySql, live half", PgFactCollector.PlanRegressionDailySql, "FROM query_store_interval_latest AS l", "l.server_id = $1::integer", "l.first_execution_time >= $4::timestamp"),
             ("PgFactCollector.PlanRegressionTableSql", PgFactCollector.PlanRegressionTableSql, "FROM query_store_interval_latest", "WHERE server_id = $1", "first_execution_time >= $4"),
             ("PgDrillDownCollector.RegressedQueriesTableSql", PgDrillDownCollector.RegressedQueriesTableSql, "FROM query_store_interval_latest", "WHERE server_id = $1", "first_execution_time >= $7"),
+            ("PgDrillDownCollector.RegressedQueriesDailySql, live half", PgDrillDownCollector.RegressedQueriesDailySql, "FROM query_store_interval_latest AS q", "q.server_id = $1::integer", "q.first_execution_time >= $9::timestamp"),
         };
 
         foreach (var (name, sql, table, server, bound) in reads)
@@ -204,7 +205,7 @@ public sealed class QueryStoreBackgroundIndexesTests
        chunk it builds. The Query Store backfill writes backdated rows into older chunks as well as the newest, under
        the collector's 10 s COPY deadline, so no chunk is safe to lock and no background index targets that table. */
     [Fact]
-    public void TheBackgroundIndexes_AreTheBrinThenTheWideBtreeThenTheLatestBtree_AndNoneTargetsTheRawHypertable()
+    public void TheBackgroundIndexes_AreTheBrinThenTheWideBtreeThenTheLatestBtreeThenTheQueryBtreesWideThenLatest_ThenTheStatementTextBtree_AndNoneTargetsTheRawHypertable()
     {
         Assert.Equal(
             new[]
@@ -212,6 +213,10 @@ public sealed class QueryStoreBackgroundIndexesTests
                 QueryStoreIntervalWideBrinIndex.IndexName,
                 QueryStoreBackgroundIndexes.WideServerFirstExecIndexName,
                 QueryStoreBackgroundIndexes.LatestServerFirstExecIndexName,
+                QueryStoreBackgroundIndexes.WideNonRegularFirstExecIndexName,
+                QueryStoreBackgroundIndexes.WideDatabaseQueryFirstExecIndexName,
+                QueryStoreBackgroundIndexes.LatestDatabaseQueryFirstExecIndexName,
+                QueryStoreBackgroundIndexes.StatementTextServerLastSeenIndexName,
             },
             QueryStoreBackgroundIndexes.All.Select(spec => spec.IndexName).ToArray());
 

@@ -16,6 +16,7 @@ using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
@@ -26,6 +27,7 @@ using PerformanceMonitor.Collectors;
 using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Analysis;
 using PerformanceMonitor.Darling.Service.Hosting;
+using PerformanceMonitor.Darling.Service.Investigations;
 using PerformanceMonitor.Darling.Service.Mcp;
 using PerformanceMonitor.Darling.Storage;
 
@@ -95,10 +97,12 @@ public static class DarlingWebEndpoints
     internal static readonly IReadOnlySet<string> WebOnlyReadNames = new HashSet<string>(StringComparer.Ordinal)
     {
         "get_alert_details",
+        "get_overview_baselines",
+        "get_block_chain",
     };
 
     /// <summary>The tool names deliberately absent from the <c>/api/read/*</c> 1:1 read surface. <c>analyze_server</c>
-    /// makes a live monitored-server connection; <c>mute_analysis_finding</c> writes; the <c>analyze_*_plan</c> family
+    /// makes a live monitored-server connection; <c>mute_analysis_finding</c> and <c>unmute_analysis_finding</c> (#6383) write; the <c>analyze_*_plan</c> family
     /// is the compute-heavy plan-analysis phase-2 work; the Custom Views tools (#1599) are served by their OWN
     /// richer web endpoints (<c>/api/views</c> CRUD + <c>/api/compose/run</c> + the <c>/api/catalog</c> compose
     /// vocabulary that <c>describe_custom_view_catalog</c> mirrors), not a <c>/api/read/{tool}</c> query-string mirror;
@@ -114,11 +118,16 @@ public static class DarlingWebEndpoints
     /// <c>update</c> / <c>delete</c> write <c>config.custom_alert_rules</c> and <c>get</c> / <c>list</c> /
     /// <c>validate_custom_alert_rule</c> read/validate against the compose catalog, none a <c>/api/read/{tool}</c>
     /// mirror. <c>get_tool_guide</c> (#3898) reads no data at all: it serves the MCP tools' own reading guides out of
-    /// the registration-time catalog only the MCP host builds, so a web read of it has nothing to mirror.</summary>
+    /// the registration-time catalog only the MCP host builds, so a web read of it has nothing to mirror.
+    /// <c>wait_for_investigation_requests</c> (#5822) is an agent's long poll: it holds the call up to 25 seconds waiting
+    /// for a request to open, which is no page read, and the web page reads the requests through
+    /// <c>list_investigation_requests</c>. <c>backtest_custom_alert_rule</c> (#5911) replays a rule over up to 7 days of
+    /// history in up to 2,880 queries and 60 seconds, which is no page read: it is served over MCP only.</summary>
     public static readonly IReadOnlySet<string> ExcludedToolNames = new HashSet<string>(StringComparer.Ordinal)
     {
         "analyze_server",
         "mute_analysis_finding",
+        "unmute_analysis_finding",
         "analyze_query_plan",
         "analyze_procedure_plan",
         "analyze_query_store_plan",
@@ -132,7 +141,39 @@ public static class DarlingWebEndpoints
         "delete_custom_view",
         "run_custom_view_panel",
         "update_alert_settings",
+        /* #5916: a threshold override is set over MCP; the web grid has its own admin-login route, not a generic read. */
+        "set_alert_threshold_override",
+        /* #6006: a signature merge is an MCP action through the agent gate; the web has no route for it. */
+        "merge_deadlock_signatures",
+        /* #5632 step 7: the plan force tools change a monitored SQL Server through the server action gate; the web has no route for them. */
+        "force_query_store_plan",
+        "unforce_query_store_plan",
+        /* #5632 step 10: an eviction changes a monitored SQL Server through the server action gate; the web has no route for it. */
+        "evict_cached_plan",
+        /* #5632 step 12: a kill ends a session on a monitored SQL Server through the server action gate; the web has no route for it. */
+        "kill_session",
+        /* #5632 step 10: an agent's read of what compiled after its eviction, served over MCP by journal id; no page read mirrors it. */
+        "get_compiles_after_evict",
+        /* #6230 part B: the incident actions queue a command to the service over MCP; the web has its own routes for them, none a generic read.
+           get_command_result reads a queue row by id and get_agent_changes is the MCP twin of GET /api/agent-changes. */
+        "test_connection",
+        "analyze_now",
+        "purge_now",
+        "undo_plan_change",
+        "get_command_result",
+        "get_agent_changes",
         "set_notification_route_enabled",
+        "set_notification_route_fallback",
+        "create_notification_route",
+        "update_notification_route",
+        "dismiss_alert_history",
+        "restore_alert_history",
+        "set_quiet_window",
+        "clear_quiet_window",
+        /* #5632 Phase A: claim and submit write investigation state for an agent over MCP; the web serves the two
+           investigation reads only (/api/read). */
+        "claim_investigation_request",
+        "submit_investigation_report",
         "delete_notification_route",
         "create_mute_rule",
         "update_mute_rule",
@@ -148,19 +189,58 @@ public static class DarlingWebEndpoints
         "delete_custom_alert_rule",
         "validate_custom_alert_rule",
         "test_custom_alert_rule",
+        "backtest_custom_alert_rule",
         "list_custom_alert_templates",
         "create_server_tag",
         "update_server_tag",
         "delete_server_tag",
         "assign_server_tag",
         "unassign_server_tag",
+        "create_query_tag",
+        "update_query_tag",
+        "delete_query_tag",
+        "assign_query_tag",
+        "unassign_query_tag",
+        "create_query_tag_rule",
+        "update_query_tag_rule",
+        "delete_query_tag_rule",
+        /* #5982: the rule reads are not on /api/read. test_query_tag_rule runs the shared resolver over up to 10,000 stored sightings,
+           which is no page read. The rules page (#5986) has its own routes, MapQueryTags: GET /api/query-tag-rules (the list) and
+           GET /api/query-tag-rules/test (the dry run, admitted and recorded under this name). */
+        "list_query_tag_rules",
+        "test_query_tag_rule",
+        "run_collectors_now",
+        /* #6230: the collection-state writes (pause, resume, disable and enable a server, a server's excluded databases, reload) are MCP-only:
+           the Viewer and the command plane already carry them, and the web host's viewer role holds no write on config_service or
+           config_monitored_servers. Their read, get_collection_state, is MCP-only too: the Viewer's Manage Servers and Settings windows show the same state. */
+        "get_collection_state",
+        "pause_collection",
+        "resume_collection",
+        "disable_server",
+        "enable_server",
+        "set_server_excluded_databases",
+        "reload_config",
+        /* #6227: the five collector schedule writes are MCP-only (the Viewer's schedule editor is the page for a person), and the
+           get_collector_schedules read is for an agent checking its own change before and after; no page read mirrors it. */
+        "disable_collector",
+        "enable_collector",
+        "set_collector_frequency",
+        "set_collector_run_at",
+        "set_collector_retention",
+        "get_collector_schedules",
+        /* #6269: the server action switches have their own web routes (GET /api/server-actions and PUT /api/servers/{id}/actions/{action}, admin role); the MCP write is under mcp.allowServerAdmin. */
+        "set_server_action",
+        "get_server_actions",
         "get_tool_guide",
+        "wait_for_investigation_requests",
+        /* #6033: an agent's read of one claimed request's frozen evidence, served by claim; no page read mirrors it. */
+        "get_investigation_evidence",
     };
 
     /// <summary>
     /// #4203: every read-only tool NOT yet converted to observe cancellation all the way to Npgsql — the
-    /// ratchet <c>WebReadCancellationPinTests</c> holds in both directions, the same shape
-    /// <c>LiveCleanupConversionRatchetTests</c> uses for its own conversion sweep. A name here may only be
+    /// ratchet <c>WebReadCancellationPinTests</c> holds in both directions.
+    /// A name here may only be
     /// REMOVED, on the PR that finishes threading its <see cref="ReadToolHandler"/> entry AND its
     /// <c>[McpServerTool]</c> method's own <c>CancellationToken</c> parameter down to every store call — never
     /// added, because every tool on the <c>/api/read/*</c> surface is in scope for the same fix and none is
@@ -305,7 +385,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// and the MCP host's analysis fill — so compare_analysis' banding here reads a series the store was already asked
     /// for this analysis hour from memory. Null keeps the analysis service's baselines private to it.</para>
     /// </summary>
-    public static void MapAll(WebApplication app, NpgsqlDataSource postgres, CollectorRuntimeState collector, ILogger logger, BaselineCache? baselineCache = null, PostgresConfig? postgresConfig = null, ReadLatencyAccumulator? readLatency = null, PerformanceMonitor.PlanAnalysis.AnalyzerConfig? analyzerConfig = null, MonitoredServerRegistryState? registryState = null, SlowReadLog? slowReads = null)
+    public static void MapAll(WebApplication app, NpgsqlDataSource postgres, CollectorRuntimeState collector, ILogger logger, BaselineCache? baselineCache = null, PostgresConfig? postgresConfig = null, ReadLatencyAccumulator? readLatency = null, PerformanceMonitor.PlanAnalysis.AnalyzerConfig? analyzerConfig = null, MonitoredServerRegistryState? registryState = null, SlowReadLog? slowReads = null, ReadAdmission? readAdmission = null, StoreOwnerSource? ownerSource = null, McpDataDetail dataDetail = McpDataDetail.MetadataOnly, IPseudonymKeySource? pseudonymKeys = null, InvestigationExportGate? investigationExportGate = null, IPasswordKeyRing? passwordKeys = null)
     {
         /* #4442 scope 2, #4782: the read-latency seat THIS call's routes record into -- the accumulator and
            logger this call was given, held in a per-call object that the two record sites close over: the
@@ -315,7 +395,11 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
            the same process (six test classes call MapAll, and xUnit runs classes in parallel) took the samples
            of a server built before it. Production calls MapAll once, so nothing changes there. A caller with
            no accumulator (a test that maps the routes directly) records nothing. */
-        var readLatencyRecorder = new ReadLatencyRecorder(readLatency, logger, slowReads);
+        var readLatencyRecorder = new ReadLatencyRecorder(readLatency, logger, slowReads, readAdmission);
+
+        /* #6445: the Admin writes the web's store login cannot make answer a 403 whose advice depends on the store. A managed store refuses
+           postgres.webConnectionString, so its sentences say the dashboard lists only and the Viewer app makes the change. */
+        var managedStore = DarlingWebStoreWrites.IsManaged(postgresConfig);
 
         /* Liveness AND collection state (#2953). The one health surface that does not read the store, which
            makes it the only one that can answer when the store IS the problem — so it reports the collector's
@@ -342,8 +426,35 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         /* The pre-banded fleet roll-up (also surfaced as the get_fleet_overview MCP tool). */
         app.MapGet("/api/fleet", async (HttpContext context) =>
         {
-            var hours = Math.Clamp(QueryInt(context, "hours_back", "hours", DefaultFleetHours), 1, 168);
-            var worstCount = Math.Max(0, QueryInt(context, "worst_count", null, DarlingFleetReader.DefaultWorstCount));
+            /* #5644 W22: a present, non-integer window or count is refused like an out-of-range one. */
+            if (NonIntegerParamRefusal(context) is { } fleetRefusal)
+            {
+                return ToHttpResult(fleetRefusal, DarlingWebFailureLog.RouteOf(context.Request), logger, 0, context.RequestAborted);
+            }
+
+            /* #5644 (review of W22): an out-of-range window or count is refused with the {"status":"invalid"} 400
+               the read loop answers, never clamped to a different window and answered 200 (REVIEW-TRAPS: counts
+               are refused, not clamped). The refusal names the spelling the caller sent (hours or hours_back).
+               The in-product callers send neither (apiGetFleet asks for the bare /api/fleet, the one-hour default). */
+            var hours = QueryInt(context, "hours_back", "hours", DefaultFleetHours);
+            var worstCount = QueryInt(context, "worst_count", null, DarlingFleetReader.DefaultWorstCount);
+            if (FleetParamRefusal(hours, worstCount, key => First(context, key)) is { } fleetRangeRefusal)
+            {
+                return ToHttpResult(fleetRangeRefusal, DarlingWebFailureLog.RouteOf(context.Request), logger, 0, context.RequestAborted);
+            }
+
+            /* #5506 part 3: admitted, and recorded, under its MCP twin's name and window band, so the long-read table learns
+               this route from its own samples. */
+            using var readScope = ReadScope.Open(logger);
+            var fleetBand = ReadWindowBand.Of(hours);
+            using var ticket = await AdmitWebRouteAsync(readAdmission, "get_fleet_overview", fleetBand, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                return BusyResult(refusal);
+            }
+
+            using var run = new WebRouteRun(readLatencyRecorder, "get_fleet_overview", fleetBand, context, readScope.Scope);
+
             var now = DateTime.UtcNow;
             var result = await DarlingFleetReader.GetFleetOverviewAsync(
                 postgres, now.AddHours(-hours), now, now, worstCount,
@@ -352,6 +463,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                     : (serverId, ct) => DarlingWorker.AnalysisSeparatelyMonitoredDatabasesAsync(serverId, registryState.Read(), postgres, ct),
                 logger: logger,
                 cancellationToken: context.RequestAborted);
+            run.Complete(ReadOutcome.Ok);
             return Results.Json(result, DarlingFleetReader.JsonOptions);
         });
 
@@ -364,8 +476,18 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
            to the 32 KB cap (the response is compressed on the wire, #4188); only get_ag_health keeps that cap. */
         app.MapGet("/api/ag", async (HttpContext context) =>
         {
+            /* #5506 part 3 (round 1, M3): admitted, and recorded, under its MCP twin get_ag_health and its window band, like /api/fleet (D8). */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await AdmitWebRouteAsync(readAdmission, AgHealthRoute, ReadWindowBand.None, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                return BusyResult(refusal);
+            }
+
+            using var run = new WebRouteRun(readLatencyRecorder, AgHealthRoute, ReadWindowBand.None, context, readScope.Scope);
             var result = await DarlingAgReader.GetAgHealthAsync(
                 postgres, null, DateTime.UtcNow, responseByteBudget: null, cancellationToken: context.RequestAborted);
+            run.Complete(ReadOutcome.Ok);
             return Results.Json(result, DarlingAgReader.JsonOptions);
         });
 
@@ -380,99 +502,238 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         });
 
         /* One GET per read-only tool, calling the tool method directly (no SQL/projection re-implementation). */
-        foreach (var (name, handler) in BuildReadDispatch(logger, postgresConfig, registryState))
+        foreach (var (name, handler) in BuildReadDispatch(logger, postgresConfig, registryState, readAdmission))
         {
             app.MapGet("/api/read/" + name, async (HttpContext context) =>
             {
                 var stopwatch = Stopwatch.StartNew();
-                string result;
                 using var readScope = ReadScope.Open(logger);
                 readScope.Scope.CaptureStatements = true;
-                try
+
+                /* #5506 part 3: admission, after the scope and the band. A refused read answers 429 and records busy; a
+                   browser that leaves the queue records cancelled; a queued read records its wait as one queue_wait
+                   sample. The recorded elapsed time starts after admission (D1). */
+                /* #5644 W22: ?hours=abc / ?hours=1.5 (or any other integer knob) was read as the default and answered
+                   200 for a different window than the one asked for, while ?hours=500 got a 400. Refused up front now,
+                   before any tool runs, in the same envelope the range refusals use; and (#5506 part 3, round 1 L5) before
+                   the cache and admission, so a malformed request on a heavy route is never queued or refused busy. */
+                if (NonIntegerParamRefusal(context) is { } nonIntegerRefusal)
                 {
-                    /* A newest-first capped read is judged against the window it read: with no anchor sent, the end is
-                       taken once here and handed to both the read and the note check. A request with its own anchor
-                       is left as sent. */
-                    var askedAsOf = AsOf(context);
-                    if (askedAsOf is null && WebDataStartNote.CappedByRead.ContainsKey(name))
+                    return ToHttpResult(nonIntegerRefusal, DarlingWebFailureLog.RouteOf(context.Request), logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+                }
+
+                var admissionBand = WebWindowBand(name, key => First(context, key));
+                /* #5506 part 3: a heavy cacheable read is answered from the read cache, joins an identical read running now,
+                   or runs once and is stored (the text before the statement sweep, which ToHttpResult runs on every answer).
+                   The key is the query string as sent, before the read below adds its own as_of. A hit skips admission. */
+                if (readAdmission is { } admission && admission.IsCached(ReadSurface.Web, name, admissionBand))
+                {
+                    var cache = admission.Cache;
+                    var ttl = ReadResultCache.TtlOf(admissionBand);
+                    /* Round 2, L4: each value of a repeated name is passed apart (StringValues.ToString() joins them with a comma,
+                       which ?database=x%2Cy also gives); the key escapes every name and value. */
+                    var key = ReadCacheKey.ForWeb(name,
+                        context.Request.Query.SelectMany(q => q.Value.Select(v => new KeyValuePair<string, string?>(q.Key, v))),
+                        cache.Generation, cache, ttl);
+                    if (cache.TryGet(key, out var stored))
                     {
-                        askedAsOf = WebDataStartNote.FormatWindowEnd(DateTime.UtcNow);
-                        context.Request.QueryString = context.Request.QueryString.Add("as_of", askedAsOf);
+                        /* Round 2, L3: a hit runs no read, so it does not count as one in flight. */
+                        readScope.Scope.Uncount();
+                        admission.NoteCacheHit(ReadSurface.Web, name);
+                        RecordWebReadLatency(readLatencyRecorder, name, ReadOutcome.CacheHit, stopwatch.ElapsedMilliseconds, context, readScope.Scope);
+                        return ToHttpResult(stored, DarlingWebFailureLog.RouteOf(context.Request), logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
                     }
 
-                    result = await handler(context, postgres, analysis);
+                    /* D6: the read runs once, under the flight's token, which is cancelled only when every caller waiting for it
+                       has left; each caller waits with its own. It runs on a detached copy of the first caller's request
+                       (round 1, C3), never by swapping that request's RequestAborted: the first caller's own abort must
+                       still end its own request (the #4276 backstop reads RequestAborted to tell a browser that left from a
+                       failure), and the read must not touch a request that has ended. */
+                    var callerAborted = context.RequestAborted;
+                    var joinedAt = Stopwatch.StartNew();
+                    var flight = cache.Join(key, ttl, token => RunWebReadAsync(DetachedReadContext(context, token)), read => read.Text);
+                    if (flight.IsLead)
+                    {
+                        admission.NoteCacheMiss(ReadSurface.Web, name);
+                        return (await flight.WaitAsync(callerAborted)).Answer;
+                    }
 
-                    /* #4966: a grid over a window says where its table's data starts when that is after the window's
-                       start. Added to the web mirror only, never to the tool, so the MCP payloads are unchanged. A
-                       failed probe returns the tool's answer as it was. */
-                    var askedHours = QueryInt(context, "hours", "hours_back", 0);
-                    result = await WebDataStartNote.AddAsync(
-                        postgres, name, Server(context), askedHours > 0 ? askedHours : null, askedAsOf, result, logger, context.RequestAborted);
+                    /* Round 2, L3: a joined caller runs no read while it waits for the shared one. Round 2, M1: it records only its
+                       own outcome (busy, cancelled, or cache_hit for the shared answer), never the read's, which the lead records
+                       once: N joiners of one timed-out read are not N + 1 timeouts, and their shorter waits never reach the
+                       percentiles or the hourly p90 table. */
+                    readScope.Scope.Uncount();
+                    try
+                    {
+                        var shared = await flight.WaitAsync(callerAborted);
+                        var joinedOutcome = ReadResultCache.JoinedOutcome(shared.Outcome, callerAborted);
+                        if (joinedOutcome == ReadOutcome.CacheHit)
+                        {
+                            admission.NoteCacheHit(ReadSurface.Web, name);
+                        }
+
+                        RecordWebReadLatency(readLatencyRecorder, name, joinedOutcome, joinedAt.ElapsedMilliseconds, context, readScope.Scope);
+                        return shared.Text is { } text
+                            ? ToHttpResult(text, DarlingWebFailureLog.RouteOf(context.Request), logger, joinedAt.ElapsedMilliseconds, callerAborted)
+                            : shared.Answer;
+                    }
+                    catch (Exception ex)
+                    {
+                        var thrown = ReadResultCache.JoinedOutcome(
+                            ReadOutcomeClassifier.Classify(ex, callerAborted) == ReadOutcome.Cancelled ? ReadOutcome.Cancelled : null, callerAborted);
+                        if (thrown == ReadOutcome.CacheHit)
+                        {
+                            admission.NoteCacheHit(ReadSurface.Web, name);
+                        }
+
+                        RecordWebReadLatency(readLatencyRecorder, name, thrown, joinedAt.ElapsedMilliseconds, context, readScope.Scope);
+                        throw;
+                    }
                 }
-                catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+
+                return (await RunWebReadAsync(context)).Answer;
+
+                /* The read itself, on the request it is given: the caller's own, or a detached copy for a shared read. */
+                async Task<WebReadAnswer> RunWebReadAsync(HttpContext context)
                 {
-                    /* #4276: the browser left. Not a failure — no log line, and rethrown so the #4276
-                       top-of-pipeline backstop (which already owns this exact classification) sees the same
-                       exception rather than this catch turning it into a written body for a caller who is gone. */
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    /* #4276/#4283: a binding-layer throw (the tools normally swallow their own into
-                       McpHelpers.FormatError's envelope and return normally, so this is only a backstop).
-                       Reported and answered directly from the real Exception here — ServerErrorResult's
-                       sentence-based classifier is for the FAR more common case below, where the exception is
-                       already gone by the time a tool's own catch handed back its envelope. Answering here
-                       too, rather than falling through to ToHttpResult, keeps the ONE log line #4276 added:
-                       routing this through FormatError first would make ToHttpResult's classifier re-derive
-                       from text what this catch already knows structurally, and log it a second time. */
-                    DarlingWebFailureLog.Report(logger, DarlingWebFailureLog.RouteOf(context.Request), stopwatch.ElapsedMilliseconds, ex);
-                    var thrownOutcome = ReadScope.Resolve(ReadOutcomeClassifier.Classify(ex, context.RequestAborted), readScope.Fallback);
-                    RecordWebReadLatency(readLatencyRecorder, name, thrownOutcome, stopwatch.ElapsedMilliseconds);
-                    OfferWebSlowRead(readLatencyRecorder, readScope.Scope, name, thrownOutcome, stopwatch.ElapsedMilliseconds, context, SlowReadLog.ErrorClassOf(ex));
-                    return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
-                }
+                    string result;
+                    using var ticket = readAdmission is null || !ReadAdmission.IsAdmitted(name)
+                        ? ReadAdmissionTicket.Passed
+                        : await ReadScope.AdmitAsync(readAdmission, ReadSurface.Web, name, admissionBand, context.RequestAborted);
+                    if (ticket.Refusal is { } refusal)
+                    {
+                        RecordWebReadLatency(readLatencyRecorder, name, ReadOutcome.Busy, ticket.QueueMs ?? 0, context, readScope.Scope);
+                        return new WebReadAnswer(BusyResult(refusal), null, ReadOutcome.Busy);
+                    }
 
-                /* #4442 scope 2: recorded on BOTH arms of this loop -- here for a tool result that made it
-                   back as a string (success, or a tool's own caught-and-formatted failure), above for a
-                   binding-layer throw the try/catch above answers directly. ClassifyToolResponse's
-                   ServerError arm is the only shape that can carry a 57014 sentence (a tool that caught its
-                   own statement_timeout and formatted it); everything else that reaches here is Ok. */
-                var webOutcome = ClassifyToolResponse(result) == ToolResponseKind.ServerError
-                    ? ReadOutcomeClassifier.ClassifySentence(McpHelpers.ErrorMessageOf(result), context.RequestAborted)
-                    : ReadOutcome.Ok;
-                var resolvedOutcome = ReadScope.Resolve(webOutcome, readScope.Fallback);
-                RecordWebReadLatency(readLatencyRecorder, name, resolvedOutcome, stopwatch.ElapsedMilliseconds);
-                OfferWebSlowRead(readLatencyRecorder, readScope.Scope, name, resolvedOutcome, stopwatch.ElapsedMilliseconds, context,
-                    resolvedOutcome == ReadOutcome.Error ? "tool_error" : SlowReadLog.ErrorClassOf(resolvedOutcome));
+                    if (ticket.CallerLeft)
+                    {
+                        RecordWebReadLatency(readLatencyRecorder, name, ReadOutcome.Cancelled, ticket.QueueMs ?? 0, context, readScope.Scope);
+                        context.RequestAborted.ThrowIfCancellationRequested();
+                    }
 
-                return ToHttpResult(result, DarlingWebFailureLog.RouteOf(context.Request), logger, stopwatch.ElapsedMilliseconds);
+                    if (ticket.QueueMs is { } queueMs)
+                    {
+                        RecordWebReadLatency(readLatencyRecorder, name, ReadOutcome.QueueWait, queueMs, context, readScope.Scope);
+                    }
+
+                    stopwatch.Restart();
+                    try
+                    {
+                        /* A newest-first capped read is judged against the window it read: with no anchor sent, the end is
+                           taken once here and handed to both the read and the note check. A request with its own anchor
+                           is left as sent. */
+                        var askedAsOf = AsOf(context);
+                        if (askedAsOf is null && WebDataStartNote.CappedByRead.ContainsKey(name))
+                        {
+                            askedAsOf = WebDataStartNote.FormatWindowEnd(DateTime.UtcNow);
+                            context.Request.QueryString = context.Request.QueryString.Add("as_of", askedAsOf);
+                        }
+
+                        result = await handler(context, postgres, analysis);
+
+                        /* #5644 W22: the tools' own window parameter is hours_back, but a web caller sends hours; a refusal for an
+                           out-of-range one (?hours=-5, ?hours=500) is worded in the caller's own parameter. */
+                        result = NameWindowParameterTheCallerSent(result, key => First(context, key));
+
+                        /* #4966: a grid over a window says where its table's data starts when that is after the window's
+                           start. Added to the web mirror only, never to the tool, so the MCP payloads are unchanged. A
+                           failed probe returns the tool's answer as it was. */
+                        var askedHours = QueryInt(context, "hours", "hours_back", 0);
+                        result = await WebDataStartNote.AddAsync(
+                            postgres, name, Server(context), askedHours > 0 ? askedHours : null, askedAsOf, result, logger, context.RequestAborted);
+                    }
+                    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+                    {
+                        /* #4276: the browser left. Not a failure — no log line, and rethrown so the #4276
+                           top-of-pipeline backstop (which already owns this exact classification) sees the same
+                           exception rather than this catch turning it into a written body for a caller who is gone. */
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        /* #5678: the browser left and the store's connect timed out before it could raise a cancellation
+                           (Npgsql can do that for an already-cancelled token): still the #4276 not-a-failure case. */
+                        context.RequestAborted.ThrowIfCancellationRequested();
+
+                        /* #4276/#4283: a binding-layer throw (the tools normally swallow their own into
+                           McpHelpers.FormatError's envelope and return normally, so this is only a backstop).
+                           Reported and answered directly from the real Exception here — ServerErrorResult's
+                           sentence-based classifier is for the FAR more common case below, where the exception is
+                           already gone by the time a tool's own catch handed back its envelope. Answering here
+                           too, rather than falling through to ToHttpResult, keeps the ONE log line #4276 added:
+                           routing this through FormatError first would make ToHttpResult's classifier re-derive
+                           from text what this catch already knows structurally, and log it a second time. */
+                        DarlingWebFailureLog.Report(logger, DarlingWebFailureLog.RouteOf(context.Request), stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                        var thrownOutcome = ReadScope.Resolve(ReadOutcomeClassifier.Classify(ex, context.RequestAborted), readScope.Fallback);
+                        RecordWebReadLatency(readLatencyRecorder, name, thrownOutcome, stopwatch.ElapsedMilliseconds, context, readScope.Scope);
+                        OfferWebSlowRead(readLatencyRecorder, readScope.Scope, name, thrownOutcome, stopwatch.ElapsedMilliseconds, context, SlowReadLog.ErrorClassOf(ex));
+                        return new WebReadAnswer(Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex)), null, thrownOutcome);
+                    }
+
+                    /* #4442 scope 2: recorded on BOTH arms of this loop -- here for a tool result that made it
+                       back as a string (success, or a tool's own caught-and-formatted failure), above for a
+                       binding-layer throw the try/catch above answers directly. ClassifyToolResponse's
+                       ServerError arm is the only shape that can carry a 57014 sentence (a tool that caught its
+                       own statement_timeout and formatted it); everything else that reaches here is Ok. */
+                    var webOutcome = ClassifyToolResponse(result) == ToolResponseKind.ServerError
+                        ? ReadOutcomeClassifier.ClassifySentence(McpHelpers.ErrorMessageOf(result), context.RequestAborted)
+                        : ReadOutcome.Ok;
+                    var resolvedOutcome = ReadScope.Resolve(webOutcome, readScope.Fallback);
+                    RecordWebReadLatency(readLatencyRecorder, name, resolvedOutcome, stopwatch.ElapsedMilliseconds, context, readScope.Scope);
+                    OfferWebSlowRead(readLatencyRecorder, readScope.Scope, name, resolvedOutcome, stopwatch.ElapsedMilliseconds, context,
+                        resolvedOutcome == ReadOutcome.Error ? "tool_error" : SlowReadLog.ErrorClassOf(resolvedOutcome));
+
+                    /* #5678: a tool-caught sentence for a browser that has left is not a failure either (see ThrowIfCallerGone). */
+                    ThrowIfCallerGone(result, context.RequestAborted);
+                    var cacheable = resolvedOutcome == ReadOutcome.Ok && ClassifyToolResponse(result) == ToolResponseKind.JsonPassthrough
+                        && ReadResultCache.IsCacheableText(result, gcf: false);
+                    return new WebReadAnswer(ToHttpResult(result, DarlingWebFailureLog.RouteOf(context.Request), logger, stopwatch.ElapsedMilliseconds, context.RequestAborted),
+                        cacheable ? result : null, resolvedOutcome);
+                }
             });
         }
 
-        MapCustomViews(app, postgres, logger, readLatencyRecorder);
-        MapCustomAlerts(app, postgres, logger);
+        MapCustomViews(app, postgres, logger, readLatencyRecorder, readAdmission, managedStore);
+        MapCustomAlerts(app, postgres, logger, readAdmission, readLatencyRecorder);
         MapMuteRules(app, postgres, logger);
+        DarlingKnownPatternRoutes.Map(app, postgres, logger);
+        MapInvestigationNotes(app, new InvestigationRequestStore(postgres, McpCommandDeadlines.ReadSeconds), logger, managedStore);
+        MapThresholdOverrides(app, postgres, logger, managedStore);
+        MapAgentSetup(app, postgres, logger, passwordKeys, managedStore);
+        MapAgentChanges(app, new AgentChangeUndo(postgres, McpCommandDeadlines.ReadSeconds), logger, ownerSource, managedStore);
         MapServerTags(app, postgres, logger);
+        MapServerActions(app, postgres, new AgentChangeUndo(postgres, McpCommandDeadlines.ReadSeconds), logger, ownerSource, managedStore);
         MapAdminServers(app, postgres);
+        MapQueryTags(app, postgres, logger, readAdmission, readLatencyRecorder);
+        MapCollectorRuns(app, new PostgresSnapshotNowStore(postgres), logger, async (name, ct) => { var (r, err) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, name, ct, NameClash.Refuse); return (r.ServerId, err); });
         MapServers(app, postgres, logger);
         MapAlertHistoryDismiss(app, postgres, logger);
+        MapInvestigationFeedback(app, postgres, logger, managedStore);
+        MapInvestigationExport(
+            app, postgres, logger, dataDetail, pseudonymKeys, readAdmission, readLatencyRecorder,
+            investigationExportGate ?? new InvestigationExportGate(InvestigationExportGate.FolderFor(
+                DarlingManagedPostgres.ResolveDataDirectory(postgresConfig ?? new PostgresConfig()))),
+            managedStore: managedStore);
+        MapInvestigationPractice(app, postgres, logger);
+        MapInvestigationPersonWrites(app, postgres, logger, managedStore);
+        MapWebhookSigningStatus(app, collector);
 
         /* The fleet sweep feed (#3466 lane 3): dedicated read routes like /api/fleet, over the same
            FleetSweepStore presentation reads lane 4's get_sweep_reports tool will serve — see
            DarlingFleetSweepEndpoints for the span discipline, the seat posture, and why its logger
            seat takes the service logger threaded here rather than app.Logger. */
-        DarlingFleetSweepEndpoints.Map(app, postgres, logger);
+        DarlingFleetSweepEndpoints.Map(app, postgres, logger, readAdmission, readLatencyRecorder);
 
         /* The per-alert triage page's assembly endpoint (#2710): everything it serves is already reachable
            through the /api/read mirror above — it adds assembly (alert match + anchored sections), not reach. */
-        DarlingTriageEndpoint.Map(app, postgres, analysis, logger);
+        DarlingTriageEndpoint.Map(app, postgres, analysis, logger, readAdmission, readLatencyRecorder);
 
         /* The alert-notebook binding endpoint (#4222 slice C): the mechanical conversion of a firing into a
            read-only notebook definition. Same reach as the triage page it sits beside - everything it
            serves is already reachable through /api/read/*. */
-        AlertNotebookEndpoint.Map(app, postgres, analysis, logger);
-        DarlingServerDatabasesEndpoint.Map(app, postgres, logger); // #5245: the database picker's list
+        AlertNotebookEndpoint.Map(app, postgres, analysis, logger, readAdmission, readLatencyRecorder);
+        DarlingServerDatabasesEndpoint.Map(app, postgres, logger, readAdmission, readLatencyRecorder); // #5245: the database picker's list
     }
 
     /* ─────────────────────────── #1563 custom views: session, catalog, CRUD ─────────────────────────── */
@@ -488,7 +749,8 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// <see cref="ValidateDefinition"/> (the authority) before any write; the store adds optimistic concurrency +
     /// duplicate-name conflict detection. Error bodies are always <c>{"error": "..."}</c>, matching the read surface.
     /// </summary>
-    private static void MapCustomViews(WebApplication app, NpgsqlDataSource postgres, ILogger logger, ReadLatencyRecorder readLatencyRecorder)
+    internal static void MapCustomViews(WebApplication app, NpgsqlDataSource postgres, ILogger logger, ReadLatencyRecorder readLatencyRecorder,
+        ReadAdmission? readAdmission, bool managedStore = false)
     {
         var store = new CustomViewStore(postgres);
 
@@ -500,7 +762,13 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
            client sends, so this is the affordance layer, never the enforcement. A failed probe fails closed to
            read-only in the UI. */
         app.MapGet("/api/session", (HttpContext context) =>
-            JsonNodeResult(new JsonObject { ["can_edit"] = DarlingWebSeat.FromContext(context).CanEdit }));
+        {
+            /* #6214: can_own is whether this session can own a personal view (it holds an owner key: an OIDC sign-in made after owner keys
+               existed). The page decides the Personal checkbox from it, and "My views" and read-only from each view's own `mine`. Neither the
+               subject nor the key is returned: a name decides nothing, and a key is never shown. */
+            var seat = DarlingWebSeat.FromContext(context);
+            return JsonNodeResult(new JsonObject { ["can_edit"] = seat.CanEdit, ["can_own"] = seat.OwnerKey is not null, ["signed_in_admin"] = DarlingWebSeat.IsSignedInAdmin(context), ["managed_store"] = managedStore });
+        });
 
         /* The read catalog: input truth (read names + their WIRE query keys) the composer binds params from. */
         /* #5562: ?server= makes the collector intervals the SERVER's own (a per-server schedule row wins over the
@@ -509,34 +777,49 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
            resolver's refusal, not a silent fall back to the fleet's numbers. */
         app.MapGet("/api/catalog", async (HttpContext context) =>
         {
+            /* #5506 part 3 (round 2, L5): it reads the store (the schedule overrides, and the server resolver for ?server=), so
+               it is admitted, and recorded, under its MCP twin describe_custom_view_catalog: a light read passes at once. */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await AdmitWebRouteAsync(readAdmission, CatalogRoute, ReadWindowBand.None, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                return BusyResult(refusal);
+            }
+
+            using var run = new WebRouteRun(readLatencyRecorder, CatalogRoute, ReadWindowBand.None, context, readScope.Scope);
             var serverName = context.Request.Query["server"].ToString();
             if (string.IsNullOrWhiteSpace(serverName))
             {
                 var fleetSchedules = await DarlingDataReader.ReadScheduleOverridesAsync(postgres, null, context.RequestAborted);
+                run.Complete(ReadOutcome.Ok);
                 return JsonNodeResult(BuildCatalogNode(null, fleetSchedules));
             }
 
             var (resolved, resolveError) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, serverName, context.RequestAborted);
             if (resolveError != null)
             {
+                run.Complete(ReadOutcome.Ok);
                 return JsonNodeResult(JsonNode.Parse(resolveError)!.AsObject());
             }
 
             var schedules = await DarlingDataReader.ReadScheduleOverridesAsync(postgres, resolved.ServerId, context.RequestAborted);
+            run.Complete(ReadOutcome.Ok);
             return JsonNodeResult(BuildCatalogNode(resolved.ServerId, schedules));
         });
 
-        /* List — a bare array of summaries (no definition); [] when none. */
+        /* List — a bare array of summaries (no definition); [] when none. Every shared view, plus the caller's OWN personal views
+           (#6214): a personal view is listed for its owner only. That is a list filter, not access control: GET by id below still returns
+           any view, so a shared link keeps working. */
         app.MapGet("/api/views", async (HttpContext context) =>
         {
-            var views = await store.ListAsync(context.RequestAborted);
+            var views = await store.ListAsync(callerOwnerKey: DarlingWebSeat.FromContext(context).OwnerKey, cancellationToken: context.RequestAborted);
             return JsonNodeResult(BuildSummariesNode(views));
         });
 
         /* Get one — full, including the definition; 404 when missing. */
         app.MapGet("/api/views/{id:long}", async (HttpContext context, long id) =>
         {
-            var result = await store.GetAsync(id, context.RequestAborted);
+            var result = await store.GetAsync(id, DarlingWebSeat.FromContext(context).OwnerKey, context.RequestAborted);
             return result is CustomViewResult.Ok ok
                 ? JsonNodeResult(BuildFullViewNode(ok.View!))
                 : NotFoundResult();
@@ -563,11 +846,23 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 return ErrorResult(validation.Error!, StatusCodes.Status400BadRequest);
             }
 
+            /* #6214: a personal view is owned by the signed-in person's owner key, so a session that has none cannot make one: the shared
+               token and the tokenless loopback operator have no person, and a cookie from before owner keys existed names a person but
+               carries no key (they sign in again). Every create from a session that has a key stamps it, personal or not, so the creator
+               can later make their own shared view personal. */
+            var seat = DarlingWebSeat.FromContext(context);
+            var personal = request.Personal ?? false;
+            if (personal && seat.OwnerKey is null)
+            {
+                return ErrorResult(NoOwnerKeyMessage(seat), StatusCodes.Status400BadRequest);
+            }
+
             /* #4283: no local catch — an unexpected throw here (never ex.Message on the wire) is exactly what
                the #4281 top-of-pipeline backstop exists to answer, and MapAll wires this route after it. */
             var result = await store.CreateAsync(
                 request.Name, request.Description, request.DefinitionJson,
-                updatedBy: DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+                updatedBy: seat.EditorPrincipal, folder: request.Folder, personal: personal, ownerKey: seat.OwnerKey,
+                cancellationToken: context.RequestAborted);
             return result switch
             {
                 CustomViewResult.Ok ok => CreatedResult(context, $"/api/views/{ok.View!.Id}", BuildFullViewNode(ok.View)),
@@ -604,21 +899,44 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 return ErrorResult(validation.Error!, StatusCodes.Status400BadRequest);
             }
 
+            /* #6214: an omitted folder or personal flag keeps the stored value. A personal view is its owner's alone to change (the
+               store's UPDATE holds the same rule, so a race cannot slip past this read). */
+            var seat = DarlingWebSeat.FromContext(context);
+            var current = await store.GetAsync(id, seat.OwnerKey, context.RequestAborted);
+            if (current is not CustomViewResult.Ok { View: { } stored })
+            {
+                return NotFoundResult();
+            }
+
+            if (stored.Personal && !stored.Mine)
+            {
+                return ErrorResult(CustomViewStore.NotOwnerMessage, StatusCodes.Status403Forbidden);
+            }
+
+            var personal = request.Personal ?? stored.Personal;
+            if (personal && seat.OwnerKey is null)
+            {
+                return ErrorResult(NoOwnerKeyMessage(seat), StatusCodes.Status400BadRequest);
+            }
+
             /* #4283: no local catch — see the create route's comment above. */
             var result = await store.UpdateAsync(
                 id, request.Name, request.Description, request.DefinitionJson, expectedVersion,
-                updatedBy: DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+                updatedBy: seat.EditorPrincipal, folder: request.FolderGiven ? request.Folder : stored.Folder, personal: personal,
+                actorKey: seat.OwnerKey, cancellationToken: context.RequestAborted);
             return result switch
             {
                 CustomViewResult.Ok ok => JsonNodeResult(BuildFullViewNode(ok.View!)),
                 CustomViewResult.NotFound => NotFoundResult(),
+                CustomViewResult.Forbidden forbidden => ErrorResult(forbidden.Message, StatusCodes.Status403Forbidden),
                 CustomViewResult.Conflict conflict => ErrorResult(conflict.Message, StatusCodes.Status409Conflict),
                 CustomViewResult.Invalid invalid => ErrorResult(invalid.Message, StatusCodes.Status400BadRequest),
                 _ => ErrorResult("Could not update the view.", StatusCodes.Status500InternalServerError),
             };
         });
 
-        /* Delete — 204 on success, 404 when missing. Any authenticated seat; application/json required. */
+        /* Delete — 204 on success, 404 when missing, 403 for somebody else's personal view (#6214). Any authenticated seat;
+           application/json required. */
         app.MapDelete("/api/views/{id:long}", async (HttpContext context, long id) =>
         {
             if (!IsJsonContentType(context.Request.ContentType))
@@ -627,8 +945,13 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             }
 
             /* #4283: no local catch — see the create route's comment above. */
-            var result = await store.DeleteAsync(id, context.RequestAborted);
-            return result is CustomViewResult.Ok ? Results.NoContent() : NotFoundResult();
+            var result = await store.DeleteAsync(id, DarlingWebSeat.FromContext(context).OwnerKey, cancellationToken: context.RequestAborted);
+            return result switch
+            {
+                CustomViewResult.Ok => Results.NoContent(),
+                CustomViewResult.Forbidden forbidden => ErrorResult(forbidden.Message, StatusCodes.Status403Forbidden),
+                _ => NotFoundResult(),
+            };
         });
 
         /* Compile-and-run a single composed panel spec (Custom Views v2, #1563) against the least-privilege
@@ -668,13 +991,33 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                sees. Only THIS web mapping (see ComposeRunFailureResult) stops putting a STORE fault's text on
                the wire (M1's outcome.Fault, checked before outcome.Error is ever read for the 400/500 split). */
             var stopwatch = Stopwatch.StartNew();
-            var outcome = await RunComposedPanelAsync(postgres, body, context.RequestAborted, readLatencyRecorder, ComposeClientDeadlineHeadroomSeconds, remapClientTimeout: true, includeDataStartFields: true);
+            var outcome = await RunComposedPanelAsync(postgres, body, context.RequestAborted, readLatencyRecorder, ComposeClientDeadlineHeadroomSeconds, remapClientTimeout: true, includeDataStartFields: true,
+                caller: WebReadCaller(context), cacheHost: ReadSurface.Web);
+            if (outcome.PayloadText is { } payloadText)
+            {
+                return Results.Text(payloadText, "application/json");
+            }
+
             if (outcome.Payload is not null)
             {
                 return JsonNodeResult(outcome.Payload);
             }
 
-            return ComposeRunFailureResult(outcome, "/api/compose/run", logger, stopwatch.ElapsedMilliseconds);
+            /* #5506 part 3: the runner refused the panel at admission. */
+            if (outcome.Busy is { } busy)
+            {
+                return BusyResult(busy);
+            }
+
+            /* #5678: any failed run for a browser that has left is not logged: a store fault, the generic catch's sentence, and a
+               panel author's own query error (ComposeRunFailureResult's 400 Warning) all end the request instead. A 404 is
+               answered as before. */
+            if (outcome.Payload is null && !outcome.IsNotFound)
+            {
+                context.RequestAborted.ThrowIfCancellationRequested();
+            }
+
+            return ComposeRunFailureResult(outcome, "/api/compose/run", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
     }
 
@@ -696,7 +1039,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// naming the gate. The store/evaluator run on the host's least-privilege VIEWER pool (the same
     /// <paramref name="postgres"/> the reads and <c>/api/compose/run</c> use — never the owner pool).
     /// </summary>
-    private static void MapCustomAlerts(WebApplication app, NpgsqlDataSource postgres, ILogger logger)
+    private static void MapCustomAlerts(WebApplication app, NpgsqlDataSource postgres, ILogger logger, ReadAdmission? readAdmission = null, ReadLatencyRecorder? readLatencyRecorder = null)
     {
         var store = new CustomAlertRuleStore(postgres);
 
@@ -738,11 +1081,18 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 return ErrorResult(definitionError ?? "definition is invalid.", StatusCodes.Status400BadRequest);
             }
 
+            var (createExpiry, createExpiryError) = Mcp.DarlingMcpCustomAlertTools.ResolveCreateExpiry(request.ExpiresAtText);
+            if (createExpiryError is not null)
+            {
+                return ErrorResult(createExpiryError, StatusCodes.Status400BadRequest);
+            }
+
             /* #4283: no local catch — an unexpected throw here (never ex.Message on the wire) is exactly what
                the #4281 top-of-pipeline backstop exists to answer, and MapAll wires this route after it. */
             var result = await store.CreateAsync(
                 request.Name, request.Description, request.DefinitionJson, request.Enabled,
-                updatedBy: DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+                updatedBy: DarlingWebSeat.FromContext(context).EditorPrincipal, expiresAtUtc: createExpiry,
+                cancellationToken: context.RequestAborted);
             return result switch
             {
                 CustomAlertRuleResult.Ok ok => CreatedResult(context, $"/api/alerts/{ok.Rule!.Id}", BuildFullRuleNode(ok.Rule)),
@@ -779,10 +1129,26 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 return ErrorResult(definitionError ?? "definition is invalid.", StatusCodes.Status400BadRequest);
             }
 
+            /* #6235: a full replace, so an absent expiry clears it. A value that is in the past is refused only when it is a CHANGE: an
+               editor that re-saves an already-expired rule sends its old expiry back, and that must still save. */
+            var existing = await store.GetAsync(id, context.RequestAborted);
+            if (existing is not CustomAlertRuleResult.Ok { Rule: { } existingRule })
+            {
+                return AlertNotFoundResult();
+            }
+
+            var (updateExpiry, updateExpiryError) = Mcp.DarlingMcpCustomAlertTools.ResolveUpdateExpiry(
+                request.ExpiresAtText ?? string.Empty, existingRule.ExpiresAtUtc);
+            if (updateExpiryError is not null)
+            {
+                return ErrorResult(updateExpiryError, StatusCodes.Status400BadRequest);
+            }
+
             /* #4283: no local catch — see the create route's comment above. */
             var result = await store.UpdateAsync(
                 id, request.Name, request.Description, request.DefinitionJson, request.Enabled, expectedVersion,
-                updatedBy: DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+                updatedBy: DarlingWebSeat.FromContext(context).EditorPrincipal, expiresAtUtc: updateExpiry,
+                cancellationToken: context.RequestAborted);
             return result switch
             {
                 CustomAlertRuleResult.Ok ok => JsonNodeResult(BuildFullRuleNode(ok.Rule!)),
@@ -815,11 +1181,11 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         /* The starter templates (#3325): the SAME code-defined set the list_custom_alert_templates MCP tool
            returns, byte-identical (wraps that tool), mapped through the shared ToHttpResult exactly as the
            /api/read/* tool endpoints map their string results. Read-only, touches no store; open to any seat. */
-        app.MapGet("/api/alert-templates", async () =>
+        app.MapGet("/api/alert-templates", async (HttpContext context) =>
         {
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpCustomAlertTools.ListCustomAlertTemplates();
-            return ToHttpResult(result, "/api/alert-templates", logger, stopwatch.ElapsedMilliseconds);
+            return ToHttpResult(result, "/api/alert-templates", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
 
         /* Validate — dry-run a definition WITHOUT persisting; returns {valid, error}. The definition rides as an
@@ -870,13 +1236,701 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 return ErrorResult(bodyError, StatusCodes.Status400BadRequest);
             }
 
+            /* #5506 part 3: a rule test reads collected data like any read, admitted and recorded under its MCP twin's name. */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await AdmitWebRouteAsync(readAdmission, "test_custom_alert_rule", ReadWindowBand.None, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                return BusyResult(refusal);
+            }
+
+            using var run = new WebRouteRun(readLatencyRecorder, "test_custom_alert_rule", ReadWindowBand.None, context, readScope.Scope);
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpCustomAlertTools.TestCustomAlertRule(postgres, ruleId, definitionJson);
-            return ToHttpResult(result, "/api/alerts/test", logger, stopwatch.ElapsedMilliseconds);
+            run.Complete(ToolResultOutcome(result, context.RequestAborted));
+            return ToHttpResult(result, "/api/alerts/test", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
     }
 
     /* ─────────────────────── #3450 mute rules: the dedicated write endpoints ─────────────────────── */
+
+    /// <summary>
+    /// The pending agent notes screen's routes (#5903): <c>GET /api/investigation-notes/pending</c> lists the notes an agent
+    /// proposed that nobody has decided, and <c>PUT /api/investigation-notes/{id}/approve</c> and <c>.../reject</c> decide
+    /// one. The write routes answer as the mute-rule writes do: <c>application/json</c> required (the same CSRF discipline),
+    /// born gated by the host's write gate (<see cref="Hosting.DarlingWebSeat.IsRequestAllowed"/> refuses every unsafe
+    /// method to a read-only seat), 404 when the note is gone or already decided, 403 with <see cref="NoteDecisionRefusedMessage"/>
+    /// when the store refuses the write for privilege (SQLSTATE 42501: deciding a note is an <c>admin</c> role write, and the web
+    /// host runs on whatever login it was given, the <c>viewer</c> role on a managed or compose store), 400 when the person
+    /// rule refuses the seat's name (<see cref="InvestigationPersonWrites.ValidateActor"/>), a fixed-sentence 500 or 503
+    /// for any other store failure. The decision is stamped as every web write is: the seat's <see cref="DarlingWebSeat.EditorPrincipal"/>
+    /// (the signed-in subject, else <c>web</c>) shaped as <c>person:&lt;name&gt;</c>, as the Viewer stamps a decision. The list body goes through the statement sweep (#4348) like every other body that carries text an agent wrote.
+    /// </summary>
+    private static void MapInvestigationNotes(WebApplication app, InvestigationRequestStore notes, ILogger logger, bool managedStore = false)
+    {
+        app.MapGet("/api/investigation-notes/pending", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                /* One row past the cap tells a full page from a cut one (#5903). */
+                var pending = await notes.ListPendingNotesAsync(PendingNotesLimit + 1, context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(
+                    PendingNotesBody(pending), "/api/investigation-notes/pending", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-notes/pending", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/investigation-notes/{id:long}/approve", async (HttpContext context, long id) =>
+        {
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var decidedBy = NoteDecider(DarlingWebSeat.FromContext(context));
+            if (InvestigationPersonWrites.ValidateActor(decidedBy) is not null)
+            {
+                return PersonActorRefusedResult();
+            }
+
+            try
+            {
+                if (!await notes.ApproveNoteAsync(id, decidedBy, context.RequestAborted))
+                {
+                    return ErrorResult("That note is not pending: it was already decided, or it is gone.", StatusCodes.Status404NotFound);
+                }
+
+                return DarlingWebStatementSweep.JsonText(
+                    NoteDecisionBody("approved", id, decidedBy), "/api/investigation-notes/{id}/approve", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return NoteDecisionRefusedResult(managedStore);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-notes/{id}/approve", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/investigation-notes/{id:long}/reject", async (HttpContext context, long id) =>
+        {
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var decidedBy = NoteDecider(DarlingWebSeat.FromContext(context));
+            if (InvestigationPersonWrites.ValidateActor(decidedBy) is not null)
+            {
+                return PersonActorRefusedResult();
+            }
+
+            try
+            {
+                if (!await notes.RejectNoteAsync(id, decidedBy, context.RequestAborted))
+                {
+                    return ErrorResult("That note is not pending: it was already decided, or it is gone.", StatusCodes.Status404NotFound);
+                }
+
+                return DarlingWebStatementSweep.JsonText(
+                    NoteDecisionBody("rejected", id, decidedBy), "/api/investigation-notes/{id}/reject", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return NoteDecisionRefusedResult(managedStore);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-notes/{id}/reject", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>
+    /// The threshold-overrides grid's routes (#5916 part 4): <c>GET /api/threshold-overrides</c> lists the overrides and
+    /// <c>PUT /api/threshold-overrides</c> sets or clears one (the body and the answers are <see cref="DarlingWebThresholdOverrides"/>'s).
+    /// The write answers as the note decisions do (#5903): <c>application/json</c> required, born gated by the host's write gate,
+    /// 403 with <see cref="DarlingWebThresholdOverrides.RefusedMessage"/> when the store login holds no write grant on the table
+    /// (the <c>viewer</c> role of a managed or compose store), 400 for a refused key, value or server. Every body goes through the
+    /// statement sweep (#4348): <c>set_by</c> on an agent's override is text an agent named.
+    /// </summary>
+    private static void MapThresholdOverrides(WebApplication app, NpgsqlDataSource postgres, ILogger logger, bool managedStore = false)
+    {
+        app.MapGet("/api/threshold-overrides", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                return DarlingWebStatementSweep.JsonText(
+                    await DarlingWebThresholdOverrides.ListBodyAsync(postgres, context.RequestAborted),
+                    "/api/threshold-overrides", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/threshold-overrides", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/threshold-overrides", async (HttpContext context) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            JsonObject? body;
+            try
+            {
+                body = await JsonNode.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted) as JsonObject;
+            }
+            catch (JsonException)
+            {
+                body = null;
+            }
+
+            if (body is null)
+            {
+                return ErrorResult("The body must be a JSON object: {server_name, key, value, database_name?, clear?}.", StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var (status, answer) = await DarlingWebThresholdOverrides.ChangeAsync(
+                    postgres, logger, body, DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted, managedStore);
+                return DarlingWebStatementSweep.JsonText(
+                    answer, "/api/threshold-overrides", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, status);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/threshold-overrides", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>
+    /// The agent setup routes (#6264), level with the desktop Viewer: <c>GET /api/agent-setup/access</c> says whether this login can write;
+    /// <c>POST /api/notification-routes</c>, <c>PUT /api/notification-routes/{id}</c> and <c>DELETE /api/notification-routes/{id}</c> create, edit and
+    /// delete a route's agent channel, match, scope, enabled flag, resolution override, fallback and destinations (webhook URLs and routing key sealed
+    /// as the Viewer and the MCP route tools seal them, never answered; email recipients); <c>GET /api/environment-profiles</c> lists the profiles and <c>PUT /api/environment-profiles</c> saves or removes one.
+    /// The writes need <c>application/json</c>, are born gated by the host's write gate (a read-only seat is refused every unsafe method), answer
+    /// 403 when the store refuses for privilege (SQLSTATE 42501: the <c>viewer</c> role of a managed or compose store), 404 for a route that is
+    /// gone and 400 with the shared rule's sentence for a refused value. The work is <see cref="DarlingWebAgentSetup"/>'s.
+    /// </summary>
+    private static void MapAgentSetup(WebApplication app, NpgsqlDataSource postgres, ILogger logger, IPasswordKeyRing? passwordKeys, bool managedStore = false)
+    {
+        app.MapGet("/api/agent-setup/access", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                return Results.Json(DarlingWebAgentSetup.ForSeat(
+                    await DarlingWebAgentSetup.AccessAsync(postgres, context.RequestAborted), DarlingWebSeat.IsSignedInAdmin(context)));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/agent-setup/access", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapGet("/api/environment-profiles", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                return DarlingWebStatementSweep.JsonText(
+                    DarlingWebAgentSetup.ForSeat(
+                        await DarlingWebAgentSetup.ProfilesBodyAsync(postgres, context.RequestAborted), DarlingWebSeat.IsSignedInAdmin(context)),
+                    "/api/environment-profiles", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/environment-profiles", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/environment-profiles", async Task<IResult> (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var run = await AgentSetupRunAsync(context, logger, "/api/environment-profiles",
+                (body, editor, ct) => DarlingWebAgentSetup.SaveProfileAsync(postgres, body, editor, ct, managedStore));
+            return DarlingWebStatementSweep.JsonText(
+                run.Body, "/api/environment-profiles", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, run.Status);
+        });
+
+        app.MapPost("/api/notification-routes", async Task<IResult> (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var run = await AgentSetupRunAsync(context, logger, "/api/notification-routes",
+                (body, editor, ct) => DarlingWebAgentSetup.SaveRouteAsync(postgres, logger, null, body, editor, passwordKeys ?? DarlingPasswordKey.Current, ct, managedStore));
+            return DarlingWebStatementSweep.JsonText(
+                run.Body, "/api/notification-routes", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, run.Status);
+        });
+
+        app.MapPut("/api/notification-routes/{id:int}", async Task<IResult> (HttpContext context, int id) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var run = await AgentSetupRunAsync(context, logger, "/api/notification-routes/{id}",
+                (body, editor, ct) => DarlingWebAgentSetup.SaveRouteAsync(postgres, logger, id, body, editor, passwordKeys ?? DarlingPasswordKey.Current, ct, managedStore));
+            return DarlingWebStatementSweep.JsonText(
+                run.Body, "/api/notification-routes/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, run.Status);
+        });
+
+        app.MapDelete("/api/notification-routes/{id:int}", async (HttpContext context, int id) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return DarlingWebStatementSweep.JsonText(
+                    new JsonObject { ["error"] = InvestigationWriteSignInMessage }, "/api/notification-routes/{id}", logger,
+                    stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+
+            /* #6265: the person is named as a note decision names them; a signed-in name the journal cannot hold is refused before anything runs. */
+            if (PersonWriteActor(context) is null)
+            {
+                return DarlingWebStatementSweep.JsonText(
+                    new JsonObject { ["error"] = PersonWriteActorRefusal }, "/api/notification-routes/{id}", logger,
+                    stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                var (status, answer) = await DarlingWebAgentSetup.DeleteRouteAsync(
+                    postgres, logger, id, DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted, managedStore);
+                return DarlingWebStatementSweep.JsonText(
+                    answer, "/api/notification-routes/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, status);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/notification-routes/{id}", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>One agent setup write: <c>application/json</c> required (the same CSRF discipline as the other web writes), the body a JSON
+    /// object, the seat's <see cref="DarlingWebSeat.EditorPrincipal"/> as the editor. Always answers a status and a body for the route to send
+    /// through the statement sweep: a refusal's sentence, or the fixed-sentence 500 or 503 of a failure.</summary>
+    private static async Task<(int Status, JsonNode Body)> AgentSetupRunAsync(
+        HttpContext context, ILogger logger, string route,
+        Func<JsonObject, string, CancellationToken, Task<(int Status, JsonNode Body)>> write)
+    {
+        /* #6274: every agent setup write needs a signed-in admin. A dashboard with no sign-in stores no seat, so the default shared-token
+           seat that FromContext hands back would let any process on the host change routes and profiles with no credential. */
+        if (!DarlingWebSeat.IsSignedInAdmin(context))
+        {
+            return (StatusCodes.Status403Forbidden, new JsonObject { ["error"] = InvestigationWriteSignInMessage });
+        }
+
+        if (!IsJsonContentType(context.Request.ContentType))
+        {
+            return (StatusCodes.Status415UnsupportedMediaType, new JsonObject { ["error"] = "Content-Type must be application/json." });
+        }
+
+        JsonObject? body;
+        try
+        {
+            body = await JsonNode.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted) as JsonObject;
+        }
+        catch (JsonException)
+        {
+            body = null;
+        }
+
+        if (body is null)
+        {
+            return (StatusCodes.Status400BadRequest, new JsonObject { ["error"] = "The body must be a JSON object." });
+        }
+
+        /* #6265: the person is named as a note decision names them (InvestigationPersonWrites.PersonActor); a signed-in name the journal
+           cannot hold is refused with the same fixed sentence, before anything runs. */
+        if (PersonWriteActor(context) is null)
+        {
+            return (StatusCodes.Status400BadRequest, new JsonObject { ["error"] = PersonWriteActorRefusal });
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            return await write(body, DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            DarlingWebFailureLog.Report(logger, route, stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+            return (DarlingWebFailureLog.StatusCode(ex), DarlingWebFailureLog.Body(ex));
+        }
+    }
+
+    /// <summary>The 403 sentence a note decision answers when the store refuses the write (SQLSTATE 42501): the web host runs on
+    /// whatever login <c>postgres.webConnectionString</c> names, and deciding a note is an <c>admin</c> role write (#5903).</summary>
+    internal static string NoteDecisionRefusedMessage(bool managedStore) =>
+        DarlingWebStoreWrites.Refused("decide notes", managedStore, "Decide them in the Viewer app");
+
+    /// <summary>The sentence a person-made investigation change answers with 403 when the request holds no signed-in admin seat (#6265):
+    /// a dashboard with no sign-in configured has no caller to name, so the change is made in the Viewer or after signing in.</summary>
+    internal const string InvestigationWriteSignInMessage = "Sign in to the web as an admin to make this change, or use the Viewer.";
+
+    /// <summary>The 403 answered to a change that needs a signed-in admin: <see cref="InvestigationWriteSignInMessage"/>, nothing written.</summary>
+    private static IResult SignInRequiredResult() => ErrorResult(InvestigationWriteSignInMessage, StatusCodes.Status403Forbidden);
+
+    /// <summary>The 403 a refused note decision answers: the fixed <see cref="NoteDecisionRefusedMessage"/> sentence in the mute-rule error envelope.</summary>
+    private static IResult NoteDecisionRefusedResult(bool managedStore) =>
+        ErrorResult(NoteDecisionRefusedMessage(managedStore), StatusCodes.Status403Forbidden);
+
+    /// <summary>True when the store refused the statement for privilege (SQLSTATE 42501).</summary>
+    internal static bool IsInsufficientPrivilege(Exception ex) => ex is PostgresException { SqlState: "42501" };
+
+    /// <summary>The most pending notes one list answers. A fleet that proposes more than this has a backlog the screen cannot
+    /// show whole; the list says so (<c>truncated</c>), and deciding the oldest shows the rest.</summary>
+    internal const int PendingNotesLimit = 200;
+
+    /// <summary>Who a note decision is stamped as: <c>person:&lt;signed-in name&gt;</c>, the seat's <see cref="DarlingWebSeat.EditorPrincipal"/>
+    /// shaped by <see cref="InvestigationPersonWrites.PersonActor"/> as the Viewer and the web's own person writes record a person (#6265).
+    /// The signed-in subject, else <c>web</c> for the shared token, so that token's decision is <c>person:web</c>.</summary>
+    internal static string NoteDecider(DarlingWebSeat seat) => InvestigationPersonWrites.PersonActor(seat.EditorPrincipal);
+
+    /// <summary>The list body: <c>{notes_returned, truncated, notes: [{note_id, server_id, server_name, metric_name, family,
+    /// story_path_hash, note_text, author, source_request_id, proposed_at_utc, expires_at_utc}]}</c>, oldest proposal first.
+    /// <paramref name="pending"/> is read with <see cref="PendingNotesLimit"/> + 1 rows: the first <see cref="PendingNotesLimit"/>
+    /// are returned and <c>truncated</c> is true when the extra row exists.</summary>
+    internal static JsonObject PendingNotesBody(IReadOnlyList<PendingInvestigationNote> pending)
+    {
+        var array = new JsonArray();
+        foreach (var note in pending.Take(PendingNotesLimit))
+        {
+            array.Add(new JsonObject
+            {
+                ["note_id"] = note.NoteId,
+                ["server_id"] = note.ServerId,
+                ["server_name"] = note.ServerName,
+                ["metric_name"] = note.MetricName,
+                ["family"] = note.Family,
+                ["story_path_hash"] = note.StoryPathHash,
+                ["note_text"] = note.NoteText,
+                ["author"] = note.Author,
+                ["source_request_id"] = note.SourceRequestId?.ToString(),
+                ["proposed_at_utc"] = note.ProposedAtUtc.ToString("o", CultureInfo.InvariantCulture),
+                ["expires_at_utc"] = note.ExpiresAtUtc.ToString("o", CultureInfo.InvariantCulture),
+            });
+        }
+
+        return new JsonObject { ["notes_returned"] = array.Count, ["truncated"] = pending.Count > PendingNotesLimit, ["notes"] = array };
+    }
+
+    internal static JsonObject NoteDecisionBody(string status, long noteId, string decidedBy) =>
+        new() { ["status"] = status, ["note_id"] = noteId, ["decided_by"] = decidedBy };
+
+    /* ─────────────────────── #5917 agent changes: the list, one-click undo and the switch ─────────────────────── */
+
+    /// <summary>The 403 sentence an undo or a switch answers when the store refuses the write for privilege (SQLSTATE 42501): the web host
+    /// runs on whatever login <c>postgres.webConnectionString</c> names, the <c>viewer</c> role on a managed or compose store (#5917).</summary>
+    internal static string AgentChangeRefusedMessage(bool managedStore) =>
+        DarlingWebStoreWrites.Refused("undo or switch off agent changes", managedStore);
+
+    /// <summary>The 403 a refused undo or switch answers: the fixed <see cref="AgentChangeRefusedMessage"/> sentence in the error envelope.</summary>
+    private static IResult AgentChangeRefusedResult(bool managedStore) =>
+        ErrorResult(AgentChangeRefusedMessage(managedStore), StatusCodes.Status403Forbidden);
+
+    /// <summary>
+    /// The Agent changes routes (#5917): <c>GET /api/agent-changes</c> lists the calls (with their result, or "unknown"), the refusals,
+    /// the switch and <c>can_decide</c> (false under the viewer role: the page then lists only); <c>GET /api/agent-changes/{id}/muted-alerts</c>
+    /// lists the alerts muted since a mute change; <c>PUT /api/agent-changes/{id}/undo</c> undoes one change and <c>PUT /api/agent-changes/switch</c>
+    /// turns every agent change on or off. The writes need <c>application/json</c>, are gated by the host's write gate, answer 403 with
+    /// <see cref="AgentChangeRefusedMessage"/> when the store refuses for privilege, 404 when the call is not in the journal, 409 with the
+    /// refusal ("changed since", name taken, already undone, no undo) and 400 for a bad body or login. Journal text goes through
+    /// <c>InvestigationFieldMasking.JournalDetail</c> at the web's level (full, as the other web reads of the journal).
+    /// </summary>
+    private static void MapAgentChanges(WebApplication app, AgentChangeUndo changes, ILogger logger, StoreOwnerSource? ownerSource = null, bool managedStore = false)
+    {
+        app.MapGet("/api/agent-changes", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var read = await changes.ReadAsync(AgentChangesLimit, context.RequestAborted);
+                var canDecide = await changes.CanDecideAsync(context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(
+                    AgentChangesBody(read, canDecide, DateTime.UtcNow), "/api/agent-changes", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/agent-changes", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapGet("/api/agent-changes/{id:long}/muted-alerts", async (HttpContext context, long id) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var alerts = await changes.ReadMutedAlertsAsync(id, 200, context.RequestAborted);
+                var array = new JsonArray();
+                foreach (var a in alerts)
+                {
+                    array.Add(new JsonObject
+                    {
+                        ["alert_time_utc"] = a.AlertTimeUtc.ToString("o", CultureInfo.InvariantCulture), ["server_id"] = a.ServerId,
+                        ["server_name"] = a.ServerName, ["metric_name"] = a.MetricName, ["current_value"] = a.CurrentValue, ["threshold_value"] = a.ThresholdValue,
+                    });
+                }
+
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["alerts_returned"] = array.Count, ["alerts"] = array },
+                    "/api/agent-changes/{id}/muted-alerts", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/agent-changes/{id}/muted-alerts", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/agent-changes/{id:long}/undo", async (HttpContext context, long id) =>
+        {
+            /* #6265: an undo is a person's act, so it needs a signed-in admin before anything is read or written. */
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var login = DarlingWebSeat.FromContext(context).EditorPrincipal;
+            try
+            {
+                /* #5632 step 9: a plan force or unforce is undone by the service's plan force code, which reads the server first. The first request
+                   (no confirm) answers the statement and the state and writes nothing; {"confirm": true, "statement": "<shown>"} writes. */
+                if ((await changes.GetAsync(id, context.RequestAborted))?.IsPlanChange == true)
+                {
+                    /* A plan undo writes to the monitored server, so it needs a signed-in admin, not just the web's store login (#6269). */
+                    if (!DarlingWebSeat.IsSignedInAdmin(context))
+                    {
+                        return SignInRequiredResult();
+                    }
+
+                    if (!await changes.CanDecideAsync(context.RequestAborted))
+                    {
+                        return AgentChangeRefusedResult(managedStore);
+                    }
+
+                    var (planBody, planStatus) = await UndoPlanChangeAsync(context, changes, ownerSource, logger, id, login);
+                    return DarlingWebStatementSweep.JsonText(planBody, "/api/agent-changes/{id}/undo", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, planStatus);
+                }
+
+                var result = await changes.UndoAsync(id, login, context.RequestAborted);
+                if (result.Undone)
+                {
+                    return DarlingWebStatementSweep.JsonText(new JsonObject { ["status"] = "undone", ["called_id"] = id, ["undone_by"] = AgentChangeUndo.PersonActor(login), ["message"] = result.Words },
+                        "/api/agent-changes/{id}/undo", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+                }
+
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = result.Words, ["code"] = result.Code },
+                    "/api/agent-changes/{id}/undo", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted,
+                    result.Code == "not_found" ? StatusCodes.Status404NotFound : StatusCodes.Status409Conflict);
+            }
+            catch (ArgumentException)
+            {
+                return ErrorResult("The signed-in name cannot be recorded as the person who undid this change.", StatusCodes.Status400BadRequest);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return AgentChangeRefusedResult(managedStore);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/agent-changes/{id}/undo", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/agent-changes/switch", async (HttpContext context) =>
+        {
+            /* #6265: the service-wide agent switch is a person's act, so it needs a signed-in admin before anything is read or written. */
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var login = DarlingWebSeat.FromContext(context).EditorPrincipal;
+            try
+            {
+                if (JsonNode.Parse(await ReadBodyAsync(context)) is not JsonObject body || body["enabled"] is not JsonValue flag || !flag.TryGetValue(out bool enabled))
+                {
+                    return ErrorResult("Send {\"enabled\": true} or {\"enabled\": false}.", StatusCodes.Status400BadRequest);
+                }
+
+                await changes.SetEnabledAsync(enabled, login, context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["status"] = enabled ? "on" : "off", ["enabled"] = enabled },
+                    "/api/agent-changes/switch", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is JsonException or ArgumentException)
+            {
+                return ErrorResult("The request body is not valid, or the signed-in name cannot be recorded.", StatusCodes.Status400BadRequest);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return AgentChangeRefusedResult(managedStore);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/agent-changes/switch", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>
+    /// A person's undo of a plan force or unforce (#5632, step 9). 200 <c>{status: "confirm", statement, state, message}</c> without a confirm
+    /// (nothing written); 200 <c>{status: "undone", ...}</c> with <c>{"confirm": true}</c>; a refusal is 409 <c>{error, code}</c> (404 for
+    /// <c>not_found</c>); a server that took no write is 502. A viewer-role store is 403 before anything else, as the store kinds' undo answers it
+    /// (the route checks that, then sweeps what this returns).
+    /// </summary>
+    private static async Task<(JsonObject Body, int Status)> UndoPlanChangeAsync(HttpContext context, AgentChangeUndo changes, StoreOwnerSource? ownerSource, ILogger logger,
+        long id, string login)
+    {
+        var confirm = false;
+        string? shown = null;
+        var raw = await ReadBodyAsync(context);
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            try
+            {
+                if (JsonNode.Parse(raw) is not JsonObject body)
+                {
+                    return (new JsonObject { ["error"] = "Send {} or {\"confirm\": true, \"statement\": \"<the statement shown>\"}." }, StatusCodes.Status400BadRequest);
+                }
+
+                confirm = body["confirm"] is JsonValue flag && flag.TryGetValue(out bool yes) && yes;
+                shown = body["statement"] is JsonValue text && text.TryGetValue(out string? sentence) ? sentence : null;
+            }
+            catch (JsonException)
+            {
+                return (new JsonObject { ["error"] = "The request body is not valid JSON." }, StatusCodes.Status400BadRequest);
+            }
+        }
+
+        var answer = await Mcp.DarlingMcpPlanForceTools.UndoPlanChangeAsync(changes, ownerSource?.Read(), logger, id, login, confirm, shown, context.RequestAborted);
+        if (answer.Succeeded)
+        {
+            return (answer.ToJson(), StatusCodes.Status200OK);
+        }
+
+        return UndoRefusalBody(answer);
+    }
+
+    /// <summary>The words the browser gets when a plan undo does not succeed.</summary>
+    internal const string UndoFailedWords =
+        "The undo did not complete on the server. The Darling service log has the server's own words.";
+
+    /// <summary>
+    /// The body and status of a plan undo that was refused or failed (#5632, step 9). A refusal carries this code's own sentence. A failure
+    /// carries the monitored server's exception text (the executor scrubs the secret from it, but it can still name hosts and addresses), so
+    /// the browser gets <see cref="UndoFailedWords"/> and the code instead (#4283). The executor already logged the server's words.
+    /// </summary>
+    internal static (JsonObject Body, int Status) UndoRefusalBody(PlanUndoAnswer undoRefusal)
+    {
+        var failed = undoRefusal.Status == PlanUndoAnswer.Failed;
+        var refused = new JsonObject
+        {
+            ["error"] = failed ? UndoFailedWords : undoRefusal.Message,
+            ["code"] = undoRefusal.Code,
+            ["status"] = undoRefusal.Status,
+        };
+        if (undoRefusal.State is not null)
+        {
+            refused["state"] = undoRefusal.State.DeepClone();
+        }
+
+        return (refused, undoRefusal.Code == "not_found" ? StatusCodes.Status404NotFound
+            : undoRefusal.Code == "bad_login" ? StatusCodes.Status400BadRequest
+            : failed ? StatusCodes.Status502BadGateway
+            : StatusCodes.Status409Conflict);
+    }
+
+    /// <summary>The most calls and refusals the Agent changes list answers.</summary>
+    internal const int AgentChangesLimit = 200;
+
+    /// <summary>The list body: <c>{enabled, can_decide, changes: [{called_id, called_at_utc, request_id, server_id, server_name (the registry's name, or "Server N (removed)"), actor, reason, tool, kind, detail,
+    /// result (done, failed or unknown), result_detail, undone_at_utc, undone_by, muted_alerts, can_undo}], refusals: [...]}</c>. A call with no
+    /// result row is <c>unknown</c>. <c>detail</c> goes through the journal masking helper at the web's level.</summary>
+    internal static JsonObject AgentChangesBody(AgentChangesRead read, bool canDecide, DateTime nowUtc)
+    {
+        var masker = McpDataDetailMasker.ForAnswer(McpDataDetail.Full);
+        var calls = new JsonArray();
+        foreach (var c in read.Changes)
+        {
+            calls.Add(new JsonObject
+            {
+                ["called_id"] = c.CalledId,
+                ["called_at_utc"] = c.CalledAtUtc.ToString("o", CultureInfo.InvariantCulture),
+                ["request_id"] = c.RequestId?.ToString(),
+                ["server_id"] = c.ServerId,
+                ["server_name"] = c.ServerName, ["server_removed"] = c.ServerId is not null && c.ServerName is null,
+                ["actor"] = c.Actor,
+                ["reason"] = c.Reason,
+                ["tool"] = c.Tool,
+                ["kind"] = c.Kind,
+                ["detail"] = InvestigationFieldMasking.JournalDetail(c.DetailJson, masker),
+                ["result"] = c.Result.ToString().ToLowerInvariant(),
+                ["result_detail"] = c.ResultJson is null ? null : InvestigationFieldMasking.JournalDetail(c.ResultJson, masker),
+                ["undone_at_utc"] = c.UndoneAtUtc?.ToString("o", CultureInfo.InvariantCulture),
+                ["undone_by"] = c.UndoneBy,
+                ["muted_alerts"] = c.MutedAlerts,
+                ["force_review"] = c.ForceReview?.Words,
+                ["force_checks_opened"] = c.ForceReview?.Opened,
+                ["force_checks_answered"] = c.ForceReview?.Answered,
+                ["can_undo"] = c.CanTryUndo(nowUtc),
+            });
+        }
+
+        var refusals = new JsonArray();
+        foreach (var r in read.Refusals)
+        {
+            refusals.Add(new JsonObject
+            {
+                ["journal_id"] = r.JournalId, ["at_utc"] = r.AtUtc.ToString("o", CultureInfo.InvariantCulture), ["request_id"] = r.RequestId?.ToString(),
+                ["server_id"] = r.ServerId, ["server_name"] = r.ServerName, ["server_removed"] = r.ServerId is not null && r.ServerName is null,
+                ["actor"] = r.Actor, ["code"] = r.Code, ["tool"] = r.Tool,
+            });
+        }
+
+        return new JsonObject { ["enabled"] = read.Enabled, ["can_decide"] = canDecide, ["changes"] = calls, ["refusals"] = refusals };
+    }
 
     /// <summary>
     /// The mute-rule WRITE surface (#3450): create / update / set-enabled / delete, the web twins of the four
@@ -946,7 +2000,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpAlertTools.CreateMuteRuleCore(store, await ReadBodyAsync(context), serverNameLookup);
-            return MuteRuleToolResult(result, "/api/mute-rules", logger, stopwatch.ElapsedMilliseconds, StatusCodes.Status201Created);
+            return MuteRuleToolResult(result, "/api/mute-rules", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status201Created);
         });
 
         /* Update — PARTIAL, the merged update_mute_rule semantics verbatim: the body carries ONLY the fields to
@@ -963,7 +2017,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpAlertTools.UpdateMuteRuleCore(store, id, await ReadBodyAsync(context), serverNameLookup);
-            return MuteRuleToolResult(result, "/api/mute-rules/{id}", logger, stopwatch.ElapsedMilliseconds);
+            return MuteRuleToolResult(result, "/api/mute-rules/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
 
         /* Set-enabled — the reversible flag flip that keeps the rule's id, scope, reason and creation date (the
@@ -998,7 +2052,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpAlertTools.SetMuteRuleEnabledCore(store, id, enabled);
-            return MuteRuleToolResult(result, "/api/mute-rules/{id}/enabled", logger, stopwatch.ElapsedMilliseconds);
+            return MuteRuleToolResult(result, "/api/mute-rules/{id}/enabled", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
 
         /* Delete — 200 with the verb's {status:"deleted", rule_id} envelope rather than the views surface's
@@ -1014,7 +2068,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpAlertTools.DeleteMuteRuleCore(store, id);
-            return MuteRuleToolResult(result, "/api/mute-rules/{id}", logger, stopwatch.ElapsedMilliseconds);
+            return MuteRuleToolResult(result, "/api/mute-rules/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
     }
 
@@ -1134,7 +2188,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             if (ClassifyToolResponse(result) is ToolResponseKind.ServerError)
             {
-                return ServerErrorResult(RedactSecrets(McpHelpers.ErrorMessageOf(result), secrets), "/api/servers", logger, stopwatch.ElapsedMilliseconds);
+                return ServerErrorResult(RedactSecrets(McpHelpers.ErrorMessageOf(result), secrets), "/api/servers", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
             }
 
             var answer = RedactAddAnswer(result, secrets);
@@ -1209,11 +2263,11 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 {
                     /* A store whose roles predate the edit function (#5240): still a 500, but the body says what to do
                        instead of the generic sentence. The text is ours; PostgreSQL's own error never reaches this far. */
-                    DarlingWebFailureLog.Report(logger, "/api/servers/{id}", ran.Stopwatch!.ElapsedMilliseconds, sentence);
+                    DarlingWebFailureLog.Report(logger, "/api/servers/{id}", ran.Stopwatch!.ElapsedMilliseconds, sentence, context.RequestAborted);
                     return ErrorResult(DarlingMcpServerAdminTools.EditStoreNeedsRolesText, StatusCodes.Status500InternalServerError);
                 }
 
-                return ServerErrorResult(sentence, "/api/servers/{id}", logger, ran.Stopwatch!.ElapsedMilliseconds);
+                return ServerErrorResult(sentence, "/api/servers/{id}", logger, ran.Stopwatch!.ElapsedMilliseconds, context.RequestAborted);
             }
 
             var answer = RedactEditAnswer(result, secrets);
@@ -1242,7 +2296,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                return ServerErrorResult($"admin server read failed ({ex.GetType().Name})", "/api/admin/servers/{id}", logger, stopwatch.ElapsedMilliseconds);
+                return ServerErrorResult($"admin server read failed ({ex.GetType().Name})", "/api/admin/servers/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
             }
 
             if (row is null)
@@ -1454,7 +2508,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                catch would hold it for the life of the process and answer 429 forever. */
             slot.Release();
             return new ServerWriteRun(
-                ServerErrorResult($"{labels.ToolName} failed ({ex.GetType().Name})", labels.Route, logger, stopwatch.ElapsedMilliseconds), null, null);
+                ServerErrorResult($"{labels.ToolName} failed ({ex.GetType().Name})", labels.Route, logger, stopwatch.ElapsedMilliseconds, CancellationToken.None), null, null);
         }
 
         /* The slot is freed by the core itself, once, when it finishes (completed or faulted) - never by the wait's
@@ -1483,7 +2537,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         {
             /* The cores catch their own faults, so this is a backstop; only the TYPE is logged. */
             return new ServerWriteRun(
-                ServerErrorResult($"{labels.ToolName} failed ({ex.GetType().Name})", labels.Route, logger, stopwatch.ElapsedMilliseconds), null, null);
+                ServerErrorResult($"{labels.ToolName} failed ({ex.GetType().Name})", labels.Route, logger, stopwatch.ElapsedMilliseconds, CancellationToken.None), null, null);
         }
         finally
         {
@@ -1504,18 +2558,38 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     internal sealed class SingleReleaseSlot
     {
         private readonly SemaphoreSlim gate;
-        private int held = 1;
+        private readonly object sync = new();
+        private readonly Action? beforeFree;
+        private bool released;
 
-        internal SingleReleaseSlot(SemaphoreSlim gate)
+        /// <param name="gate">The one-slot gate to free.</param>
+        /// <param name="beforeFree">A test seam only: runs inside the first release, after it claimed the slot and before
+        /// it frees the gate, so a test can stand a second caller in that window. Production passes nothing.</param>
+        internal SingleReleaseSlot(SemaphoreSlim gate, Action? beforeFree = null)
         {
             this.gate = gate;
+            this.beforeFree = beforeFree;
         }
 
-        /// <summary>Frees the slot on the first call; every later call does nothing.</summary>
+        /// <summary>
+        /// Frees the slot on the first call; every later call does nothing, but it does not RETURN until the first
+        /// call has really freed the gate (#6440). A flag flipped with Interlocked.Exchange before gate.Release() let a
+        /// second caller see "already released" and return while the first caller, preempted between the flag and
+        /// the Release, had not freed the gate yet: the handler then sent its answer, the client sent its next
+        /// edit, and that edit was refused with 429. The lock makes the second caller wait that moment out. Nothing
+        /// inside it blocks or awaits.
+        /// </summary>
         internal void Release()
         {
-            if (Interlocked.Exchange(ref held, 0) == 1)
+            lock (sync)
             {
+                if (released)
+                {
+                    return;
+                }
+
+                released = true;
+                beforeFree?.Invoke();
                 gate.Release();
             }
         }
@@ -1824,10 +2898,760 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                DarlingWebFailureLog.Report(logger, "/api/alert-history/dismiss", stopwatch.ElapsedMilliseconds, ex);
+                DarlingWebFailureLog.Report(logger, "/api/alert-history/dismiss", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
                 return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
             }
         });
+    }
+
+    /* ─────────────────────── #5913 feedback on investigation reports ─────────────────────── */
+
+    /// <summary>The longest feedback request body the route reads (two 4000-character fields plus the rest, with room for escapes).</summary>
+    internal const int MaxFeedbackBodyBytes = 64 * 1024;
+
+    /// <summary>The most reported requests one feedback list answers (the Viewer's list holds the same number).</summary>
+    internal const int FeedbackListLimit = 200;
+
+    /// <summary>The 403 sentence a feedback record answers when the store refuses the write (SQLSTATE 42501): the web host runs on
+    /// whatever login <c>postgres.webConnectionString</c> names, and recording feedback is an <c>admin</c> role write (#5913).</summary>
+    internal static string FeedbackRefusedMessage(bool managedStore) =>
+        DarlingWebStoreWrites.Refused("record feedback", managedStore, "Give feedback in the Viewer app");
+
+    /* ─────────────────────── #5918 practice scores ─────────────────────── */
+
+    /// <summary>
+    /// The web's list of practice scores (#5918, #5632 Phase B): <c>GET /api/investigation-practice-scores</c> answers the score per agent
+    /// over the practice requests opened in the last <c>hours_back</c> hours (default 720, at most 8760): <c>{hours_back, agents: [{agent_id,
+    /// cases, scored, matched, unscored, points, possible, percent, missed_step_cases}]}</c>, agents in name order, <c>percent</c> null for an
+    /// agent with nothing scored yet. This route only reads: the score is advisory, so nothing here decides anything or writes
+    /// (a practice request is started by <see cref="MapInvestigationPersonWrites"/>).
+    /// </summary>
+    internal static void MapInvestigationPractice(WebApplication app, NpgsqlDataSource postgres, ILogger logger)
+    {
+        var store = new InvestigationPracticeStore(postgres, McpCommandDeadlines.ReadSeconds);
+
+        app.MapGet("/api/investigation-practice-scores", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var hours = 720;
+            if (context.Request.Query.TryGetValue("hours_back", out var hoursText)
+                && (!int.TryParse(hoursText.ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out hours) || hours < 1 || hours > 8760))
+            {
+                return ErrorResult("hours_back must be a whole number from 1 to 8760.", StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                var scores = await store.ReadScoresAsync(DateTime.UtcNow.AddHours(-hours), context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(
+                    PracticeScoresBody(scores, hours), "/api/investigation-practice-scores", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-practice-scores", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /* ─────────────────────── #6265 close a request, write a note, start a practice request ─────────────────────── */
+
+    /// <summary>The 403 sentence these three writes answer when the store refuses them for privilege (SQLSTATE 42501): the web host runs on
+    /// whatever login <c>postgres.webConnectionString</c> names, the <c>viewer</c> role on a managed or compose store (#6265).</summary>
+    internal static string InvestigationWriteRefusedMessage(bool managedStore) =>
+        DarlingWebStoreWrites.Refused("close a request, write a note or start a practice request", managedStore, "Do it in the Viewer app");
+
+    /// <summary>The most bytes one of these write bodies may carry (a note is at most 2,000 characters).</summary>
+    internal const int MaxInvestigationWriteBodyBytes = 64 * 1024;
+
+    /// <summary>
+    /// The three investigation writes a person makes (#6265, #5632), the web's twins of the desktop Viewer's: <c>PUT /api/investigation-requests/{id}/close</c>
+    /// (body <c>{reason}</c>) closes an open, claimed or reported request; <c>PUT /api/investigation-notes</c> (body <c>{note_text, server_id?, metric_name?, days?}</c>)
+    /// writes a note a person stands behind, approved as written (an agent's proposed note still waits for Approve); <c>PUT /api/investigation-practice-requests/{id}</c>
+    /// opens a practice request replaying one judged case. They call the same storage code the Viewer does
+    /// (<see cref="InvestigationRequestStore.CloseRequestAsync"/>, <see cref="InvestigationRequestStore.WriteNoteAsync"/>,
+    /// <see cref="InvestigationPracticeStore.OpenAsync"/>), so the states, the refusals and the journal rows are the same: <c>closed</c>,
+    /// <c>note_written</c> and <c>opened</c>, each by <c>person:&lt;signed-in name&gt;</c>. Born gated as the other web writes are: <c>application/json</c>
+    /// required, a read-only seat refused by the host's write gate, a store login without the admin role answered 403 with
+    /// <see cref="InvestigationWriteRefusedMessage"/>. Each route needs a signed-in admin
+    /// (<see cref="DarlingWebSeat.IsSignedInAdmin"/>): a dashboard with no sign-in configured has no caller to name, so it answers 403 with
+    /// <see cref="InvestigationWriteSignInMessage"/> and writes nothing. An agent's MCP token is not a web sign-in either.
+    /// 400 for a value the rules refuse (in plain words), 404 for an unknown request or case, 409 for a request that cannot be closed or a case that
+    /// cannot be replayed, a fixed-sentence 500 or 503 for any other store failure.
+    /// </summary>
+    internal static void MapInvestigationPersonWrites(WebApplication app, NpgsqlDataSource postgres, ILogger logger, bool managedStore = false)
+    {
+        var requests = new InvestigationRequestStore(postgres, McpCommandDeadlines.ReadSeconds, () => DateTime.UtcNow);
+        var practice = new InvestigationPracticeStore(postgres, McpCommandDeadlines.ReadSeconds);
+
+        app.MapPut("/api/investigation-requests/{requestId}/close", async (HttpContext context, string requestId) =>
+        {
+            const string route = "/api/investigation-requests/{requestId}/close";
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            if (!Guid.TryParse(requestId, out var request))
+            {
+                return ErrorResult("The request id is not a request id.", StatusCodes.Status400BadRequest);
+            }
+
+            var (body, bodyRefusal) = await ReadInvestigationWriteBodyAsync(context);
+            if (body is null)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = bodyRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            var reason = body["reason"] is JsonValue reasonValue && reasonValue.TryGetValue<string>(out var reasonText) ? reasonText : null;
+            if (InvestigationPersonWrites.ValidateCloseReason(reason) is { } reasonRefusal)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = reasonRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            if (PersonWriteActor(context) is not { } actor)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = PersonWriteActorRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                if (!await requests.CloseRequestAsync(request, actor, reason!, context.RequestAborted))
+                {
+                    return ErrorResult("That request is not open: it is already closed or expired, or it is gone.", StatusCodes.Status409Conflict);
+                }
+
+                return DarlingWebStatementSweep.JsonText(
+                    new JsonObject { ["status"] = "closed", ["request_id"] = request.ToString(), ["closed_by"] = actor },
+                    route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = InvestigationWriteRefusedMessage(managedStore) }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, route, stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/investigation-notes", async (HttpContext context) =>
+        {
+            const string route = "/api/investigation-notes";
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var (body, bodyRefusal) = await ReadInvestigationWriteBodyAsync(context);
+            if (body is null)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = bodyRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            var text = body["note_text"] is JsonValue textValue && textValue.TryGetValue<string>(out var noteText) ? noteText : null;
+            var metric = body["metric_name"] is JsonValue metricValue && metricValue.TryGetValue<string>(out var metricText) ? metricText : null;
+            int? serverId = null;
+            if (body["server_id"] is { } serverNode)
+            {
+                if (serverNode is not JsonValue serverValue || !serverValue.TryGetValue<int>(out var id) || id < 1)
+                {
+                    return ErrorResult("server_id must be a whole number, or left out for a fleet note.", StatusCodes.Status400BadRequest);
+                }
+
+                serverId = id;
+            }
+
+            var days = InvestigationPersonWrites.NoteDefaultDays;
+            if (body["days"] is { } daysNode && (daysNode is not JsonValue daysValue || !daysValue.TryGetValue<int>(out days)))
+            {
+                return ErrorResult("days must be a whole number.", StatusCodes.Status400BadRequest);
+            }
+
+            if (InvestigationPersonWrites.ValidateNote(text, days, metric) is { } noteRefusal)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = noteRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            if (PersonWriteActor(context) is not { } actor)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = PersonWriteActorRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                if (serverId is { } named && !await requests.ServerRegisteredAsync(named, context.RequestAborted))
+                {
+                    return ErrorResult("That server is not registered.", StatusCodes.Status404NotFound);
+                }
+
+                var noteId = await requests.WriteNoteAsync(serverId, metric, text!, actor, days, context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(
+                    new JsonObject { ["status"] = "approved", ["note_id"] = noteId, ["author"] = actor, ["server_id"] = serverId, ["days"] = days },
+                    route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = InvestigationWriteRefusedMessage(managedStore) }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, route, stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/investigation-practice-requests/{requestId}", async (HttpContext context, string requestId) =>
+        {
+            const string route = "/api/investigation-practice-requests/{requestId}";
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return SignInRequiredResult();
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            if (!Guid.TryParse(requestId, out var source))
+            {
+                return ErrorResult("The request id is not a request id.", StatusCodes.Status400BadRequest);
+            }
+
+            if (PersonWriteActor(context) is not { } actor)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = PersonWriteActorRefusal }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                var (outcome, practiceId, storeSentence) = await practice.OpenAsync(source, actor, context.RequestAborted);
+                if (outcome != InvestigationPracticeOutcome.Opened)
+                {
+                    /* The store's own sentence says why the case was not replayed (never an exception's text). */
+                    return DarlingWebStatementSweep.JsonText(
+                        new JsonObject { ["error"] = storeSentence ?? "The practice request was not opened.", ["outcome"] = outcome.ToString(), ["request_id"] = practiceId?.ToString() },
+                        route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted,
+                        outcome == InvestigationPracticeOutcome.NotFound ? StatusCodes.Status404NotFound : StatusCodes.Status409Conflict);
+                }
+
+                return DarlingWebStatementSweep.JsonText(
+                    new JsonObject { ["status"] = "opened", ["request_id"] = practiceId?.ToString(), ["source_request_id"] = source.ToString(), ["opened_by"] = actor },
+                    route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (IsInsufficientPrivilege(ex))
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = InvestigationWriteRefusedMessage(managedStore) }, route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, route, stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>The journal actor of a person's investigation write: <c>person:&lt;signed-in name&gt;</c> (the seat's
+    /// <see cref="DarlingWebSeat.EditorPrincipal"/>), or null when the built actor is not one the journal may hold: a name the undo path
+    /// refuses (invisible, format or bidi characters, whitespace, over 64 characters) or an actor longer than 128.</summary>
+    private static string? PersonWriteActor(HttpContext context)
+    {
+        var actor = InvestigationPersonWrites.PersonActor(DarlingWebSeat.FromContext(context).EditorPrincipal);
+        return InvestigationPersonWrites.ValidateActor(actor) is null ? actor : null;
+    }
+
+    private const string PersonWriteActorRefusal = "The signed-in name cannot be recorded as the person who made this change.";
+
+    /// <summary>The 400 a person-made change answers when the signed-in name cannot be recorded: the fixed <see cref="PersonWriteActorRefusal"/> sentence, never the name.</summary>
+    private static IResult PersonActorRefusedResult() => ErrorResult(PersonWriteActorRefusal, StatusCodes.Status400BadRequest);
+
+    /// <summary>Reads a bounded JSON object body for the investigation writes: the object, or the plain sentence that refuses it.</summary>
+    private static async Task<(JsonObject? Body, string? Refusal)> ReadInvestigationWriteBodyAsync(HttpContext context)
+    {
+        string text;
+        try
+        {
+            text = await ReadBoundedBodyAsync(context, MaxInvestigationWriteBodyBytes);
+        }
+        catch (InvalidDataException)
+        {
+            return (null, "Request body is too large.");
+        }
+
+        try
+        {
+            if (JsonNode.Parse(text) is JsonObject body)
+            {
+                /* A JsonObject reads its properties lazily, so a duplicate key surfaces as an ArgumentException on first access, outside
+                   this try. Touch Count here so the duplicate is refused as a body that is not a JSON object, not an unhandled 500. */
+                _ = body.Count;
+                return (body, null);
+            }
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
+        {
+        }
+
+        return (null, "The body must be a JSON object.");
+    }
+
+    /// <summary>PURE: the practice scores body (see <see cref="MapInvestigationPractice"/>).</summary>
+    internal static JsonObject PracticeScoresBody(IReadOnlyList<InvestigationPracticeScore> scores, int hoursBack)
+    {
+        var agents = new JsonArray();
+        foreach (var s in scores)
+        {
+            agents.Add(new JsonObject
+            {
+                ["agent_id"] = s.AgentId,
+                ["cases"] = s.Cases,
+                ["scored"] = s.Scored,
+                ["matched"] = s.Matched,
+                ["unscored"] = s.Unscored,
+                ["points"] = s.Points,
+                ["possible"] = s.Possible,
+                ["percent"] = s.Percent is { } p ? Math.Round(p * 100, 1) : null,
+                ["missed_step_cases"] = s.MissedStepCases,
+            });
+        }
+
+        return new JsonObject { ["hours_back"] = hoursBack, ["agents"] = agents };
+    }
+
+    /// <summary>
+    /// <c>GET /api/webhook-signing</c> (#5998): whether the settings row's generic webhook and each route that has its own key holds
+    /// a signing key, whether a rotation is in its window and when it ends. A status page only: the web has no write surface for
+    /// notifications, and the answer is served from what the service read when it applied the store's configuration, so it holds no
+    /// key text and does not depend on the web login being able to read the key columns.
+    /// </summary>
+    internal static void MapWebhookSigningStatus(WebApplication app, CollectorRuntimeState collector, Func<DateTime>? utcNow = null)
+    {
+        var clock = utcNow ?? (() => DateTime.UtcNow);
+        app.MapGet("/api/webhook-signing", () => Results.Text(collector.SigningStatus.Answer(clock()).ToJsonString(), "application/json"));
+    }
+
+    /// <summary>
+    /// The feedback routes (#5913): <c>GET /api/investigation-feedback</c> lists the reported requests of the last
+    /// <c>hours_back</c> hours (default 168, at most 2160) with the feedback people gave each, and the false-positive counts per alert
+    /// family; <c>PUT /api/investigation-feedback/{requestId}</c> records the signed-in person's feedback on one report.
+    /// The write answers as the mute-rule writes do: <c>application/json</c> required, a read-only seat refused by the host's write gate,
+    /// 400 for a value the rules refuse (<see cref="InvestigationFeedbackRules"/>, in plain words), 404 for an unknown request, 409 for
+    /// a request with no report, 403 with <see cref="FeedbackRefusedMessage"/> when the store refuses the write for privilege (the web
+    /// decides only under an admin store login, as the notes screen does), a fixed-sentence 500 or 503 for any other store failure.
+    /// The author is the seat's <see cref="DarlingWebSeat.EditorPrincipal"/> shaped by <see cref="InvestigationFeedbackRules.AuthorFromIdentity"/>.
+    /// A second record by the same author replaces the first. Bodies go through the statement sweep (#4348): they carry text an agent
+    /// and a person wrote.
+    /// </summary>
+    internal static void MapInvestigationFeedback(WebApplication app, NpgsqlDataSource postgres, ILogger logger, bool managedStore = false)
+    {
+        var store = new InvestigationFeedbackStore(postgres, McpCommandDeadlines.ReadSeconds);
+
+        app.MapGet("/api/investigation-feedback", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var hours = 168;
+            if (context.Request.Query.TryGetValue("hours_back", out var hoursText)
+                && (!int.TryParse(hoursText.ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out hours) || hours < 1 || hours > 2160))
+            {
+                return ErrorResult("hours_back must be a whole number from 1 to 2160.", StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                var since = DateTime.UtcNow.AddHours(-hours);
+                /* One connection for the list, the counts and the capability probe (#5913). */
+                await using var connection = await postgres.OpenConnectionAsync(context.RequestAborted);
+                var (rows, truncated) = await store.ListReportedAsync(connection, since, null, FeedbackListLimit, context.RequestAborted);
+                var counts = await store.FamilyCountsAsync(connection, since, null, context.RequestAborted);
+                var canRecord = await store.CanRecordAsync(connection, context.RequestAborted);
+                return DarlingWebStatementSweep.JsonText(
+                    FeedbackListBody(rows, truncated, counts, hours, canRecord), "/api/investigation-feedback", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-feedback", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/investigation-feedback/{requestId}", async (HttpContext context, string requestId) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            if (!Guid.TryParse(requestId, out var request))
+            {
+                return ErrorResult("The request id is not a request id.", StatusCodes.Status400BadRequest);
+            }
+
+            string text;
+            try
+            {
+                text = await ReadBoundedBodyAsync(context, MaxFeedbackBodyBytes);
+            }
+            catch (InvalidDataException)
+            {
+                return ErrorResult("Request body is too large.", StatusCodes.Status400BadRequest);
+            }
+
+            if (!TryParseFeedbackBody(text, request, DarlingWebSeat.FromContext(context).EditorPrincipal, out var submission, out var refusal))
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = refusal! }, "/api/investigation-feedback/{requestId}",
+                    logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                var result = await store.RecordAsync(submission!, context.RequestAborted);
+                /* The store's own sentence for a refused, unknown or unreported request (never an exception's text). */
+                var (outcome, sentence) = result;
+                if (outcome is not (InvestigationFeedbackOutcome.Recorded or InvestigationFeedbackOutcome.Replaced))
+                {
+                    return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = sentence! },"/api/investigation-feedback/{requestId}",
+                        logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, FeedbackRefusalStatus(outcome));
+                }
+
+                var receipt = FeedbackReceipt(outcome, request, submission!.Author);
+                return DarlingWebStatementSweep.JsonText(
+                    receipt, "/api/investigation-feedback/{requestId}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (IsFeedbackPrivilegeRefusal(ex))
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = FeedbackRefusedMessage(managedStore) }, "/api/investigation-feedback/{requestId}",
+                    logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-feedback/{requestId}", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
+    /// <summary>The 403 sentence the export answers a login that may not record feedback (#6236).</summary>
+    internal static string InvestigationExportRefusedMessage(bool managedStore) =>
+        DarlingWebStoreWrites.Refused("export investigation cases", managedStore, "Run --export-investigations on the host");
+
+    /// <summary>The 403 sentence the export answers a request that is not a signed-in admin session (#6236).</summary>
+    internal const string InvestigationExportSeatMessage =
+        "Exporting investigation cases needs a signed-in dashboard account with the admin role. A viewer account, and a dashboard with no sign-in "
+        + "configured, cannot: run --export-investigations on the host instead.";
+
+    /// <summary>The route name the export is admitted and recorded under (#6236).</summary>
+    internal const string InvestigationExportRoute = "investigation_export";
+
+    /// <summary>The seconds a second export is told to wait when one is already running (#6236).</summary>
+    internal const int InvestigationExportRetryAfterSeconds = 30;
+
+    /// <summary>
+    /// The download of the investigation cases that have feedback (#6236): <c>GET /api/investigation-export?since=&amp;until=&amp;server=&amp;verdict=</c>
+    /// answers JSON lines (<c>application/x-ndjson</c>, one case per line, the same bytes <c>--export-investigations</c> writes) as an attachment.
+    /// Two gates, both required: the request is a signed-in dashboard session whose account holds the admin role
+    /// (<see cref="DarlingWebSeat.IsSignedInAdmin"/>; a viewer account and a dashboard with no sign-in are refused), and the web login holds INSERT and
+    /// UPDATE on the feedback table (<see cref="InvestigationFeedbackStore.CanRecordAsync"/>). The route is heavy from its first call (<see cref="ReadAdmission.AlwaysHeavyRoutes"/>), only one
+    /// export runs at a time (a second answers 429 with Retry-After), and the read-admission slot is released before the file is sent.
+    /// Text is masked at the <c>mcp.dataDetail</c> the service started with, with the store's pseudonym key, by <see cref="InvestigationFeedbackExport"/>,
+    /// the same code the command line runs. The cases are written one at a time to a work file in the service's own data folder and the file is then sent
+    /// through the same handle (deleted when it closes), so a refused case refuses the whole download and no case is held in memory. 400 for a date, verdict or server it cannot use.
+    /// </summary>
+    internal static void MapInvestigationExport(
+        WebApplication app, NpgsqlDataSource postgres, ILogger logger, McpDataDetail dataDetail, IPseudonymKeySource? pseudonymKeys,
+        ReadAdmission? readAdmission = null, ReadLatencyRecorder? readLatencyRecorder = null, InvestigationExportGate? exportGate = null,
+        bool managedStore = false)
+    {
+        exportGate ??= new InvestigationExportGate(InvestigationExportGate.FolderFor(DarlingManagedPostgres.ResolveDataDirectory(new PostgresConfig())));
+        var feedbackStore = new InvestigationFeedbackStore(postgres, McpCommandDeadlines.ReadSeconds);
+        var requestStore = new InvestigationRequestStore(postgres, McpCommandDeadlines.ReadSeconds, () => DateTime.UtcNow);
+
+        app.MapGet("/api/investigation-export", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            if (!DarlingWebSeat.IsSignedInAdmin(context))
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = InvestigationExportSeatMessage }, "/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+
+            var since = ExportDate(context, "since", out var badSince);
+            var until = ExportDate(context, "until", out var badUntil);
+            if (badSince || badUntil)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = "since and until are dates such as 2026-10-01 or 2026-10-01T06:00:00Z." }, "/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            var verdict = context.Request.Query.TryGetValue("verdict", out var verdictText) ? verdictText.ToString() : null;
+            if (InvestigationFeedbackExport.FilterRefusal(since, until, verdict) is { } filterRefusal)
+            {
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = filterRefusal }, "/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+            }
+
+            /* One export runs at a time, from before its work file exists until the file is gone: a second request answers busy and
+               creates nothing. */
+            if (!exportGate.TryEnter())
+            {
+                return BusyResult(new ReadAdmissionRefusal(
+                    "An investigation export is already running. Try again when it has finished.", InvestigationExportRetryAfterSeconds, 1, 0));
+            }
+
+            /* Up to 2000 cases are read, so the route is heavy from its first call (ReadAdmission.AlwaysHeavyRoutes). The slot covers the
+               store read into the work file only: it is released before the file is sent. */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await AdmitWebRouteAsync(readAdmission, InvestigationExportRoute, ReadWindowBand.None, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                exportGate.Exit();
+                return BusyResult(refusal);
+            }
+
+            using var run = new WebRouteRun(readLatencyRecorder, InvestigationExportRoute, ReadWindowBand.None, context, readScope.Scope);
+            try
+            {
+                await using (var connection = await postgres.OpenConnectionAsync(context.RequestAborted))
+                {
+                    if (!await feedbackStore.CanRecordAsync(connection, context.RequestAborted))
+                    {
+                        run.Complete(ReadOutcome.GateFailed);
+                        return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = InvestigationExportRefusedMessage(managedStore) }, "/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+                    }
+                }
+
+                var (serverId, serverLabel, serverError) = await InvestigationFeedbackExport.ResolveServerAsync(postgres, context.Request.Query.TryGetValue("server", out var serverText) ? serverText.ToString() : null, context.RequestAborted);
+                if (serverError is not null)
+                {
+                    run.Complete(ReadOutcome.Ok);
+                    return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = serverError }, "/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status400BadRequest);
+                }
+
+                var key = await PseudonymKeySources.KeyForAsync(pseudonymKeys, dataDetail, context.RequestAborted);
+                /* One handle for the whole life of the file: written, rewound and sent through the same handle, never reopened by name. */
+                await using var file = InvestigationExportFile.CreateScratch(exportGate.Folder);
+                var outcome = await InvestigationFeedbackExport.WriteAsync(
+                    requestStore, since, until, serverId, verdict, dataDetail, key, file, context.RequestAborted);
+                await file.FlushAsync(context.RequestAborted);
+                file.Position = 0;
+
+                if (outcome.Refused)
+                {
+                    return DarlingWebStatementSweep.Refusal("/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+                }
+
+                context.Response.ContentType = "application/x-ndjson; charset=utf-8";
+                context.Response.Headers.ContentDisposition = "attachment; filename=\"investigation-cases.jsonl\"";
+                if (outcome.Truncated)
+                {
+                    context.Response.Headers["X-Export-Truncated"] = InvestigationRequestStore.FeedbackExportLimit.ToString(CultureInfo.InvariantCulture);
+                }
+
+                if (outcome.HeldBack > 0)
+                {
+                    context.Response.Headers["X-Export-Held-Back"] = outcome.HeldBack.ToString(CultureInfo.InvariantCulture);
+                }
+
+                if (serverLabel is not null)
+                {
+                    context.Response.Headers["X-Export-Server"] = Uri.EscapeDataString(serverLabel);
+                }
+
+                /* The store work is done: the slot and the route's timing end here, so a slow download holds neither. The one-export gate
+                   stays held until the file is gone. */
+                run.Complete(ReadOutcome.Ok);
+                run.Dispose();
+                ticket.Dispose();
+                if (exportGate.BeforeSend is { } beforeSend)
+                {
+                    await beforeSend();
+                }
+
+                context.Response.ContentLength = file.Length;
+                await file.CopyToAsync(context.Response.Body, context.RequestAborted);
+                return Results.Empty;
+            }
+            catch (Exception ex) when (IsFeedbackPrivilegeRefusal(ex))
+            {
+                run.Complete(ReadOutcome.GateFailed);
+                return DarlingWebStatementSweep.JsonText(new JsonObject { ["error"] = InvestigationExportRefusedMessage(managedStore) }, "/api/investigation-export", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status403Forbidden);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/investigation-export", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+            finally
+            {
+                exportGate.Exit();
+            }
+        });
+    }
+
+    /// <summary>One date query parameter of the export (#6236): null when absent, with <paramref name="bad"/> set when it is not a date.</summary>
+    private static DateTime? ExportDate(HttpContext context, string name, out bool bad)
+    {
+        bad = false;
+        if (!context.Request.Query.TryGetValue(name, out var text) || string.IsNullOrWhiteSpace(text))
+            return null;
+        if (DateTimeOffset.TryParse(text.ToString(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var when))
+            return when.UtcDateTime;
+        bad = true;
+        return null;
+    }
+
+    internal static JsonObject FeedbackReceipt(InvestigationFeedbackOutcome outcome, Guid request, string author) => new()
+    {
+        ["status"] = outcome == InvestigationFeedbackOutcome.Recorded ? "recorded" : "replaced",
+        ["request_id"] = request.ToString(),
+        ["author"] = author,
+    };
+
+    /// <summary>The status a refused feedback record answers: 404 for an unknown request, 409 for one with no report, else 400.</summary>
+    private static int FeedbackRefusalStatus(InvestigationFeedbackOutcome outcome) => outcome switch
+    {
+        InvestigationFeedbackOutcome.NotFound => StatusCodes.Status404NotFound,
+        InvestigationFeedbackOutcome.NoReport => StatusCodes.Status409Conflict,
+        _ => StatusCodes.Status400BadRequest,
+    };
+
+    /// <summary>True when the store refused the feedback write for privilege (SQLSTATE 42501).</summary>
+    private static bool IsFeedbackPrivilegeRefusal(Exception ex) => ex is PostgresException { SqlState: "42501" };
+
+    /// <summary>
+    /// PURE: parses a feedback body, <c>{"verdict": "right|partly|wrong", "corrected_verdict": null|"real"|"false_positive"|"needs_person",
+    /// "missed_step": null|"...", "comment": null|"..."}</c>, into the submission for <paramref name="request"/> by <paramref name="identity"/>.
+    /// False with a caller-facing <paramref name="refusal"/> when the body is not a JSON object, a field is not text, or a value fails
+    /// <see cref="InvestigationFeedbackRules"/>. Unknown fields are ignored.
+    /// </summary>
+    internal static bool TryParseFeedbackBody(string body, Guid request, string identity, out InvestigationFeedbackSubmission? submission, out string? refusal)
+    {
+        submission = null;
+        refusal = null;
+        JsonNode? parsed;
+        try
+        {
+            parsed = JsonNode.Parse(body);
+        }
+        catch (JsonException)
+        {
+            refusal = "The body is not JSON.";
+            return false;
+        }
+
+        if (parsed is not JsonObject obj)
+        {
+            refusal = "The body must be a JSON object with a verdict.";
+            return false;
+        }
+
+        string? Field(string name, out bool bad)
+        {
+            bad = false;
+            if (!obj.TryGetPropertyValue(name, out var node) || node is null)
+            {
+                return null;
+            }
+
+            if (node is JsonValue value && value.TryGetValue<string>(out var text))
+            {
+                return text;
+            }
+
+            bad = true;
+            return null;
+        }
+
+        var verdict = Field("verdict", out var badVerdict);
+        var corrected = Field("corrected_verdict", out var badCorrected);
+        var missed = Field("missed_step", out var badMissed);
+        var comment = Field("comment", out var badComment);
+        if (badVerdict || badCorrected || badMissed || badComment)
+        {
+            refusal = "verdict, corrected_verdict, missed_step and comment must each be text or null.";
+            return false;
+        }
+
+        /* A sign-in name the table's author rule cannot hold is shaped, not refused: DOMAIN\erik reads DOMAIN_erik-1a2b3c4d (a hash suffix keeps two such sign-ins apart). */
+        var author = InvestigationFeedbackRules.AuthorFromIdentity(identity) ?? "web";
+        var candidate = new InvestigationFeedbackSubmission(
+            request, verdict ?? "", string.IsNullOrWhiteSpace(corrected) ? null : corrected,
+            string.IsNullOrWhiteSpace(missed) ? null : missed, string.IsNullOrWhiteSpace(comment) ? null : comment, author);
+        var problems = InvestigationFeedbackRules.Validate(candidate);
+        if (problems.Count > 0)
+        {
+            refusal = InvestigationFeedbackRules.RefusalMessage(problems);
+            return false;
+        }
+
+        submission = candidate;
+        return true;
+    }
+
+    /// <summary>The list body: <c>{hours_back, can_record, requests_returned, truncated, families: [{family, reported, with_feedback, marked_wrong,
+    /// agent_false_positives, false_positives}], requests: [{request_id, server_name, family, first_metric, opened_at_utc, reported_at_utc,
+    /// agent_id, report_verdict, root_cause, summary, feedback: [{verdict, corrected_verdict, missed_step, comment, author, recorded_at_utc}]}]}</c>,
+    /// newest report first. <c>can_record</c> is whether the web dashboard's own store login may write feedback (false on managed and
+    /// compose stores, where it connects as the viewer role): the page shows its form only when it is true (#5913).</summary>
+    internal static JsonObject FeedbackListBody(
+        IReadOnlyList<InvestigationFeedbackListRow> rows, bool truncated, IReadOnlyList<InvestigationFamilyCounts> counts, int hoursBack,
+        bool canRecord)
+    {
+        static string Iso(DateTime t) => DateTime.SpecifyKind(t, DateTimeKind.Utc).ToString("o", CultureInfo.InvariantCulture);
+        var requests = new JsonArray();
+        foreach (var row in rows)
+        {
+            var feedback = new JsonArray();
+            foreach (var f in row.Feedback)
+            {
+                feedback.Add(new JsonObject
+                {
+                    ["verdict"] = f.Verdict,
+                    ["corrected_verdict"] = f.CorrectedVerdict,
+                    ["missed_step"] = f.MissedStep,
+                    ["comment"] = f.Comment,
+                    ["author"] = f.Author,
+                    ["recorded_at_utc"] = Iso(f.CreatedAtUtc),
+                });
+            }
+
+            requests.Add(new JsonObject
+            {
+                ["request_id"] = row.RequestId.ToString(),
+                ["server_name"] = row.ServerName,
+                ["family"] = row.Family,
+                ["first_metric"] = row.FirstMetric,
+                ["opened_at_utc"] = Iso(row.OpenedAtUtc),
+                ["reported_at_utc"] = Iso(row.ReportedAtUtc),
+                ["agent_id"] = row.AgentId,
+                ["report_verdict"] = row.ReportVerdict,
+                ["root_cause"] = row.RootCause,
+                ["summary"] = row.Summary,
+                ["feedback"] = feedback,
+            });
+        }
+
+        return new JsonObject
+        {
+            ["hours_back"] = hoursBack,
+            ["can_record"] = canRecord,
+            ["requests_returned"] = requests.Count,
+            ["truncated"] = truncated,
+            ["families"] = InvestigationToolCore.FamilyCountsPayload(counts),
+            ["requests"] = requests,
+        };
     }
 
     /// <summary>
@@ -1950,6 +3774,275 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// lets a read-only seat make a GET); the read runs on the viewer-role pool, whose column grant on
     /// <c>config_monitored_servers</c> leaves out the credential columns, and the statement names none of them.
     /// </summary>
+    /// <summary>The most request-body bytes the run-collectors route reads (a list of collector names).</summary>
+    internal const int MaxCollectorRunBodyBytes = 16 * 1024;
+
+    /// <summary>
+    /// The run-collectors-now routes (#5941). <c>POST /api/collectors/run</c> (body: the server name, optional collectors) queues a <c>snapshot_now</c> for
+    /// one server: an empty body runs every enabled collector, <c>{"collectors":["name", ...]}</c> runs only those, each
+    /// even when disabled. It needs the edit seat (a read-only seat gets 403) and goes through <see cref="SnapshotNowRequests"/>,
+    /// the same guard the MCP tool uses: 202 queued, 409 when a run for the server is queued or going, 429 (with Retry-After)
+    /// within 60 seconds of the last one, 400 for an unknown collector name, 404 for an unknown server. The page then polls
+    /// <c>GET /api/collectors/run/{commandId}</c> for the result the service wrote: the collectors run,
+    /// the rows, and the ones it skipped with the reason.
+    /// </summary>
+    internal static void MapCollectorRuns(
+        WebApplication app, ISnapshotNowStore store, ILogger logger,
+        Func<string, CancellationToken, Task<(int ServerId, string? Error)>> resolveServer, TimeProvider? clock = null)
+    {
+        var requests = new SnapshotNowRequests(store, clock);
+
+        app.MapPost("/api/collectors/run", async (HttpContext context) =>
+        {
+            var seat = DarlingWebSeat.FromContext(context);
+            if (!seat.CanEdit)
+            {
+                return ErrorResult("This account has read-only access.", StatusCodes.Status403Forbidden);
+            }
+
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            string body;
+            try
+            {
+                body = await ReadBoundedBodyAsync(context, MaxCollectorRunBodyBytes);
+            }
+            catch (InvalidDataException)
+            {
+                return ErrorResult("Request body is too large.", StatusCodes.Status400BadRequest);
+            }
+
+            string? serverName;
+            IReadOnlyList<string>? collectors = null;
+            try
+            {
+                var parsedBody = JsonNode.Parse(body) as JsonObject;
+                serverName = parsedBody?["server"]?.GetValue<string>();
+                if (parsedBody?["collectors"] is JsonNode list)
+                {
+                    if (!SnapshotNowArgs.TryParse(new JsonObject { ["collectors"] = list.DeepClone() }.ToJsonString(), out var parsed, out var parseError))
+                    {
+                        return ErrorResult(parseError!, StatusCodes.Status400BadRequest);
+                    }
+
+                    collectors = parsed;
+                }
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
+            {
+                return ErrorResult("The body must be a JSON object with a \"server\" name and an optional \"collectors\" list.", StatusCodes.Status400BadRequest);
+            }
+
+            if (string.IsNullOrWhiteSpace(serverName))
+            {
+                return ErrorResult("The body must name the server.", StatusCodes.Status400BadRequest);
+            }
+
+            SnapshotRequestOutcome outcome;
+            var stopwatch = Stopwatch.StartNew();
+            int id;
+            try
+            {
+                var (resolvedId, resolveError) = await resolveServer(serverName, context.RequestAborted);
+                if (resolveError is not null)
+                {
+                    return CollectorRunResolveFailure(resolveError, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+                }
+
+                id = resolvedId;
+                outcome = await requests.RequestAsync(id, collectors, seat.EditorPrincipal ?? "web", context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return ServerErrorResult($"run collectors request failed ({ex.GetType().Name})", "/api/collectors/run", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+
+            if (outcome.Accepted)
+            {
+                logger.LogInformation("Web: {Principal} queued a collector run for server {ServerId} ({Scope}).",
+                    seat.EditorPrincipal, id, collectors is { Count: > 0 } ? string.Join(",", collectors) : "all enabled");
+                return JsonNodeResult(
+                    new JsonObject { ["status"] = "queued", ["command_id"] = outcome.CommandId }, StatusCodes.Status202Accepted);
+            }
+
+            var refusal = new JsonObject { ["error"] = outcome.Text, ["code"] = outcome.Code };
+            if (outcome.NextAllowedUtc is { } next)
+            {
+                refusal["next_allowed_utc"] = next.ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+                var wait = (int)Math.Ceiling(Math.Max(1, (next - (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime).TotalSeconds));
+                context.Response.Headers["Retry-After"] = wait.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            var status = outcome.Code switch
+            {
+                SnapshotRequestOutcome.InFlightCode => StatusCodes.Status409Conflict,
+                SnapshotRequestOutcome.RateLimitedCode => StatusCodes.Status429TooManyRequests,
+                SnapshotRequestOutcome.UnknownServerCode => StatusCodes.Status404NotFound,
+                _ => StatusCodes.Status400BadRequest,
+            };
+            return JsonNodeResult(refusal, status);
+        });
+
+        app.MapGet("/api/collectors/run/{commandId:long}", async (HttpContext context, long commandId) =>
+        {
+            SnapshotCommandState? state;
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                state = await store.ReadStateAsync(commandId, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return ServerErrorResult($"run collectors read failed ({ex.GetType().Name})", "/api/collectors/run/{commandId}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+
+            if (state is null)
+            {
+                return ErrorResult("No such collector run.", StatusCodes.Status404NotFound);
+            }
+
+            context.Response.Headers.CacheControl = "no-store";
+            var node = new JsonObject
+            {
+                ["status"] = state.Status,
+                ["finished"] = state.Status is "succeeded" or "failed",
+                ["result_status"] = state.ResultStatus,
+            };
+            if (state.ResultJson is not null)
+            {
+                try
+                {
+                    node["result"] = JsonNode.Parse(state.ResultJson);
+                }
+                catch (JsonException)
+                {
+                    /* The service wrote it; if it is not JSON the page shows the status alone. */
+                }
+            }
+
+            return JsonNodeResult(node);
+        });
+    }
+
+    /// <summary>
+    /// What the run route answers when the server resolver hands back an error string (#5941 review). The resolver has three
+    /// shapes and each gets its own answer: a registry read fault (a store fault, not the caller's request) is logged and answers
+    /// the fixed 500/503 body; a name that matches no server ("Could not resolve server. ...") is a 404 with the envelope's plain
+    /// message; any other refusal envelope (a name that matches several servers) is a 400 with its plain message. The raw
+    /// envelope JSON is never the body.
+    /// </summary>
+    internal static IResult CollectorRunResolveFailure(string error, ILogger logger, long elapsedMs, CancellationToken requestAborted)
+    {
+        if (ClassifyToolResponse(error) == ToolResponseKind.ServerError)
+        {
+            return ServerErrorResult(error, "/api/collectors/run", logger, elapsedMs, requestAborted);
+        }
+
+        var message = McpHelpers.ErrorMessageOf(error);
+        var noMatch = !McpHelpers.IsRefusalEnvelope(error)
+            || message.StartsWith("Could not resolve server", StringComparison.Ordinal);
+        return ErrorResult(message, noMatch ? StatusCodes.Status404NotFound : StatusCodes.Status400BadRequest);
+    }
+
+    /// <summary>The 403 a refused switch change answers when the web signs in to the store as the viewer role (#6269).</summary>
+    internal static string ServerActionRefusedMessage(bool managedStore) =>
+        DarlingWebStoreWrites.Refused("change server action switches", managedStore);
+
+    /// <summary>
+    /// The server action switch routes (#6269). <c>GET /api/server-actions</c> lists every server with a state for each action
+    /// (<c>{can_decide, servers_returned, servers: [{server_id, server_name, engine, engine_kind, actions: [{action, valid, enabled, set_by,
+    /// updated_at_utc}]}]}</c>; <c>can_decide</c> is false under the viewer role, which lists only). <c>PUT /api/servers/{id}/actions/{action}</c>
+    /// with <c>{"enabled": true|false}</c> sets one switch: 200 <c>{status: set|unchanged, ...}</c>; 400 for a bad body, an unknown action or a
+    /// signed-in name that cannot be recorded; 403 under the viewer role (and for a read-only seat, which the host's method gate refuses first);
+    /// 404 for an unknown server; 409 when the server's engine cannot run the action; 415 without <c>application/json</c>; 503 before the service
+    /// has published its store owner connection. <b>The write runs on that owner connection</b>, because no other role can write the table; the
+    /// admin check is the web login's own privileges (<see cref="AgentChangeUndo.CanDecideAsync"/>) and the seat's method gate. The change is
+    /// journaled by <c>person:&lt;login&gt;</c>, surface <c>web</c>.
+    /// </summary>
+    internal static void MapServerActions(WebApplication app, NpgsqlDataSource postgres, AgentChangeUndo changes, ILogger logger, StoreOwnerSource? ownerSource, bool managedStore = false)
+    {
+        app.MapGet("/api/server-actions", async (HttpContext context) =>
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var rows = await ServerActionSwitches.ListAsync(postgres, context.RequestAborted);
+                var body = Mcp.DarlingMcpServerActionTools.ListToJson(rows);
+                body["can_decide"] = DarlingWebSeat.IsSignedInAdmin(context) && await changes.CanDecideAsync(context.RequestAborted);
+                body["signed_in_admin"] = DarlingWebSeat.IsSignedInAdmin(context);
+                return DarlingWebStatementSweep.JsonText(body, "/api/server-actions", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/server-actions", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+
+        app.MapPut("/api/servers/{id:int}/actions/{action}", async (HttpContext context, int id, string action) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (JsonNode.Parse(await ReadBodyAsync(context)) is not JsonObject body || body["enabled"] is not JsonValue flag || !flag.TryGetValue(out bool enabled))
+                {
+                    return ErrorResult("Send {\"enabled\": true} or {\"enabled\": false}.", StatusCodes.Status400BadRequest);
+                }
+
+                /* A signed-in admin comes first: the store login the web runs on says nothing about who is calling (#6269). */
+                if (!DarlingWebSeat.IsSignedInAdmin(context))
+                {
+                    return SignInRequiredResult();
+                }
+
+                /* The same actor every web person write records: ONE person: prefix on the signed-in name (NoteDecider), held to the shared 256-unit name rule. */
+                var actor = NoteDecider(DarlingWebSeat.FromContext(context));
+                if (InvestigationPersonWrites.ValidateActor(actor) is not null)
+                {
+                    return ErrorResult("The signed-in name cannot be recorded as the person who changed this switch.", StatusCodes.Status400BadRequest);
+                }
+
+                /* The admin check comes before anything is read or written. */
+                if (!await changes.CanDecideAsync(context.RequestAborted))
+                {
+                    return ErrorResult(ServerActionRefusedMessage(managedStore), StatusCodes.Status403Forbidden);
+                }
+
+                var owner = ownerSource?.Read();
+                if (owner is null)
+                {
+                    return ErrorResult("The service has not published its store owner connection yet, so the switch cannot be written. Try again in a moment.",
+                        StatusCodes.Status503ServiceUnavailable);
+                }
+
+                var result = await ServerActionSwitches.SetAsync(owner, id, action, enabled, actor, ServerActionSurfaces.Web, context.RequestAborted);
+                var status = result.Succeeded ? StatusCodes.Status200OK
+                    : result.Code == "unknown_server" ? StatusCodes.Status404NotFound
+                    : result.Code is "not_for_engine" or "switch_busy" ? StatusCodes.Status409Conflict
+                    : StatusCodes.Status400BadRequest;
+                return DarlingWebStatementSweep.JsonText(result.ToJson(), "/api/servers/{id}/actions/{action}", logger, stopwatch.ElapsedMilliseconds,
+                    context.RequestAborted, status);
+            }
+            catch (Exception ex) when (ex is JsonException)
+            {
+                return ErrorResult("The request body is not valid.", StatusCodes.Status400BadRequest);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DarlingWebFailureLog.Report(logger, "/api/servers/{id}/actions/{action}", stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
+                return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
+            }
+        });
+    }
+
     internal static void MapAdminServers(WebApplication app, NpgsqlDataSource postgres)
     {
         app.MapGet(DarlingAdminServersReader.Route, async (HttpContext context) =>
@@ -1969,7 +4062,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// the viewer role's two single-table grants are only the floor beneath it.
     ///
     /// <para><b>Routes.</b> <c>POST /api/server-tags</c> (<c>{name, parent_id?, colour?}</c>, 201 on
-    /// <c>created</c>); <c>PATCH /api/server-tags/{id}</c> (the body IS the partial <c>changes_json</c>);
+    /// <c>created</c>); <c>PATCH /api/server-tags/{id}</c> (the body IS the partial <c>changes_json</c>, or the single field <c>{"move":"up"|"down"}</c> to reorder siblings, #6094);
     /// <c>DELETE /api/server-tags/{id}?confirm=true</c> (the flag rides the query string, so the DELETE stays
     /// bodyless like <c>DELETE /api/mute-rules/{id}</c>); <c>POST /api/server-tags/{id}/servers</c> and
     /// <c>DELETE /api/server-tags/{id}/servers</c> (<c>{server_ids: [...]}</c> in the body).</para>
@@ -2003,7 +4096,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpServerTagTools.CreateServerTagCore(store, name, parentId, colour, context.RequestAborted);
             LogServerTagWrite(logger, context, "create", null, result, 0);
-            return ServerTagToolResult(result, "/api/server-tags", logger, stopwatch.ElapsedMilliseconds, StatusCodes.Status201Created);
+            return ServerTagToolResult(result, "/api/server-tags", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status201Created);
         });
 
         app.MapPatch("/api/server-tags/{id:int}", async (HttpContext context, int id) =>
@@ -2026,7 +4119,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpServerTagTools.UpdateServerTagCore(store, id, changes, context.RequestAborted);
             LogServerTagWrite(logger, context, "update", id, result, 0);
-            return ServerTagToolResult(result, "/api/server-tags/{id}", logger, stopwatch.ElapsedMilliseconds);
+            return ServerTagToolResult(result, "/api/server-tags/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
 
         app.MapDelete("/api/server-tags/{id:int}", async (HttpContext context, int id) =>
@@ -2045,7 +4138,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpServerTagTools.DeleteServerTagCore(store, id, confirm, context.RequestAborted);
             LogServerTagWrite(logger, context, "delete", id, result, 0);
-            return ServerTagToolResult(result, "/api/server-tags/{id}", logger, stopwatch.ElapsedMilliseconds);
+            return ServerTagToolResult(result, "/api/server-tags/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
 
         app.MapPost("/api/server-tags/{id:int}/servers", async (HttpContext context, int id) =>
@@ -2064,7 +4157,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpServerTagTools.AssignServerTagCore(store, id, serverIds, context.RequestAborted);
             LogServerTagWrite(logger, context, "assign", id, result, serverIds.Count);
-            return ServerTagToolResult(result, "/api/server-tags/{id}/servers", logger, stopwatch.ElapsedMilliseconds);
+            return ServerTagToolResult(result, "/api/server-tags/{id}/servers", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
 
         app.MapDelete("/api/server-tags/{id:int}/servers", async (HttpContext context, int id) =>
@@ -2083,8 +4176,341 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             var stopwatch = Stopwatch.StartNew();
             var result = await Mcp.DarlingMcpServerTagTools.UnassignServerTagCore(store, id, serverIds, context.RequestAborted);
             LogServerTagWrite(logger, context, "unassign", id, result, serverIds.Count);
-            return ServerTagToolResult(result, "/api/server-tags/{id}/servers", logger, stopwatch.ElapsedMilliseconds);
+            return ServerTagToolResult(result, "/api/server-tags/{id}/servers", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
         });
+    }
+
+    /// <summary>
+    /// The query-tag web routes (#5986), the same shape as <see cref="MapServerTags"/>: each write route parses its JSON
+    /// body and hands it to the matching <c>DarlingMcpQueryTagTools.*Core</c> or <c>DarlingMcpQueryTagRuleTools.*Core</c> over
+    /// a store on the viewer-role pool, so the page and the MCP tools share one set of rules and one set of answers.
+    /// <c>application/json</c> is required on every write (the CSRF discipline of the other write routes). The admin gate is
+    /// the seat's method gate (<see cref="DarlingWebSeat.IsRequestAllowed"/> refuses every non-GET from a read-only seat);
+    /// the viewer role's grants on the three tag tables are only the floor beneath it. The writer's name is stamped on a
+    /// new assignment or rule as <c>created_by</c> (the seat's <see cref="DarlingWebSeat.EditorPrincipal"/>), not <c>mcp</c>.
+    ///
+    /// <para><b>Tag routes.</b> <c>POST /api/query-tags</c> (<c>{name, parent_id?, colour?}</c>, 201);
+    /// <c>PATCH /api/query-tags/{id}</c> (the body IS the partial <c>changes_json</c>);
+    /// <c>DELETE /api/query-tags/{id}?confirm=true</c> (409 <c>confirm_required</c> with the counts until the flag rides along);
+    /// <c>POST /api/query-tags/{id}/assignments</c> and <c>DELETE /api/query-tags/{id}/assignments</c>
+    /// (<c>{kind, query_hash?, database_name?, schema_name?, object_name?, server_id?}</c>; assign also takes <c>query_id?</c>).
+    /// Unassign is keyed by the assignment's key and server scope, as the MCP tool is: the tag id in the path is not part of
+    /// the key.</para>
+    ///
+    /// <para><b>Rule routes.</b> <c>POST /api/query-tag-rules</c> (<c>{field, pattern?, tag_id?, priority?, enabled?, server_id?}</c>,
+    /// 201); <c>PATCH /api/query-tag-rules/{id}</c> (the partial <c>changes_json</c>); <c>DELETE /api/query-tag-rules/{id}</c>;
+    /// <c>GET /api/query-tag-rules[?server_id=]</c> (the list, in the order the rules apply) and
+    /// <c>GET /api/query-tag-rules/test?...</c> (the dry run: <c>rule_id</c> or a draft's <c>field</c>, <c>pattern</c>,
+    /// <c>tag_id</c>, <c>priority</c>, plus <c>server_id</c> and <c>window_hours</c>). The test is a GET, so a read-only seat
+    /// can run it: it writes nothing, and it is admitted like any other read. Both reads are swept (#4348) because a rule's
+    /// pattern and a sample's matched value are text.</para>
+    /// </summary>
+    internal static void MapQueryTags(WebApplication app, NpgsqlDataSource postgres, ILogger logger,
+        ReadAdmission? readAdmission = null, ReadLatencyRecorder? readLatencyRecorder = null)
+    {
+        var tags = new QueryTagStore(postgres, Mcp.DarlingMcpQueryTagTools.WriteCommandSeconds);
+        var rules = new QueryTagRuleStore(postgres, Mcp.DarlingMcpQueryTagRuleTools.CommandSeconds);
+
+        app.MapPost("/api/query-tags", async (HttpContext context) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var (body, bodyError) = await ReadJsonObjectAsync(context);
+            if (body is null)
+            {
+                return ErrorResult(bodyError!, StatusCodes.Status400BadRequest);
+            }
+
+            var reader = new QueryTagBodyReader(body, "A query tag", "name", "parent_id", "colour");
+            var name = reader.String("name");
+            var parentId = reader.Int("parent_id");
+            var colour = reader.String("colour");
+            bodyError = reader.Error;
+            if (bodyError is not null)
+            {
+                return ErrorResult(bodyError, StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagTools.CreateQueryTagCore(tags, name, parentId, colour, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "create", null, result);
+            return QueryTagToolResult(result, "/api/query-tags", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status201Created);
+        });
+
+        app.MapPatch("/api/query-tags/{id:int}", async (HttpContext context, int id) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            string changes;
+            try
+            {
+                changes = await ReadBoundedBodyAsync(context, MaxServerTagBodyBytes);
+            }
+            catch (InvalidDataException)
+            {
+                return ErrorResult("Request body is too large.", StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagTools.UpdateQueryTagCore(tags, id, changes, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "update", id, result);
+            return QueryTagToolResult(result, "/api/query-tags/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapDelete("/api/query-tags/{id:int}", async (HttpContext context, int id) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var (confirm, bodyError) = ParseConfirm(context.Request.Query);
+            if (bodyError is not null)
+            {
+                return ErrorResult(bodyError, StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagTools.DeleteQueryTagCore(tags, id, confirm, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "delete", id, result);
+            return QueryTagToolResult(result, "/api/query-tags/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapPost("/api/query-tags/{id:int}/assignments", async (HttpContext context, int id) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var (body, bodyError) = await ReadJsonObjectAsync(context);
+            if (body is null)
+            {
+                return ErrorResult(bodyError!, StatusCodes.Status400BadRequest);
+            }
+
+            var reader = new QueryTagBodyReader(body, "An assignment", "kind", "query_hash", "database_name", "schema_name", "object_name", "server_id", "query_id");
+            var kind = reader.String("kind");
+            var queryHash = reader.String("query_hash");
+            var databaseName = reader.String("database_name");
+            var schemaName = reader.String("schema_name");
+            var objectName = reader.String("object_name");
+            var serverId = reader.Int("server_id");
+            var queryId = reader.Long("query_id");
+            bodyError = reader.Error;
+            if (bodyError is not null)
+            {
+                return ErrorResult(bodyError, StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagTools.AssignQueryTagCore(
+                tags, id, kind, queryHash, databaseName, schemaName, objectName, serverId, queryId,
+                DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "assign", id, result);
+            return QueryTagToolResult(result, "/api/query-tags/{id}/assignments", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapDelete("/api/query-tags/{id:int}/assignments", async (HttpContext context, int id) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var (body, bodyError) = await ReadJsonObjectAsync(context);
+            if (body is null)
+            {
+                return ErrorResult(bodyError!, StatusCodes.Status400BadRequest);
+            }
+
+            var reader = new QueryTagBodyReader(body, "An unassignment", "kind", "query_hash", "database_name", "schema_name", "object_name", "server_id");
+            var kind = reader.String("kind");
+            var queryHash = reader.String("query_hash");
+            var databaseName = reader.String("database_name");
+            var schemaName = reader.String("schema_name");
+            var objectName = reader.String("object_name");
+            var serverId = reader.Int("server_id");
+            bodyError = reader.Error;
+            if (bodyError is not null)
+            {
+                return ErrorResult(bodyError, StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagTools.UnassignQueryTagCore(
+                tags, kind, queryHash, databaseName, schemaName, objectName, serverId, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "unassign", id, result);
+            return QueryTagToolResult(result, "/api/query-tags/{id}/assignments", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapPost("/api/query-tag-rules", async (HttpContext context) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var (body, bodyError) = await ReadJsonObjectAsync(context);
+            if (body is null)
+            {
+                return ErrorResult(bodyError!, StatusCodes.Status400BadRequest);
+            }
+
+            var reader = new QueryTagBodyReader(body, "A query tag rule", "field", "pattern", "tag_id", "priority", "enabled", "server_id");
+            var field = reader.String("field");
+            var pattern = reader.String("pattern");
+            var tagId = reader.Int("tag_id");
+            var priority = reader.Int("priority");
+            var enabled = reader.Bool("enabled");
+            var serverId = reader.Int("server_id");
+            bodyError = reader.Error;
+            if (bodyError is not null)
+            {
+                return ErrorResult(bodyError, StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagRuleTools.CreateCore(
+                rules, field, pattern, tagId, priority ?? Mcp.DarlingMcpQueryTagRuleTools.DefaultPriority, enabled ?? true, serverId,
+                DarlingWebSeat.FromContext(context).EditorPrincipal, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "rule-create", null, result);
+            return QueryTagToolResult(result, "/api/query-tag-rules", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted, StatusCodes.Status201Created);
+        });
+
+        app.MapPatch("/api/query-tag-rules/{id:long}", async (HttpContext context, long id) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            string changes;
+            try
+            {
+                changes = await ReadBoundedBodyAsync(context, MaxServerTagBodyBytes);
+            }
+            catch (InvalidDataException)
+            {
+                return ErrorResult("Request body is too large.", StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagRuleTools.UpdateCore(rules, id, changes, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "rule-update", id, result);
+            return QueryTagToolResult(result, "/api/query-tag-rules/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapDelete("/api/query-tag-rules/{id:long}", async (HttpContext context, long id) =>
+        {
+            if (!IsJsonContentType(context.Request.ContentType))
+            {
+                return UnsupportedMediaTypeResult();
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagRuleTools.DeleteCore(rules, id, context.RequestAborted);
+            LogQueryTagWrite(logger, context, "rule-delete", id, result);
+            return QueryTagToolResult(result, "/api/query-tag-rules/{id}", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapGet("/api/query-tag-rules", async (HttpContext context) =>
+        {
+            if (!TryReadQueryTagInt(context.Request.Query, "server_id", out var serverId, out var bodyError))
+            {
+                return ErrorResult(bodyError!, StatusCodes.Status400BadRequest);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagRuleTools.ListCore(rules, serverId, context.RequestAborted);
+            return ToHttpResult(result, "/api/query-tag-rules", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+
+        app.MapGet("/api/query-tag-rules/test", async (HttpContext context) =>
+        {
+            var query = context.Request.Query;
+            if (!TryReadQueryTagInt(query, "rule_id", out var ruleId, out var bodyError)
+                || !TryReadQueryTagInt(query, "tag_id", out var tagId, out bodyError)
+                || !TryReadQueryTagInt(query, "priority", out var priority, out bodyError)
+                || !TryReadQueryTagInt(query, "server_id", out var serverId, out bodyError)
+                || !TryReadQueryTagInt(query, "window_hours", out var windowHours, out bodyError)
+                || !TrySingleQueryValue(query, "field", out var field)
+                || !TrySingleQueryValue(query, "pattern", out var pattern))
+            {
+                return ErrorResult(bodyError ?? "Each parameter may be given once.", StatusCodes.Status400BadRequest);
+            }
+
+            /* The dry run reads up to 10,000 stored sightings like any collected-data read: admitted and recorded under its MCP twin's name. */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await AdmitWebRouteAsync(readAdmission, "test_query_tag_rule", ReadWindowBand.None, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                return BusyResult(refusal);
+            }
+
+            using var run = new WebRouteRun(readLatencyRecorder, "test_query_tag_rule", ReadWindowBand.None, context, readScope.Scope);
+            var stopwatch = Stopwatch.StartNew();
+            var result = await Mcp.DarlingMcpQueryTagRuleTools.TestCore(
+                rules, ruleId, field.Length == 0 ? null : field, pattern.Length == 0 ? null : pattern, tagId,
+                priority ?? Mcp.DarlingMcpQueryTagRuleTools.DefaultPriority, serverId,
+                windowHours ?? Mcp.DarlingMcpQueryTagRuleTools.DefaultWindowHours, TimeProvider.System, context.RequestAborted);
+            run.Complete(ToolResultOutcome(result, context.RequestAborted));
+            return ToHttpResult(result, "/api/query-tag-rules/test", logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
+        });
+    }
+
+    /// <summary>An optional whole-number query parameter: absent or blank is null, given more than once or not a number is a refusal sentence.</summary>
+    private static bool TryReadQueryTagInt(IQueryCollection query, string key, out int? value, out string? error)
+    {
+        value = null;
+        error = null;
+        if (!TrySingleQueryValue(query, key, out var text))
+        {
+            error = $"{key} must be given once.";
+            return false;
+        }
+
+        if (text.Length == 0)
+        {
+            return true;
+        }
+
+        if (!int.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+        {
+            error = $"{key} must be a whole number.";
+            return false;
+        }
+
+        value = parsed;
+        return true;
+    }
+
+    /// <summary>Who changed a query tag, assignment or rule is on the row only for assignments and rules; this line records the verb for
+    /// every successful write. Verb and id only, never a name, pattern or body text.</summary>
+    private static void LogQueryTagWrite(ILogger logger, HttpContext context, string verb, long? id, string result)
+    {
+        if (ServerTagEnvelopeStatus(result) is < 200 or >= 300)
+        {
+            return;
+        }
+
+        logger.LogInformation("Query tag {Verb} by {Principal}: id {Id}", verb, DarlingWebSeat.FromContext(context).EditorPrincipal, id);
+    }
+
+    /// <summary>The envelope pass-through the query-tag write routes share: the answer is swept first (#4348, a pattern or a
+    /// name echoes text a caller typed), then answered exactly as <see cref="ServerTagToolResult"/> answers.</summary>
+    internal static IResult QueryTagToolResult(string result, string route, ILogger logger, long elapsedMs, CancellationToken requestAborted,
+        int successStatus = StatusCodes.Status200OK)
+    {
+        var swept = DarlingWebStatementSweep.Apply(result);
+        if (swept.Refused) return DarlingWebStatementSweep.Refusal(route, logger, elapsedMs, requestAborted);
+        return ServerTagToolResult(swept.Text, route, logger, elapsedMs, requestAborted, successStatus);
     }
 
     /// <summary>Parses the request body as one JSON object, or names why it is not.</summary>
@@ -2264,7 +4690,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         try
         {
             var status = JsonNode.Parse(result) is JsonObject envelope ? TryGetString(envelope, "status") : null;
-            return status is "created" or "updated" or "unchanged" or "deleted" or "assigned" or "unassigned"
+            return status is "created" or "updated" or "unchanged" or "deleted" or "assigned" or "unassigned" or "moved"
                 ? successStatus
                 : StatusCodes.Status500InternalServerError;
         }
@@ -2277,12 +4703,13 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// <summary>The envelope pass-through the server-tag routes share: <see cref="MuteRuleToolResult"/>'s error
     /// handling (the caught-exception sentence never reaches the wire) with <see cref="ServerTagEnvelopeStatus"/>'s
     /// status.</summary>
-    internal static IResult ServerTagToolResult(string result, string route, ILogger logger, long elapsedMs, int successStatus = StatusCodes.Status200OK)
+    internal static IResult ServerTagToolResult(string result, string route, ILogger logger, long elapsedMs, CancellationToken requestAborted,
+        int successStatus = StatusCodes.Status200OK)
     {
         var kind = ClassifyToolResponse(result);
         if (kind is ToolResponseKind.ServerError)
         {
-            return ServerErrorResult(McpHelpers.ErrorMessageOf(result), route, logger, elapsedMs);
+            return ServerErrorResult(McpHelpers.ErrorMessageOf(result), route, logger, elapsedMs, requestAborted);
         }
 
         var httpStatus = ServerTagEnvelopeStatus(result, successStatus);
@@ -2357,17 +4784,18 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// ONCE, the body a fixed message, 503 when the sentence carries a caught statement_timeout's 57014 token,
     /// 500 otherwise. Any other error (a bare non-JSON string) is still wrapped as <c>{"error": sentence}</c>.</para>
     /// </summary>
-    internal static IResult MuteRuleToolResult(string result, string route, ILogger logger, long elapsedMs, int successStatus = StatusCodes.Status200OK)
+    internal static IResult MuteRuleToolResult(string result, string route, ILogger logger, long elapsedMs, CancellationToken requestAborted,
+        int successStatus = StatusCodes.Status200OK)
     {
         /* #4348: swept first, like ToHttpResult. A mute rule echoes the pattern it was given, which can be a statement. */
         var swept = DarlingWebStatementSweep.Apply(result);
-        if (swept.Refused) return DarlingWebStatementSweep.Refusal(route, logger, elapsedMs);
+        if (swept.Refused) return DarlingWebStatementSweep.Refusal(route, logger, elapsedMs, requestAborted);
         result = swept.Text;
 
         var kind = ClassifyToolResponse(result);
         if (kind is ToolResponseKind.ServerError)
         {
-            return ServerErrorResult(McpHelpers.ErrorMessageOf(result), route, logger, elapsedMs);
+            return ServerErrorResult(McpHelpers.ErrorMessageOf(result), route, logger, elapsedMs, requestAborted);
         }
 
         var httpStatus = MuteRuleEnvelopeStatus(result, successStatus);
@@ -2386,12 +4814,21 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// stay what they always were either way, so run_custom_view_panel's MCP answer never changes.
     /// <see cref="AuthorSqlState"/> (#4293 round 2) is set only on the author-actionable PostgresException arm,
     /// so the web log line can name the SQLSTATE without re-deriving it.</summary>
-    internal readonly record struct ComposeRunOutcome(JsonObject? Payload, string? Error, bool IsServerError, PostgresException? Fault = null, string? AuthorSqlState = null, bool IsNotFound = false)
+    internal readonly record struct ComposeRunOutcome(JsonObject? Payload, string? Error, bool IsServerError, PostgresException? Fault = null, string? AuthorSqlState = null, bool IsNotFound = false, ReadAdmissionRefusal? Busy = null, string? PayloadText = null)
     {
+        /// <summary>#5506 part 3: the panel was refused at admission. The MCP tool answers <c>busy</c>, the web route 429.</summary>
+        internal static ComposeRunOutcome Refused(ReadAdmissionRefusal refusal) => new(null, refusal.Sentence, false, null, null, false, refusal);
+
         /// <summary>W13: the scoped server is not registered and nothing is stored under its name. The MCP tool answers <c>not_found</c>, the web route 404.</summary>
         internal static ComposeRunOutcome NotFound(string error) => new(null, error, false, null, null, true);
 
         internal static ComposeRunOutcome Ok(JsonObject payload) => new(payload, null, false);
+
+        /// <summary>#5506 part 3 (round 1, C1): a panel answered from the read cache. <see cref="PayloadText"/> is the text the
+        /// run that stored it answered, so the caller writes the same bytes; <see cref="Payload"/> is parsed from it for a
+        /// caller that reads the object.</summary>
+        internal static ComposeRunOutcome FromCache(string payloadText) =>
+            new((JsonObject)JsonNode.Parse(payloadText)!, null, false, PayloadText: payloadText);
 
         internal static ComposeRunOutcome BadRequest(string error) => new(null, error, false);
 
@@ -2617,7 +5054,92 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     internal static async Task<ComposeRunOutcome> RunComposedPanelAsync(
         NpgsqlDataSource postgres, JsonObject body, System.Threading.CancellationToken cancellationToken,
         ReadLatencyRecorder? readLatency = null, int clientDeadlineHeadroomSeconds = 0, bool remapClientTimeout = false, bool includeDataStartFields = false,
-        Action<Exception>? onRunException = null, DateTime? nowUtc = null)
+        Action<Exception>? onRunException = null, DateTime? nowUtc = null, string? caller = null, ReadSurface? cacheHost = null)
+    {
+        /* #5506 part 3 (round 1, C1): a heavy panel is answered from the read cache, joins an identical run in flight, or
+           runs once and is stored, as /api/read and the MCP reads are. The host that runs it (cacheHost: web or mcp) is
+           part of the key (D4): the two serialize the payload differently and the web adds its data-start fields, so
+           their entries are never shared. What is stored is the exact text the host answers (PayloadText), so a hit is
+           byte-identical to the run that stored it. A hit skips admission. */
+        var admission = readLatency?.Admission;
+        if (cacheHost is { } host && admission is not null
+            && admission.IsCached(ReadSurface.Compose, ComposeRouteLabel(body), ComposeWindowBand(body)))
+        {
+            return await RunComposedPanelCachedAsync(postgres, body, readLatency!, admission, host,
+                clientDeadlineHeadroomSeconds, remapClientTimeout, includeDataStartFields, onRunException, nowUtc, caller, cancellationToken);
+        }
+
+        return await RunComposedPanelAdmittedAsync(postgres, body, readLatency, clientDeadlineHeadroomSeconds,
+            remapClientTimeout, includeDataStartFields, onRunException, nowUtc, caller, cacheHost, cancellationToken);
+    }
+
+    private static async Task<ComposeRunOutcome> RunComposedPanelCachedAsync(
+        NpgsqlDataSource postgres, JsonObject body, ReadLatencyRecorder readLatency,
+        ReadAdmission admission, ReadSurface host, int clientDeadlineHeadroomSeconds, bool remapClientTimeout, bool includeDataStartFields,
+        Action<Exception>? onRunException, DateTime? nowUtc, string? caller, System.Threading.CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        using var readScope = ReadScope.Open(readLatency.Logger);
+        var composeRoute = ComposeRouteLabel(body);
+        var composeBand = ComposeWindowBand(body);
+        var recordCaller = caller ?? ReadCaller.AmbientMcpCaller;
+        var cache = admission.Cache;
+        var ttl = ReadResultCache.TtlOf(composeBand);
+        var key = ReadCacheKey.ForCompose(host, composeRoute, body.ToJsonString(), cache.Generation, cache, ttl);
+        if (cache.TryGet(key, out var stored))
+        {
+            /* Round 2, L3: a hit runs no read, so it does not count as one in flight. */
+            readScope.Scope.Uncount();
+            admission.NoteCacheHit(ReadSurface.Compose, composeRoute);
+            RecordAdmissionSample(readLatency, composeRoute, ReadOutcome.CacheHit, stopwatch.ElapsedMilliseconds, composeBand, readScope.Scope, recordCaller);
+            return ComposeRunOutcome.FromCache(stored);
+        }
+
+        /* D6: the run is shared; the caller that starts it records its real outcome inside the run. Round 2, M1: a caller
+           that joined records only its own outcome with its own elapsed time (busy, cancelled, or cache_hit for the shared
+           answer), never the run's, so one run counts once. */
+        var flight = cache.Join(key, ttl,
+            token => RunComposedPanelAdmittedAsync(postgres, body, readLatency, clientDeadlineHeadroomSeconds, remapClientTimeout,
+                includeDataStartFields, onRunException, nowUtc, caller, host, token),
+            run => run.PayloadText is { } text && ReadResultCache.IsCacheableText(text, gcf: false) ? text : null);
+        if (flight.IsLead)
+        {
+            admission.NoteCacheMiss(ReadSurface.Compose, composeRoute);
+            return await flight.WaitAsync(cancellationToken);
+        }
+
+        /* Round 2, L3: a joined caller runs no read while it waits for the shared one. */
+        readScope.Scope.Uncount();
+        try
+        {
+            var shared = await flight.WaitAsync(cancellationToken);
+            var joinedOutcome = ReadResultCache.JoinedOutcome(shared.Busy is not null ? ReadOutcome.Busy : null, cancellationToken);
+            if (joinedOutcome == ReadOutcome.CacheHit)
+            {
+                admission.NoteCacheHit(ReadSurface.Compose, composeRoute);
+            }
+
+            RecordAdmissionSample(readLatency, composeRoute, joinedOutcome, stopwatch.ElapsedMilliseconds, composeBand, readScope.Scope, recordCaller);
+            return shared;
+        }
+        catch (Exception ex)
+        {
+            var thrown = ReadResultCache.JoinedOutcome(
+                ReadOutcomeClassifier.Classify(ex, cancellationToken) == ReadOutcome.Cancelled ? ReadOutcome.Cancelled : null, cancellationToken);
+            if (thrown == ReadOutcome.CacheHit)
+            {
+                admission.NoteCacheHit(ReadSurface.Compose, composeRoute);
+            }
+
+            RecordAdmissionSample(readLatency, composeRoute, thrown, stopwatch.ElapsedMilliseconds, composeBand, readScope.Scope, recordCaller);
+            throw;
+        }
+    }
+
+    private static async Task<ComposeRunOutcome> RunComposedPanelAdmittedAsync(
+        NpgsqlDataSource postgres, JsonObject body,
+        ReadLatencyRecorder? readLatency, int clientDeadlineHeadroomSeconds, bool remapClientTimeout, bool includeDataStartFields,
+        Action<Exception>? onRunException, DateTime? nowUtc, string? caller, ReadSurface? cacheHost, System.Threading.CancellationToken cancellationToken)
     {
         /* #4442 scope 2: recorded ONCE per call, here, so the web /api/compose/run route and the MCP
            run_custom_view_panel tool -- both of which call this ONE runner -- contribute exactly one
@@ -2629,8 +5151,45 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         var stopwatch = Stopwatch.StartNew();
         using var readScope = ReadScope.Open(readLatency?.Logger);
         readScope.Scope.CaptureStatements = true;
+
+        /* #5506 part 3: admission, after the scope and the band, under the same route label and band the run records.
+           A refusal records busy, a caller that leaves the queue records cancelled, and a queued run records its wait as
+           one queue_wait sample; the recorded elapsed time starts after admission (D1). */
+        var admission = readLatency?.Admission;
+        var composeRoute = ComposeRouteLabel(body);
+        var composeBand = ComposeWindowBand(body);
+        using var ticket = admission is null
+            ? ReadAdmissionTicket.Passed
+            : await ReadScope.AdmitAsync(admission, ReadSurface.Compose, composeRoute, composeBand, cancellationToken);
+        if (ticket.Refusal is { } refusal)
+        {
+            RecordAdmissionSample(readLatency, composeRoute, ReadOutcome.Busy, ticket.QueueMs ?? 0, composeBand, readScope.Scope, caller ?? ReadCaller.AmbientMcpCaller);
+            return ComposeRunOutcome.Refused(refusal);
+        }
+
+        if (ticket.CallerLeft)
+        {
+            RecordAdmissionSample(readLatency, composeRoute, ReadOutcome.Cancelled, ticket.QueueMs ?? 0, composeBand, readScope.Scope, caller ?? ReadCaller.AmbientMcpCaller);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        if (ticket.QueueMs is { } queueMs)
+        {
+            RecordAdmissionSample(readLatency, composeRoute, ReadOutcome.QueueWait, queueMs, composeBand, readScope.Scope, caller ?? ReadCaller.AmbientMcpCaller);
+        }
+
+        stopwatch.Restart();
         var outcome = await RunComposedPanelCoreAsync(postgres, body, clientDeadlineHeadroomSeconds, remapClientTimeout, includeDataStartFields, cancellationToken, readLatency?.Logger, onRunException, nowUtc);
-        RecordComposeLatency(readLatency, body, outcome, stopwatch.ElapsedMilliseconds, cancellationToken, readScope.Fallback, readScope.Scope);
+        /* Round 1, C1: the text the host answers, taken once here so a cached copy of it is the same bytes. */
+        if (cacheHost is { } host && outcome.Payload is { } payload)
+        {
+            outcome = outcome with { PayloadText = host == ReadSurface.Mcp ? payload.ToJsonString(McpHelpers.JsonOptions) : payload.ToJsonString() };
+        }
+
+        /* #5793: the web route passes its session hash; the MCP tool passes none, and the tool filter's ambient caller
+           names the client instead. */
+        RecordComposeLatency(readLatency, body, outcome, stopwatch.ElapsedMilliseconds, cancellationToken, readScope.Fallback, readScope.Scope,
+            caller ?? ReadCaller.AmbientMcpCaller);
         return outcome;
     }
 
@@ -2639,20 +5198,232 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// either way (the compose catalog's own measure keys, never the caller's free text).</summary>
     private const string ComposeUnknownRouteLabel = "compose:unknown";
 
+    /// <summary>#5506 part 3 (round 2, L5): the MCP twin <c>/api/catalog</c> is admitted and recorded under.</summary>
+    internal const string CatalogRoute = "describe_custom_view_catalog";
+
+    /// <summary>#5506 part 3 (round 1, M3): the name <c>/api/ag</c> is admitted and recorded under, its MCP twin's.</summary>
+    internal const string AgHealthRoute = "get_ag_health";
+
+    /// <summary>#5506 part 3: the web answer to a refused read: 429, a <c>Retry-After</c> header, and <c>{"error": sentence}</c>,
+    /// which the page already shows (<c>wwwroot/js/util.js</c> reads <c>body.error</c>).</summary>
+    internal static IResult BusyResult(ReadAdmissionRefusal refusal) =>
+        new RetryAfterResult(ErrorResult(refusal.Sentence, StatusCodes.Status429TooManyRequests), refusal.RetryAfterSeconds);
+
+    /// <summary>An answer with a <c>Retry-After</c> header, set on the response it is written to (round 1, C3): a busy
+    /// answer made by a shared read reaches every caller of that read with the header, not only the first.</summary>
+    private sealed class RetryAfterResult(IResult inner, int retryAfterSeconds) : IResult
+    {
+        public Task ExecuteAsync(HttpContext httpContext)
+        {
+            httpContext.Response.Headers.RetryAfter = retryAfterSeconds.ToString(CultureInfo.InvariantCulture);
+            return inner.ExecuteAsync(httpContext);
+        }
+    }
+
+    /// <summary>
+    /// #5506 part 3 (round 1, C3): a copy of a read request for a read several callers share. It carries what a read
+    /// handler and the recording read (method, path, query string, headers and cookies, user, services, remote address)
+    /// and <paramref name="readToken"/> as its <c>RequestAborted</c>, so the shared read runs under the flight's token while
+    /// the caller's own request keeps its own, and nothing the read does (its <c>as_of</c> added to the query string)
+    /// changes the caller's request.
+    /// </summary>
+    internal static HttpContext DetachedReadContext(HttpContext source, CancellationToken readToken)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var copy = new DefaultHttpContext
+        {
+            RequestAborted = readToken,
+            User = source.User,
+            RequestServices = source.RequestServices,
+        };
+        var from = source.Request;
+        var to = copy.Request;
+        to.Method = from.Method;
+        to.Scheme = from.Scheme;
+        to.Host = from.Host;
+        to.PathBase = from.PathBase;
+        to.Path = from.Path;
+        to.QueryString = from.QueryString;
+        foreach (var header in from.Headers)
+        {
+            to.Headers[header.Key] = header.Value;
+        }
+
+        copy.Connection.RemoteIpAddress = source.Connection.RemoteIpAddress;
+        return copy;
+    }
+
+    /// <summary>#5506 part 3: admits a dedicated web read route (<c>/api/fleet</c>, <c>/api/triage</c>,
+    /// <c>/api/alerts/test</c>) and, given a recorder and the route's open scope, records its admission sample under the
+    /// <c>web</c> surface and <paramref name="route"/> as the read loop does: <c>busy</c> when refused, <c>cancelled</c> when
+    /// the browser left the queue, <c>queue_wait</c> when it waited. The run itself is recorded by <see cref="WebRouteRun"/>.
+    /// A browser that leaves the queue ends the request, as the read loop's #4276 arm does.</summary>
+    internal static Task<ReadAdmissionTicket> AdmitWebRouteAsync(ReadAdmission? admission, string route, string band, HttpContext context,
+        ReadLatencyRecorder? recorder = null, ReadScope? scope = null)
+    {
+        if (admission is null)
+        {
+            return Task.FromResult(ReadAdmissionTicket.Passed);
+        }
+
+        /* Not async (round 1, L4): AdmitAsync sets the nesting marker in the CALLER's flow, and an async method undoes
+           every AsyncLocal it sets when it returns, so a read nested under this route would take a second slot (a
+           deadlock at a limit of 1). Only the recording below runs in an async continuation; it sets no AsyncLocal. */
+        return RecordAsync(ReadScope.AdmitAsync(admission, ReadSurface.Web, route, band, context.RequestAborted));
+
+        async Task<ReadAdmissionTicket> RecordAsync(Task<ReadAdmissionTicket> admitting)
+        {
+            var ticket = await admitting;
+            if (ticket.Refusal is not null)
+            {
+                RecordWebRouteSample(recorder, route, ReadOutcome.Busy, ticket.QueueMs ?? 0, band, scope, context);
+            }
+            else if (ticket.CallerLeft)
+            {
+                RecordWebRouteSample(recorder, route, ReadOutcome.Cancelled, ticket.QueueMs ?? 0, band, scope, context);
+                ticket.Dispose();
+                context.RequestAborted.ThrowIfCancellationRequested();
+            }
+            else if (ticket.QueueMs is { } queueMs)
+            {
+                RecordWebRouteSample(recorder, route, ReadOutcome.QueueWait, queueMs, band, scope, context);
+            }
+
+            return ticket;
+        }
+    }
+
+    /// <summary>#5506 part 3: one sample of a dedicated web read route under the <c>web</c> surface. Never throws into the
+    /// request; a missing recorder or scope records nothing.</summary>
+    internal static void RecordWebRouteSample(ReadLatencyRecorder? recorder, string route, ReadOutcome outcome, long elapsedMs, string band, ReadScope? scope, HttpContext context)
+    {
+        if (recorder is null || scope is null)
+        {
+            return;
+        }
+
+        try
+        {
+            recorder.Accumulator?.Record(ReadSurface.Web, route, outcome, elapsedMs, band, scope.InFlightAtStart, scope.WaitMs, WebReadCaller(context));
+        }
+        catch (Exception ex)
+        {
+            recorder.Logger?.LogDebug(ex, "Read-latency recording failed for the web route {Route}.", route);
+        }
+    }
+
+    /// <summary>The outcome of a tool answer, as the read loop classifies it: a server-error envelope by its sentence
+    /// (a caught 57014 is a timeout), anything else <c>ok</c>.</summary>
+    internal static ReadOutcome ToolResultOutcome(string result, System.Threading.CancellationToken requestAborted) =>
+        ClassifyToolResponse(result) == ToolResponseKind.ServerError
+            ? ReadOutcomeClassifier.ClassifySentence(McpHelpers.ErrorMessageOf(result), requestAborted)
+            : ReadOutcome.Ok;
+
+    /// <summary>
+    /// #5506 part 3: the run sample of a dedicated web read route (<c>/api/fleet</c>, <c>/api/triage</c>,
+    /// <c>/api/alerts/test</c>), so the long-read table (<see cref="ReadAdmission"/>) learns these routes from their own
+    /// p90 instead of the window-size rule alone. Created once the read may run, so the elapsed time starts after
+    /// admission (D1). Disposing records once: the outcome given to <see cref="Complete"/>, a fallback the scope noted on an
+    /// <c>ok</c>, or, when the route threw before completing, <c>cancelled</c> for a browser that left and <c>error</c>
+    /// otherwise.
+    /// </summary>
+    internal sealed class WebRouteRun : IDisposable
+    {
+        private readonly ReadLatencyRecorder? _recorder;
+        private readonly string _route;
+        private readonly string _band;
+        private readonly HttpContext _context;
+        private readonly ReadScope _scope;
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private ReadOutcome? _outcome;
+        private int _recorded;
+
+        internal WebRouteRun(ReadLatencyRecorder? recorder, string route, string band, HttpContext context, ReadScope scope)
+        {
+            _recorder = recorder;
+            _route = route;
+            _band = band;
+            _context = context;
+            _scope = scope;
+        }
+
+        /// <summary>The outcome the route answered with.</summary>
+        internal void Complete(ReadOutcome outcome) => _outcome = outcome;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _recorded, 1) != 0)
+            {
+                return;
+            }
+
+            var outcome = _outcome ?? (_context.RequestAborted.IsCancellationRequested ? ReadOutcome.Cancelled : ReadOutcome.Error);
+            RecordWebRouteSample(_recorder, _route, ReadScope.Resolve(outcome, _scope.Fallback), _stopwatch.ElapsedMilliseconds, _band, _scope, _context);
+        }
+    }
+
+    /// <summary>#5506 part 3: one admission sample of a composed-panel run (busy, cancelled in the queue, or queue_wait).</summary>
+    private static void RecordAdmissionSample(ReadLatencyRecorder? recorder, string route, ReadOutcome outcome, long elapsedMs, string band, ReadScope scope, string? caller)
+    {
+        try
+        {
+            recorder?.Accumulator?.Record(ReadSurface.Compose, route, outcome, elapsedMs, band, scope.InFlightAtStart, 0, caller);
+        }
+        catch (Exception ex)
+        {
+            recorder?.Logger?.LogDebug(ex, "Read-latency recording failed for a composed-panel admission.");
+        }
+    }
+
     /// <summary>Records one <c>/api/read/&lt;name&gt;</c> sample under the <c>web</c> surface -- <paramref
     /// name="name"/> is already a bounded-cardinality route label (the dispatch table's own tool name, never
     /// caller-supplied text). Never throws into the request: swallowed and logged at Debug, exactly like the
     /// compose path's own recording.</summary>
-    private static void RecordWebReadLatency(ReadLatencyRecorder recorder, string name, ReadOutcome outcome, long elapsedMs)
+    private static void RecordWebReadLatency(ReadLatencyRecorder recorder, string name, ReadOutcome outcome, long elapsedMs, HttpContext context, ReadScope scope)
     {
         try
         {
-            recorder.Accumulator?.Record(ReadSurface.Web, name, outcome, elapsedMs);
+            /* #5506: the band of the window the page asked for (hours, hours_back or days_back on the query string). A
+               request that sends none reads the read's own default window, which the catalog row declares (PHours(def),
+               PInt("days_back", def)), so it records that window's band; only a read that takes no window records none. */
+            var band = WebWindowBand(name, key => First(context, key));
+            recorder.Accumulator?.Record(ReadSurface.Web, name, outcome, elapsedMs, band, scope.InFlightAtStart, scope.WaitMs, WebReadCaller(context));
         }
         catch (Exception ex)
         {
             recorder.Logger?.LogDebug(ex, "Read-latency recording failed for /api/read/{Route}.", name);
         }
+    }
+
+    /// <summary>The caller of a web or composed-panel read (#5793): <see cref="ReadCaller.OfWebSession(string?)"/> over the
+    /// request's session key, a salted hash. Only the hash leaves this method; the key itself is never recorded.</summary>
+    internal static string WebReadCaller(HttpContext context)
+        => ReadCaller.OfWebSession(context.Request.Cookies[Mcp.DarlingWebHostService.SessionCookieName]);
+
+    /// <summary>The window band of one <c>/api/read/&lt;name&gt;</c> request (#5506): the window the query string sent, else
+    /// the default <see cref="CatalogDescriptors"/> declares for that read, else <c>none</c>. Internal so a test can pin a
+    /// request that sends no window against the catalog's default.</summary>
+    internal static string WebWindowBand(string name, Func<string, string?> sent) =>
+        ReadWindowBand.OrFixed(ReadWindowBand.Of(ReadWindowBand.HoursOf(sent, key => CatalogDefaultText(name, key))), name);
+
+    /// <summary>The default the catalog row of read <paramref name="name"/> declares for parameter <paramref name="key"/>,
+    /// as text; null when the read is not in the catalog, does not take that parameter, or declares no default.</summary>
+    private static string? CatalogDefaultText(string name, string key)
+    {
+        if (!CatalogDescriptors.TryGetValue(name, out var read))
+        {
+            return null;
+        }
+
+        foreach (var parameter in read.Params)
+        {
+            if (string.Equals(parameter.Name, key, StringComparison.Ordinal))
+            {
+                return ReadWindowBand.DefaultText(parameter.Default);
+            }
+        }
+
+        return null;
     }
 
     /// <summary>The query string as slow-read arguments. A key name is caller text: only plain identifier characters
@@ -2723,7 +5494,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 ? q.Value.Select(v => new KeyValuePair<string, string?>(q.Key, v))
                 : [new KeyValuePair<string, string?>(q.Key, null)]));
 
-            recorder.SlowReads.Offer(scope, ReadSurface.Web, name, outcome, elapsedMs, arguments, errorClass, recorder.Logger);
+            recorder.SlowReads.Offer(scope, ReadSurface.Web, name, outcome, elapsedMs, arguments, errorClass, recorder.Logger, WebReadCaller(context));
         }
         catch (Exception ex)
         {
@@ -2731,7 +5502,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         }
     }
 
-    private static void RecordComposeLatency(ReadLatencyRecorder? recorder, JsonObject body, ComposeRunOutcome outcome, long elapsedMs, System.Threading.CancellationToken cancellationToken, ReadFallback? noted = null, ReadScope? scope = null)
+    private static void RecordComposeLatency(ReadLatencyRecorder? recorder, JsonObject body, ComposeRunOutcome outcome, long elapsedMs, System.Threading.CancellationToken cancellationToken, ReadFallback? noted = null, ReadScope? scope = null, string? caller = null)
     {
         try
         {
@@ -2759,7 +5530,8 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                                 : ReadOutcome.Error;
 
             var resolved = ReadScope.Resolve(readOutcome, noted);
-            recorder?.Accumulator?.Record(ReadSurface.Compose, measureKey, resolved, elapsedMs);
+            recorder?.Accumulator?.Record(ReadSurface.Compose, measureKey, resolved, elapsedMs, ComposeWindowBand(body),
+                scope?.InFlightAtStart ?? 0, scope?.WaitMs ?? 0, caller);
 
             /* #5097: a slow or failed run also becomes a slow-read row. The panel body is the arguments. */
             if (scope is not null && recorder?.SlowReads is { } slowReads && slowReads.ShouldRecord(resolved, elapsedMs))
@@ -2767,13 +5539,25 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 var errorClass = outcome.Fault is not null ? SlowReadLog.ErrorClassOf(outcome.Fault)
                     : outcome.AuthorSqlState is { Length: > 0 } sqlState ? sqlState
                     : resolved == ReadOutcome.Error ? "compose_error" : null;
-                slowReads.Offer(scope, ReadSurface.Compose, measureKey, resolved, elapsedMs, body.DeepClone() as JsonObject, errorClass, recorder.Logger);
+                slowReads.Offer(scope, ReadSurface.Compose, measureKey, resolved, elapsedMs, body.DeepClone() as JsonObject, errorClass, recorder.Logger, caller);
             }
         }
         catch (Exception ex)
         {
             recorder?.Logger?.LogDebug(ex, "Read-latency recording failed for a composed-panel run.");
         }
+    }
+
+    /// <summary>The window band of a composed-panel run (#5506): the windowStart/windowEnd pair when both parse, else the
+    /// body's hours, else the default window the runner reads (<see cref="DefaultComposeHours"/>).</summary>
+    internal static string ComposeWindowBand(JsonObject body)
+    {
+        if (ComposeSpec.TryParseUtcInstant(body["windowStart"], out var start) && ComposeSpec.TryParseUtcInstant(body["windowEnd"], out var end))
+        {
+            return ReadWindowBand.Of(start, end);
+        }
+
+        return ReadWindowBand.Of(body["hours"] is JsonValue hoursValue && hoursValue.TryGetValue<int>(out var hours) ? hours : DefaultComposeHours);
     }
 
     /// <summary>The compile-and-run body <see cref="RunComposedPanelAsync"/> wraps with latency recording --
@@ -2820,6 +5604,17 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
            $server variable value. Absent / "All" / empty => the WHOLE FLEET (no server predicate); one or
            many names => a bound server_name = ANY filter. */
         var serverScope = ParseServerScope(body, values);
+
+        /* #5633 item 17: a spec that names a server by its display name (or in another case) is placed through the shared
+           server-name resolver, the one every other server-scoped tool uses, before anything reads by name. A name matching
+           several servers is refused with the resolver's own sentence. */
+        var (resolvedScope, scopeRefusal) = await ComposeServerScope.ResolveNamesAsync(postgres, serverScope, cancellationToken, logger);
+        if (scopeRefusal is not null)
+        {
+            return ComposeRunOutcome.BadRequest(McpHelpers.ErrorMessageOf(scopeRefusal));
+        }
+
+        serverScope = resolvedScope;
 
         /* The run window (#1606): an explicit absolute pair (windowStart/windowEnd — the zoom/brush and
            historical-analysis path) takes precedence over the relative `hours` (which the frontend keeps
@@ -2885,6 +5680,9 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ? await ResolveQueryStoreWideEligibleAsync(postgres, serverScope, start, end, hasWindowEnd ? end : (DateTime?)null, cancellationToken, plan)
             : default;
         var queryStoreWideEligible = wideResolution.Eligible;
+        /* #6115: the servers the gate refused. The panel reads them raw and every other server in scope from the interval table. Null when
+           every server passed (today's all-wide text) and when none did (today's all-raw text, Eligible false). */
+        var rawServerIds = wideResolution.RawServerIds;
 
         /* #5582: a wide-table read the daily summary says cannot finish inside the statement timeout is refused here, in
            milliseconds, before any fact row is read. Both callers of this runner (the web endpoint and the MCP tool
@@ -2903,7 +5701,13 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 stampThrough = wideResolution.StampThrough;
             }
 
-            if (await QueryStoreWideReadGuard.CheckAsync(postgres, serverScope, countedStart, end, logger, cancellationToken, limit, stampThrough) is { } tooBig)
+            /* #6115: the guard's wide estimate leaves out the servers read raw (the interval table never reads them), and ADDS the raw half's
+               rows, counted from the collection log over the window's own start (the raw half is not clamped to the wide start) at 1.0 each,
+               against the same limit. One statement reads both halves under one timeout, so the sum is what must fit. The wide figure is
+               exactly what the guard counted before #6115 for those servers, so a split panel is never let through that today's code would
+               refuse for the same wide rows; the raw rows can only refuse more. A panel whose every server passes adds nothing and is
+               unchanged. A log that cannot answer adds nothing: the guard fails open, as it always has. */
+            if (await QueryStoreWideReadGuard.CheckAsync(postgres, serverScope, countedStart, end, logger, cancellationToken, limit, stampThrough, rawServerIds, start) is { } tooBig)
             {
                 return ComposeRunOutcome.BadRequest(tooBig);
             }
@@ -2915,6 +5719,14 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
            takes its connection, so this lookup never asks the pool for a second one while the snapshot holds the first. */
         var registryLookupFailed = false;
         var unregisteredServers = await ComposeServerScope.FindUnregisteredAsync(postgres, serverScope, cancellationToken, logger, () => registryLookupFailed = true);
+
+        /* #5811: a raw-route object_name panel reads module names from collect.module_map, which the worker creates at start, and reads
+           procedure_stats only from the map's watermark less the refresh slack (ruling C). Where that create failed, the compile keeps the
+           window-wide ranking CTE, which needs no map; with no watermark the overlay is the whole window. Asked here, before the
+           hourly-edges snapshot takes its connection, and only for a panel that joins modules. A panel whose hourly-edges guard passes
+           reads the watermark again inside its snapshot and uses that one; a watermark read earlier is never newer, so this one only
+           widens the overlay. */
+        var moduleMap = plan!.UsesModuleJoin ? await ProbeModuleMapAsync(postgres, logger, cancellationToken) : (Missing: false, Through: null);
 
         /* #4605: only a panel the hourly-plus-raw-edges route could serve pays for the count guard. It runs on one
            connection, in a REPEATABLE READ READ ONLY transaction the panel statement shares, so a collector batch that
@@ -2950,15 +5762,26 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
         await using var snapshot = hourlyEdgesSnapshot;
 
-        var runContext = new ComposeRunContext(serverScope, start, end, values, rollups, now, coverage, queryStoreWideEligible, wideResolution.WideStart, HourlyEdges: snapshot?.Verdict, ModuleMapThrough: snapshot?.ModuleMapThrough, UnregisteredServers: unregisteredServers, QueryStoreGroupMembers: wideResolution.GroupMembers, QueryStoreStampThrough: stampThrough);
+        var runContext = new ComposeRunContext(serverScope, start, end, values, rollups, now, coverage, queryStoreWideEligible, wideResolution.WideStart, HourlyEdges: snapshot?.Verdict, ModuleMapThrough: snapshot?.ModuleMapThrough ?? moduleMap.Through, UnregisteredServers: unregisteredServers, QueryStoreGroupMembers: wideResolution.GroupMembers, QueryStoreStampThrough: stampThrough, ModuleMapMissing: moduleMap.Missing, QueryStoreRawServerIds: rawServerIds);
         var (compiled, compileError) = ComposeCompiler.Compile(plan!, runContext);
         if (compileError is not null)
         {
             return ComposeRunOutcome.BadRequest(compileError);
         }
 
+        /* #5811: a query_stats or procedure_stats panel read raw for its whole window, whose collection log says the read cannot finish
+           inside the statement timeout, is refused here in milliseconds instead of after a minute of reading. Decided on the compiled
+           route, so a panel the hourly-raw-edges route or a rollup serves is never counted. A panel whose hourly-edges guard did not pass
+           holds the snapshot's connection, and the estimate reads there under a savepoint. Fails open, like the Query Store guard above. */
+        if (QueryStoreWideReadGuard.RawCollectorFor(plan!.Measure.SourceTable, compiled!.Route) is { } rawCollector
+            && await QueryStoreWideReadGuard.CheckRawAsync(postgres, snapshot?.Connection, serverScope, rawCollector, start, end, logger, cancellationToken) is { } rawTooBig)
+        {
+            return ComposeRunOutcome.BadRequest(rawTooBig);
+        }
+
         ReadScope.NoteSource(
-            queryStoreWideEligible ? ReadScope.SourceIntervalTable : snapshot?.Verdict is not null ? ReadScope.SourceHourlyEdges : ReadScope.SourceRaw);
+            queryStoreWideEligible ? ReadScope.SourceIntervalTable : snapshot?.Verdict is not null ? ReadScope.SourceHourlyEdges : ReadScope.SourceRaw,
+            queryStoreWideEligible && rawServerIds is { Count: > 0 } ? "split_raw_servers" : null);
 
         try
         {
@@ -3032,11 +5855,23 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             if (queryStoreWideEligible && wideResolution.WideStart is DateTime historyStart && historyStart > start)
             {
                 payload["query_store_history_starts"] = McpHelpers.FormatEffectiveStart(historyStart);
-                payload["query_store_history_note"] = QueryStoreHistoryNote(historyStart, wideResolution.Bound, wideResolution.SettingServer);
+                payload["query_store_history_note"] = QueryStoreHistoryNote(historyStart, wideResolution.Bound, wideResolution.SettingServer)
+                    + (rawServerIds is { Count: > 0 }
+                        ? " Servers whose interval table could not serve the window were read from the raw tables, from the window's own start (#6115)."
+                        : string.Empty);
                 if (wideResolution.SettingServer is not null)
                 {
                     payload["query_store_history_set_by"] = wideResolution.SettingServer;
                 }
+            }
+
+            /* #6115 review: a split run whose passing servers did not move the wide start has no history note above, so the payload always says on its
+               own how many servers were read raw. */
+            if (queryStoreWideEligible && rawServerIds is { Count: > 0 })
+            {
+                payload["query_store_raw_servers_note"] = rawServerIds.Count == 1
+                    ? "1 server whose interval table could not serve the window was read from the raw tables, from the window's own start (#6115)."
+                    : $"{rawServerIds.Count} servers whose interval table could not serve the window were read from the raw tables, from the window's own start (#6115).";
             }
 
             return ComposeRunOutcome.Ok(payload);
@@ -3084,14 +5919,14 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// may read <c>collect.query_store_interval_wide</c> (V145) instead of deduping raw — decided here, in the
     /// runner, BEFORE <see cref="ComposeCompiler.Compile"/> runs, because the compiler stays pure and never
     /// opens a connection. Reuses the pure <see cref="QueryStoreIntervalWide.UseTable"/> decision (through
-    /// <see cref="QueryStoreIntervalWide.ReadsTableAsync"/>, which also runs clause 6 — no legacy row in the
-    /// window — and the literal-end-before-applied_through refusal) for EVERY server in scope: a fleet panel
+    /// <see cref="QueryStoreIntervalWide.ReadsTableAsync"/>, which also applies the literal-end-before-applied_through
+    /// refusal; clause 6, the legacy-row probe, is not asked for here, because the composed panels read the newest snapshot per interval) for EVERY server in scope: a fleet panel
     /// (null/empty <paramref name="serverScope"/>) must pass for every server the store has rows for, or the
     /// hybrid would silently under-read a server whose table coverage lags. Any fault, a schema below V145, or
     /// a refused clause on any server in scope makes the whole panel raw — every input here leans toward raw,
     /// the same rule #3953 already applies to the single-server reads.
     /// </summary>
-    internal static async Task<(bool Eligible, DateTime? WideStart, QueryStoreIntervalWide.WideStartBound Bound, string? SettingServer, long? GroupMembers, DateTime? StampThrough)> ResolveQueryStoreWideEligibleAsync(
+    internal static async Task<(bool Eligible, DateTime? WideStart, QueryStoreIntervalWide.WideStartBound Bound, string? SettingServer, long? GroupMembers, DateTime? StampThrough, IReadOnlyList<int>? RawServerIds)> ResolveQueryStoreWideEligibleAsync(
         NpgsqlDataSource postgres, IReadOnlyList<string>? serverScope, DateTime start, DateTime end,
         DateTime? literalWindowEnd, System.Threading.CancellationToken cancellationToken, PanelPlan? groupMembersFor = null)
     {
@@ -3152,11 +5987,28 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             /* The floors are one store-wide answer: the first server to reach that step reads them into this
                cache and the rest reuse them; a check that refuses before that step never reads them. */
             var storeWide = new QueryStoreIntervalWide.StoreWideInputsCache();
+
+            /* #6115: the gate decides per server, and a server that fails no longer sends the whole panel to raw: it reads raw, and the
+               servers that pass read the interval table (the split). Each server is in exactly one set, so no row is read twice.
+               A server with no coverage row AND no Query Store row in the window is neither: it adds no cost to either half, so it
+               must not make the fleet read raw (option 1 of the issue). It is classified with the passing servers, because the wide
+               half is "every server not read raw", and a server that reads nothing there costs nothing; and it is left out of the
+               wide start, because it has no history to bound. A server with no coverage row and rows in the window cannot use the
+               interval table, so it reads raw like any refused server. Decided from the two small probes below, never from the gate,
+               whose own answer for such a server is always "refuse". */
+            var covered = await ReadQueryStoreCoveredServersAsync(connection, cancellationToken);
+            var rawServers = new List<int>();
+            var passed = 0;
             foreach (var (serverId, serverName) in wideServers)
             {
+                if (!covered.Contains(serverId) && !await QueryStoreServerHasRowsAsync(connection, serverId, start, end, cancellationToken))
+                {
+                    continue;
+                }
+
                 var plan = await QueryStoreIntervalWide.ResolveReadAsync(
                     connection, serverId, start, end, literalWindowEnd, ComposeQueryStoreWideMinWindow,
-                    McpCommandDeadlines.ReadSeconds, ReadScope.Current?.Logger, cancellationToken, storeWide);
+                    McpCommandDeadlines.ReadSeconds, ReadScope.Current?.Logger, legacyRows: QueryStoreIntervalWide.LegacyRows.Allow, cancellationToken, storeWide: storeWide);
                 if (!plan.UseTable)
                 {
                     if (plan.DecisionFailed)
@@ -3164,9 +6016,12 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                         ReadScope.Note(ReadFallback.GateFailed);
                     }
 
-                    return default;
+                    /* A server whose decision faulted reads raw too: raw is the exact source, and a fault leans toward it, as it always did. */
+                    rawServers.Add(serverId);
+                    continue;
                 }
 
+                passed++;
                 if (plan.ReadStart > wideStart)
                 {
                     wideStart = plan.ReadStart;
@@ -3175,6 +6030,16 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 }
             }
 
+            /* No server could read the interval table: the whole panel reads raw, as it did before #6115. */
+            if (passed == 0)
+            {
+                return default;
+            }
+
+            /* A server in scope that is not enabled is not gated, and the all-wide text has always read its retained rows from the
+               interval table unchecked. The split keeps that: it is on the wide side, and costs the raw half nothing. */
+            IReadOnlyList<int>? rawServerIds = rawServers.Count > 0 ? rawServers : null;
+
             /* #5582: for a Query Store RankedTimeSeries panel, the members of its group dimension, on this same connection, so the
                compiler can bound the single-scan base CTE (buckets x members). Null for any other panel, and when unknown. */
             long? groupMembers = groupMembersFor is null
@@ -3182,15 +6047,47 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 : await QueryStoreGroupMembers.ResolveAsync(connection, groupMembersFor, wideServers.Count, cancellationToken);
 
             /* #5582 part 3: where the compose rollup stops answering, on this same connection. Null (today's route) on any fault. */
-            var stampThrough = await ResolveQueryStoreStampThroughAsync(connection, scopedServerIds.ToArray(), wideStart, end, schemaVersion, cancellationToken);
+            var stampThrough = await ResolveQueryStoreStampThroughAsync(
+                connection, (rawServerIds is null ? scopedServerIds : scopedServerIds.Except(rawServerIds).ToList()).ToArray(), wideStart, end, schemaVersion, cancellationToken);
 
-            return (true, wideStart, bound, settingServer, groupMembers, stampThrough);
+            return (true, wideStart, bound, settingServer, groupMembers, stampThrough, rawServerIds);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             ReadScope.NoteFallback(ReadFallback.GateFailed, "#4605 compose Query Store wide-table eligibility check", ex);
             return default;
         }
+    }
+
+    /// <summary>#6115: the servers with a coverage row for the interval table. $1 none.</summary>
+    internal const string QueryStoreCoveredServersSql = "SELECT server_id FROM collect.query_store_interval_wide_coverage";
+
+    /// <summary>#6115: whether a server holds any raw Query Store row in the window ($1 server, $2 start, $3 end). One index probe on
+    /// (server_id, collection_time), and it stops at the first row.</summary>
+    internal const string QueryStoreServerHasRowsSql =
+        "SELECT EXISTS (SELECT 1 FROM collect.query_store_stats WHERE server_id = $1 AND collection_time >= $2 AND collection_time <= $3)";
+
+    private static async Task<HashSet<int>> ReadQueryStoreCoveredServersAsync(NpgsqlConnection connection, System.Threading.CancellationToken cancellationToken)
+    {
+        var covered = new HashSet<int>();
+        await using var command = new NpgsqlCommand(QueryStoreCoveredServersSql, connection) { CommandTimeout = McpCommandDeadlines.ReadSeconds };
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            covered.Add(reader.GetInt32(0));
+        }
+
+        return covered;
+    }
+
+    private static async Task<bool> QueryStoreServerHasRowsAsync(
+        NpgsqlConnection connection, int serverId, DateTime start, DateTime end, System.Threading.CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(QueryStoreServerHasRowsSql, connection) { CommandTimeout = McpCommandDeadlines.ReadSeconds };
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Integer, Value = serverId });
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(start, DateTimeKind.Unspecified) });
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Timestamp, Value = DateTime.SpecifyKind(end, DateTimeKind.Unspecified) });
+        return (bool)(await command.ExecuteScalarAsync(cancellationToken))!;
     }
 
     /// <summary>
@@ -3259,7 +6156,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// <see cref="ToHttpResult"/>'s ServerError arm reclassifies a tool's envelope, since by this point the
     /// real Exception is equally gone — only the sentence survived the round trip through
     /// <see cref="ComposeRunOutcome"/>.</summary>
-    internal static IResult ComposeRunFailureResult(ComposeRunOutcome outcome, string route, ILogger logger, long elapsedMs)
+    internal static IResult ComposeRunFailureResult(ComposeRunOutcome outcome, string route, ILogger logger, long elapsedMs, CancellationToken requestAborted)
     {
         /* W13: an unknown server is a plain 404 with its message, never a quiet empty answer. */
         if (outcome.IsNotFound)
@@ -3269,7 +6166,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
         if (outcome.Fault is not null)
         {
-            DarlingWebFailureLog.Report(logger, route, elapsedMs, outcome.Fault);
+            DarlingWebFailureLog.Report(logger, route, elapsedMs, outcome.Fault, requestAborted);
             return Results.Json(DarlingWebFailureLog.Body(outcome.Fault), statusCode: DarlingWebFailureLog.StatusCode(outcome.Fault));
         }
 
@@ -3284,12 +6181,12 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         }
 
         return outcome.IsServerError
-            ? ServerErrorResult(outcome.Error!, route, logger, elapsedMs)
+            ? ServerErrorResult(outcome.Error!, route, logger, elapsedMs, requestAborted)
             : ErrorResult(outcome.Error!, StatusCodes.Status400BadRequest);
     }
 
     /// <summary>Default compose-run window (hours) when the request omits one.</summary>
-    private const int DefaultComposeHours = 24;
+    internal const int DefaultComposeHours = 24;
 
     /* The absolute-instant parser lives in ComposeSpec.TryParseUtcInstant (#2735): the run path's
        windowStart/windowEnd and a stored cell range's windowStart/windowEnd are the SAME vocabulary, so
@@ -3386,6 +6283,35 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// <summary>#4605: a savepoint around the module map watermark read, so a fault in that read (the map's state table missing, say)
     /// is undone and the panel statement still runs on the same connection and snapshot.</summary>
     private const string HourlyEdgesModuleMapSavepointSql = "SAVEPOINT hourly_edges_module_map";
+
+    /// <summary>#5811: whether <c>collect.module_map</c> exists, as a catalog lookup.</summary>
+    internal const string ModuleMapExistsSql = "SELECT to_regclass('collect.module_map') IS NOT NULL";
+
+    /// <summary>
+    /// #5811: whether <c>collect.module_map</c> is missing from this store, so a raw-route module join compiles the window-wide
+    /// ranking CTE that needs no map, and otherwise the map's watermark (<see cref="DarlingModuleMap.ReadWatermarkAsync"/>, null when
+    /// there is none or its read fails), which bounds the module CTE's procedure_stats overlay (ruling C). A lookup that faults answers
+    /// missing: the old CTE is slower, but it runs on any store.
+    /// </summary>
+    private static async Task<(bool Missing, DateTime? Through)> ProbeModuleMapAsync(NpgsqlDataSource postgres, ILogger? logger, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await postgres.OpenConnectionAsync(cancellationToken);
+            await using var command = new NpgsqlCommand(ModuleMapExistsSql, connection) { CommandTimeout = McpCommandDeadlines.ReadSeconds };
+            if (await command.ExecuteScalarAsync(cancellationToken) is not true)
+            {
+                return (true, null);
+            }
+
+            return (false, await DarlingModuleMap.ReadWatermarkAsync(connection, cancellationToken));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogDebug(ex, "The #5811 module map lookup failed; the panel ranks procedure_stats over its window instead.");
+            return (true, null);
+        }
+    }
 
     /// <summary>#4605: undoes the watermark read's savepoint, whether the read succeeded or failed.</summary>
     private const string HourlyEdgesModuleMapRollbackSql = "ROLLBACK TO SAVEPOINT hourly_edges_module_map";
@@ -4583,21 +7509,25 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         {
             /* ── analysis reads (AuditConfig/CompareAnalysis/GetAnalysisFacts/GetAnalysisFindings) ── */
             ["audit_config"] = R(CatAnalysis, "Configuration-audit findings for a server.", PServer()),
-            ["compare_analysis"] = R(CatAnalysis, "Compare a window's analysis facts against an earlier baseline.", PServer(), PHours(4), PInt("baseline_hours_back", 28), PAsOf()),
+            ["compare_analysis"] = R(CatAnalysis, "Compare a window's analysis facts against an earlier baseline.", PServer(), PHours(4), PInt("baseline_hours_back"), PAsOf()),
             ["get_analysis_facts"] = R(CatAnalysis, "Raw analysis facts for a window, filtered by source and minimum severity.", PServer(), PHours(4), PText("source"), PDouble("min_severity", 0), PAsOf()),
             ["get_analysis_findings"] = R(CatAnalysis, "Persisted analysis findings for a server.", PServer(), PHours(24), PAsOf(), PLimit(MaxRowLimit), PBool("include_drilldown", false), PBool("full_text", true)),
 
             /* ── sessions (DarlingMcpSessionTools) ── */
-            ["get_active_queries"] = R(CatSessions, "Currently-active queries, optionally blocking-only.", PServer(), PHours(1), PDatabases(), PBool("blocking_only", false), PText("wait_type"), PLimit(50), PAsOf()),
+            ["get_active_queries"] = R(CatSessions, "Currently-active queries, optionally blocking-only.", PServer(), PHours(1), PDatabases(), PBool("blocking_only", false), PText("wait_type"), PLimit(50), PAsOf(), PText("tag"), PText("collection_time"), PBool("snapshots_only", false)),
             ["get_session_stats"] = R(CatSessions, "Session-level summary counters for a server.", PServer()),
             ["get_waiting_tasks"] = R(CatSessions, "Tasks currently waiting, with wait type and duration.", PServer(), PHours(1), PLimit(30), PDatabases(), PAsOf()),
 
             /* ── alerts / mute rules (DarlingMcpAlertTools) ── */
-            ["get_alert_history"] = R(CatAlerts, "Recent fired-alert history for a server, newest first and bounded by limit. Excludes operator-dismissed alerts unless include_dismissed is true (dismissed_excluded_count says how many the default hid).", PServer(), PHours(24), PLimit(50), PAsOf(), PBool("include_dismissed", false)),
+            ["get_alert_history"] = R(CatAlerts, "Recent fired-alert history for a server, newest first and bounded by limit. Excludes operator-dismissed alerts unless include_dismissed is true (dismissed_excluded_count says how many the default hid). include_streak adds streak_days to each row: days in a row this metric fired at this time of day before the alert, muted fires counting.", PServer(), PHours(24), PLimit(50), PAsOf(), PBool("include_dismissed", false), PText("metric_name"), PText("family"), PBool("include_streak", false)),
             ["get_alert_settings"] = R(CatAlerts, "The current alert-settings configuration."),
             /* #5241: a web-only read (no MCP tool behind it, see WebOnlyReadNames): one alert's advice and fix script,
                fetched when its Analysis row is first expanded. The key is the page's own row identity. */
             ["get_alert_details"] = R(CatAlerts, "One fired alert's advice: the heading, fields, advice text and fix script the desktop's Alert Detail shows (never the Apply payload), found by server_id, metric_name and alert_time exactly as get_alert_history reports them. An alert with no advice, or no match, answers an empty details list.", new CatalogParam("server_id", TypeInt, true, null), PReqText("metric_name"), PReqText("alert_time")),
+            ["list_investigation_requests"] = R(CatAlerts, "Level 1 investigation requests alerts opened for an agent, newest first, with the state computed from the lease and expiry.",
+                PText("state"), PServer(), PText("family"), PLimit(20)),
+            ["get_investigation_reports"] = R(CatAlerts, "Investigation requests with their agent reports and journal: one request by id (with its brief), or those opened in the window.",
+                PServer(), PText("request_id"), PHours(24)),
             ["get_mute_rules"] = R(CatAlerts, "The alert mute rules (enabled-only by default).", PBool("enabled_only", true)),
             /* #3598: a read the web host's viewer role can serve — the tool selects only the non-secret carve
                (route_id, metric_match, the GENERATED configured_channels presence column, smtp_recipients,
@@ -4606,6 +7536,9 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             /* ── blocking / deadlocks (DarlingMcpBlockingTools) ── */
             ["get_blocked_process_xml"] = R(CatBlocking, "Blocked-process-report XML captures.", PServer(), PHours(24), PLimit(5), PDatabases(), PAsOf()),
+            /* #6292: a web-only read (no MCP tool behind it, see WebOnlyReadNames): the lead-blocker tree of one blocked-process row,
+               fetched when the row's Block chain action is used. The key is the page's own row identity. */
+            ["get_block_chain"] = R(CatBlocking, "The lead-blocker tree of one blocked-process row: the lead blocker at the root and the sessions it blocks under it, built from the blocked-process reports and DMV blocking snapshots within five minutes of the row, exactly as the desktop viewer builds it.", PServer(), PReqText("event_time"), PReqInt("blocked_spid"), PInt("blocked_ecid", 0)),
             ["get_blocking"] = R(CatBlocking, "Blocking chains observed in the window.", PServer(), PHours(24), PLimit(30), PDatabases(), PAsOf()),
             ["get_blocking_trend"] = R(CatBlocking, "Blocking-event counts over time.", PServer(), PHours(24), PDatabases(), PAsOf()),
             ["get_deadlock_detail"] = R(CatBlocking, "Deadlock graph detail for recent deadlocks.", PServer(), PHours(24), PLimit(5), PBool("full_graph", true), PAsOf()),
@@ -4625,11 +7558,14 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_query_store_health"] = R(CatConfig, "Per-database Query Store health: actual vs desired state, readonly_reason, storage vs cap, and the two capture modes (query_capture_mode ALL / AUTO / CUSTOM / NONE, wait_stats_capture_mode ON / OFF; null on a pre-rung row or a pre-2017 engine).", PServer(), PDatabases()),
             ["get_server_config_changes"] = R(CatConfig, "Server-configuration changes over time.", PServer(), PHours(168), PAsOf()),
             ["get_trace_flag_changes"] = R(CatConfig, "Trace-flag changes over time.", PServer(), PHours(168), PAsOf()),
+            ["get_known_patterns"] = R(CatConfig, "The operator-written known-pattern entries (a note on a recurring alert pattern); get_alert_history rows carry the matches.", PServer(), PText("metric_name")),
+            ["get_change_watches"] = R(CatConfig, "A server's change watches, open and closed: each recorded change opens a 60 minute watch, with its changes, measures and result.", PServer(), PText("state"), PLimit(20)),
 
             /* ── core data reads (DarlingMcpDataTools + long-query / fleet tools) ── */
-            ["get_collection_health"] = R(CatData, "Per-collector collection health for a server.", PServer()),
+            ["get_collection_health"] = R(CatData, "Per-collector collection health for a server. server=* with collector_name answers for that one collector on every enabled server (hours: default 24).", PServer(), PText("collector_name")),
             ["get_collection_log"] = R(CatData, "Raw per-run collector log for a server, newest first — or slowest first when min_duration_ms is supplied.", PServer(), PHours(24), PLimit(200), PAsOf(), PText("collector_name"), PDouble("min_duration_ms"), PText("status")),
             ["get_current_waits_trend"] = R(CatData, "Waiting-task and blocked-session series over time.", PServer(), PHours(4), PDatabases(), PAsOf()),
+            ["get_client_timeouts"] = R(CatData, "Client-timeout (attention) counts, rate and top databases, applications and statements over the window, with the newest sampled events (#5640).", PServer(), PHours(1), PLimit(20), PAsOf()),
             ["get_blocking_stats"] = R(CatData, "Blocking duration and deadlock severity per minute.", PServer(), PHours(24), PDatabases(), PAsOf()),
             ["get_cpu_utilization"] = R(CatData, "CPU utilization over time.", PServer(), PHours(4), PAsOf(), PInt("bucket_minutes")),
             ["get_file_io_stats"] = R(CatData, "Per-file IO stall/throughput stats.", PServer(), PDatabases()),
@@ -4639,14 +7575,21 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_query_heatmap"] = R(CatData, "Query counts per (time bin x log-magnitude bucket) - the viewer's Query Heatmap as a table.", PServer(), PHours(24), PText("metric"), PDatabases(), PInt("bucket_minutes", 5), PLimit(500), PAsOf()),
             ["get_query_store_regressions"] = R(CatData, "Queries whose Query Store performance got WORSE vs their baseline.", PServer(), PHours(24), PDatabases(), PLimit(50), PBool("full_text", true), PAsOf()),
             ["get_query_store_clutter"] = R(CatData, "The Query Store CLUTTER view: per database the collector's read cost (how often and by how much it was the slowest fan-out item), plan churn (plans per query, arrivals per day, one-shot plans) and the options row, each with raw numbers and a decomposed verdict; ONE per-server overhead block (non-sleep QDS_* wait deltas with the excluded sleep waits named, and the Query Store memory clerk). Replicas excluded by architecture with the reason on the row; query_capture_mode (ALL / AUTO / CUSTOM / NONE) carried with capture_mode_known beside it, null meaning a capture older than the V137 rung rather than NONE. window_truncated says the raw tier did not hold the whole window. Composed from collected rows - no new query against the server.", PServer(), PHours(24), PLimit(DarlingMcpQueryStoreClutterTools.DefaultLimit), PBool("include_fleet_median", false), PAsOf(), PDatabases()),
+            ["get_resource_use_by_tag"] = R(CatData, "Resource use rolled up by query tag, one section per source (plan cache, Query Store, procedures, blocking, deadlocks); sections are never summed. Omit the server for the fleet.", PServer(), PHours(24), PText("tag"), PLimit(DarlingMcpQueryTagRollupTools.DefaultLimit), PAsOf()),
             ["get_query_store_query_history"] = R(CatData, "One Query Store query's executions, duration and CPU per plan over the window (requires database_name, query_id).", PReqText("database_name"), PReqInt("query_id"), PServer(), PHours(24), PAsOf()),
-            ["get_query_store_top"] = R(CatData, "Top Query Store queries in the window, optionally filtered by execution outcome or to one exact module before ranking; window_truncated says the raw tier did not hold the whole window (effective_hours_back how far it reached).", PServer(), PHours(24), PTop(20), PDatabases(), PAsOf(), PText("execution_type"), PText("module_name"), PBool("full_text", false)),
-            ["get_long_query_completions"] = R(CatData, "Completed long-running queries captured by the XE trace.", PServer(), PHours(24), PLimit(30), PAsOf(), PDatabases()),
+            ["get_forced_plans"] = R(CatData, "Whether each Query Store force works: one entry per plan forced in its database's newest capture, with a state (WORKING, NOT_EXERCISED, IGNORED, FAILING, UNKNOWN_PLAN_NOT_COLLECTED or REMOVED) and the evidence (database_name optional).", PServer(), PHours(24), PAsOf(), PDatabases()),
+            ["get_plan_force_precheck"] = R(CatData, "Reads one Query Store plan before anyone forces it: verdict blocked (plan_not_found or plan_already_forced, a force that cannot work) or not_blocked (never safe), the warnings with stable codes for the agent's own instructions to weigh, what a person should read first, and the checks the store could not answer (requires database_name, query_id, plan_id; compare_plan_id optional).", PReqText("database_name"), PReqInt("query_id"), PReqInt("plan_id"), PInt("compare_plan_id"), PServer(), PHours(24), PAsOf()),
+            ["get_query_store_aborts"] = R(CatData, "Queries ranked by Query Store runs that ended aborted (a client timeout or cancel) or with an exception, with each query's share of its own runs, the average aborted duration and the newest failure time; window_truncated says the store did not hold the whole window.", PServer(), PHours(24), PTop(20), PText("database_name"), PAsOf(), PBool("full_text", false)),
+            ["get_cpu_by_database"] = R(CatData, "Databases ranked by CPU over the window with each one's share of the server total, its heaviest statement and the procedure stats' CPU beside it (never added to it).", PServer(), PHours(24), PTop(20), PAsOf()),
+            ["get_load_by_caller"] = R(CatSessions, "Active-query snapshots grouped by host, program and login, ranked by CPU, with each group's share and top statements.", PServer(), PHours(1), PTop(20), PInt("statements", 3), PAsOf()),
+            ["get_query_pileups"] = R(CatSessions, "Capture times when min_sessions or more sessions ran the same query_hash at once, with the main waits and the head blocker from the nearest blocking snapshot.", PServer(), PHours(24), PInt("min_sessions", 5), PTop(10), PAsOf()),
+            ["get_query_store_top"] = R(CatData, "Top Query Store queries in the window, optionally filtered by execution outcome or to one exact module before ranking; window_truncated says the raw tier did not hold the whole window (effective_hours_back how far it reached).", PServer(), PHours(24), PTop(20), PDatabases(), PAsOf(), PText("execution_type"), PText("module_name"), PBool("full_text", false), PText("tag")),
+            ["get_long_query_completions"] = R(CatData, "Completed long-running queries captured by the XE trace.", PServer(), PHours(24), PLimit(30), PAsOf(), PDatabases(), PText("tag")),
             ["get_server_properties"] = R(CatData, "Server properties/inventory for a server.", PServer()),
             ["get_tempdb_trend"] = R(CatData, "tempdb space usage over time.", PServer(), PHours(24), PAsOf(), PInt("bucket_minutes")),
-            ["get_top_procedures_by_cpu"] = R(CatData, "Top stored procedures, ranked by CPU (the default), duration, reads or executions (order_by).", PServer(), PHours(24), PTop(20), PDatabases(), PTextDefault("order_by", "cpu"), PAsOf(), PTextDefault("detail", "summary")),
-            ["get_top_queries_by_cpu"] = R(CatData, "Top queries, ranked by CPU (the default), duration, reads or executions (order_by), optionally parallel-only / min-DOP.", PServer(), PHours(24), PTop(20), PDatabases(), PBool("parallel_only", false), PInt("min_dop", 0), PTextDefault("order_by", "cpu"), PAsOf(), PTextDefault("detail", "summary")),
-            ["get_pg_top_queries"] = R(CatData, "Top PostgreSQL query shapes by total execution time (Aurora targets).", PServer(), PHours(24), PLimit(20), PAsOf()),
+            ["get_top_procedures_by_cpu"] = R(CatData, "Top stored procedures, ranked by CPU (the default), duration, reads or executions (order_by).", PServer(), PHours(24), PTop(20), PDatabases(), PTextDefault("order_by", "cpu"), PAsOf(), PTextDefault("detail", "summary"), PText("tag")),
+            ["get_top_queries_by_cpu"] = R(CatData, "Top queries, ranked by CPU (the default), duration, reads or executions (order_by), optionally parallel-only / min-DOP.", PServer(), PHours(24), PTop(20), PDatabases(), PBool("parallel_only", false), PInt("min_dop", 0), PTextDefault("order_by", "cpu"), PAsOf(), PTextDefault("detail", "summary"), PText("tag")),
+            ["get_pg_top_queries"] = R(CatData, "Top PostgreSQL query shapes by total execution time (Aurora targets).", PServer(), PHours(24), PLimit(20), PBool("full_text", true), PAsOf()),
             ["get_pg_plans"] = R(CatData, "Captured PostgreSQL execution plans, grouped by shape. Plans are redacted at collection.", PServer(), PHours(24), PLimit(10), PText("query_id"), PAsOf()),
             ["get_pg_plan_capture_readiness"] = R(CatData, "Whether a PostgreSQL target can capture execution plans at all, facet by facet, with the remedy for each step that is not in place. Read this when a plan or target-log read is empty.", PServer(), PHours(24), PLimit(25), PAsOf()),
             ["get_pg_logging_audit"] = R(CatData, "Whether a PostgreSQL target's logging settings (log_min_duration_statement, log_lock_waits, log_temp_files, log_autovacuum_min_duration, log_checkpoints, log_connections, log_disconnections) are producing the lines they could, per setting: verdict, what it unlocks, the recommended value with its cost, and the remedy in the hosting flavour's syntax. Judged from the newest stored pg_server_config snapshot, not the live server; plan capture's own settings are listed and pointed at get_pg_plan_capture_readiness.", PServer()),
@@ -4684,7 +7627,9 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_wait_stats"] = R(CatData, "Top wait statistics in the window.", PServer(), PHours(24), PLimit(20), PAsOf()),
             ["get_wait_trend"] = R(CatData, "One wait type's totals over time (requires wait_type).", PReqText("wait_type"), PServer(), PHours(24), PAsOf(), PInt("bucket_minutes")),
             ["get_wait_types"] = R(CatData, "The wait types observed in the window.", PServer(), PHours(24), PAsOf()),
+            ["find_database"] = R(CatData, "Which monitored server holds a database: exact, case-insensitive name match against each server's newest database list, with the registry and display names, whether the server is still monitored and when the list was last seen (requires database_name).", PReqText("database_name")),
             ["list_servers"] = R(CatData, "The monitored servers known to the store."),
+            ["list_query_tags"] = R(CatData, "The query tag tree with each tag's hand assignments, their precedence over rules, and whether the tag map has caught up."),
 
             /* ── trends (DarlingMcpTrendTools) ── */
             ["get_file_io_trend"] = R(CatTrends, "File I/O read and write latency over time per database and file type, heaviest stall first; database_name charts one database per file.", PServer(), PHours(24), PAsOf(), PInt("bucket_minutes"), PDatabases()),
@@ -4693,13 +7638,16 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_perfmon_trend"] = R(CatTrends, "One perfmon counter over time (requires counter_name).", PReqText("counter_name"), PServer(), PHours(24), PAsOf(), PInt("bucket_minutes")),
             /* #3653 item 17: the four reads below disclose the WINDOW floor as window_truncated (beside
                effective_start / effective_hours_back) — not the page dialect's truncated, which they never had. */
-            ["get_procedure_duration_trend"] = R(CatTrends, "Stored-procedure elapsed ms/sec + executions/sec over time; window_truncated says the tier did not hold the whole window.", PServer(), PHours(24), PAsOf(), PInt("bucket_minutes"), PDatabases()),
+            ["get_procedure_duration_trend"] = R(CatTrends, "Stored-procedure elapsed ms/sec + executions/sec over time, or one procedure's with procedure_name (its full_name from the Top Procedures grid, plus one database_name); window_truncated says the tier did not hold the whole window.", PServer(), PHours(24), PAsOf(), PInt("bucket_minutes"), PDatabases(), PText("procedure_name")),
             ["get_query_duration_trend"] = R(CatTrends, "Query elapsed ms/sec + executions/sec over time (per-interval rates, not percentiles); window_truncated says the tier did not hold the whole window.", PServer(), PHours(24), PAsOf(), PInt("bucket_minutes"), PDatabases()),
             ["get_query_store_duration_trend"] = R(CatTrends, "Query Store duration ms/sec + executions/sec over time; window_truncated says the tier did not hold the whole window.", PServer(), PHours(24), PAsOf(), PDatabases()),
             ["get_query_trend"] = R(CatTrends, "One query's metrics over time (requires query_hash + database_name); window_truncated says the tier did not hold the whole window.", PReqText("query_hash"), PReqText("database_name"), PServer(), PHours(24), PAsOf()),
 
             /* ── health / overview (DarlingMcpHealthTools / DarlingMcpFleetTools) ── */
             ["get_server_summary"] = R(CatOverview, "A one-shot health summary for a server.", PServer()),
+            /* #6291: a web-only read (no MCP tool behind it, see WebOnlyReadNames): the four baselines (CPU, waits per second, I/O latency, blocking)
+               at the window start that the Overview strips draw their bands and anomaly markers from. Keyed by the window start the page draws. */
+            ["get_overview_baselines"] = R(CatOverview, "The four baselines the Overview strips draw their band and anomaly markers from (CPU, waits per second, I/O latency, blocking): each bucket's mean and effective standard deviation at the window start, null where there is not enough history.", PServer(), PReqText("window_start")),
             ["get_daily_summary"] = R(CatOverview, "The daily health summary (optionally for a specific date).", PServer(), PText("summary_date")),
             ["get_daily_summary_range"] = R(CatOverview, "One daily health summary per collected day over a span of days - the Performance Calendar's month grid.", PServer(), PInt("days_back", 30), PAsOf()),
             ["get_fleet_overview"] = R(CatOverview, "The banded cross-server fleet roll-up.", PHours(DefaultFleetHours), PTextDefault("detail", "summary"), PBool("worst_only", false), PText("band")),
@@ -4714,14 +7662,14 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_collector_stall_probes"] = R(CatOverview, "The out-of-band server-wide wait samples taken while one of OUR collectors was stalled mid-read - what the monitored instance was doing inside the window the sequential sweep records nothing in. Carries the outcome census beside the samples, deliberately unbanded.", PServer(), PInt("days_back", 7), PLimit(DarlingMcpStallProbeTools.DefaultLimit)),
             ["get_oversized_plan_backlog"] = R(CatOverview, "The cached plans this tool measured as too large to capture inline, and what the out-of-band sweep has done about each one: per server the three verdict buckets (pending/captured/expired, a strict partition), the attempt figures on still-pending rows, the newest capture and expiry instants, and observed_bytes min/median/max, with the per-collector census beside them. Takes no window - a worklist updated in place, not a series. Pass server_name with include_rows for the claim keys.", PServer(), PBool("include_rows", false), PLimit(DarlingMcpOversizedPlanBacklogTools.DefaultLimit)),
             ["get_slow_reads"] = R(CatOverview, "The monitoring tool's OWN slow or failed reads, newest first - each with the arguments it was asked with, the source that answered and its slowest statements. Recorded when a read took 5 seconds or more or ended in a timeout, error or limit. Optional server, surface (web/compose/mcp) and route filter.", PHours(DarlingMcpSlowReadTools.DefaultHours), PServer(), PText("surface"), PText("route"), PLimit(DarlingMcpSlowReadTools.DefaultLimit)),
-            ["get_read_latency"] = R(CatOverview, "The monitoring tool's OWN read-latency history (self-monitoring) - which of the web dashboard's or MCP server's own reads is really slow, and how often it times out. p50/p95/p99 are bucket upper-bound estimates, per (surface, route), sorted p95 desc. Optional surface (web/compose/mcp) and route filter. fallbacks and gate_failures count reads that fell back to raw.", PHours(DarlingMcpReadLatencyTools.DefaultHours), PText("surface"), PText("route"), PLimit(DarlingMcpReadLatencyTools.DefaultLimit)),
+            ["get_read_latency"] = R(CatOverview, "The monitoring tool's OWN read-latency history (self-monitoring) - which of the web dashboard's or MCP server's own reads is really slow, and how often it times out. p50/p95/p99 are bucket upper-bound estimates, per (surface, route, window band: 1h, 24h, 7d, 7d+ or none), so one route can return a row per band; sorted p95 desc. window_band is the width of the window the read asked for (its default window when it sent none). max_in_flight is the most other reads running when one started; wait_total_ms is the summed wait for a store connection. Optional surface (web/compose/mcp) and route filter. fallbacks and gate_failures count reads that fell back to raw.", PHours(DarlingMcpReadLatencyTools.DefaultHours), PText("surface"), PText("route"), PLimit(DarlingMcpReadLatencyTools.DefaultLimit)),
 
             /* ── latch / spinlock (DarlingMcpLatchSpinlockTools) ── */
             ["get_latch_stats"] = R(CatLatch, "Top latch waits in the window.", PServer(), PHours(24), PTop(10), PAsOf()),
             ["get_spinlock_stats"] = R(CatLatch, "Top spinlock activity in the window.", PServer(), PHours(24), PTop(10), PAsOf()),
 
             /* ── memory grants (DarlingMcpMemoryGrantTools) ── */
-            ["get_memory_grants"] = R(CatMemoryGrants, "Active/recent memory grants.", PServer(), PHours(1), PAsOf()),
+            ["get_memory_grants"] = R(CatMemoryGrants, "Active/recent memory grants. chart=true answers the whole window as one point per bucket per resource pool instead of grants[] and window[]; bucket_minutes picks the width.", PServer(), PHours(1), PAsOf(), PBool("chart", false), PInt("bucket_minutes")),
             ["get_memory_pressure_events"] = R(CatMemoryGrants, "Memory-pressure events in the window.", PServer(), PHours(24), PAsOf()),
             ["get_resource_semaphore"] = R(CatMemoryGrants, "Resource-semaphore state over time.", PServer(), PHours(24), PAsOf()),
 
@@ -4764,7 +7712,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_health_parser_scheduler_issues"] = R(CatSystemHealth, "system_health: non-yielding scheduler issues.", PServer(), PHours(24), PLimit(50), PAsOf()),
             ["get_health_parser_severe_errors"] = R(CatSystemHealth, "system_health: severe (sev >= 19) errors.", PServer(), PHours(24), PLimit(50), PAsOf(), PDatabases()),
             ["get_health_parser_significant_waits"] = R(CatSystemHealth, "system_health: individual 500 ms+ waits with their statement.", PServer(), PHours(24), PLimit(50), PAsOf()),
-            ["get_health_parser_system_health"] = R(CatSystemHealth, "system_health: the raw parsed session records.", PServer(), PHours(24), PLimit(50), PAsOf()),
+            ["get_health_parser_system_health"] = R(CatSystemHealth, "system_health: the raw parsed session records. chart=true answers one row per time bucket (mean CPU) across the whole window instead of the newest limit rows; bucket_minutes picks the width.", PServer(), PHours(24), PLimit(50), PAsOf(), PBool("chart", false), PInt("bucket_minutes")),
             // FinOps web parity (#4843), set A: append new FinOps entries below this line only.
             ["get_finops_inventory"] = R(CatFinOps, "FinOps Server Inventory for the whole fleet, one row per configured server. view is server_inventory; limit caps servers returned; include_removed adds servers removed from the configuration.", PText("view"), PInt("limit", DarlingMcpFinOpsInventoryTools.DefaultLimit), PBool("include_removed", false)),
             ["get_finops_recommendations"] = R(CatFinOps, "FinOps recommendations for one server, High severity first; est_savings_usd_month is null without a monthly cost.", PServer()),
@@ -5194,8 +8142,11 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /* ── request body parsing + response building ── */
 
     /// <summary>A parsed create/update body: name (required, trimmed), description (optional), the definition as
-    /// raw JSON text (re-serialized from the parsed node), and version (present only on updates).</summary>
-    private sealed record ViewWriteRequest(string Name, string? Description, string DefinitionJson, int? Version);
+    /// raw JSON text (re-serialized from the parsed node), version (present only on updates), and (#6214) the folder
+    /// (<see cref="FolderGiven"/> tells an omitted key from an explicit null, which means the top level) and the personal flag
+    /// (null when omitted).</summary>
+    private sealed record ViewWriteRequest(
+        string Name, string? Description, string DefinitionJson, int? Version, bool FolderGiven = false, string? Folder = null, bool? Personal = null);
 
     /// <summary>Parses the request body into a <see cref="ViewWriteRequest"/>, or returns a caller-facing error
     /// (the definition's STRUCTURE is validated separately by <see cref="ValidateDefinition"/>).</summary>
@@ -5238,7 +8189,34 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             version = v;
         }
 
-        return (new ViewWriteRequest(name.Trim(), description, definitionJson, version), null);
+        var folderGiven = obj.ContainsKey("folder");
+        string? folder = null;
+        if (folderGiven && obj["folder"] is { } folderNode)
+        {
+            if (folderNode is not JsonValue folderValue || !folderValue.TryGetValue<string>(out var folderText))
+            {
+                return (null, "'folder' must be a string, or null for the top level.");
+            }
+
+            folder = CustomViewStore.NormalizeFolder(folderText, out var folderError);
+            if (folderError is not null)
+            {
+                return (null, folderError);
+            }
+        }
+
+        bool? personal = null;
+        if (obj["personal"] is { } personalNode)
+        {
+            if (personalNode is not JsonValue personalValue || !personalValue.TryGetValue<bool>(out var personalFlag))
+            {
+                return (null, "'personal' must be true or false.");
+            }
+
+            personal = personalFlag;
+        }
+
+        return (new ViewWriteRequest(name.Trim(), description, definitionJson, version, folderGiven, folder, personal), null);
     }
 
     /// <summary>The full single-view wire shape (definition embedded as JSON, NOT an escaped string). Shared by
@@ -5254,7 +8232,16 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         ["created_at"] = view.CreatedAt,
         ["updated_at"] = view.UpdatedAt,
         ["updated_by"] = view.UpdatedBy,
+        ["folder"] = view.Folder,
+        ["personal"] = view.Personal,
+        ["created_by"] = view.CreatedBy,
+        ["mine"] = view.Mine,
     };
+
+    /// <summary>The 400 sentence for a personal view a session cannot own (#6214): a session that names a person (a cookie from before
+    /// owner keys existed) signs in again; one with no person at all has none to give.</summary>
+    internal static string NoOwnerKeyMessage(DarlingWebSeat seat) =>
+        seat.Subject is null ? CustomViewStore.NoIdentityMessage : CustomViewStore.SignInAgainMessage;
 
     /// <summary>The bare-array list wire shape (no definition body). Carries the view <c>kind</c> — always
     /// concrete (<c>"dashboard"</c> when the stored definition declares none) so the list page/sidebar can badge
@@ -5273,6 +8260,10 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 ["updated_at"] = view.UpdatedAt,
                 ["updated_by"] = view.UpdatedBy,
                 ["kind"] = view.Kind ?? "dashboard",
+                ["folder"] = view.Folder,
+                ["personal"] = view.Personal,
+                ["created_by"] = view.CreatedBy,
+                ["mine"] = view.Mine,
             });
         }
 
@@ -5285,7 +8276,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// definition as raw JSON text (re-serialized from the parsed node), <c>enabled</c> (defaults true when the
     /// key is absent, matching create's default and a full-replace PUT), and version (present only on updates).
     /// The definition's STRUCTURE is validated separately by <see cref="CustomAlertRuleDefinition.TryParse"/>.</summary>
-    private sealed record AlertWriteRequest(string Name, string? Description, string DefinitionJson, bool Enabled, int? Version);
+    private sealed record AlertWriteRequest(string Name, string? Description, string DefinitionJson, bool Enabled, int? Version, string? ExpiresAtText = null);
 
     /// <summary>Parses an alert create/update body into an <see cref="AlertWriteRequest"/>, or a caller-facing
     /// error. Mirrors <see cref="ParseViewBodyAsync"/>, adding the <c>enabled</c> field alert rules carry.</summary>
@@ -5336,7 +8327,20 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             version = v;
         }
 
-        return (new AlertWriteRequest(name.Trim(), description, definitionJson, enabled, version), null);
+        /* #6235: the optional expiry. Absent, null or empty means the rule does not expire (a full-replace PUT clears it, like every
+           other field the editor sends); anything else is parsed by the store call below, so a bad value is a 400, not a throw. */
+        string? expiresText = null;
+        if (obj["expires_at_utc"] is JsonValue expiresValue)
+        {
+            if (!expiresValue.TryGetValue<string>(out var expiresString))
+            {
+                return (null, $"'expires_at_utc' must be {CustomAlertExpiry.Spelling}, or null for a rule that does not expire.");
+            }
+
+            expiresText = string.IsNullOrWhiteSpace(expiresString) ? null : expiresString;
+        }
+
+        return (new AlertWriteRequest(name.Trim(), description, definitionJson, enabled, version, expiresText), null);
     }
 
     /// <summary>Extracts just the embedded <c>definition</c> object from a body as raw JSON text — the
@@ -5402,18 +8406,10 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// <see cref="Mcp.DarlingMcpCustomAlertTools"/>'s (definition embedded as JSON, plus the <c>enabled</c>
     /// column alert rules carry), so the web GET/POST/PUT and the MCP get/create/update return the same rule
     /// shape.</summary>
-    internal static JsonObject BuildFullRuleNode(CustomAlertRule rule) => new()
-    {
-        ["id"] = rule.Id,
-        ["name"] = rule.Name,
-        ["description"] = rule.Description,
-        ["definition"] = JsonNode.Parse(rule.DefinitionJson),
-        ["enabled"] = rule.Enabled,
-        ["version"] = rule.Version,
-        ["created_at"] = rule.CreatedAt,
-        ["updated_at"] = rule.UpdatedAt,
-        ["updated_by"] = rule.UpdatedBy,
-    };
+    internal static JsonObject BuildFullRuleNode(CustomAlertRule rule) =>
+        JsonSerializer.SerializeToNode(new CustomAlertRuleImage(rule.Id, rule.Name, rule.Description, JsonNode.Parse(rule.DefinitionJson),
+            rule.Enabled, rule.Version, rule.CreatedAt, rule.UpdatedAt, rule.UpdatedBy,
+            CustomAlertExpiry.Format(rule.ExpiresAtUtc), rule.IsExpiredAt(DateTime.UtcNow)))!.AsObject();
 
     /// <summary>The bare-array list wire shape (no definition body), carrying <c>enabled</c> so the list can
     /// badge a paused rule without fetching each full definition — plus <c>last_fired</c> (#3360), the naive-UTC
@@ -5435,6 +8431,8 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 ["updated_at"] = rule.UpdatedAt,
                 ["updated_by"] = rule.UpdatedBy,
                 ["last_fired"] = rule.LastFired,
+                ["expires_at_utc"] = CustomAlertExpiry.Format(rule.ExpiresAtUtc),
+                ["expired"] = rule.IsExpiredAt(DateTime.UtcNow),
             });
         }
 
@@ -5486,14 +8484,16 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// touches). <see cref="MapAll"/> builds the dispatch with the web host's own config; a caller with none
     /// gets the tool's own "unavailable" envelope rather than a null-reference throw if that one entry is ever
     /// invoked without it.</para>
+    /// <para><paramref name="readAdmission"/> (#5506 part 3) reaches only the <c>get_read_latency</c> mirror, for the same live
+    /// <c>admission</c> object the MCP tool returns; a dispatch built without it answers without that object.</para>
     /// </summary>
-    internal static IReadOnlyDictionary<string, ReadToolHandler> BuildReadDispatch(ILogger? logger = null, PostgresConfig? postgresConfig = null, MonitoredServerRegistryState? registryState = null)
+    internal static IReadOnlyDictionary<string, ReadToolHandler> BuildReadDispatch(ILogger? logger = null, PostgresConfig? postgresConfig = null, MonitoredServerRegistryState? registryState = null, ReadAdmission? readAdmission = null)
     {
         var dispatch = new Dictionary<string, ReadToolHandler>(StringComparer.Ordinal)
         {
             /* ── analysis reads (take the DarlingAnalysisService) ── */
             ["audit_config"] = (c, pg, an) => DarlingMcpTools.AuditConfig(an, pg, Server(c), c.RequestAborted),
-            ["compare_analysis"] = (c, pg, an) => DarlingMcpTools.CompareAnalysis(an, pg, Server(c), Hours(c, 4), QueryInt(c, "baseline_hours_back", null, 28), as_of: AsOf(c), cancellationToken: c.RequestAborted),
+            ["compare_analysis"] = (c, pg, an) => DarlingMcpTools.CompareAnalysis(an, pg, Server(c), Hours(c, 4), QueryNullableInt(c, "baseline_hours_back"), as_of: AsOf(c), cancellationToken: c.RequestAborted),
             ["get_analysis_facts"] = (c, pg, an) => DarlingMcpTools.GetAnalysisFacts(an, pg, Server(c), Hours(c, 4), Str(c, "source"), QueryDouble(c, "min_severity", 0), as_of: AsOf(c), cancellationToken: c.RequestAborted),
             // #4198: the tool's own default (limit 18, previews) is sized for a chat caller's token budget.
             // The viewer's two "Analysis Findings" tables render no preview-cut field and never asked for a
@@ -5503,7 +8503,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             /* ── sessions ── */
             ["get_active_queries"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpSessionTools.GetActiveQueries(pg, Server(c), Hours(c, 1), databases, QueryBool(c, "blocking_only", false), Str(c, "wait_type"), Rows(c, "limit", 50), 2000, AsOf(c), logger, c.RequestAborted)
+                ? DarlingMcpSessionTools.GetActiveQueries(pg, Server(c), Hours(c, 1), databases, QueryBool(c, "blocking_only", false), Str(c, "wait_type"), Rows(c, "limit", 50), 2000, AsOf(c), logger, c.RequestAborted, tag: Str(c, "tag"), collectionTime: Str(c, "collection_time"), snapshotsOnly: QueryBool(c, "snapshots_only", false))
                 : DatabaseNamesRefusal(c),
             ["get_session_stats"] = (c, pg, an) => DarlingMcpSessionTools.GetSessionStats(pg, Server(c), c.RequestAborted),
             ["get_waiting_tasks"] = (c, pg, an) => DatabaseNames(c) is { } databases
@@ -5511,16 +8511,18 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 : DatabaseNamesRefusal(c),
 
             /* ── alerts / mute rules ── */
-            ["get_alert_history"] = (c, pg, an) => DarlingMcpAlertTools.GetAlertHistory(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), as_of: AsOf(c), include_dismissed: QueryBool(c, "include_dismissed", false), cancellationToken: c.RequestAborted),
+            ["get_alert_history"] = (c, pg, an) => DarlingMcpAlertTools.GetAlertHistory(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), as_of: AsOf(c), include_dismissed: QueryBool(c, "include_dismissed", false), metric_name: Str(c, "metric_name"), family: Str(c, "family"), include_streak: QueryBool(c, "include_streak", false), cancellationToken: c.RequestAborted),
             ["get_alert_details"] = (c, pg, an) => First(c, "server_id") is null ? MissingParam("server_id")
                 : !RequireText(c, "metric_name", out var detailsMetric) ? MissingParam("metric_name")
                 : !RequireText(c, "alert_time", out var detailsTime) ? MissingParam("alert_time")
                 : int.TryParse(First(c, "server_id"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var detailsServerId)
                     ? DarlingMcpAlertTools.GetAlertDetails(pg, detailsServerId, detailsMetric, detailsTime, c.RequestAborted)
                     : DarlingMcpAlertTools.GetAlertDetails(pg, 0, "", detailsTime, c.RequestAborted),
-            ["get_alert_settings"] = (c, pg, an) => DarlingMcpAlertTools.GetAlertSettings(pg, c.RequestAborted),
+            ["get_alert_settings"] = (c, pg, an) => DarlingMcpAlertTools.GetAlertSettings(pg, Server(c), c.RequestAborted),
             ["get_mute_rules"] = (c, pg, an) => DarlingMcpAlertTools.GetMuteRules(pg, QueryBool(c, "enabled_only", true), c.RequestAborted),
             ["get_notification_routes"] = (c, pg, an) => DarlingMcpAlertTools.GetNotificationRoutes(pg, c.RequestAborted),
+            ["list_investigation_requests"] = (c, pg, an) => DarlingMcpInvestigationTools.ListInvestigationRequests(pg, Str(c, "state"), Server(c), Str(c, "family"), QueryInt(c, "limit", null, 20), c.RequestAborted),
+            ["get_investigation_reports"] = (c, pg, an) => DarlingMcpInvestigationTools.ReportsAsync(pg, McpDataDetail.Full, Server(c), Str(c, "request_id"), Hours(c, 24), c.RequestAborted),
 
             /* ── fleet sweep reports (#3466 lane 4) ── the tool mirror beside the dedicated /api/sweeps
                routes, the /api/fleet + /api/read/get_fleet_overview coexistence: the page reads its own
@@ -5547,6 +8549,14 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_blocking"] = (c, pg, an) => DatabaseNames(c) is { } databases
                 ? DarlingMcpBlockingTools.GetBlocking(pg, Server(c), Hours(c, 24), Rows(c, "limit", 30), null, false, AsOf(c), databases, DarlingMcpBlockingTools.WebSqlTextPreviewLength, registryState, logger, c.RequestAborted)
                 : DatabaseNamesRefusal(c),
+            /* #6292: the web-only Block chain read. A key that is present but unreadable is refused, never defaulted; an omitted ecid is 0, as the
+               grid carries it. The tree is the Viewer's own, built by the shared reconstruction. */
+            ["get_block_chain"] = (c, pg, an) => !RequireText(c, "event_time", out var chainEventTime)
+                ? MissingParam("event_time")
+                : !OptionalInt(c, "blocked_spid", out var chainSpid) ? UnparseableParam("blocked_spid")
+                : chainSpid is null ? MissingParam("blocked_spid")
+                : !OptionalInt(c, "blocked_ecid", out var chainEcid) ? UnparseableParam("blocked_ecid")
+                : DarlingWebBlockChain.GetBlockChain(pg, Server(c), chainEventTime, chainSpid.Value, chainEcid ?? 0, c.RequestAborted),
             ["get_blocking_trend"] = (c, pg, an) => DatabaseNames(c) is { } databases
                 ? DarlingMcpBlockingTools.GetBlockingTrend(pg, Server(c), Hours(c, 24), AsOf(c), databases, c.RequestAborted)
                 : DatabaseNamesRefusal(c),
@@ -5568,7 +8578,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                web viewer has always shown the whole query text. The row pins its OWN default to true so
                #4198's MCP-side budget cut does not silently truncate what the viewer renders. */
             ["get_plan_corrections"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpPlanCorrectionTools.GetPlanCorrections(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), AsOf(c), QueryBool(c, "full_text", true), databases, null, c.RequestAborted)
+                ? DarlingMcpPlanCorrectionTools.GetPlanCorrections(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), AsOf(c), QueryBool(c, "full_text", true), databases, null, c.RequestAborted, collapse: true)
                 : DatabaseNamesRefusal(c),
 
             /* ── config (current + history) ── */
@@ -5587,13 +8597,15 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 ? DarlingMcpConfigHistoryTools.GetQueryStoreHealth(pg, Server(c), databases, c.RequestAborted)
                 : DatabaseNamesRefusal(c),
             ["get_server_config_changes"] = (c, pg, an) => DarlingMcpConfigHistoryTools.GetServerConfigChanges(pg, Server(c), Hours(c, 168), as_of: AsOf(c), cancellationToken: c.RequestAborted),
+            ["get_known_patterns"] = (c, pg, an) => DarlingMcpKnownPatternTools.GetKnownPatterns(pg, Server(c), Str(c, "metric_name"), cancellationToken: c.RequestAborted),
+            ["get_change_watches"] = (c, pg, an) => DarlingMcpChangeWatchTools.GetChangeWatches(pg, Server(c), Str(c, "state"), Rows(c, "limit", 20), c.RequestAborted),
             ["get_trace_flag_changes"] = (c, pg, an) => DarlingMcpConfigHistoryTools.GetTraceFlagChanges(pg, Server(c), Hours(c, 168), as_of: AsOf(c), cancellationToken: c.RequestAborted),
 
             /* ── core data reads ── */
             /* #4198: full_detail=true keeps the web viewer's payload exactly what it was before the default
                cut — every field on every collector row, never the compact shape a boring-healthy row gets
                by default. */
-            ["get_collection_health"] = (c, pg, an) => DarlingMcpDataTools.GetCollectionHealth(pg, Server(c), full_detail: true, cancellationToken: c.RequestAborted),
+            ["get_collection_health"] = (c, pg, an) => DarlingMcpDataTools.GetCollectionHealth(pg, Server(c), full_detail: true, collector_name: Str(c, "collector_name"), hours_back: Hours(c, 24), cancellationToken: c.RequestAborted),
             /* #4198: full_text: true, because error_message carried no preview cap before this PR — the
                web viewer keeps that behavior (an operator reading the Collection Log grid gets the whole
                error, the same way get_deadlock_detail's row passes TrendBudget.Chart-style overrides to
@@ -5606,6 +8618,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_current_waits_trend"] = (c, pg, an) => DatabaseNames(c) is { } databases
                 ? DarlingMcpDataTools.GetCurrentWaitsTrend(pg, Server(c), Hours(c, 4), databases, AsOf(c), c.RequestAborted)
                 : DatabaseNamesRefusal(c),
+            ["get_client_timeouts"] = (c, pg, an) => DarlingMcpClientTimeoutTools.GetClientTimeouts(pg, Server(c), Hours(c, 1), Rows(c, "limit", 20), AsOf(c), logger, c.RequestAborted),
             ["get_blocking_stats"] = (c, pg, an) => DatabaseNames(c) is { } databases
                 ? DarlingMcpDataTools.GetBlockingStats(pg, Server(c), Hours(c, 24), databases, AsOf(c), logger, c.RequestAborted)
                 : DatabaseNamesRefusal(c),
@@ -5631,7 +8644,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 ? DarlingMcpQueryStoreRegressionTools.GetQueryStoreRegressions(pg, Server(c), Hours(c, 24), databases, Rows(c, "limit", 50), full_text: QueryBool(c, "full_text", true), as_of: AsOf(c), logger: logger, cancellationToken: c.RequestAborted)
                 : DatabaseNamesRefusal(c),
             ["get_query_store_clutter"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpQueryStoreClutterTools.GetQueryStoreClutter(pg, Server(c), Hours(c, 24), Rows(c, "limit", DarlingMcpQueryStoreClutterTools.DefaultLimit), QueryBool(c, "include_fleet_median", false), AsOf(c), databases, c.RequestAborted)
+                ? DarlingMcpQueryStoreClutterTools.GetQueryStoreClutter(pg, Server(c), Hours(c, 24), Rows(c, "limit", DarlingMcpQueryStoreClutterTools.DefaultLimit), QueryBool(c, "include_fleet_median", false), AsOf(c), databases, logger, c.RequestAborted)
                 : DatabaseNamesRefusal(c),
             /* #4198: query_text already had a 2000-character cap before this tool had a full_text opt-in at
                all, so the viewer keeps that exact number through the previewLength overload -- QueryBool
@@ -5639,28 +8652,44 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                query override) reproduces the page exactly as it always rendered. */
             /* #5234: the History button's read. The same refusal ladder as get_query_store_plan_xml: a key that is present
                but unreadable is refused, never defaulted. */
+            ["get_resource_use_by_tag"] = (c, pg, an) => DarlingMcpQueryTagRollupTools.GetResourceUseByTag(pg, Server(c), Hours(c, 24), Str(c, "tag"), Rows(c, "limit", DarlingMcpQueryTagRollupTools.DefaultLimit), as_of: AsOf(c), logger: logger, cancellationToken: c.RequestAborted),
             ["get_query_store_query_history"] = (c, pg, an) => !RequireText(c, "database_name", out var qshDatabase)
                 ? MissingParam("database_name")
                 : !OptionalLong(c, "query_id", out var qshQueryId) ? UnparseableParam("query_id")
                 : qshQueryId is null ? MissingParam("query_id")
                 : DarlingMcpQueryStoreHistoryTools.GetQueryStoreQueryHistory(pg, qshDatabase, qshQueryId.Value, Server(c), Hours(c, 24), AsOf(c), c.RequestAborted),
+            ["get_forced_plans"] = (c, pg, an) => DatabaseNames(c) is { } fpDatabases
+                ? DarlingMcpForcedPlanTools.GetForcedPlans(pg, Server(c), Hours(c, 24), AsOf(c), fpDatabases, c.RequestAborted)
+                : DatabaseNamesRefusal(c),
+            ["get_plan_force_precheck"] = (c, pg, an) => !RequireText(c, "database_name", out var pfDatabase)
+                ? MissingParam("database_name")
+                : !OptionalLong(c, "query_id", out var pfQueryId) ? UnparseableParam("query_id")
+                : pfQueryId is null ? MissingParam("query_id")
+                : !OptionalLong(c, "plan_id", out var pfPlanId) ? UnparseableParam("plan_id")
+                : pfPlanId is null ? MissingParam("plan_id")
+                : !OptionalLong(c, "compare_plan_id", out var pfCompareId) ? UnparseableParam("compare_plan_id")
+                : DarlingMcpPlanForcePrecheckTools.GetPlanForcePrecheck(pg, pfDatabase, pfQueryId.Value, pfPlanId.Value, Server(c), pfCompareId, Hours(c, 24), AsOf(c), logger, c.RequestAborted),
+            ["get_query_store_aborts"] = (c, pg, an) => DarlingMcpQueryStoreAbortsTools.GetQueryStoreAborts(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), DatabaseFilter.One(Str(c, "database_name")), AsOf(c), QueryBool(c, "full_text", false), 2000, c.RequestAborted),
+            ["get_cpu_by_database"] = (c, pg, an) => DarlingMcpWhoDroveItTools.GetCpuByDatabaseCore(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), AsOf(c), c.RequestAborted),
+            ["get_load_by_caller"] = (c, pg, an) => DarlingMcpWhoDroveItTools.GetLoadByCallerCore(pg, Server(c), Hours(c, 1), Rows(c, "top", 20), Rows(c, "statements", 3), AsOf(c), c.RequestAborted),
+            ["get_query_pileups"] = (c, pg, an) => DarlingMcpWhoDroveItTools.GetQueryPileupsCore(pg, Server(c), Hours(c, 24), Rows(c, "min_sessions", 5), Rows(c, "top", 10), AsOf(c), c.RequestAborted),
             ["get_query_store_top"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpDataTools.GetQueryStoreTop(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), databases, as_of: AsOf(c), execution_type: Str(c, "execution_type"), module_name: Str(c, "module_name"), full_text: QueryBool(c, "full_text", false), previewLength: 2000, cancellationToken: c.RequestAborted)
+                ? DarlingMcpDataTools.GetQueryStoreTop(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), databases, as_of: AsOf(c), execution_type: Str(c, "execution_type"), module_name: Str(c, "module_name"), full_text: QueryBool(c, "full_text", false), previewLength: 2000, cancellationToken: c.RequestAborted, tag: Str(c, "tag"), responseByteBudget: null)
                 : DatabaseNamesRefusal(c),
             ["get_long_query_completions"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpLongQueryTools.GetLongQueryCompletions(pg, Server(c), Hours(c, 24), Rows(c, "limit", 30), AsOf(c), databases, logger, c.RequestAborted)
+                ? DarlingMcpLongQueryTools.GetLongQueryCompletions(pg, Server(c), Hours(c, 24), Rows(c, "limit", 30), AsOf(c), databases, logger, c.RequestAborted, tag: Str(c, "tag"))
                 : DatabaseNamesRefusal(c),
             ["get_server_properties"] = (c, pg, an) => DarlingMcpDataTools.GetServerProperties(pg, Server(c), c.RequestAborted),
             ["get_tempdb_trend"] = (c, pg, an) => OptionalInt(c, "bucket_minutes", out var bucketMinutes)
                 ? DarlingMcpDataTools.GetTempDbTrend(pg, Server(c), Hours(c, 24), AsOf(c), bucketMinutes, TrendBudget.Chart, cancellationToken: c.RequestAborted)
                 : UnparseableParam("bucket_minutes"),
             ["get_top_procedures_by_cpu"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpDataTools.GetTopProceduresRanked(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), databases, as_of: AsOf(c), detail: Str(c, "detail") ?? "summary", order_by: Str(c, "order_by"), cancellationToken: c.RequestAborted)
+                ? DarlingMcpDataTools.GetTopProceduresRanked(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), databases, as_of: AsOf(c), detail: Str(c, "detail") ?? "summary", order_by: Str(c, "order_by"), cancellationToken: c.RequestAborted, logger: logger, tag: Str(c, "tag"))
                 : DatabaseNamesRefusal(c),
             ["get_top_queries_by_cpu"] = (c, pg, an) => DatabaseNames(c) is { } databases
-                ? DarlingMcpDataTools.GetTopQueriesRanked(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), databases, QueryBool(c, "parallel_only", false), QueryInt(c, "min_dop", null, 0), group_by: "query_hash", as_of: AsOf(c), detail: Str(c, "detail") ?? "summary", order_by: Str(c, "order_by"), cancellationToken: c.RequestAborted)
+                ? DarlingMcpDataTools.GetTopQueriesRanked(pg, Server(c), Hours(c, 24), Rows(c, "top", 20), databases, QueryBool(c, "parallel_only", false), QueryInt(c, "min_dop", null, 0), group_by: "query_hash", as_of: AsOf(c), detail: Str(c, "detail") ?? "summary", order_by: Str(c, "order_by"), cancellationToken: c.RequestAborted, tag: Str(c, "tag"))
                 : DatabaseNamesRefusal(c),
-            ["get_pg_top_queries"] = (c, pg, an) => DarlingMcpPgStatementTools.GetPgTopQueries(pg, Server(c), Hours(c, 24), Rows(c, "limit", 20), as_of: AsOf(c), cancellationToken: c.RequestAborted),
+            ["get_pg_top_queries"] = (c, pg, an) => DarlingMcpPgStatementTools.GetPgTopQueries(pg, Server(c), Hours(c, 24), Rows(c, "limit", 20), full_text: QueryBool(c, "full_text", true), as_of: AsOf(c), cancellationToken: c.RequestAborted),
             /* query_id arrives as TEXT and is passed through as text (#2548): a queryid that made a
                round trip through a JSON number has already been rounded, and the tool rejects one it
                cannot parse exactly rather than silently matching nothing. */
@@ -5713,7 +8742,11 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                     : UnparseableParam("bucket_minutes"))
                 : MissingParam("wait_type"),
             ["get_wait_types"] = (c, pg, an) => DarlingMcpDataTools.GetWaitTypes(pg, Server(c), Hours(c, 24), as_of: AsOf(c), cancellationToken: c.RequestAborted),
+            ["find_database"] = (c, pg, an) => !RequireText(c, "database_name", out var fdDatabase)
+                ? MissingParam("database_name")
+                : DarlingMcpFindDatabaseTools.FindDatabase(pg, fdDatabase, c.RequestAborted),
             ["list_servers"] = (c, pg, an) => DarlingMcpDataTools.ListServers(pg, c.RequestAborted),
+            ["list_query_tags"] = (c, pg, an) => DarlingMcpQueryTagTools.ListQueryTags(pg, c.RequestAborted),
 
             /* ── trends ── */
             /* #3897: the trends a page charts pass the CHART budget — a browser draws far more points than a model
@@ -5739,7 +8772,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 : MissingParam("counter_name"),
             ["get_procedure_duration_trend"] = (c, pg, an) => OptionalInt(c, "bucket_minutes", out var bucketMinutes)
                 ? (DatabaseNames(c) is { } databases
-                    ? DarlingMcpTrendTools.GetProcedureDurationTrend(pg, Server(c), Hours(c, 24), AsOf(c), bucketMinutes, databases, TrendBudget.Chart, cancellationToken: c.RequestAborted)
+                    ? DarlingMcpTrendTools.GetProcedureDurationTrend(pg, Server(c), Hours(c, 24), AsOf(c), bucketMinutes, databases, TrendBudget.Chart, Str(c, "procedure_name"), c.RequestAborted)
                     : DatabaseNamesRefusal(c))
                 : UnparseableParam("bucket_minutes"),
             ["get_query_duration_trend"] = (c, pg, an) => OptionalInt(c, "bucket_minutes", out var bucketMinutes)
@@ -5758,6 +8791,10 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
             /* ── health / overview ── */
             ["get_server_summary"] = (c, pg, an) => DarlingMcpHealthTools.GetServerSummary(pg, Server(c), registryState, logger, c.RequestAborted),
+            /* #6291: the web-only Overview baselines read. A key that is present but unreadable is refused, never defaulted. */
+            ["get_overview_baselines"] = (c, pg, an) => !RequireText(c, "window_start", out var baselineWindowStart)
+                ? MissingParam("window_start")
+                : DarlingWebOverviewBaselines.GetOverviewBaselines(pg, an, Server(c), baselineWindowStart, c.RequestAborted),
             ["get_daily_summary"] = (c, pg, an) => DarlingMcpHealthTools.GetDailySummary(pg, Server(c), Str(c, "summary_date"), registryState, logger, c.RequestAborted),
             ["get_daily_summary_range"] = (c, pg, an) => DarlingMcpHealthTools.GetDailySummaryRange(pg, Server(c), QueryInt(c, "days_back", null, 30), AsOf(c), registryState, logger, c.RequestAborted),
             ["get_fleet_overview"] = (c, pg, an) => DarlingMcpFleetTools.GetFleetOverview(pg, Hours(c, DefaultFleetHours), Str(c, "detail") ?? "summary", QueryBool(c, "worst_only", false), Str(c, "band"), registryState: registryState, logger: logger, cancellationToken: c.RequestAborted),
@@ -5776,14 +8813,16 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             ["get_collector_stall_probes"] = (c, pg, an) => DarlingMcpStallProbeTools.GetCollectorStallProbes(pg, Server(c), QueryInt(c, "days_back", null, 7), Rows(c, "limit", DarlingMcpStallProbeTools.DefaultLimit), c.RequestAborted),
             ["get_oversized_plan_backlog"] = (c, pg, an) => DarlingMcpOversizedPlanBacklogTools.GetOversizedPlanBacklog(pg, Server(c), QueryBool(c, "include_rows", false), Rows(c, "limit", DarlingMcpOversizedPlanBacklogTools.DefaultLimit), c.RequestAborted),
             ["get_slow_reads"] = (c, pg, an) => DarlingMcpSlowReadTools.GetSlowReads(pg, Hours(c, DarlingMcpSlowReadTools.DefaultHours), Server(c), Str(c, "surface"), Str(c, "route"), Rows(c, "limit", DarlingMcpSlowReadTools.DefaultLimit), false, c.RequestAborted),
-            ["get_read_latency"] = (c, pg, an) => DarlingMcpReadLatencyTools.GetReadLatency(pg, Hours(c, DarlingMcpReadLatencyTools.DefaultHours), Str(c, "surface"), Str(c, "route"), Rows(c, "limit", DarlingMcpReadLatencyTools.DefaultLimit), c.RequestAborted),
+            ["get_read_latency"] = (c, pg, an) => DarlingMcpReadLatencyTools.GetReadLatency(pg, Hours(c, DarlingMcpReadLatencyTools.DefaultHours), Str(c, "surface"), Str(c, "route"), Rows(c, "limit", DarlingMcpReadLatencyTools.DefaultLimit), readAdmission, c.RequestAborted),
 
             /* ── latch / spinlock ── */
             ["get_latch_stats"] = (c, pg, an) => DarlingMcpLatchSpinlockTools.GetLatchStats(pg, Server(c), Hours(c, 24), Rows(c, "top", 10), as_of: AsOf(c), cancellationToken: c.RequestAborted),
             ["get_spinlock_stats"] = (c, pg, an) => DarlingMcpLatchSpinlockTools.GetSpinlockStats(pg, Server(c), Hours(c, 24), Rows(c, "top", 10), as_of: AsOf(c), cancellationToken: c.RequestAborted),
 
             /* ── memory grants ── */
-            ["get_memory_grants"] = (c, pg, an) => DarlingMcpMemoryGrantTools.GetMemoryGrants(pg, Server(c), Hours(c, 1), as_of: AsOf(c), cancellationToken: c.RequestAborted),
+            ["get_memory_grants"] = (c, pg, an) => OptionalInt(c, "bucket_minutes", out var bucketMinutes)
+                ? DarlingMcpMemoryGrantTools.GetMemoryGrants(pg, Server(c), Hours(c, 1), AsOf(c), QueryBool(c, "chart", false), bucketMinutes, TrendBudget.Chart, c.RequestAborted)
+                : UnparseableParam("bucket_minutes"),
             ["get_memory_pressure_events"] = (c, pg, an) => DarlingMcpMemoryGrantTools.GetMemoryPressureEvents(pg, Server(c), Hours(c, 24), as_of: AsOf(c), cancellationToken: c.RequestAborted),
             ["get_resource_semaphore"] = (c, pg, an) => DarlingMcpMemoryGrantTools.GetResourceSemaphore(pg, Server(c), Hours(c, 24), as_of: AsOf(c), cancellationToken: c.RequestAborted),
 
@@ -5902,10 +8941,14 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
                 ? DarlingMcpHealthParserTools.GetSevereErrors(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), databases, AsOf(c), null, c.RequestAborted)
                 : DatabaseNamesRefusal(c),
             ["get_health_parser_significant_waits"] = (c, pg, an) => DarlingMcpHealthParserTools.GetSignificantWaits(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), as_of: AsOf(c), cancellationToken: c.RequestAborted),
-            ["get_health_parser_system_health"] = (c, pg, an) => DarlingMcpHealthParserTools.GetSystemHealth(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), as_of: AsOf(c), cancellationToken: c.RequestAborted),
+            ["get_health_parser_system_health"] = (c, pg, an) => !QueryBool(c, "chart", false)
+                ? DarlingMcpHealthParserTools.GetSystemHealth(pg, Server(c), Hours(c, 24), Rows(c, "limit", 50), as_of: AsOf(c), cancellationToken: c.RequestAborted)
+                : OptionalInt(c, "bucket_minutes", out var bucketMinutes)
+                    ? DarlingMcpHealthParserTools.GetSystemHealthChart(pg, Server(c), Hours(c, 24), bucketMinutes, AsOf(c), cancellationToken: c.RequestAborted)
+                    : UnparseableParam("bucket_minutes"),
             // FinOps web parity (#4843), set A: append new FinOps entries below this line only.
             ["get_finops_inventory"] = (c, pg, an) => DarlingMcpFinOpsInventoryTools.GetFinOpsInventory(pg, First(c, "view") ?? "", QueryInt(c, "limit", null, DarlingMcpFinOpsInventoryTools.DefaultLimit), QueryBool(c, "include_removed", false), c.RequestAborted),
-            ["get_finops_recommendations"] = (c, pg, an) => DarlingMcpFinOpsRecommendationsTools.GetFinOpsRecommendations(pg, Server(c), c.RequestAborted),
+            ["get_finops_recommendations"] = (c, pg, an) => DarlingMcpFinOpsRecommendationsTools.GetFinOpsRecommendations(pg, Server(c), logger, c.RequestAborted),
             // FinOps web parity (#4843), set A ends.
             // Each set belongs to one series of changes. Append to your own set only,
             // so the two series never edit the same lines of this read list.
@@ -5915,7 +8958,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
             //
             //
             // FinOps web parity (#4843), set B: append new FinOps entries below this line only.
-            ["get_finops"] = (c, pg, an) => DarlingMcpFinOpsTools.GetFinOps(pg, First(c, "view") ?? "", Server(c), Hours(c, 24), QueryInt(c, "limit", null, 10), Str(c, "database_name"), QueryBool(c, "full_text", false), Str(c, "object_name"), c.RequestAborted),
+            ["get_finops"] = (c, pg, an) => DarlingMcpFinOpsTools.GetFinOps(pg, First(c, "view") ?? "", Server(c), Hours(c, 24), QueryInt(c, "limit", null, 10), Str(c, "database_name"), QueryBool(c, "full_text", false), Str(c, "object_name"), logger, c.RequestAborted),
             // FinOps web parity (#4843), set B ends.
         };
 
@@ -5932,6 +8975,10 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     }
 
     /* ─────────────────────────── response mapping ─────────────────────────── */
+
+    /// <summary>#5506 part 3: one web read's answer: what the caller gets, the text the read cache may store (null when
+    /// it may not), and the outcome a caller that joined the read records (null when the read recorded nothing).</summary>
+    private sealed record WebReadAnswer(IResult Answer, string? Text, ReadOutcome? Outcome);
 
     /// <summary>How a tool's returned string maps to an HTTP outcome — the four kinds of outcome a tool has
     /// (data or a miss; a failure; a refusal; a bare string nothing shapes any more), each with its code.</summary>
@@ -6019,36 +9066,55 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// tool's own catch turns <c>ex.Message</c> into <c>McpHelpers.ErrorMessageOf(result)</c> — a PostgreSQL
     /// error starting with its SQLSTATE and the server's message, or a failed store connection naming its host
     /// and port — before this method ever sees it. The sentence is logged ONCE through
-    /// <see cref="DarlingWebFailureLog.Report(ILogger,string,long,string)"/> (so the service log still names
+    /// <see cref="DarlingWebFailureLog.Report(ILogger,string,long,string,System.Threading.CancellationToken)"/> (so the service log still names
     /// what failed) and the body becomes <see cref="DarlingWebFailureLog.Body(string)"/>'s fixed message, under
     /// <see cref="DarlingWebFailureLog.StatusCode(string)"/> — 503 when the sentence carries a caught
     /// statement_timeout's 57014 token, 500 otherwise, the same split #4281's backstop gives an UNCAUGHT one.
     /// The bare <c>"Error during "</c> arm <see cref="ClassifyToolResponse"/> keeps for an un-migrated producer
     /// maps here too, for the same reason.</para>
     /// </summary>
-    internal static IResult ToHttpResult(string result, string route, ILogger logger, long elapsedMs)
+    internal static IResult ToHttpResult(string result, string route, ILogger logger, long elapsedMs, CancellationToken requestAborted)
     {
         /* #4348: the statement filter's web sweep. It runs BEFORE ClassifyToolResponse, so the error sentence
            ServerErrorResult echoes is swept too, and a body it cannot read is never written. */
         var swept = DarlingWebStatementSweep.Apply(result);
-        if (swept.Refused) return DarlingWebStatementSweep.Refusal(route, logger, elapsedMs);
+        if (swept.Refused) return DarlingWebStatementSweep.Refusal(route, logger, elapsedMs, requestAborted);
         result = swept.Text;
 
         return ClassifyToolResponse(result) switch
         {
             ToolResponseKind.JsonPassthrough => Results.Text(result, "application/json"),
             ToolResponseKind.Refusal => Results.Text(result, "application/json", statusCode: StatusCodes.Status400BadRequest),
-            ToolResponseKind.ServerError => ServerErrorResult(McpHelpers.ErrorMessageOf(result), route, logger, elapsedMs),
+            ToolResponseKind.ServerError => ServerErrorResult(McpHelpers.ErrorMessageOf(result), route, logger, elapsedMs, requestAborted),
             _ => Results.Json(new { error = result }, statusCode: StatusCodes.Status400BadRequest),
         };
+    }
+
+    /// <summary>
+    /// #5678: ends the request the way #4276 does when the browser has left and a tool's own caught failure is about to be
+    /// logged for it. A tool that catches its own exception hands back an <c>Error during ...</c> sentence and returns
+    /// normally, so the <c>OperationCanceledException</c> catch never sees it; when the cause was the caller going away (a
+    /// cancelled token can surface as a connect timeout rather than a cancellation), logging it as a read failure blames the
+    /// service for a request nobody is waiting on. Throwing <c>OperationCanceledException(requestAborted)</c> hands it to the
+    /// top-of-pipeline backstop (<see cref="DarlingWebFailureObserver"/>), which writes no line and no body for it. Only a
+    /// result that classifies as <see cref="ToolResponseKind.ServerError"/> is touched: a payload or a client-correctable
+    /// refusal is answered as before. Call it AFTER any latency sample, which is already right for a gone caller
+    /// (<see cref="ReadOutcomeClassifier.ClassifySentence"/> says Cancelled).
+    /// </summary>
+    internal static void ThrowIfCallerGone(string result, CancellationToken requestAborted)
+    {
+        if (requestAborted.IsCancellationRequested && ClassifyToolResponse(result) == ToolResponseKind.ServerError)
+        {
+            throw new OperationCanceledException(requestAborted);
+        }
     }
 
     /// <summary>The ServerError arm's body, factored out so both <see cref="ToHttpResult"/> and the
     /// <c>/api/read/*</c> loop's binding-layer catch (which holds the real <see cref="Exception"/>, not just
     /// its sentence) answer with the identical fixed shape.</summary>
-    internal static IResult ServerErrorResult(string sentence, string route, ILogger logger, long elapsedMs)
+    internal static IResult ServerErrorResult(string sentence, string route, ILogger logger, long elapsedMs, CancellationToken requestAborted)
     {
-        DarlingWebFailureLog.Report(logger, route, elapsedMs, sentence);
+        DarlingWebFailureLog.Report(logger, route, elapsedMs, sentence, requestAborted);
         return Results.Json(DarlingWebFailureLog.Body(sentence), statusCode: DarlingWebFailureLog.StatusCode(sentence));
     }
 
@@ -6387,13 +9453,110 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
         Task.FromResult(McpHelpers.Refusal(key, $"Invalid value for parameter '{key}'. {expected ?? "Expected a number."}"));
 
 
+    /// <summary>
+    /// Every query-string knob the dispatch reads as a whole number through <see cref="QueryInt"/> / <see cref="Rows"/> /
+    /// <see cref="Hours"/> (#5644 W22). <see cref="ParseInt"/> reads an unreadable one as the default, so a window or row
+    /// count the caller got wrong was answered, with a 200, for a different one than the one asked for.
+    /// </summary>
+    internal static readonly string[] IntegerQueryKeys =
+    [
+        "hours", "hours_back", "days_back", "trend_hours_back", "baseline_hours_back", "limit", "top",
+        "bucket_minutes", "min_dop", "worst_count", "statements", "min_sessions"
+    ];
+
+    /// <summary>
+    /// The 400 envelope for the first <see cref="IntegerQueryKeys"/> knob that is present but not a whole number
+    /// (<c>?hours=abc</c>, <c>?hours=1.5</c>), else null. An absent or empty knob still takes the tool's default, and a number out of
+    /// range is left to the tool, which owns that refusal. Pure over the lookup, so a test pins it without a server.
+    /// </summary>
+    internal static string? NonIntegerParamRefusal(Func<string, string?> lookup)
+    {
+        foreach (var key in IntegerQueryKeys)
+        {
+            var raw = lookup(key);
+            if (!string.IsNullOrEmpty(raw) && !int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+            {
+                return McpHelpers.Refusal(key, $"Invalid {key} value '{McpHelpers.Truncate(raw, 40)}'. Must be a whole number.");
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// #5644 W22: the window refusal (<c>hints.parameter</c> <c>hours_back</c>) a web caller got for <c>?hours=</c> out of range, said in
+    /// the parameter the caller sent. The tools name <c>hours_back</c> (the MCP parameter, kept as it is for MCP callers); the web
+    /// accepts both spellings, and a request that sent only <c>hours</c> was told off for a parameter it never used. A request that
+    /// sent <c>hours_back</c> (alone or beside <c>hours</c>), a refusal for any other parameter, and a result that is not a refusal
+    /// envelope come back unchanged. Only the standalone word is renamed: <c>baseline_hours_back</c> stays.
+    /// </summary>
+    internal static string NameWindowParameterTheCallerSent(string result, Func<string, string?> lookup)
+    {
+        if (!McpHelpers.IsRefusalEnvelope(result) || string.IsNullOrEmpty(lookup("hours")) || !string.IsNullOrEmpty(lookup("hours_back")))
+        {
+            return result;
+        }
+
+        try
+        {
+            if (JsonNode.Parse(result) is not JsonObject envelope
+                || envelope["hints"] is not JsonObject hints
+                || hints["parameter"]?.GetValue<string>() != "hours_back")
+            {
+                return result;
+            }
+
+            hints["parameter"] = "hours";
+            if (envelope["message"]?.GetValue<string>() is { } message)
+            {
+                envelope["message"] = Regex.Replace(message, @"(?<![A-Za-z0-9_])hours_back(?![A-Za-z0-9_])", "hours");
+            }
+
+            return envelope.ToJsonString();
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
+        {
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// #5644: the refusal envelope for an out-of-range <c>/api/fleet</c> window (<paramref name="hours"/> outside 1..168) or a
+    /// negative <paramref name="worstCount"/>, else null. Same envelope and sentences as the MCP tool's
+    /// <see cref="McpHelpers.ValidateHoursBack(int)"/>, with the window parameter named as the caller sent it
+    /// (<see cref="NameWindowParameterTheCallerSent"/>). Pure over the lookup, so a test pins it without a server.
+    /// </summary>
+    internal static string? FleetParamRefusal(int hours, int worstCount, Func<string, string?> lookup)
+    {
+        /* The note this makes is inert today (#5814): /api/fleet calls this before its ReadScope opens, so there is no scope
+           to note on, and the route is never offered to the slow-read log. A route that starts offering it a row must note
+           its window inside the scope. */
+        var window = DarlingReadWindow.ValidateHoursBack(hours);
+        if (window is not null)
+        {
+            return NameWindowParameterTheCallerSent(window, lookup);
+        }
+
+        return worstCount < 0
+            ? McpHelpers.Refusal("worst_count", $"Invalid worst_count value '{worstCount}'. Must be zero or a positive integer.")
+            : null;
+    }
+
+    private static string? NonIntegerParamRefusal(HttpContext context) =>
+        NonIntegerParamRefusal(key => First(context, key));
+
     private static int QueryInt(HttpContext context, string key, string? aliasKey, int def) =>
         ParseInt(First(context, key) ?? (aliasKey is null ? null : First(context, aliasKey)), def);
+
+    /// <summary>A knob whose omitted value is derived from another knob (#5633 item 12: compare_analysis's baseline follows
+    /// hours_back), so a missing or unparseable value is null, not a fixed default.</summary>
+    private static int? QueryNullableInt(HttpContext context, string key) =>
+        int.TryParse(First(context, key), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
 
     /// <summary>
     /// A row-count knob (<c>?limit=</c> / <c>?top=</c>), clamped to [1, <see cref="MaxRowLimit"/>] at the
     /// dispatch layer so an authenticated/loopback caller can't request an unbounded result set from a reader
-    /// that binds the value straight into <c>LIMIT $N</c> (the /api/fleet window is clamped the same way).
+    /// that binds the value straight into <c>LIMIT $N</c> (the /api/fleet window is refused out of range instead, #5644).
     /// </summary>
     private static int Rows(HttpContext context, string key, int def) =>
         ClampRows(QueryInt(context, key, null, def));

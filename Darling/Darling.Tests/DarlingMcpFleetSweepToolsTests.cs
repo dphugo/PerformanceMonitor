@@ -40,6 +40,7 @@ namespace Darling.Tests;
 /// store, real rows, the tool called against a real TimescaleDB) runs in the out-of-band harness the
 /// lane's verification uses, since this project cannot execute on the store's platform matrix.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpFleetSweepToolsTests
 {
     /// <summary>A dead data source (unroutable port) — proves every refusal path bails WITHOUT opening a
@@ -251,7 +252,7 @@ public sealed class DarlingMcpFleetSweepToolsTests
         Assert.Contains("DarlingMcpFleetSweepTools.GetSweepReports(pg, logger,", source, StringComparison.Ordinal);
         /* #4214 part 2: BuildReadDispatch also threads postgresConfig (get_store_host's own config seat),
            so the literal grew a second argument; still the same logger-by-closure call MapAll makes. */
-        Assert.Contains("BuildReadDispatch(logger, postgresConfig, registryState)", source, StringComparison.Ordinal);
+        Assert.Contains("BuildReadDispatch(logger, postgresConfig, registryState, readAdmission)", source, StringComparison.Ordinal);
 
         /* The delegate itself did NOT grow a seat — the ~100-entry table stays three-parameter,
            which is the whole reason the logger rides by closure. */

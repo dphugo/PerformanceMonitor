@@ -105,6 +105,10 @@ public sealed class EmailSendCore
     /// not a failed delivery, and the deliverer's shutdown path writes no history row for it. It is the only
     /// exception this method throws. Optional so every caller that has no token to give compiles unchanged.
     /// </param>
+    /// <param name="investigationJson">
+    /// #5821: the investigation request this alert opened or joined, already composed and masked, for the generic
+    /// webhook's <c>{{investigation_json}}</c> token, from Darling and Lite alike (#5820). Null (every alert that opened none) renders it empty.
+    /// </param>
     public async Task<EmailFanoutResult> TrySendAsync(
         string metricName,
         string serverName,
@@ -116,6 +120,7 @@ public sealed class EmailSendCore
         string? detailText = null,
         string? displayName = null,
         AlertNotificationMode? deliveryMode = null,
+        string? investigationJson = null,
         CancellationToken cancellationToken = default)
     {
         var emailOutcome = AlertChannelOutcome.NotAttempted;
@@ -151,7 +156,8 @@ public sealed class EmailSendCore
                WHETHER to send only; #3313's filter below decides WHICH incidents the email contains. */
             var window = TimeSpan.FromMinutes(_settings.EmailCooldownMinutes);
             var decision = await _cooldown.EvaluateAsync(
-                serverId, metricName, context?.Incidents, window);
+                serverId, metricName, context?.Incidents, window,
+                bypassCooldown: context?.EscalationBypassesCooldown == true /* #5641 */);
 
             /* #3430: the per-metric repeat ceiling, on the email channel's own budget and the cooldown's own
                instant. Consulted only once the cooldown has already said this alert sends — an alert inside
@@ -180,7 +186,7 @@ public sealed class EmailSendCore
                     context, detailText, decision.DeliverableDedupKeys, budget.Roster);
 
                 var titleName = string.IsNullOrEmpty(displayName) ? metricName : displayName;
-                var subject = $"[SQL Monitor Alert] {titleName} on {serverName}";
+                var subject = $"[SQL Monitor Alert] {WebhookAlertService.ExternalTitle(titleName, context)} on {serverName}";
 
                 /* #4220: the same triage-page link the webhook channels carry (WebhookAlertService's own
                    #2710 comment explains the key) — email was the one channel without it. The dedup key
@@ -203,7 +209,7 @@ public sealed class EmailSendCore
                    and a recipient list without them is not a configuration. #4751: `smtpConfigured` above only
                    asks that SOME enabled route names recipients, so the fall-through to the parent's list can now
                    be blank — a firing no route covers, with no default list, has nobody to send to. */
-                emailRoute = NotificationRouter.Resolve(metricName, _settings.NotificationRoutes, _settings);
+                emailRoute = NotificationRouter.Resolve(metricName, _settings.NotificationRoutes, _settings, NotificationRouter.ParseServerId(serverId));
                 var recipients = emailRoute.Email.Destination ?? _settings.SmtpRecipients;
 
                 if (string.IsNullOrWhiteSpace(recipients))
@@ -296,7 +302,7 @@ public sealed class EmailSendCore
         {
             webhook = await _webhookAlertService.TrySendWebhookAlertsAsync(
                 metricName, serverName, currentValue, thresholdValue, serverId, context, detailText, displayName,
-                deliveryMode, cancellationToken);
+                deliveryMode, investigationJson, cancellationToken);
         }
 
         /* #3598: the two paths resolve the same pure function over the same inputs, so whichever one ran is
@@ -326,6 +332,54 @@ public sealed class EmailSendCore
         (_consecutiveFailures, _lastFailureError);
 
     /// <summary>
+    /// Sends one alert resolution email (#5825) to the recipients the fire it closes went to. No cooldown, budget or
+    /// route: the caller already knows the destination, and a delivered fire always gets its one clear. Null when the
+    /// send succeeded, the SMTP error when it did not. Never throws.
+    /// </summary>
+    internal async Task<string?> TrySendResolutionEmailAsync(string recipients, AlertResolutionFacts facts)
+    {
+        ArgumentNullException.ThrowIfNull(facts);
+        var title = facts.Title;
+        var serverName = facts.ServerName;
+        try
+        {
+            var subject = $"[SQL Monitor Resolved] {title} on {serverName}";
+            /* The resolution's own body: its facts as the data table, not the fire's value and threshold rows. */
+            var (htmlBody, plainTextBody) = EmailTemplateBuilder.BuildResolutionEmail(facts, _branding);
+            await SendEmailAsync(_settings, subject, htmlBody, plainTextBody, context: null, recipients: recipients);
+            _logger.LogInformation($"Alert resolution email sent for {title} on {serverName}");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"ALERT RESOLUTION EMAIL FAILED for {title} on {serverName}: {ex.GetType().Name}: {ex.Message}");
+            return ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// #6003, D8: a notice (an investigation request that expired with no agent on it) to <paramref name="recipients"/>,
+    /// rendered as an alert email with no threshold. Null on success, else the error.
+    /// </summary>
+    internal async Task<string?> TrySendNoticeEmailAsync(
+        string recipients, string title, string serverName, string currentValue, string detailText)
+    {
+        try
+        {
+            var (htmlBody, plainTextBody) = EmailTemplateBuilder.BuildAlertEmail(
+                title, serverName, currentValue, "", _settings.EmailCooldownMinutes, _branding, detailText: detailText);
+            await SendEmailAsync(_settings, $"[SQL Monitor] {title} on {serverName}", htmlBody, plainTextBody, context: null,
+                recipients: recipients);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"NOTICE EMAIL FAILED for {title} on {serverName}: {ex.GetType().Name}: {ex.Message}");
+            return ex.Message;
+        }
+    }
+
+    /// <summary>
     /// Sends a test email to verify SMTP configuration. Returns null on success, or the error
     /// message on failure. Static — the test-send path supplies its own <see cref="IAlertSettings"/>
     /// (Lite: <c>new AppAlertSettings()</c>; Dashboard: the transient form-values adapter, MOD-1).
@@ -351,6 +405,28 @@ public sealed class EmailSendCore
         {
             return ex.Message;
         }
+    }
+
+    /// <summary>
+    /// The warning a settings window shows at Save, Test and Validate when these SMTP settings would send the
+    /// login to the mail server without encryption, or null when they would not. With SSL off,
+    /// <see cref="SmtpClient"/> ignores a STARTTLS offer and sends AUTH in the clear, so the username and
+    /// password cross the network readable by anyone on the path. The send attaches credentials only when a
+    /// username is set (see <see cref="SendEmailAsync"/>), so a password with no username is not a risk.
+    /// A warning, not a block: an internal relay on port 25 is a real setup, and the send still goes out.
+    /// </summary>
+    /// <param name="passwordSet">Whether a password will be sent: typed in the settings window or already
+    /// stored.</param>
+    public static string? CleartextCredentialsWarning(bool useSsl, string? username, bool passwordSet)
+    {
+        if (useSsl || string.IsNullOrWhiteSpace(username) || !passwordSet)
+        {
+            return null;
+        }
+
+        return "SSL is off, so the SMTP username and password are sent to the mail server without "
+            + "encryption. Anyone on the network path can read them. Turn SSL on, or use this only "
+            + "on a network you trust.";
     }
 
     /// <summary>

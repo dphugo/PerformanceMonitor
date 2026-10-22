@@ -43,6 +43,7 @@ namespace Darling.Tests;
 /// write — a bad or unknown field returns {status:"invalid"} without ever opening a connection. The live
 /// tune / CRUD round-trip (and the config_version self-bump) is gated below.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
 {
     /// <summary>A dead data source (unroutable port) — proves the validate-before-write path bails on a bad
@@ -52,19 +53,25 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
     private static readonly string[] AlertToolSurface =
     {
         "create_mute_rule",
+        /* #6231: the route author and editor (sealed through the shared writer) and the dismiss pair. */
+        "create_notification_route",
         "delete_mute_rule",
         /* #3598 (V131): the notification-routes trio — the read publishes the family taxonomy and the routes
            (destinations withheld, presence reported); the two writes are the ones that move no destination,
            the set_mute_rule_enabled / delete_mute_rule shape. */
         "delete_notification_route",
+        "dismiss_alert_history",
         "get_alert_history",
         "get_alert_settings",
         "get_mute_rules",
         "get_notification_routes",
+        "restore_alert_history",
         "set_mute_rule_enabled",
         "set_notification_route_enabled",
+        "set_notification_route_fallback",
         "update_alert_settings",
         "update_mute_rule",
+        "update_notification_route",
     };
 
     private static MethodInfo[] ToolMethods() => typeof(DarlingMcpAlertTools)
@@ -97,14 +104,16 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
     }
 
     [Theory]
-    [InlineData("get_alert_history", "server_name,hours_back,limit,as_of,include_dismissed")]
+    [InlineData("get_alert_history", "server_name,hours_back,limit,as_of,include_dismissed,metric_name,family,include_streak")]
     [InlineData("get_mute_rules", "enabled_only")]
     [InlineData("update_alert_settings", "settings_json")]
-    [InlineData("create_mute_rule", "server_name,metric_name,database_pattern,query_text_pattern,wait_type_pattern,job_name_pattern,reason,expires_at,server_id")]
-    [InlineData("delete_mute_rule", "rule_id")]
-    [InlineData("set_mute_rule_enabled", "rule_id,enabled")]
-    [InlineData("update_mute_rule", "rule_id,changes_json")]
+    /* #5915: each mute write tool also takes the optional agent_action, last (Level 2: ignored under the writes arm). */
+    [InlineData("create_mute_rule", "server_name,metric_name,database_pattern,query_text_pattern,wait_type_pattern,job_name_pattern,reason,expires_at,server_id,client_app_pattern,external_source,agent_action,starts_at")]
+    [InlineData("delete_mute_rule", "rule_id,agent_action")]
+    [InlineData("set_mute_rule_enabled", "rule_id,enabled,agent_action")]
+    [InlineData("update_mute_rule", "rule_id,changes_json,agent_action")]
     [InlineData("set_notification_route_enabled", "route_id,enabled")]
+    [InlineData("set_notification_route_fallback", "route_id,fallback_route_id")]
     [InlineData("delete_notification_route", "route_id")]
     public void ParamContract_MatchesContract(string toolName, string expectedCsv)
     {
@@ -112,10 +121,10 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
     }
 
     [Fact]
-    public void ParamContract_AlertSettings_TakesNoInputParameters()
+    public void ParamContract_AlertSettings_TakesOnlyTheOptionalServerName()
     {
-        /* Only the injected NpgsqlDataSource, which is not [Description]-decorated — an empty input schema. */
-        Assert.Empty(McpParams("get_alert_settings"));
+        /* The injected NpgsqlDataSource is not [Description]-decorated; the one input is the optional server_name (#5916). */
+        Assert.Equal(new[] { "server_name" }, McpParams("get_alert_settings").Select(p => p.Name).ToArray());
     }
 
     [Fact]
@@ -688,7 +697,8 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
         /* The single-table reads are private, so the split cannot be reintroduced -- asserted so that
            widening either back to public is a decision someone makes here rather than a quiet edit. */
         Assert.Contains("private static async Task<AlertSettingsReadRow?> ReadAlertSettingsAsync", reader, StringComparison.Ordinal);
-        Assert.Contains("private static async Task<int?> ReadDeliveryCooldownAsync", reader, StringComparison.Ordinal);
+        /* #5825: the delivery read also carries the per-channel resolution flags, so it returns a DeliveryRead. */
+        Assert.Contains("private static async Task<DeliveryRead?> ReadDeliveryAsync", reader, StringComparison.Ordinal);
 
         /* And both tool paths go through the combined entry point -- get_alert_settings and the post-write
            re-read, which is the one described to the caller as the authoritative merged state. */
@@ -1008,7 +1018,8 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
     {
         var build = typeof(DarlingMcpAlertTools).GetMethod(
             "BuildAlertSettingsPayload", BindingFlags.NonPublic | BindingFlags.Static)!;
-        var payload = build.Invoke(null, new object[] { row, deliveryCooldownMinutes })!;
+        var delivery = new Reader.DeliveryRead(deliveryCooldownMinutes, new Reader.SendResolutionsRead(false, false, false, false));
+        var payload = build.Invoke(null, new object[] { row, delivery })!;
         var json = JsonSerializer.Serialize(payload, payload.GetType(), McpHelpers.JsonOptions);
         return (JsonObject)JsonNode.Parse(json)!;
     }
@@ -1045,6 +1056,183 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
         var warnings = ((System.Collections.IEnumerable)result.GetType().GetField("Item3")!.GetValue(result)!)
             .Cast<string>().ToList();
         return (targets, error, warnings);
+    }
+
+    /// <summary>#5641 (V177): the Runnable Queue switch and its two bars are reported under <c>runnable_queue</c>
+    /// through the engine's own clamp, written under the engine's own floor, and a Critical below Warning is refused
+    /// when both are sent. (A lone bar against the stored other is checked inside the write transaction; that arm is
+    /// in the live test.)</summary>
+    [Fact]
+    public void RunnableQueue_IsReportedThroughTheClamp_AndWrittenWithTheEnginesValidation()
+    {
+        var payload = SerializedSettingsPayload(SampleSettingsRow());
+        var rq = payload["runnable_queue"]!;
+        Assert.False(rq["enabled"]!.GetValue<bool>());
+        Assert.Equal(5, rq["warning_per_scheduler"]!.GetValue<int>());
+        Assert.Equal(11, rq["critical_per_scheduler"]!.GetValue<int>());
+
+        /* A stored pair the engine would rewrite is reported the way the engine reads it. */
+        var crossed = SampleSettingsRow() with { RunnableQueueWarningPerScheduler = 9, RunnableQueueCriticalPerScheduler = 3 };
+        var crossedRq = SerializedSettingsPayload(crossed)["runnable_queue"]!;
+        Assert.Equal(9, crossedRq["warning_per_scheduler"]!.GetValue<int>());
+        Assert.Equal(9, crossedRq["critical_per_scheduler"]!.GetValue<int>());
+
+        var (targets, error) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(
+            "{\"runnable_queue\":{\"enabled\":true,\"warning_per_scheduler\":6,\"critical_per_scheduler\":6}}")!);
+        Assert.Null(error);
+        Assert.Equal(
+            new[]
+            {
+                (DarlingMcpAlertTools.AlertSettingsTable, "runnable_queue_enabled"),
+                (DarlingMcpAlertTools.AlertSettingsTable, "runnable_queue_warning_per_scheduler"),
+                (DarlingMcpAlertTools.AlertSettingsTable, "runnable_queue_critical_per_scheduler"),
+            },
+            targets.ToArray());
+
+        foreach (var body in new[]
+        {
+            "{\"runnable_queue\":{\"warning_per_scheduler\":0}}",
+            "{\"runnable_queue\":{\"critical_per_scheduler\":0}}",
+            "{\"runnable_queue\":{\"warning_per_scheduler\":\"8\"}}",
+            "{\"runnable_queue\":{\"enabled\":\"yes\"}}",
+            "{\"runnable_queue\":{\"warning_per_scheduler\":10,\"critical_per_scheduler\":9}}",
+            "{\"runnable_queue\":{\"critical_per_scheduler\":9,\"warning_per_scheduler\":10}}",
+            "{\"runnable_queue\":{\"nope\":1}}",
+        })
+        {
+            /* The tool answers "invalid" and writes nothing whenever the error is set, whatever the partial list holds. */
+            var (_, refusedError) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(body)!);
+            Assert.NotNull(refusedError);
+        }
+    }
+
+    /// <summary>#6098 (V200): <c>excluded_volumes</c> is reported at the top level beside <c>excluded_databases</c>, the write
+    /// targets that column, and anything that is not an array of strings is refused. (The canonical form it stores is
+    /// <c>VolumeExclusionsTests</c>'s.)</summary>
+    [Fact]
+    public void ExcludedVolumes_IsReported_AndWrittenInTheCanonicalForm()
+    {
+        var payload = SerializedSettingsPayload(SampleSettingsRow());
+        Assert.Equal(new[] { "S:\\", "/mnt/scratch" }, payload["excluded_volumes"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray());
+
+        var (targets, error) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(
+            "{\"excluded_volumes\":[\" S:\\\\ \",\"s:\",\"\",\"/mnt/scratch/\"]}")!);
+        Assert.Null(error);
+        var target = Assert.Single(targets);
+        Assert.Equal((DarlingMcpAlertTools.AlertSettingsTable, "excluded_volumes"), target);
+
+        var (_, notArray) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse("{\"excluded_volumes\":\"S:\\\\\"}")!);
+        Assert.NotNull(notArray);
+    }
+
+    /// <summary>#6098 input checks: an excluded_volumes entry holding a comma or a control character, an entry over 260
+    /// characters, and a list of more than 256 entries are refused with the tool's invalid answer and nothing is written
+    /// (not truncated or dropped silently). A separator-only entry is not refused: the normaliser drops it.</summary>
+    [Theory]
+    [InlineData("{\"excluded_volumes\":[\"/mnt/a,b\"]}")]
+    [InlineData("{\"excluded_volumes\":[\"/mnt/a\\u0000b\"]}")]
+    [InlineData("{\"excluded_volumes\":[\"/mnt/a\\nb\"]}")]
+    public void ExcludedVolumes_RefusesACommaOrControlCharacterEntry_AndWritesNothing(string body)
+    {
+        var (targets, error) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(body)!);
+
+        Assert.NotNull(error);
+        Assert.Contains("excluded_volumes", error);
+        Assert.Empty(targets);
+    }
+
+    private static string ArrayBody(string field, IEnumerable<string> items) =>
+        new JsonObject { [field] = new JsonArray(items.Select(i => (JsonNode?)JsonValue.Create(i)).ToArray()) }.ToJsonString();
+
+    [Fact]
+    public void ExcludedVolumes_RefusesOverLongAndOverCountInput_ButAcceptsTheLimits()
+    {
+        var (_, tooLong) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(ArrayBody("excluded_volumes", new[] { "/" + new string('a', 260) }))!);
+        var (_, tooMany) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(ArrayBody("excluded_volumes", Enumerable.Range(0, 257).Select(i => "/v" + i)))!);
+        Assert.NotNull(tooLong);
+        Assert.NotNull(tooMany);
+
+        var (okTargets, okError) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(
+            ArrayBody("excluded_volumes", Enumerable.Range(0, 255).Select(i => "/v" + i).Append("/" + new string('a', 259))))!);
+        Assert.Null(okError);
+        Assert.Single(okTargets);
+
+        var (sepTargets, sepError) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse("{\"excluded_volumes\":[\"\\\\\",\"/\"]}")!);
+        Assert.Null(sepError);
+        Assert.Single(sepTargets);
+    }
+
+    /// <summary>#6098 input checks, alert-side excluded_databases: at most 256 names of at most 128 characters and no control
+    /// character; a comma stays allowed because SQL Server database names may hold one.</summary>
+    [Fact]
+    public void ExcludedDatabases_RefusesOverLongOverCountAndControlCharacterNames_ButAllowsAComma()
+    {
+        var (okTargets, okError) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(
+            ArrayBody("excluded_databases", new[] { "Sales,2024", new string('d', 128) }))!);
+        Assert.Null(okError);
+        Assert.Single(okTargets);
+
+        foreach (var bad in new[]
+        {
+            ArrayBody("excluded_databases", new[] { new string('d', 129) }),
+            ArrayBody("excluded_databases", new[] { "a\0b" }),
+            ArrayBody("excluded_databases", Enumerable.Range(0, 257).Select(i => "db" + i)),
+        })
+        {
+            var (targets, error) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(bad)!);
+            Assert.NotNull(error);
+            Assert.Contains("excluded_databases", error);
+            Assert.Empty(targets);
+        }
+    }
+
+    /// <summary>#5640 (V179): the Client Timeouts switch and its two per-minute bars are reported under <c>client_timeouts</c>
+    /// through the engine's own clamp, written under the engine's own floor, and a Critical below Warning is refused when both
+    /// are sent. (A lone bar against the stored other is checked inside the write transaction, like Runnable Queue's.)</summary>
+    [Fact]
+    public void ClientTimeouts_IsReportedThroughTheClamp_AndWrittenWithTheEnginesValidation()
+    {
+        var payload = SerializedSettingsPayload(SampleSettingsRow());
+        var ct = payload["client_timeouts"]!;
+        Assert.True(ct["enabled"]!.GetValue<bool>());
+        Assert.Equal(4, ct["warning_per_minute"]!.GetValue<int>());
+        Assert.Equal(25, ct["critical_per_minute"]!.GetValue<int>());
+        Assert.Equal(new[] { "enabled", "warning_per_minute", "critical_per_minute", "warning_multiple", "critical_multiple" }, ct.AsObject().Select(p => p.Key).ToArray());
+
+        /* A stored pair the engine would rewrite is reported the way the engine reads it. */
+        var crossed = SampleSettingsRow() with { ClientTimeoutsWarningPerMinute = 9, ClientTimeoutsCriticalPerMinute = 3 };
+        var crossedCt = SerializedSettingsPayload(crossed)["client_timeouts"]!;
+        Assert.Equal(9, crossedCt["warning_per_minute"]!.GetValue<int>());
+        Assert.Equal(9, crossedCt["critical_per_minute"]!.GetValue<int>());
+        var belowFloor = SampleSettingsRow() with { ClientTimeoutsWarningPerMinute = 0, ClientTimeoutsCriticalPerMinute = 0 };
+        Assert.Equal(1, SerializedSettingsPayload(belowFloor)["client_timeouts"]!["warning_per_minute"]!.GetValue<int>());
+
+        var (targets, error) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(
+            "{\"client_timeouts\":{\"enabled\":true,\"warning_per_minute\":6,\"critical_per_minute\":6}}")!);
+        Assert.Null(error);
+        Assert.Equal(
+            new[]
+            {
+                (DarlingMcpAlertTools.AlertSettingsTable, "client_timeouts_enabled"),
+                (DarlingMcpAlertTools.AlertSettingsTable, "client_timeouts_warning_per_minute"),
+                (DarlingMcpAlertTools.AlertSettingsTable, "client_timeouts_critical_per_minute"),
+            },
+            targets.ToArray());
+
+        foreach (var body in new[]
+        {
+            "{\"client_timeouts\":{\"warning_per_minute\":0}}",
+            "{\"client_timeouts\":{\"critical_per_minute\":0}}",
+            "{\"client_timeouts\":{\"warning_per_minute\":\"10\"}}",
+            "{\"client_timeouts\":{\"enabled\":\"yes\"}}",
+            "{\"client_timeouts\":{\"warning_per_minute\":10,\"critical_per_minute\":9}}",
+            "{\"client_timeouts\":{\"critical_per_minute\":9,\"warning_per_minute\":10}}",
+            "{\"client_timeouts\":{\"nope\":1}}",
+        })
+        {
+            var (_, refusedError) = ParseAsPartialUpdate((JsonObject)JsonNode.Parse(body)!);
+            Assert.NotNull(refusedError);
+        }
     }
 
     /// <summary>The columns the parser would write to one table.</summary>
@@ -1126,7 +1314,17 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
            (the upgrade-day state) — so a payload that dropped the column and fell through to the file or the
            default would read 'digest' / not-'store' and fail rather than match; and a value the writer hands
            back to the same column, which is what the round-trip equality needs to see. */
-        AnalysisUncorroboratedRoute: "page");
+        AnalysisUncorroboratedRoute: "page",
+        /* #5641 (V177): deliberately NOT the shipped true / 8 / 16 -- a sample equal to the DEFAULTs would let a payload that
+           dropped the columns and fell back to the engine defaults still match. Warning is 1 or more and Critical is at
+           least Warning, so the pair is one the writer accepts. */
+        RunnableQueueEnabled: false, RunnableQueueWarningPerScheduler: 5, RunnableQueueCriticalPerScheduler: 11,
+        /* #5640 (V179): deliberately NOT the shipped false / 10 / 60 -- enabled TRUE against the shipped OFF, and a pair of 4 and 25 -- for
+           the same reason: a payload that dropped the columns and fell back to the engine defaults would not match. */
+        ClientTimeoutsEnabled: true, ClientTimeoutsWarningPerMinute: 4, ClientTimeoutsCriticalPerMinute: 25,
+        ExcludedVolumes: new[] { "S:\\", "/mnt/scratch" },
+        /* #5736 (V211): not the shipped 3 / 10, for the same reason as the floors above. */
+        ClientTimeoutsWarningMultiple: 2, ClientTimeoutsCriticalMultiple: 7);
 
     [Fact]
     public void AlertSettingsSql_ReadsSingleGlobalRow()
@@ -1195,6 +1393,7 @@ public sealed class DarlingMcpAlertToolsSurfaceAndSqlTests
     [InlineData("update_mute_rule", "changes_json,rule_id")]
     [InlineData("get_notification_routes", "")]
     [InlineData("set_notification_route_enabled", "enabled,route_id")]
+    [InlineData("set_notification_route_fallback", "route_id")]
     [InlineData("delete_notification_route", "route_id")]
     public void AdvertisedSchema_RequiredParams_MatchTheContract(string toolName, string expectedCsv)
     {
@@ -1836,7 +2035,7 @@ public sealed class UpdateMuteRuleTests
 
         Assert.Equal("updated", DarlingMcpTestData.StatusOf(json));
         Assert.True(store.Row(RuleId)!.MatchesEveryAlert);
-        Assert.Equal("(matches all alerts)", (string)Payload(json)["summary"]!);
+        Assert.Equal("(matches all alerts)", (string)Payload(json)["match_summary"]!);
     }
 
     /// <summary>create_mute_rule's expires_at spelling lands on the same field and reports under the
@@ -2090,7 +2289,7 @@ internal sealed class SlowInsertMuteRuleStore : IMuteRuleStore
 /// the sibling write tools already answer a repeat (<c>conflict</c> for custom rules and views, <c>already_muted</c>
 /// for an analysis mute). The MCP tool (<c>CreateMuteRuleOver</c>, the body <c>CreateMuteRule</c> hands the
 /// Postgres-backed store) and the web route (<c>CreateMuteRuleCore</c>) share one insert, so a rule either path made
-/// is a repeat to the other. The identity is the six scope and pattern fields plus the expiry, against rules that are
+/// is a repeat to the other. The identity is the seven scope and pattern fields plus the expiry, against rules that are
 /// enabled and unexpired.
 /// </summary>
 public sealed class RepeatedCreateMuteRuleTests
@@ -2472,7 +2671,7 @@ public sealed class RepeatedCreateMuteRuleTests
         Assert.Contains("CreateMuteRuleOver(new PgMuteRuleStore(postgres)", source, StringComparison.Ordinal);
         /* Exactly two callers of the checked insert (the tool's body and the web core), and no unchecked
            InsertAsync left on a create path. */
-        Assert.Equal(2, source.Split("await InsertUnlessDuplicateAsync(store, rule)").Length - 1);
+        Assert.Equal(2, source.Split("await InsertUnlessDuplicateAsync(store, rule").Length - 1);
         Assert.DoesNotContain("new PgMuteRuleStore(postgres).InsertAsync(rule)", source, StringComparison.Ordinal);
     }
 }
@@ -2893,6 +3092,71 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                 await DarlingMcpTestData.ExecAsync(cleanup, cleanupCt, "UPDATE config_notification SET email_cooldown_minutes = $1 WHERE id = 1", originalDeliveryCooldown);
                 await DarlingMcpTestData.ExecAsync(cleanup, cleanupCt, "DELETE FROM config_mute_rules WHERE reason = $1", muteTag);
             });
+        }
+    }
+
+    /// <summary>
+    /// #5641 (V177) against the real store: <c>update_alert_settings</c> writes the Runnable Queue switch and bars, and a LONE bar
+    /// that would cross the stored other one is refused with nothing written (the transaction's post-write check; two bars in one
+    /// body are checked in the parser and pinned without a store).
+    /// </summary>
+    [Fact]
+    public async Task UpdateAlertSettings_RunnableQueueBars_AreWritten_AndALoneCrossingBarIsRefused_AgainstDevPostgres()
+    {
+        var cs = ConnectionString;
+        Assert.SkipWhen(string.IsNullOrEmpty(cs), "Set DARLING_TEST_PG to a Postgres connection string to run the live Runnable Queue settings test.");
+
+        var ct = TestContext.Current.CancellationToken;
+        using var connection = new NpgsqlConnection(cs);
+        await connection.OpenAsync(ct);
+        await PgMigrations.MigrateAsync(connection, ct);
+        await using var postgres = NpgsqlDataSource.Create(cs!);
+        await DarlingMcpTestData.ExecAsync(connection, ct, "INSERT INTO config_service (id) VALUES (1) ON CONFLICT (id) DO NOTHING");
+        await DarlingMcpTestData.ExecAsync(connection, ct, "INSERT INTO config_alert_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING");
+        await DarlingMcpTestData.ExecAsync(connection, ct, "INSERT INTO config_notification (id) VALUES (1) ON CONFLICT (id) DO NOTHING");
+
+        /* The three columns are singletons the whole store shares: captured here, put back in the cleanup. */
+        var originalEnabled = (bool)(await ScalarAsync(connection, ct, "SELECT runnable_queue_enabled FROM config_alert_settings WHERE id = 1"))!;
+        var originalWarning = Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_warning_per_scheduler FROM config_alert_settings WHERE id = 1"));
+        var originalCritical = Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_critical_per_scheduler FROM config_alert_settings WHERE id = 1"));
+
+        var bodySucceeded = false;
+        try
+        {
+            var written = await DarlingMcpAlertTools.UpdateAlertSettings(postgres,
+                "{\"runnable_queue\":{\"enabled\":false,\"warning_per_scheduler\":6,\"critical_per_scheduler\":12}}");
+            Assert.Equal("updated", DarlingMcpTestData.StatusOf(written));
+            using (var doc = JsonDocument.Parse(written))
+            {
+                var rq = doc.RootElement.GetProperty("settings").GetProperty("runnable_queue");
+                Assert.False(rq.GetProperty("enabled").GetBoolean());
+                Assert.Equal(6, rq.GetProperty("warning_per_scheduler").GetInt32());
+                Assert.Equal(12, rq.GetProperty("critical_per_scheduler").GetInt32());
+            }
+
+            Assert.Equal(6, Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_warning_per_scheduler FROM config_alert_settings WHERE id = 1")));
+            Assert.Equal(12, Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_critical_per_scheduler FROM config_alert_settings WHERE id = 1")));
+
+            /* A lone Warning above the stored Critical, and a lone Critical below the stored Warning: both refused, both leave the row alone. */
+            foreach (var body in new[] { "{\"runnable_queue\":{\"warning_per_scheduler\":13}}", "{\"runnable_queue\":{\"critical_per_scheduler\":5}}" })
+            {
+                Assert.Equal("invalid", DarlingMcpTestData.StatusOf(await DarlingMcpAlertTools.UpdateAlertSettings(postgres, body)));
+                Assert.Equal(6, Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_warning_per_scheduler FROM config_alert_settings WHERE id = 1")));
+                Assert.Equal(12, Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_critical_per_scheduler FROM config_alert_settings WHERE id = 1")));
+            }
+
+            /* A lone bar that stays in order is written. */
+            Assert.Equal("updated", DarlingMcpTestData.StatusOf(await DarlingMcpAlertTools.UpdateAlertSettings(postgres, "{\"runnable_queue\":{\"warning_per_scheduler\":12}}")));
+            Assert.Equal(12, Convert.ToInt32(await ScalarAsync(connection, ct, "SELECT runnable_queue_warning_per_scheduler FROM config_alert_settings WHERE id = 1")));
+
+            bodySucceeded = true;
+        }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DarlingMcpTestData.ExecAsync(cleanup, cleanupCt,
+                    "UPDATE config_alert_settings SET runnable_queue_enabled = $1, runnable_queue_warning_per_scheduler = $2, runnable_queue_critical_per_scheduler = $3 WHERE id = 1",
+                    originalEnabled, originalWarning, originalCritical));
         }
     }
 

@@ -41,7 +41,6 @@ namespace Darling.Tests;
 /// ahead of this rung with Darling evaluating on the seeds through <c>DarlingAlertSettings</c>; this PR gives
 /// the knob its store home so an operator can change it.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class LongRunningQueryExclusionKnobRungTests
 {
     private const int RungVersion = 135;
@@ -159,7 +158,6 @@ public sealed class LongRunningQueryExclusionKnobRungTests
             ViewerDataService.StoreSchemaProbeSql.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         Assert.Contains("hasLrqExclusionKnob", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);

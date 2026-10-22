@@ -75,8 +75,8 @@ internal static class DiagnosticsBundle
     internal static readonly string[] ConfigShapeProjected =
     {
         "DarlingConfig.Postgres", "DarlingConfig.Servers", "DarlingConfig.Analyzer", "DarlingConfig.CapturePlans",
-        "DarlingConfig.Mcp", "DarlingConfig.Web", "DarlingConfig.QueryStatsDeferredPlanFetch", "DarlingConfig.ProcedureStatsDeferredPlanFetch", "PostgresConfig.Managed", "PostgresConfig.ConnectionString",
-        "PostgresConfig.Network", "McpConfig.Enabled", "McpConfig.Network", "WebConfig.Enabled", "WebConfig.Network",
+        "DarlingConfig.Mcp", "DarlingConfig.Web", "DarlingConfig.Reads", "ReadsConfig.MaxHeavyReads", "DarlingConfig.QueryStatsDeferredPlanFetch", "DarlingConfig.ProcedureStatsDeferredPlanFetch", "PostgresConfig.Managed", "PostgresConfig.ConnectionString",
+        "PostgresConfig.Network", "McpConfig.Enabled", "McpConfig.Network", "McpConfig.AllowWrites", "McpConfig.AllowServerAdmin", "McpConfig.AllowInvestigations", "McpConfig.AllowWindowsAuthOverUnverifiedTls", "McpConfig.DataDetail", "WebConfig.Enabled", "WebConfig.Network",
         "MonitoredServer.Engine", "MonitoredServer.AlertDeliveryModeOverride",
     };
 
@@ -85,6 +85,7 @@ internal static class DiagnosticsBundle
     {
         "DarlingConfig.QueryStoreBackfillEnabled",
         "DarlingConfig.QueryStoreTextBudgetMb",
+        "DarlingConfig.QueryStoreFetchTopN",
         "DarlingConfig.PlanContentRetentionDays",
         "DarlingConfig.ComposeStatementTimeoutSeconds",
         "DarlingConfig.PlanXmlCompression",
@@ -120,12 +121,18 @@ internal static class DiagnosticsBundle
         "MonitoredServer.TrustServerCertificate",
         "MonitoredServer.EncryptMode",
         "MonitoredServer.MultiSubnetFailover",
+        /* #6254: the Query Store replica is a host (or listener name); the bundle seeds it into the host names. */
+        "MonitoredServer.QueryStoreReplica",
         "MonitoredServer.ExcludedDatabases",
         "MonitoredServer.MonthlyCostUsd",
         "MonitoredServer.StoredServerId",
         "MonitoredServer.PlanForceBotEnabled",
         "MonitoredServer.RemediationUsername",
         "MonitoredServer.RemediationEncryptedPassword",
+        /* #6170: the hypothetical-index login's name is a login, its password slot a reference to a secret; the bundle seeds the name
+           into the name set instead of projecting either. */
+        "MonitoredServer.HypotheticalIndexUsername",
+        "MonitoredServer.HypotheticalIndexEncryptedPassword",
         /* #5452: the AWS roles a deployment may use, the role a server assumes and its external ID are an account's
            identifiers and a secret. The bundle seeds all three into the name set instead of projecting them. */
         "DarlingConfig.AllowedAwsRoles",
@@ -158,9 +165,17 @@ internal static class DiagnosticsBundle
             ["servers_by_engine"] = byEngine,
             ["mcp_enabled"] = config.Mcp?.Enabled ?? false,
             ["mcp_network_exposed"] = config.Mcp?.Network is not null,
+            ["mcp_allow_writes"] = config.Mcp?.AllowWrites ?? false,
+            ["mcp_allow_server_admin"] = config.Mcp?.AllowServerAdmin ?? false,
+            ["mcp_allow_investigations"] = config.Mcp?.AllowInvestigations ?? false,
+            ["mcp_allow_windows_auth_over_unverified_tls"] = config.Mcp?.AllowWindowsAuthOverUnverifiedTls ?? false,
+            // The PARSED level word, never the raw text; an unknown value runs as metadataOnly, so it reports that.
+            ["mcp_data_detail"] = McpDataDetailModes.Word(McpDataDetailModes.Resolve(config.Mcp?.DataDetail)),
             ["web_enabled"] = config.Web?.Enabled ?? false,
             ["web_network_exposed"] = config.Web?.Network is not null,
             ["analyzer_present"] = config.Analyzer is not null,
+            /* #5506 part 3: the read-admission limit, a plain number; a busy answer is only readable beside it (0 means the limit is off). */
+            ["reads_max_heavy_reads"] = config.Reads?.MaxHeavyReads,
             ["capture_plans"] = config.CapturePlans,
             ["query_stats_deferred_plan_fetch"] = config.QueryStatsDeferredPlanFetch,
             // The PARSED mode word, never the raw text (free config text); an unknown value runs as off, so it reports off.
@@ -416,9 +431,11 @@ internal static class DiagnosticsBundle
         {
             aliaser.AddName(AliasKind.Server, server.Name);
             aliaser.AddName(AliasKind.Host, server.Host);
+            aliaser.AddName(AliasKind.Host, server.QueryStoreReplica);
             aliaser.AddName(AliasKind.Database, server.Database);
             aliaser.AddName(AliasKind.Login, server.Username);
             aliaser.AddName(AliasKind.Login, server.RemediationUsername);
+            aliaser.AddName(AliasKind.Login, server.HypotheticalIndexUsername);
             foreach (var excluded in server.ExcludedDatabases ?? new List<string>())
             {
                 aliaser.AddName(AliasKind.Database, excluded);
@@ -563,7 +580,8 @@ internal static class DiagnosticsBundle
         var hooks = config.Webhooks ?? new WebhooksConfig();
         var routes = config.NotificationRoutes ?? new List<PerformanceMonitor.Notifications.NotificationRoute>();
         var anySealed = new[] { hooks.TeamsUrl, hooks.SlackUrl, hooks.GenericUrl, hooks.GenericHeaders, hooks.PagerDutyRoutingKey }.Any(PasswordSeal.IsSealed)
-            || routes.Any(r => new[] { r.TeamsUrl, r.SlackUrl, r.GenericUrl, r.PagerDutyRoutingKey }.Any(PasswordSeal.IsSealed));
+            || routes.Any(r => new[] { r.TeamsUrl, r.SlackUrl, r.GenericUrl, r.PagerDutyRoutingKey }.Any(PasswordSeal.IsSealed))
+            || SigningTexts(hooks.GenericSigning).Concat(routes.SelectMany(r => SigningTexts(r.GenericSigning))).Any(PasswordSeal.IsSealed);
         if (!anySealed)
         {
             return Array.Empty<string>();
@@ -589,8 +607,22 @@ internal static class DiagnosticsBundle
         }
 
         AddHeaderValues(aliaser, opened.Webhooks.GenericHeaders);
+
+        /* #5998: a signing key is a secret: a log line that somehow carried one is aliased, with and without its prefix. */
+        foreach (var key in SigningTexts(opened.Webhooks.GenericSigning).Concat(opened.Routes.SelectMany(r => SigningTexts(r.GenericSigning))))
+        {
+            aliaser.AddSecret(key);
+            if (key.StartsWith(PerformanceMonitor.Notifications.WebhookSigning.KeyPrefix, StringComparison.Ordinal))
+            {
+                aliaser.AddSecret(key[PerformanceMonitor.Notifications.WebhookSigning.KeyPrefix.Length..]);
+            }
+        }
+
         return opened.Failures.Count == 0 ? Array.Empty<string>() : new[] { WebhookHostsNotAliasedNote };
     }
+
+    private static IEnumerable<string> SigningTexts(PerformanceMonitor.Notifications.WebhookSigningKeys? keys) =>
+        keys is null ? Array.Empty<string>() : new[] { keys.Key, keys.PreviousKey }.Where(k => !string.IsNullOrWhiteSpace(k));
 
     /// <summary>Registers each string value of a headers JSON object as a secret. Text that is not a JSON object adds nothing.</summary>
     private static void AddHeaderValues(BundleAliaser aliaser, string? headersJson)
@@ -897,6 +929,9 @@ internal static class DiagnosticsBundle
     internal static readonly string[] StoreReasonCodes =
     {
         "missing_store_credential", "first_run", "bootstrap_stopped", "connect_failed", "auth_failed", "timeout", "other",
+        /* #6217: what a refused connection to a managed store means, read from the store's own data directory. */
+        DiagnosticsBundleStoreLocator.ReasonDataDirectoryMissing, DiagnosticsBundleStoreLocator.ReasonNotRunning,
+        DiagnosticsBundleStoreLocator.ReasonStarting,
     };
 
     /// <summary>The caller's reason when it is one of <see cref="StoreReasonCodes"/>, else the code the error classifies to.</summary>
@@ -1189,8 +1224,13 @@ internal static class DiagnosticsBundle
     /// Writes the text to a temp file beside the target, then moves it over. The temp name is random and the file is
     /// created with <see cref="FileMode.CreateNew"/>, so a path someone planted in a shared directory is never written
     /// through. The temp file is deleted on every path that does not end in the move.
+    ///
+    /// <para>With <paramref name="restricted"/> set, on Windows, the temp file is created with its access already
+    /// limited to SYSTEM, Administrators and the account running the command (<see cref="DarlingFileSecurity.CreateHardenedFile"/>),
+    /// instead of taking the output folder's inherited access, and the move keeps that access. The alias map is
+    /// written this way: it names the real server or host behind every alias.</para>
     /// </summary>
-    internal static string? WriteAtomically(string path, string text, bool force)
+    internal static string? WriteAtomically(string path, string text, bool force, bool restricted = false)
     {
         string temp;
         try
@@ -1206,7 +1246,9 @@ internal static class DiagnosticsBundle
         var moved = false;
         try
         {
-            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var stream = restricted && OperatingSystem.IsWindows()
+                ? DarlingFileSecurity.CreateHardenedFile(temp, allowInteractiveRead: false)
+                : new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 var bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(text);
                 stream.Write(bytes, 0, bytes.Length);

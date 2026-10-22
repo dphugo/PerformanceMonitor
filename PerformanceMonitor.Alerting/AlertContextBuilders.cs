@@ -61,7 +61,7 @@ public static class AlertContextBuilders
     {
         if (events == null || events.Count == 0) return null;
 
-        var filtered = FilterBlocking(events, excludedDatabases);
+        var filtered = BlockingWaitRows(events, excludedDatabases);
         if (filtered.Count == 0) return null;
 
         var groups = GroupBlocking(serverName, filtered);
@@ -222,7 +222,7 @@ public static class AlertContextBuilders
     {
         if (events == null || events.Count == 0) return Array.Empty<AlertIncident>();
 
-        var filtered = FilterBlocking(events, excludedDatabases);
+        var filtered = BlockingWaitRows(events, excludedDatabases);
         if (filtered.Count == 0) return Array.Empty<AlertIncident>();
 
         return GroupBlocking(serverName, filtered).Select(g => g.Incident).ToList();
@@ -262,9 +262,14 @@ public static class AlertContextBuilders
     {
         if (queries is null || queries.Count == 0) return Array.Empty<AlertIncident>();
 
-        /* #1140: dedup key = query_hash (stable across literals/plans). Null hash -> no incident. */
+        /* #1140: dedup key = query_hash (stable across literals/plans). Null hash -> no incident.
+           #5711: an all-zero hash is "the engine did not say" (BACKUP, DBCC and some maintenance requests carry
+           0x0000000000000000), not a query, and keyed on as-is it folded every such request in one database into
+           one incident. The original rule extends to it: a query whose hash is unknown (NULL, empty or all-zero,
+           QueryHashIdentity.IsUnknown) emits no incident, whatever its text. A known hash keys exactly as before. */
         return queries
-            .Select(q => AlertFingerprint.ForKey(serverName, AlertFingerprint.Query, q.QueryHash ?? "",
+            .Where(q => !QueryHashIdentity.IsUnknown(q.QueryHash))
+            .Select(q => AlertFingerprint.ForKey(serverName, AlertFingerprint.Query, q.QueryHash!,
                 string.IsNullOrEmpty(q.DatabaseName) ? Array.Empty<string>() : new[] { q.DatabaseName },
                 database: q.DatabaseName))
             .Where(i => i is not null).Select(i => i!).ToList();
@@ -388,12 +393,25 @@ public static class AlertContextBuilders
     /// than a 10 GB file that is now 80% of a small one.</para>
     /// </summary>
     public static List<DatabaseFileGrowthInfo> GetBreachedFiles(
-        IReadOnlyList<DatabaseFileGrowthInfo>? files, int riseMbPerHour, int volumePercent, int lookbackMinutes)
+        IReadOnlyList<DatabaseFileGrowthInfo>? files, int riseMbPerHour, int volumePercent, int lookbackMinutes) =>
+        GetBreachedFiles(files, _ => (riseMbPerHour, volumePercent), lookbackMinutes);
+
+    /// <summary>#5910: <see cref="GetBreachedFiles(IReadOnlyList{DatabaseFileGrowthInfo}, int, int, int)"/> with each
+    /// file held to its own database's rise and level bars, which the engine resolves through
+    /// <see cref="IAlertThresholdOverrides"/>. The lookback stays one per server: it shapes the read.</summary>
+    public static List<DatabaseFileGrowthInfo> GetBreachedFiles(
+        IReadOnlyList<DatabaseFileGrowthInfo>? files,
+        Func<DatabaseFileGrowthInfo, (int RiseMbPerHour, int VolumePercent)> barsFor,
+        int lookbackMinutes)
     {
         if (files is null || files.Count == 0) return new List<DatabaseFileGrowthInfo>();
 
         var breached = files
-            .Where(f => BreachesRiseGate(f, riseMbPerHour, lookbackMinutes) || BreachesLevelGate(f, volumePercent))
+            .Where(f =>
+            {
+                var (riseMbPerHour, volumePercent) = barsFor(f);
+                return BreachesRiseGate(f, riseMbPerHour, lookbackMinutes) || BreachesLevelGate(f, volumePercent);
+            })
             .OrderByDescending(f => f.VolumePercent)
             .ThenByDescending(f => f.GrowthMb)
             .ToList();
@@ -464,6 +482,40 @@ public static class AlertContextBuilders
 
         AlertIncidentRenderer.Apply(context, Decorate(FileGrowthIncidents(serverName, shown).ToList(), decorateIncidents));
         return context;
+    }
+
+    /// <summary>
+    /// #5644 W1/W2: THE set of blocking events a blocking alert is made of, so the alert's value and its detail
+    /// cannot disagree. Excluded databases drop their rows, the reports of one wait collapse to one row carrying
+    /// the longest wait time (<see cref="BlockingWaits"/>), and the count is XE-preferred as Lite's overview has
+    /// always been: the blocked-process-report waits when there are any, else the DMV-snapshot waits. "When there
+    /// are any" is judged on the rows BEFORE the excluded-database filter, so XE reports that exist only in
+    /// excluded databases yield an empty set rather than a fall back to DMV waits. The alert
+    /// value is this set's <c>Count</c>; the card's "Blocking chain (xN)" groups are drawn from the same list, so
+    /// the chain counts add up to the value.
+    /// </summary>
+    public static IReadOnlyList<BlockedProcessAlertRow> BlockingWaitRows(
+        IReadOnlyList<BlockedProcessAlertRow>? events, IReadOnlyList<string> excludedDatabases)
+    {
+        if (events == null || events.Count == 0) return Array.Empty<BlockedProcessAlertRow>();
+
+        var hasXeReports = events.Any(r => r.Source == BlockedProcessAlertRow.XeReportSource);
+
+        var waits = BlockingWaits.Collapse(
+            FilterBlocking(events, excludedDatabases),
+            r => r.Source ?? "",
+            r => r.BlockedSpid,
+            r => r.BlockingSpid,
+            r => r.EventTime,
+            r => r.WaitTimeMs);
+
+        /* XE-or-DMV is decided on the UNFILTERED rows, as Lite's overview and the fleet tile do: if blocked-process
+           reports exist at all, they are the source, and when every one sits in an excluded database the answer
+           is empty. Deciding after the filter would fall back to the DMV snapshots there and fire an alert the
+           excluded-database rule means to suppress. */
+        return hasXeReports
+            ? waits.Where(r => r.Source == BlockedProcessAlertRow.XeReportSource).ToList()
+            : waits;
     }
 
     /* Excluded databases drop their rows; rows with no database always pass. Shared by the render path and
@@ -619,6 +671,224 @@ public static class AlertContextBuilders
             });
         }
         return context;
+    }
+
+    /// <summary>Requests shown on a Runnable Queue card (#5641): the same render budget as the Long-Running Query
+    /// card, so one card never lists more sessions than the other.</summary>
+    public const int RunnableQueueRequestDisplayCap = LongRunningQueryDisplayCap;
+
+    /// <summary>How far back the CPU samples on the engine's snapshot reach, in minutes: Lite's
+    /// <c>LocalDataService.AlertCpuSampleLookback</c> and Darling's <c>DarlingWorker.RecentCpuLookback</c>, both 15. The
+    /// Runnable Queue card's CPU window never claims more (a test pins the three to each other).</summary>
+    public const int RunnableQueueCpuSampleLookbackMinutes = 15;
+
+    /// <summary>
+    /// The Runnable Queue card's CPU item (#5641): CPU percent for the same minutes the queue average covers.
+    /// A queue of runnable tasks is a CPU symptom, so the first question on the page is whether the cores are
+    /// actually pinned. Built from the CPU samples the engine already holds on its snapshot (no read of its own):
+    /// the samples at or after <c>nowUtc - windowMinutes</c> and not after <c>nowUtc</c>, reported as an average and
+    /// a peak with the sample count. When the window holds no sample the item falls back to the snapshot's single
+    /// newest reading and says so in its heading, because a number from another minute must not read as this
+    /// window's. Returns null when there is no CPU reading at all (the card then simply has no CPU item).
+    /// <para>Round 2 of #5709: the window is clamped to <see cref="RunnableQueueCpuSampleLookbackMinutes"/> (15), the
+    /// lookback both stores read the CPU samples with, because the queue's span reaches 20 minutes at the Low-Impact
+    /// preset and up to 60 at a slower cadence while the samples never reach back that far. The heading names the
+    /// window the samples actually cover, so a longer queue span cannot claim a longer CPU window than the data
+    /// holds.</para>
+    /// </summary>
+    public static AlertDetailItem? BuildRunnableQueueCpuItem(
+        IReadOnlyList<AlertCpuSample>? recentSamples,
+        double? latestSqlCpuPercent,
+        double? latestTotalCpuPercent,
+        DateTime nowUtc,
+        int windowMinutes)
+    {
+        windowMinutes = Math.Min(windowMinutes, RunnableQueueCpuSampleLookbackMinutes);
+        var floor = nowUtc - TimeSpan.FromMinutes(windowMinutes);
+        var inWindow = (recentSamples ?? Array.Empty<AlertCpuSample>())
+            .Where(s => s.SampleTimeUtc >= floor && s.SampleTimeUtc <= nowUtc)
+            .ToList();
+
+        var sql = inWindow.Where(s => s.SqlCpuPercent.HasValue).Select(s => s.SqlCpuPercent!.Value).ToList();
+        var total = inWindow.Where(s => s.TotalCpuPercent.HasValue).Select(s => s.TotalCpuPercent!.Value).ToList();
+
+        if (sql.Count > 0 || total.Count > 0)
+        {
+            var fields = new List<(string Label, string Value)>();
+            if (sql.Count > 0)
+            {
+                fields.Add(("SQL Server CPU", string.Create(CultureInfo.InvariantCulture,
+                    $"{sql.Average():F0}% average, {sql.Max():F0}% peak")));
+            }
+            if (total.Count > 0)
+            {
+                fields.Add(("Total CPU", string.Create(CultureInfo.InvariantCulture,
+                    $"{total.Average():F0}% average, {total.Max():F0}% peak")));
+            }
+            fields.Add(("CPU samples", string.Create(CultureInfo.InvariantCulture, $"{inWindow.Count}")));
+            return new AlertDetailItem
+            {
+                Heading = string.Create(CultureInfo.InvariantCulture, $"CPU over the last {windowMinutes} minutes"),
+                Fields = fields
+            };
+        }
+
+        if (latestSqlCpuPercent.HasValue || latestTotalCpuPercent.HasValue)
+        {
+            var fields = new List<(string Label, string Value)>();
+            if (latestSqlCpuPercent.HasValue)
+            {
+                fields.Add(("SQL Server CPU", string.Create(CultureInfo.InvariantCulture, $"{latestSqlCpuPercent.Value:F0}%")));
+            }
+            if (latestTotalCpuPercent.HasValue)
+            {
+                fields.Add(("Total CPU", string.Create(CultureInfo.InvariantCulture, $"{latestTotalCpuPercent.Value:F0}%")));
+            }
+            return new AlertDetailItem { Heading = "CPU (newest sample, none in the window)", Fields = fields };
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The Client Timeouts card's detail items (#5640): the reading (rate, exact count, minutes covered, and the estimate line only
+    /// when the mute proportion changed the count), then the top statements, databases and client applications. Those three lists
+    /// cover the samples inside the finding's covered span (round 2 of #5714, L6); when the span kept no samples they are the
+    /// lookback's, the headings say "in the last N minutes", and the database and application lines carry the label "Recent ..." so
+    /// the mute dialogs pre-fill nothing from an hour-old list.
+    /// </summary>
+    public static IReadOnlyList<AlertDetailItem> BuildClientTimeoutItems(
+        AttentionEvaluator.Finding finding, AttentionWindow window)
+    {
+        var items = new List<AlertDetailItem>();
+
+        /* 1. The reading: the exact rate and count, the span, and (only when the mute proportion changed the count) the estimate line. */
+        var reading = new AlertDetailItem { Heading = "Client timeouts", Fields = new() };
+        reading.Fields.Add(("Rate", string.Create(CultureInfo.InvariantCulture, $"{finding.TotalCount / finding.CoveredMinutes:N1} per minute")));
+        reading.Fields.Add(("Count", string.Create(CultureInfo.InvariantCulture, $"{finding.TotalCount:N0} exact, from the session's event counter")));
+        reading.Fields.Add(("Minutes Covered", string.Create(CultureInfo.InvariantCulture, $"{finding.CoveredMinutes:N0} ({finding.RunCount} collector run{(finding.RunCount == 1 ? "" : "s")})")));
+        if (finding.Estimated)
+        {
+            reading.Fields.Add(("Estimate", string.Create(CultureInfo.InvariantCulture,
+                $"estimated from {finding.SampledEvents:N0} sampled events: {finding.JudgedCount / finding.CoveredMinutes:N1} per minute is not muted")));
+        }
+
+        if (finding.Bars is not null)
+        {
+            reading.Fields.Add(("Bar", AttentionEvaluator.BarSentence(finding)));
+        }
+
+        items.Add(reading);
+
+        /* 2. The top statements (the statement filter judges each sample text before it is cut), the sampled events a statement
+           appears in, not the count of timeouts. */
+        var lookback = window.TopsFromLookback;
+        var lookbackNote = string.Create(CultureInfo.InvariantCulture, $" in the last {AttentionEvaluator.ReadLookbackMinutes} minutes");
+        var rank = 0;
+        foreach (var statement in window.TopStatements.Take(AttentionTopListCap))
+        {
+            rank++;
+            var item = new AlertDetailItem
+            {
+                Heading = string.Create(CultureInfo.InvariantCulture, $"Top statement {rank}: {statement.Samples:N0} sampled event{(statement.Samples == 1 ? "" : "s")}{(lookback ? lookbackNote : "")}"),
+                Fields = new() { ("Fingerprint", statement.Name) },
+            };
+            if (!string.IsNullOrEmpty(statement.SampleText))
+            {
+                item.Fields.Add(("Statement", TruncateStatement(statement.SampleText)));
+            }
+
+            items.Add(item);
+        }
+
+        /* 3. Databases and client applications, the top first. The FIRST "Database" and "Client Application" lines are what the
+           mute dialogs pre-fill (AlertMuteContext.PopulateFromDetailText), so those two labels are used for the top entry only,
+           and only for a list that covers the span: a lookback list wears "Recent ..." labels, which the pre-fill ignores. */
+        AddTopList(items, lookback ? $"Top databases (sampled events{lookbackNote})" : "Top databases (sampled events)",
+            lookback ? "Recent Database" : "Database", window.TopDatabases);
+        AddTopList(items, lookback ? $"Top client applications (sampled events{lookbackNote})" : "Top client applications (sampled events)",
+            lookback ? "Recent Client Application" : "Client Application", window.TopApplications);
+        return items;
+    }
+
+    /// <summary>How many statements, databases and applications the Client Timeouts card lists.</summary>
+    public const int AttentionTopListCap = 5;
+
+    private static void AddTopList(List<AlertDetailItem> items, string heading, string label, IReadOnlyList<AttentionTopItem> top)
+    {
+        if (top.Count == 0)
+        {
+            return;
+        }
+
+        var item = new AlertDetailItem { Heading = heading, Fields = new() };
+        for (var i = 0; i < Math.Min(top.Count, AttentionTopListCap); i++)
+        {
+            item.Fields.Add((i == 0 ? label : $"{label} {i + 1}", top[i].Name));
+            item.Fields.Add(("Sampled Events", top[i].Samples.ToString("N0", CultureInfo.InvariantCulture)));
+        }
+
+        items.Add(item);
+    }
+
+    /// <summary>
+    /// The Runnable Queue card's top-request items (#5641): the heaviest requests in the newest query snapshot,
+    /// ranked by CPU time (then elapsed time) because the alert is about CPU queueing. Takes the rows an
+    /// unfiltered, threshold-zero <c>GetLongRunningQueriesAsync</c> read returned, which is exactly the surface the
+    /// High CPU card's maintenance probe reads; shows at most <see cref="RunnableQueueRequestDisplayCap"/> and
+    /// states the omission as a final item rather than cutting silently. Fields are the Long-Running Query
+    /// card's session fields, so a reader sees the same facts under both alerts. Returns an empty list when the
+    /// snapshot holds no request. <paramref name="readHitCap"/> says the read returned a full page, so the count of
+    /// omitted requests is a floor and the trailer reads "at least N more request(s)".
+    /// </summary>
+    public static IReadOnlyList<AlertDetailItem> BuildRunnableQueueRequestItems(IReadOnlyList<LongRunningQueryInfo> sessions, bool readHitCap = false)
+    {
+        if (sessions.Count == 0) return Array.Empty<AlertDetailItem>();
+
+        var ranked = sessions
+            .OrderByDescending(q => q.CpuTimeMs)
+            .ThenByDescending(q => q.ElapsedSeconds)
+            .ThenBy(q => q.SessionId)
+            .ToList();
+        var items = new List<AlertDetailItem>();
+        foreach (var q in ranked.Take(RunnableQueueRequestDisplayCap))
+        {
+            var item = new AlertDetailItem
+            {
+                Heading = string.Create(CultureInfo.InvariantCulture,
+                    $"Top request: session #{q.SessionId} - {q.CpuTimeMs:N0} ms CPU"),
+                Fields = new()
+            };
+            if (!string.IsNullOrEmpty(q.DatabaseName))
+                item.Fields.Add(("Database", q.DatabaseName));
+            if (!string.IsNullOrEmpty(q.ProgramName))
+                item.Fields.Add(("Program", q.ProgramName));
+            if (!string.IsNullOrEmpty(q.QueryText))
+                item.Fields.Add(("Query", TruncateStatement(q.QueryText)));
+            item.Fields.Add(("Elapsed", FormatDuration(q.ElapsedSeconds)));
+            item.Fields.Add(("CPU Time", $"{q.CpuTimeMs:N0} ms"));
+            item.Fields.Add(("Reads", $"{q.Reads:N0}"));
+            item.Fields.Add(("Writes", $"{q.Writes:N0}"));
+            if (!string.IsNullOrEmpty(q.WaitType))
+                item.Fields.Add(("Wait Type", q.WaitType));
+            if (q.BlockingSessionId.HasValue && q.BlockingSessionId.Value > 0)
+                item.Fields.Add(("Blocked By", $"Session #{q.BlockingSessionId.Value}"));
+            items.Add(item);
+        }
+
+        if (ranked.Count > RunnableQueueRequestDisplayCap)
+        {
+            items.Add(new AlertDetailItem
+            {
+                Heading = "More requests",
+                Fields = new()
+                {
+                    ("Not shown", string.Create(CultureInfo.InvariantCulture,
+                        $"{(readHitCap ? "at least " : "")}{ranked.Count - RunnableQueueRequestDisplayCap} more request(s) in the newest query snapshot"))
+                }
+            });
+        }
+        return items;
     }
 
     /// <summary>
@@ -966,12 +1236,22 @@ public static class AlertContextBuilders
        PVS %) first, so the alert names the most-consumed database. AND, not the volume pair's OR:
        percent is the trigger and the floor only keeps small databases from paging anyone. A
        thresholdPercent of 0 disables the check at the caller. */
-    public static List<PvsPressureInfo> GetBreachedPvsDatabases(List<PvsPressureInfo> databases, double thresholdPercent, double floorGb)
+    public static List<PvsPressureInfo> GetBreachedPvsDatabases(List<PvsPressureInfo> databases, double thresholdPercent, double floorGb) =>
+        GetBreachedPvsDatabases(databases, _ => (thresholdPercent, floorGb));
+
+    /* #5910: the same gates with each database held to its own pair, which the engine resolves through
+       IAlertThresholdOverrides. A database whose percent resolves to 0 never breaches. */
+    public static List<PvsPressureInfo> GetBreachedPvsDatabases(
+        List<PvsPressureInfo> databases, Func<PvsPressureInfo, (double ThresholdPercent, double FloorGb)> barsFor)
     {
         return databases
-            .Where(d => thresholdPercent > 0
-                && d.PvsPercent >= thresholdPercent
-                && (floorGb <= 0 || d.PvsGb >= floorGb))
+            .Where(d =>
+            {
+                var (thresholdPercent, floorGb) = barsFor(d);
+                return thresholdPercent > 0
+                    && d.PvsPercent >= thresholdPercent
+                    && (floorGb <= 0 || d.PvsGb >= floorGb);
+            })
             .OrderByDescending(d => d.PvsPercent)
             .ToList();
     }

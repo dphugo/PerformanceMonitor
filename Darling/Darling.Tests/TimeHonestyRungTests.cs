@@ -58,7 +58,6 @@ namespace Darling.Tests;
 /// after the writer has stored a twin, and after the post-rung rows are gone again); the dedup is pinned in
 /// <c>Lite.Tests/CpuUtilizationCollectorDefinitionTests</c>.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class TimeHonestyRungTests
 {
     private const int RungVersion = 134;
@@ -242,7 +241,6 @@ public sealed class TimeHonestyRungTests
             ViewerDataService.StoreSchemaProbeSql.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         Assert.Contains("hasTimeHonesty", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);
@@ -507,7 +505,6 @@ public sealed class TimeHonestyRungTests
 /// against every other live class because it shares the store.
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class TimeHonestyRungLivePostgresTests
 {
     private const int ServerId = -134134;

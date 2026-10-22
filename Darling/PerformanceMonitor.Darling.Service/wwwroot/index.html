@@ -9,6 +9,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Darling Web</title>
+    <!-- #5701: the page had no icon link, so every browser asked for /favicon.ico on its first load and got a 404.
+         A data: SVG (the CSP allows img-src data:) answers that request without a file or a round trip. -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231f6feb'/%3E%3Cpath d='M2 11l3-4 3 2 3-5 3 3' fill='none' stroke='white' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="css/theme.css" />
     <link rel="stylesheet" href="css/app.css" />
     <link rel="stylesheet" href="css/editor.css" />
@@ -16,6 +19,13 @@
   </head>
   <body>
     <div id="app">
+      <!-- #6315: below 768 px the sidebar leaves the page flow; this bar (hidden at wider widths) holds the button that
+           opens it as an overlay. js/narrow-nav.js owns the open state, aria-expanded and focus. -->
+      <header id="topbar">
+        <button id="nav-toggle" class="nav-toggle" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open the menu" title="Open the menu">&#9776;</button>
+        <span class="topbar-title">Darling Web</span>
+      </header>
+      <div id="nav-backdrop" aria-hidden="true"></div>
       <aside id="sidebar">
         <div class="brand">
           <h1>Darling Web</h1>
@@ -33,11 +43,15 @@
           <a data-route="finops" href="#/finops">FinOps</a>
           <a data-route="sweeps" href="#/sweeps">Fleet Sweeps</a>
           <a data-route="alerts" href="#/alerts">Alert History</a>
+          <a data-route="investigations" href="#/investigations">Investigations</a>
           <a data-route="alert-rules" href="#/alert-rules">Alert Rules</a>
           <a data-route="admin" href="#/admin">Admin</a>
           <a data-route="views" href="#/views">Custom Views</a>
           <a data-route="mute-rules" href="#/mute-rules">Mute Rules</a>
+          <a data-route="known-patterns" href="#/known-patterns">Known Patterns</a>
           <a data-route="manage-tags" href="#/manage-tags">Manage Tags</a>
+          <a data-route="manage-query-tags" href="#/manage-query-tags">Query Tags</a>
+          <a data-route="query-tag-usage" href="#/query-tag-usage">Query Tag Usage</a>
           <a data-route="job-history" href="#/job-history">Job History</a>
         </nav>
         <div class="server-list-header">Servers</div>

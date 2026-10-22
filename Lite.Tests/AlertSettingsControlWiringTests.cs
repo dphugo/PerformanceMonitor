@@ -29,7 +29,6 @@ namespace Lite.Tests;
 /// regresses. The apps are checked separately because their control sets legitimately differ (Darling has
 /// AG boxes Lite has no concept of); what is pinned is that each app is internally consistent.</para>
 /// </summary>
-[Trait("Reads", "Darling")]
 public sealed class AlertSettingsControlWiringTests
 {
     /// <summary>
@@ -40,7 +39,7 @@ public sealed class AlertSettingsControlWiringTests
     /// </summary>
     private static readonly string[] s_deliveryScopedBoxes =
     {
-        "AlertCooldownBox", "AlertDeliveryModeBox", "AlertPerEventMaxBox", "AlertExcludedDatabasesBox"
+        "AlertCooldownBox", "AlertDeliveryModeBox", "AlertPerEventMaxBox", "AlertExcludedDatabasesBox", "AlertExcludedVolumesBox"
     };
 
     public static TheoryData<string, string, string> Windows() => new()
@@ -103,7 +102,8 @@ public sealed class AlertSettingsControlWiringTests
     public void LiteSaveAlertSettings_PersistsEveryStaticItAssigns()
     {
         var source = File.ReadAllText(FindRepoFile(Path.Combine("Lite", "Windows", "SettingsWindow.xaml.cs")));
-        var body = MethodBody(source, "SaveAlertSettings", "Lite");
+        /* #5846 split the dialog off SaveAlertSettings: the copy-and-write pairs now live in ApplyAlertSettings. */
+        var body = MethodBody(source, "ApplyAlertSettings", "Lite");
 
         /* "App.Foo =" but not "App.Foo ==" — the assignments the Save button makes. */
         var assigned = Regex.Matches(body, @"App\.(\w+)\s*=(?!=)")
@@ -118,14 +118,16 @@ public sealed class AlertSettingsControlWiringTests
         /* The collections are the legitimate exceptions: each reaches the document as a JsonArray built a
            few lines earlier rather than as a bare "= App.X" assignment. AlertExcludedDatabases was the one;
            #3653 (A5, Q5) added the Long-Running Query opt-out knob's two lists in the same shape, and the
-           source pin in Darling.Tests.LongRunningQueryExclusionsTests holds their root["..."] keys. */
+           source pin in Darling.Tests.LongRunningQueryExclusionsTests holds their root["..."] keys.
+           AlertCooldownMinutes (#5881) reaches the document from a local the same method sets the static from, so no
+           thread can change what is written; SettingsWindowTabsLiteTests checks the value in the root. */
         var unpersisted = assigned.Except(persisted)
-            .Except(new[] { "AlertExcludedDatabases", "AlertLongRunningQueryExcludedProgramNamePrefixes", "AlertLongRunningQueryExcludedLogins" })
+            .Except(new[] { "AlertExcludedDatabases", "AlertExcludedVolumes", "AlertLongRunningQueryExcludedProgramNamePrefixes", "AlertLongRunningQueryExcludedLogins", "AlertCooldownMinutes" })
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToList();
 
         Assert.True(unpersisted.Count == 0,
-            "Lite: SaveAlertSettings copies these controls into App statics but never writes them to " +
+            "Lite: ApplyAlertSettings copies these controls into App statics but never writes them to " +
             "settings.json, so the setting applies for this session and silently reverts on next launch: " +
             string.Join(", ", unpersisted));
     }

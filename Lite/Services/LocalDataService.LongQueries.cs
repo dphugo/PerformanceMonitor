@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
 using PerformanceMonitor.Analysis.Baselines;
+using PerformanceMonitor.Common;
 using PerformanceMonitorLite.Database;
 
 namespace PerformanceMonitorLite.Services;
@@ -37,24 +38,30 @@ public partial class LocalDataService
     /// 200 and be omitted entirely, while Darling's twin — ranked by duration in SQL — kept it. Same tool
     /// name, different truth per SKU. The tool now reads <see cref="GetSlowestLongQueryCompletionsAsync"/>.</para>
     /// </summary>
-    public async Task<List<LongQueryCompletionRow>> GetRecentLongQueryCompletionsAsync(int serverId, int hoursBack = 24, DateTime? fromDate = null, DateTime? toDate = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null)
+    public async Task<List<LongQueryCompletionRow>> GetRecentLongQueryCompletionsAsync(int serverId, int hoursBack = 24, DateTime? fromDate = null, DateTime? toDate = null, IReadOnlyList<string>? databaseNames = null, DateTime? asOfUtc = null, QueryTagReadScope? tags = null)
     {
         using var connection = await OpenConnectionAsync();
         using var command = connection.CreateCommand();
 
         var (startTime, endTime) = GetTimeRange(hoursBack, fromDate, toDate, asOfUtc);
         var dbClause = BuildDbInClause(databaseNames, "database_name", 4, out var dbValues);
+        /* #5993: the query tag filter, on the raw rows before the newest-N cap. */
+        var tagValues = new List<object>();
+        if (tags is not null) { dbClause += QueryTagReadScope.HashToken("query_hash"); tagValues.AddRange(tags.ParameterValues); }
 
         command.CommandText = LongQueryCompletionsSelect + @"
 FROM " + StoredEventCopies.LongQueryCompletions("server_id = $1 AND collection_time <= $3" + dbClause, collectedFrom: "$2") + $@" AS ev
 ORDER BY event_time DESC
 LIMIT {LongQueryGridCap}";
+        if (tags is not null) command.CommandText = tags.Apply(command.CommandText, 4 + dbValues.Count);
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = startTime });
         command.Parameters.Add(new DuckDBParameter { Value = endTime });
         foreach (var db in dbValues)
             command.Parameters.Add(new DuckDBParameter { Value = db });
+        foreach (var tagValue in tagValues)
+            command.Parameters.Add(new DuckDBParameter { Value = tagValue });
 
         return await ReadLongQueryCompletionsAsync(command);
     }
@@ -70,7 +77,7 @@ LIMIT {LongQueryGridCap}";
     /// and the <c>LIMIT</c>, so the page is the slowest N of the chosen databases and a cap never counts another database's
     /// rows (Darling's <c>DarlingLongQueryReader</c> predicate sits in the same place). Null or empty reads every database.</para>
     /// </summary>
-    public async Task<List<LongQueryCompletionRow>> GetSlowestLongQueryCompletionsAsync(int serverId, int hoursBack, DateTime? asOfUtc, int limit, IReadOnlyList<string>? databaseNames = null)
+    public async Task<List<LongQueryCompletionRow>> GetSlowestLongQueryCompletionsAsync(int serverId, int hoursBack, DateTime? asOfUtc, int limit, IReadOnlyList<string>? databaseNames = null, QueryTagReadScope? tags = null)
     {
         using var connection = await OpenConnectionAsync();
         using var command = connection.CreateCommand();
@@ -78,11 +85,15 @@ LIMIT {LongQueryGridCap}";
         var (startTime, endTime) = GetTimeRange(hoursBack, null, null, asOfUtc);
         /* $4 is the row cap, so the optional database list starts at $5. */
         var dbClause = BuildDbInClause(databaseNames, "database_name", 5, out var dbValues);
+        /* #5992: the query tag filter, on the raw rows before the duration ranking and the limit. */
+        var tagValues = new List<object>();
+        if (tags is not null) { dbClause += QueryTagReadScope.HashToken("query_hash"); tagValues.AddRange(tags.ParameterValues); }
 
         command.CommandText = LongQueryCompletionsSelect + @"
 FROM " + StoredEventCopies.LongQueryCompletions("server_id = $1 AND collection_time <= $3" + dbClause, collectedFrom: "$2") + @" AS ev
 ORDER BY duration_microseconds DESC NULLS LAST, event_time DESC
 LIMIT $4";
+        if (tags is not null) command.CommandText = tags.Apply(command.CommandText, 5 + dbValues.Count);
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = startTime });
@@ -90,6 +101,8 @@ LIMIT $4";
         command.Parameters.Add(new DuckDBParameter { Value = limit });
         foreach (var db in dbValues)
             command.Parameters.Add(new DuckDBParameter { Value = db });
+        foreach (var tagValue in tagValues)
+            command.Parameters.Add(new DuckDBParameter { Value = tagValue });
 
         return await ReadLongQueryCompletionsAsync(command);
     }
@@ -136,7 +149,7 @@ SELECT
                     ClientPid = reader.IsDBNull(6) ? null : reader.GetInt32(6),
                     NtUserName = reader.IsDBNull(7) ? "" : reader.GetString(7),
                     ServerPrincipalName = reader.IsDBNull(8) ? "" : reader.GetString(8),
-                    QueryHash = reader.IsDBNull(9) ? "" : reader.GetString(9),
+                    QueryHash = reader.IsDBNull(9) ? "" : QueryHashIdentity.KnownHash(reader.GetString(9)) ?? "",
                     EventSequence = reader.IsDBNull(10) ? null : reader.GetInt64(10),
                     DurationMicroseconds = reader.IsDBNull(11) ? null : reader.GetInt64(11),
                     CpuTimeMicroseconds = reader.IsDBNull(12) ? null : reader.GetInt64(12),
@@ -162,6 +175,12 @@ SELECT
 /// </summary>
 public class LongQueryCompletionRow
 {
+    /// <summary>#5993: the row's query tag as a path ("Parent / Child"), or null. Set from the map after the read; the grid shows it.</summary>
+    public string? QueryTag { get; set; }
+
+    /// <summary>#5993: the row carries a key the "Assign query tag..." menu item can bind.</summary>
+    public bool CanAssignQueryTag => Helpers.QueryTagGrid.TargetOf(this) != null;
+
     public DateTime CollectionTime { get; set; }
     public DateTime? EventTime { get; set; }
     public string EventType { get; set; } = "";
@@ -171,7 +190,13 @@ public class LongQueryCompletionRow
     public int? ClientPid { get; set; }
     public string NtUserName { get; set; } = "";
     public string ServerPrincipalName { get; set; } = "";
+    /// <summary>The stored <c>query_hash</c>, "" when the engine gave none (#5711: the trace's batch-level events carry 0).</summary>
     public string QueryHash { get; set; } = "";
+    /// <summary>#5711: the key to group, filter or label by: the real hash, else a fingerprint of the scrubbed statement
+    /// text, else "" (such a row joins no group).</summary>
+    public string QueryIdentity => McpQueryIdentity ?? "";
+    /// <summary>#5711 review: the same identity, NULL (not "") when the row has none, so the MCP wire says null like Darling does.</summary>
+    public string? McpQueryIdentity => QueryHashIdentity.Identity(QueryHash, StatementText);
     public long? EventSequence { get; set; }
     public long? DurationMicroseconds { get; set; }
     public long? CpuTimeMicroseconds { get; set; }

@@ -225,7 +225,7 @@ globalThis.fetch = async (url, init = {}) => {
   const sent = init.body ? JSON.parse(init.body) : null;
   requests.push({ method, url: u, body: sent, contentType: (init.headers || {})["Content-Type"] || null });
   if (u === "/api/session") {
-    const r = state.sessionReply ? state.sessionReply() : { status: 200, body: { can_edit: state.canEdit } };
+    const r = state.sessionReply ? state.sessionReply() : { status: 200, body: { can_edit: state.canEdit, signed_in_admin: state.canEdit && state.signedIn !== false } };
     return reply(r.status, r.body, r.raw);
   }
   if (method === "GET" && u === "/api/admin/servers") {
@@ -309,6 +309,7 @@ try {
   fs.writeFileSync(path.join(scratch, "package.json"), '{ "type": "module" }');
   const page = await import(pathToFileURL(path.join(scratch, "pages", "admin.js")).href);
   const util = await import(pathToFileURL(path.join(scratch, "util.js")).href);
+  const actionsPage = await import(pathToFileURL(path.join(scratch, "pages", "admin-server-actions.js")).href);
   const main = body.appendChild(new FakeNode("main"));
   const mountPage = async (tab = "servers") => {
     page.renderAdmin(main, tab);
@@ -535,7 +536,7 @@ try {
       server_count: 2,
       servers: [
         { server_name: "alpha", display_name: "Alpha", engine: "sqlserver", version: "SQL Server 2022", freshness: "Online", status: "Enabled", auth: "Windows",
-          monthly_cost: "$1,234", monthly_cost_usd: 1234, added: "2025-12-31T00:00:00.0000000", read_only: false, last_collected: "2026-01-01T00:00:00Z", password: "SECRET-PW" },
+          monthly_cost: "$1,234", monthly_cost_usd: 1234, added: "2025-12-31T00:00:00.0000000", read_only: false, last_collected: "2026-01-01T00:00:00Z", password: "SECRET-PW", same_machine_as: "Peer-One, Peer-Two" },
         { server_name: "bravo", display_name: "Bravo", engine: "postgres", version: "PostgreSQL 18", freshness: "AwaitingFirstCollection", status: "Disabled", auth: "SQL Server",
           monthly_cost: null, monthly_cost_usd: 0, added: "2026-01-02T00:00:00.0000000", read_only: false, last_collected: null },
       ],
@@ -545,14 +546,33 @@ try {
         route_id: 7, metric_match: "Blocking Detected", match_kind: "exact_metric", family: "performance", configured_channels: ["slack", "pagerduty"],
         smtp_recipients: ["ops@example.test"], enabled: true, modified_at_utc: "2026-01-01T00:00:00Z", webhook_url: "https://hooks.example.test/SECRET-HOOK",
         password: "SECRET-PW", routing_key: "SECRET-KEY", slack_url: "https://hooks.example.test/SECRET-SLACKURL", pagerduty_routing_key: "SECRET-PDKEY",
-        slack_webhook_url: "https://hooks.example.test/SECRET-SLACK",
-      }],
+        slack_webhook_url: "https://hooks.example.test/SECRET-SLACK", send_resolutions: true,
+      },
+      /* #5750: the scope fields the read now carries. A server route, a tag route whose name is markup, an orphaned route that matches
+         nothing, an unreadable tag scope, and a disabled orphaned tag route. */
+      { route_id: 8, metric_match: "*", match_kind: "wildcard", family: null, configured_channels: ["teams"], smtp_recipients: [], enabled: true, modified_at_utc: "2026-01-01T00:00:00Z",
+        scope_server_id: 3, scope_server_name: "Alpha", scope_tag_id: null, scope_tag_name: null, expanded_server_count: 1, orphaned: false, scope_unreadable: false,
+        send_resolutions: false },
+      { route_id: 9, metric_match: "performance", match_kind: "family", family: "performance", configured_channels: ["slack"], smtp_recipients: [], enabled: true, modified_at_utc: "2026-01-01T00:00:00Z",
+        scope_server_id: null, scope_server_name: null, scope_tag_id: 4, scope_tag_name: "<img src=x onerror=alert(1)>", expanded_server_count: 2, orphaned: false, scope_unreadable: false,
+        send_resolutions: null },
+      { route_id: 10, metric_match: "agent-jobs", match_kind: "family", family: "agent-jobs", configured_channels: ["email"], smtp_recipients: [], enabled: true, modified_at_utc: "2026-01-01T00:00:00Z",
+        scope_server_id: 99, scope_server_name: null, scope_tag_id: null, scope_tag_name: null, expanded_server_count: null, orphaned: true, scope_unreadable: false },
+      { route_id: 11, metric_match: "reports", match_kind: "family", family: "reports", configured_channels: ["email"], smtp_recipients: [], enabled: true, modified_at_utc: "2026-01-01T00:00:00Z",
+        scope_server_id: null, scope_server_name: null, scope_tag_id: 5, scope_tag_name: "East", expanded_server_count: null, orphaned: false, scope_unreadable: true },
+      { route_id: 12, metric_match: "external", match_kind: "family", family: "external", configured_channels: ["generic"], smtp_recipients: [], enabled: false, modified_at_utc: "2026-01-01T00:00:00Z",
+        scope_server_id: null, scope_server_name: null, scope_tag_id: 6, scope_tag_name: null, expanded_server_count: null, orphaned: true, scope_unreadable: false },
+      /* A server-scoped route whose scope inputs could not be read: the desktop viewer says "scope data unreadable" (not "tag"). */
+      { route_id: 13, metric_match: "billing", match_kind: "exact_metric", family: null, configured_channels: ["email"], smtp_recipients: [], enabled: true, modified_at_utc: "2026-01-01T00:00:00Z",
+        scope_server_id: 3, scope_server_name: "Alpha", scope_tag_id: null, scope_tag_name: null, expanded_server_count: null, orphaned: false, scope_unreadable: true }],
     },
     settings: {
       alerts_enabled: true, cooldown_minutes: 15,
       cpu: { enabled: true, threshold_percent: 90, webhook_url: "SECRET-HOOK", slack_url: "SECRET-SLACKURL", pagerduty_routing_key: "SECRET-PDKEY", connection_string: "SECRET-CS", auth_token: "SECRET-AUTH", future_knob: "UNLISTED-VALUE" },
       long_running_query: { enabled: true, threshold_minutes: 30, max_results: 10, exclude_backups: true, excluded_logins: ["svc"] },
       health_bands: { deadlock_warn_per_hour: 1, deadlock_critical_per_hour: 5 }, excluded_databases: ["master"],
+      /* #5825: the per-channel send-resolutions flags, one object; a non-boolean must never reach the cell. */
+      delivery: { mode: "per_event", send_resolutions: { slack: true, teams: false, webhook: false, email: true, future: "UNLISTED-RES" } },
       analysis: { enabled: true, interval_minutes: 60, smtp_password: "SECRET-PW" }, fleet_sweep: { enabled: true, interval_minutes: 60 },
       smtp_password: "SECRET-PW",
     },
@@ -1108,14 +1128,131 @@ try {
       const disabledCannotFocus = activeElement === null;
       return { afterFocus, keptWhenSiblingRepaints, lostWhenAncestorCleared, sameNodeBack, ancestorRecorded, lostOnTextReset, detachedCannotFocus, disabledCannotFocus };
     },
+    /* #5913: the Report Feedback tab. `kind` is what the service answers a record with: recorded, refused (403, the store login is
+       not an admin one), invalid (400) or gone (404); "listonly" is a seat that cannot make changes (no form at all); "nostore" is a
+       seat that can make changes on a store whose login may not record (the list answers can_record false: no form, and the
+       page says why). The page
+       reads the list again after a record or a 404 (the list is stale) and does NOT after a 403 or a 400 (the list is right and
+       the person is told why). */
+    feedback: async (kind) => {
+      state.canEdit = kind !== "listonly";
+      const id = "11111111-1111-1111-1111-111111111111";
+      let held = [];
+      const report = () => ({
+        request_id: id, server_name: "alpha", family: "blocking", first_metric: "Blocking", opened_at_utc: "2026-10-01T00:00:00Z",
+        reported_at_utc: "2026-10-01T00:10:00Z", agent_id: "agent-a", report_verdict: "real", root_cause: "the nightly load blocks", summary: null,
+        feedback: held,
+      });
+      const answers = {
+        recorded: (sent) => { held = [{ verdict: sent.verdict, corrected_verdict: sent.corrected_verdict, missed_step: sent.missed_step, comment: sent.comment, author: "web", recorded_at_utc: "2026-10-01T01:00:00Z" }]; return { status: 200, body: { status: "recorded", request_id: id, author: "web" } }; },
+        refused: () => ({ status: 403, body: { error: "Recording feedback needs a store login with the admin role." } }),
+        invalid: () => ({ status: 400, body: { error: "The feedback was not recorded. verdict: 'great' is not right, partly or wrong." } }),
+        gone: () => ({ status: 404, body: { error: "No investigation request has that id." } }),
+      };
+      state.responder = (method, url, sent) => {
+        if (method === "GET" && url === "/api/investigation-feedback") {
+          return { status: 200, body: { hours_back: 168, can_record: kind !== "nostore", requests_returned: 1, truncated: false,
+            families: [{ family: "blocking", reported: 1, with_feedback: held.length, marked_wrong: 0, agent_false_positives: 0, false_positives: 0 }], requests: [report()] } };
+        }
+        if (method === "PUT" && url === "/api/investigation-feedback/" + id) return (answers[kind] || answers.recorded)(sent);
+        return { status: 404, body: { error: "no such request " + url } };
+      };
+      await mountPage("feedback");
+      const field = (name) => byAttr(main, "data-fb-field", name)[0] || null;
+      const reads = () => requests.filter((r) => r.method === "GET" && r.url === "/api/investigation-feedback").length;
+      const formsBefore = byAttr(main, "data-fb-form").length;
+      const readsBefore = reads();
+      const result = {
+        formsBefore, readsBefore, tabs: all(main, (n) => n.tag === "a").map((n) => n.textContent),
+        strips: all(main, (n) => n.classList.contains("strip")).map((n) => n.textContent),
+        reported: all(main, (n) => n.tag === "p" && n.textContent.startsWith("Reported ")).map((n) => n.textContent),
+        window: byAttr(main, "data-fb-window", "1").map((n) => n.textContent),
+      };
+      if (formsBefore === 0) return result;
+      field("verdict").value = "wrong";
+      await fire(field("verdict"), "change");
+      field("corrected_verdict").value = "false_positive";
+      await fire(field("corrected_verdict"), "change");
+      await typeInto(field("comment"), "never a real block");
+      await fire(byAttr(main, "data-fb-save", id)[0], "click");
+      await settle(30);
+      return {
+        ...result,
+        readsAfter: reads(),
+        writes: requests.filter((r) => r.method === "PUT").map((r) => ({ url: r.url, body: r.body, contentType: r.contentType })),
+        lines: byAttr(main, "data-fb-line").map((n) => n.textContent),
+        status: byAttr(main, "data-fb-status").map((n) => n.textContent),
+        familyRow: all(main, (n) => n.tag === "td").map((n) => n.textContent),
+      };
+    },
+    /* #5903: Approve on the Pending Notes tab. The page acts on the answer's reread flag: it reads the list again after an
+       approval or a 404 (the list is stale) and does NOT after a 403 refusal or a 500 (the list is right, the person is told why). */
+    decide: async (kind) => {
+      state.canEdit = true;
+      const note = (id) => ({
+        note_id: id, server_id: 1, server_name: "alpha", metric_name: "Blocking", family: "blocking", story_path_hash: "ABCDEF0123456789",
+        note_text: "note " + id, author: "agent:a", source_request_id: null, proposed_at_utc: "2026-10-01T00:00:00Z", expires_at_utc: "2026-12-30T00:00:00Z",
+      });
+      let pending = [note(7), note(8)];
+      const answers = {
+        approved: () => { pending = pending.filter((n) => n.note_id !== 7); return { status: 200, body: { status: "approved", note_id: 7 } }; },
+        gone: () => { pending = pending.filter((n) => n.note_id !== 7); return { status: 404, body: { error: "That note is not pending: it was already decided, or it is gone." } }; },
+        refused: () => ({ status: 403, body: { error: "Deciding a note needs a store login with the admin role." } }),
+        signin: () => ({ status: 403, body: { error: "Sign in to the web as an admin to make this change, or use the Viewer." } }),
+        broken: () => ({ status: 500, body: { error: "The store did not answer." } }),
+      };
+      state.responder = (method, url) => {
+        if (method === "GET" && url === "/api/investigation-notes/pending") return { status: 200, body: { notes_returned: pending.length, truncated: false, notes: pending } };
+        if (method === "PUT" && url === "/api/investigation-notes/7/approve") return answers[kind]();
+        return { status: 404, body: { error: "no such request " + url } };
+      };
+      await mountPage("pending");
+      const listReads = () => requests.filter((r) => r.method === "GET" && r.url === "/api/investigation-notes/pending").length;
+      const approveIds = () => byAttr(main, "data-note-id").filter((b) => b.textContent === "Approve").map((b) => b.attrs["data-note-id"]);
+      const before = listReads();
+      const rowsBefore = approveIds();
+      const approve = byAttr(main, "data-note-id", "7").find((b) => b.textContent === "Approve");
+      await fire(approve, "click");
+      await settle(30);
+      return {
+        rowsBefore,
+        listReadsBefore: before,
+        listReadsAfter: listReads(),
+        writes: requests.filter((r) => r.method === "PUT").map((r) => r.url),
+        rowsAfter: approveIds(),
+        status: byAttr(main, "data-note-status").map((n) => n.textContent),
+      };
+    },
+    /* #6265: a seat that can edit but holds no sign-in (a dashboard with no web token) sees the Pending Notes and Practice Scores lists,
+       the sign-in sentence, and none of the write forms or the Approve and Reject buttons. */
+    signedout: async (tab) => {
+      state.canEdit = true;
+      state.signedIn = false;
+      const note = { note_id: 7, server_id: 1, server_name: "alpha", metric_name: "Blocking", family: "blocking", story_path_hash: "ABCDEF0123456789",
+        note_text: "note 7", author: "agent:a", source_request_id: null, proposed_at_utc: "2026-10-01T00:00:00Z", expires_at_utc: "2026-12-30T00:00:00Z" };
+      state.responder = (method, url) => {
+        if (method === "GET" && url === "/api/investigation-notes/pending") return { status: 200, body: { notes_returned: 1, truncated: false, notes: [note] } };
+        if (method === "GET" && url === "/api/investigation-practice-scores") return { status: 200, body: { hours_back: 720, agents: [] } };
+        return { status: 404, body: { error: "no such request " + url } };
+      };
+      await mountPage(tab);
+      return {
+        sentence: main.textContent.includes("Sign in to the web as an admin to make this change, or use the Viewer."),
+        approveButtons: byAttr(main, "data-note-id").length,
+        noteForm: byAttr(main, "data-note-write").length,
+        practiceForm: byAttr(main, "data-practice-start").length,
+        writes: requests.filter((r) => r.method === "PUT").length,
+      };
+    },
     /* One call of an admin.js export, {"fn": "buildEditBody", "args": [...]} on stdin, printed as {"result": ...}; or
        {"calls": [{"fn": ..., "args": [...]}, ...]} for a table of calls in one process, printed as {"results": [...]}.
        An export that is not a function (EDIT_FIELDS) is returned as it is. */
     pure: async () => {
       const request = JSON.parse(await readStdin());
       const call = ({ fn, args = [] }) => {
-        if (!(fn in page)) throw new Error("admin.js exports no " + fn);
-        return typeof page[fn] === "function" ? page[fn](...args) : page[fn];
+        const source = fn in page ? page : fn in actionsPage ? actionsPage : null;
+        if (!source) throw new Error("admin.js exports no " + fn);
+        return typeof source[fn] === "function" ? source[fn](...args) : source[fn];
       };
       return Array.isArray(request.calls) ? { results: request.calls.map(call) } : { result: call(request) };
     },

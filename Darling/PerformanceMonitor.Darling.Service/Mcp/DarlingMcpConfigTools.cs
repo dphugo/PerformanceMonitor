@@ -34,6 +34,7 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 [McpServerToolType]
 public sealed class DarlingMcpConfigTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_server_config"), Description("Gets the current SQL Server instance configuration (sys.configurations). Shows all sp_configure settings with configured and in-use values. Useful for checking CTFP, MAXDOP, max memory, and other instance-level settings right now (unlike get_server_config_changes, which shows only what changed between connect snapshots). LATEST IS A TIME: configuration is captured when the collector CONNECTS, not on a schedule, so 'current' here means 'as of the last capture' - captured_at is that instant, and a value can be days old on a server the monitor has stayed connected to.")]
     public static async Task<string> GetServerConfig(
         NpgsqlDataSource postgres,
@@ -47,14 +48,14 @@ public sealed class DarlingMcpConfigTools
         {
             var snapshot = await DarlingCurrentConfigReader.GetLatestServerConfigAsync(postgres, resolved.ServerId, cancellationToken);
             if (snapshot.IsEmpty)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "server_config", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "server_config", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         "No server configuration data available. The config collector may not have run yet.");
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3541 A10: the connect-time capture this "current" configuration is as of. */
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 setting_count = snapshot.Count,
@@ -75,6 +76,7 @@ public sealed class DarlingMcpConfigTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_database_config"), Description("Gets database-level configuration for all databases (sys.databases). Shows recovery model, RCSI, auto-shrink, auto-close, Query Store, compatibility level, page verify, and other settings. Critical for identifying misconfigured databases. LATEST IS A TIME: captured when the collector connects, not on a schedule - captured_at is the instant these settings are as of, and a database created or altered since is not reflected until the next connect.")]
     public static Task<string> GetDatabaseConfig(
         NpgsqlDataSource postgres,
@@ -102,7 +104,7 @@ public sealed class DarlingMcpConfigTools
         {
             var snapshot = await DarlingCurrentConfigReader.GetLatestDatabaseConfigAsync(postgres, resolved.ServerId, cancellationToken);
             if (snapshot.IsEmpty)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "database_config", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "database_config", cancellationToken)
                     ?? McpHelpers.Status(
                         "unavailable",
                         "No database configuration data available. The config collector may not have run yet.");
@@ -143,7 +145,7 @@ public sealed class DarlingMcpConfigTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 database_count = result.Count,
                 databases = result
@@ -155,6 +157,15 @@ public sealed class DarlingMcpConfigTools
         }
     }
 
+    /// <summary>#5633 item 19: the empty answer of <c>get_trace_flags</c>. A successful trace_flags run that stored nothing says no flag is
+    /// enabled as of that run; with no such run it keeps the old hedge, which is then the true statement.</summary>
+    internal static string EmptyTraceFlagsStatus(CollectorRunFacts runFacts) =>
+        McpHelpers.Status(
+            "empty",
+            runFacts.NoTraceFlagsEnabled()
+                ?? "No trace flags found (none enabled, or the config collector has not run yet).");
+
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_trace_flags"), Description("Gets active trace flags on the SQL Server instance. Shows flag number, enabled status, and whether the flag is global or session-scoped. LATEST IS A TIME: captured when the collector connects, not on a schedule - captured_at is the instant these flags are as of; a flag turned on or off since is not reflected until the next connect.")]
     public static async Task<string> GetTraceFlags(
         NpgsqlDataSource postgres,
@@ -168,12 +179,12 @@ public sealed class DarlingMcpConfigTools
         {
             var snapshot = await DarlingCurrentConfigReader.GetLatestTraceFlagsAsync(postgres, resolved.ServerId, cancellationToken);
             if (snapshot.IsEmpty)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "trace_flags", cancellationToken)
-                    ?? McpHelpers.Status("empty", "No trace flags found (none enabled, or the config collector has not run yet).");
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "trace_flags", cancellationToken)
+                    ?? EmptyTraceFlagsStatus(await DarlingCollectorRunFactsReader.ReadAsync(postgres, resolved.ServerId, "trace_flags", null, null, cancellationToken));
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = snapshot.CapturedAt!.Value.ToString("o"),
                 trace_flag_count = snapshot.Count,
                 trace_flags = snapshot.Rows.Select(r => new

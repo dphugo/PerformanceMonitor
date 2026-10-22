@@ -45,7 +45,6 @@ namespace Lite.Tests;
 /// is reproduced as the exact call <c>TabItem.OnPreviewGotKeyboardFocus</c> makes, not as a real keyboard
 /// focus change, which needs a shown, activated window.</para>
 /// </summary>
-[Trait("Reads", "Darling")]
 public sealed class StandalonePlanViewerPlusTabTests
 {
     private const string PlusTag = "__PLAN_ADD_TAB__";
@@ -260,9 +259,7 @@ public sealed class StandalonePlanViewerPlusTabTests
             Tabs.Arrange(new Rect(0, 0, 900, 600));
             Tabs.UpdateLayout();
 
-            var frame = new DispatcherFrame();
-            Dispatcher.CurrentDispatcher.BeginInvoke(DispatcherPriority.SystemIdle, new Action(() => frame.Continue = false));
-            Dispatcher.PushFrame(frame);
+            StaTestThread.WaitForIdle(Dispatcher.CurrentDispatcher, StaTestThread.IdleLimit, DispatcherPriority.SystemIdle);
         }
 
         /// <summary>The focus half of a UIA select: <c>TabItem.OnPreviewGotKeyboardFocus</c> selects a tab

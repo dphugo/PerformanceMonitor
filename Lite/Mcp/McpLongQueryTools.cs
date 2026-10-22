@@ -16,7 +16,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpLongQueryTools
 {
-    [McpServerTool(Name = "get_long_query_completions"), Description("Gets the SLOWEST long-running query completions in the window: rpc/batch completions over the trace's duration threshold, plus attentions (cancels/timeouts), ranked duration DESC, attentions (no duration) last. THE PAGE IS THE window's limit SLOWEST, NOT ITS NEWEST: truncated means the window held more, none slower than the page; oldest/newest_returned_event_time bound the slowest runs' ages, NOT how far the read reached. Collector is opt-in, OFF by default: empty can mean none in the window, or the collector was off — enable 'long_query_completions' in the schedule. <<GUIDE>> Gets the SLOWEST long-running query completions in the window, captured by the opt-in long-query trace: rpc/batch completions whose duration exceeded the trace threshold, plus attentions (client cancels / query timeouts), ranked by duration DESC with attentions (no duration) last. Shows duration, CPU, reads/writes, row count, result (OK/Error/Abort — Abort means the long query was cancelled), the statement text, and the calling session/app/login. THE PAGE IS THE window's limit SLOWEST, NOT ITS NEWEST: completions_returned is how many rows you got and truncated says the window held more than limit. Because the page is duration-RANKED, oldest_returned_event_time / newest_returned_event_time tell you how old the slowest runs are and say NOTHING about how far back the read reached — every row in the window was a candidate, so a truncated page still holds the window's slowest. Both SKUs keep the same population. The collector is OFF by default; if it returns empty, enable the 'long_query_completions' collector in the schedule.")]
+    [McpServerTool(Name = "get_long_query_completions"), Description("Gets the SLOWEST long-running query completions in the window: rpc/batch completions over the trace's duration threshold, plus attentions (cancels/timeouts), ranked duration DESC, attentions (no duration) last. THE PAGE IS THE window's limit SLOWEST, NOT ITS NEWEST: truncated means the window held more, none slower than the page; oldest/newest_returned_event_time bound the slowest runs' ages, NOT how far the read reached. Collector is opt-in, OFF by default: empty can mean none in the window, or the collector was off — enable 'long_query_completions' in the schedule. <<GUIDE>> Gets the SLOWEST long-running query completions in the window, captured by the opt-in long-query trace: rpc/batch completions whose duration exceeded the trace threshold, plus attentions (client cancels / query timeouts), ranked by duration DESC with attentions (no duration) last. Shows duration, CPU, reads/writes, row count, result (OK/Error/Abort — Abort means the long query was cancelled), the statement text, and the calling session/app/login. THE PAGE IS THE window's limit SLOWEST, NOT ITS NEWEST: completions_returned is how many rows you got and truncated says the window held more than limit. Because the page is duration-RANKED, oldest_returned_event_time / newest_returned_event_time tell you how old the slowest runs are and say NOTHING about how far back the read reached — every row in the window was a candidate, so a truncated page still holds the window's slowest. query_identity is the key to group rows by: it is the engine's query_hash when the engine gave one (batch-level events carry none, so query_hash is null there), otherwise text: plus a fingerprint of the statement text that does not merge statements differing only in a literal. An attention row (client cancel or timeout) carries no statement text, so its query_identity is null and it cannot be grouped by it; a null query_identity is never a group key, so do not pool those rows under one. Both SKUs keep the same population. The collector is OFF by default; if it returns empty, enable the 'long_query_completions' collector in the schedule.")]
     public static async Task<string> GetLongQueryCompletions(
         LocalDataService dataService,
         ServerManager serverManager,
@@ -24,6 +24,7 @@ public sealed class McpLongQueryTools
         [Description("Hours of history. Default 24.")] int hours_back = 24,
         [Description("Maximum rows to return, slowest first. Default 30. This is what bounds the page — read truncated to know whether the window held more.")] int limit = 30,
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
+        [Description(QueryTagReadScope.ParameterDescription)] string? tag = null,
         [Description("Limit to one database. Omit for all databases.")] string? database_name = null)
     {
         var (resolved, error) = ServerResolver.ResolveOrError(serverManager, server_name);
@@ -31,6 +32,13 @@ public sealed class McpLongQueryTools
 
         try
         {
+            /* #5992: the query tag filter. A name no tag carries is an empty answer that says so. */
+            var tagScope = await dataService.GetQueryTagReadScopeAsync(resolved.ServerId, tag);
+            if (tagScope.Unknown)
+            {
+                return McpHelpers.Status("empty", QueryTagReadScope.UnknownTagMessage(tagScope.Requested!));
+            }
+
             var hoursError = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
             if (hoursError != null) return hoursError;
 
@@ -49,18 +57,18 @@ public sealed class McpLongQueryTools
                before the duration ranking and the limit + 1 fetch, so the page is the slowest N of the chosen database. */
             var database = string.IsNullOrWhiteSpace(database_name) ? null : database_name;
             var rows = await dataService.GetSlowestLongQueryCompletionsAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd, limit: limit + 1,
-                databaseNames: database == null ? null : new[] { database });
+                databaseNames: database == null ? null : new[] { database }, tags: tagScope);
             if (rows.Count == 0)
             {
                 /* #5244 round 2 (L2): not_collected and precondition echo database_name like every other shape. */
                 var unmet = McpHelpers.WithDatabase(
-                    await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "long_query_completions"), database)
+                    await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "long_query_completions"), database)
                     /* #2546: this collector is opt-in, so the fall-through below already sends the reader to
                        the schedule, which is the wrong place when the collector IS enabled and its session
                        is missing. The precondition answer names that state instead of quietly blaming a knob
                        that is already switched on. */
                     ?? McpHelpers.WithDatabase(
-                        await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.ServerName, "long_query_completions"), database);
+                        await McpRuntimePrecondition.StatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "long_query_completions"), database);
                 if (unmet != null)
                 {
                     return unmet;
@@ -72,9 +80,10 @@ public sealed class McpLongQueryTools
                 /* #5244 round 2 (L3): the twin of Darling's. The floor probe is not database-filtered, so a null floor (no effective_start)
                    means the store holds no long-query row for this server in the window, and only then does the answer send the reader to
                    the opt-in switch; with rows for other databases the collector is on. */
-                var collectorMayBeOff = database == null || emptyNotice.EffectiveStart is null;
+                var collectorMayBeOff = (database == null && !tagScope.Active) || emptyNotice.EffectiveStart is null;
                 return McpHelpers.StatusForDatabase("empty",
                     "No long-running query completions found in the specified time range" + McpBlockingTools.ForChosenDatabase(database)
+                        + (tagScope.Active ? $" for query tag '{tagScope.Requested}'" : "")
                         + (collectorMayBeOff ? ". The long_query_completions collector is opt-in (default OFF) — enable it in the collector schedule to capture data." : "."),
                     database, /* #5244 review L2: the echo rides on an empty answer too */
                     emptyNotice.AsHints());
@@ -112,12 +121,16 @@ public sealed class McpLongQueryTools
                     client_pid = r.ClientPid,
                     nt_username = r.NtUserName,
                     server_principal_name = r.ServerPrincipalName,
-                    query_hash = r.QueryHash
+                    /* #5711: query_hash is NULL when the engine gave none (the trace's batch-level events carry 0); query_identity
+                       is the key to group by: the real hash, else a fingerprint of the scrubbed statement text. */
+                    query_hash = QueryHashIdentity.KnownHash(r.QueryHash),
+                    query_identity = r.McpQueryIdentity,
+                    tag = tagScope.TagOfHash(r.QueryHash)
                 });
 
-            return JsonSerializer.Serialize(new
+            return McpQueryTools.WithTagFilter(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where the store's data starts, always present (false and null when the store covered the
                    window). The floor is the earlier of the coverage probe and the oldest event this page shows: a
@@ -136,7 +149,7 @@ public sealed class McpLongQueryTools
                 newest_returned_event_time = McpHelpers.FormatEffectiveStart(page.Max(r => r.EventTime)),
                 order = "duration_ms_desc",
                 completions = result
-            }, McpHelpers.JsonOptions);
+            }, tagScope.Named);
         }
         catch (Exception ex)
         {

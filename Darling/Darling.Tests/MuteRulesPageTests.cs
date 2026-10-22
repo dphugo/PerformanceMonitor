@@ -6,7 +6,10 @@
  * Licensed under the MIT License. See LICENSE file in the project root for full license information.
  */
 
+using System;
 using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 using Xunit;
 using static Darling.Tests.RepoFile;
 
@@ -25,6 +28,25 @@ public sealed class MuteRulesPageTests
     public void ThePageReadsGetMuteRules_IncludingPausedAndExpiredRules()
     {
         Assert.Contains("readTool(\"get_mute_rules\", { enabled_only: false })", Page());
+    }
+
+    /// <summary>
+    /// #5632: get_mute_rules renamed <c>summary</c> to <c>match_summary</c>, and the page kept reading <c>r.summary</c>, so
+    /// its Scope column and its delete dialog fell back to "Every alert" for every rule. Each field the page reads off a rule
+    /// row must be one the tool's per-rule projection (<c>BuildMuteRulePayload</c>) returns, so the next rename fails here.
+    /// </summary>
+    [Fact]
+    public void EveryRuleFieldThePageReads_IsOneTheToolReturns()
+    {
+        /* The tool's mute_rule object is the shared MuteRuleImage (#5917): its wire names are the record's JsonPropertyNames. */
+        var returned = typeof(PerformanceMonitor.Darling.Storage.MuteRuleImage).GetProperties()
+            .Select(p => System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Text.Json.Serialization.JsonPropertyNameAttribute>(p)!.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Contains("match_summary", returned);
+
+        var read = Regex.Matches(Page(), @"\b(?:r|rule)\.([a-z_]+)\b").Select(m => m.Groups[1].Value).Distinct(StringComparer.Ordinal).ToList();
+        Assert.Contains("match_summary", read);
+        Assert.All(read, field => Assert.True(returned.Contains(field), $"mute-rules.js reads r.{field}, which get_mute_rules does not return."));
     }
 
     [Fact]
@@ -64,7 +86,9 @@ public sealed class MuteRulesPageTests
     {
         var alerts = Wwwroot("js", "pages", "alerts.js");
         Assert.Contains("canMute = !!(await getSession()).can_edit;", alerts);
-        Assert.Contains("return canMute ? [SELECT_COLUMN].concat(ALERT_COLUMNS, [MUTE_COLUMN]) : ALERT_COLUMNS;", alerts);
+        /* #5654: the external-source column joins the base list when the page shows it; #5644 W14 puts Triage (and, for
+           an editing seat, Select and Mute) ahead of it. */
+        Assert.Contains("return canMute ? [SELECT_COLUMN, TRIAGE_COLUMN, MUTE_COLUMN].concat(base) : [TRIAGE_COLUMN].concat(base);", alerts);
         Assert.Contains("link(\"Mute this alert\", mutePrefillParams(a))", alerts);
         Assert.DoesNotContain("server_name: a.server_name", alerts);
         Assert.Contains("stored_server_name = r.StoredServerName", File.ReadAllText(PathTo("Darling", "PerformanceMonitor.Darling.Service", "Mcp", "DarlingMcpAlertTools.cs")));

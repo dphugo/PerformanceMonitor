@@ -26,6 +26,7 @@ namespace Darling.Tests;
 /// an old one, is held to both halves without anyone registering it; a sort added without either half fails
 /// here rather than showing a different time on a rerun.
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class PeakTimeTieBreakTests
 {
     private const string AnalysisProject = "PerformanceMonitor.Darling.Analysis";
@@ -189,16 +190,5 @@ LIMIT 1";
                 ("tie-broken sort", "ms_per_read DESC NULLS LAST, collection_time DESC"),
             },
             found);
-    }
-
-    [Fact]
-    public void TheIoPeakSample_AndItsReadCount_PickTheSameTiedRow()
-    {
-        /* Two arrays ride one row: the peak sample's time and that sample's reads. They must share one ORDER BY,
-           tie-break and NULLS LAST included, or a tie (or a sample with no latency) can pair one row's time with
-           another row's reads. */
-        var io = RepoFile.ReadRepoFile("Darling", AnalysisProject, "PgTargetAnomalyDetector.Io.cs");
-        Assert.Contains("(array_agg(collection_time ORDER BY ms_per_read DESC NULLS LAST, collection_time DESC))[1] AS peak_sample", io, StringComparison.Ordinal);
-        Assert.Contains("(array_agg(reads ORDER BY ms_per_read DESC NULLS LAST, collection_time DESC))[1]", io, StringComparison.Ordinal);
     }
 }

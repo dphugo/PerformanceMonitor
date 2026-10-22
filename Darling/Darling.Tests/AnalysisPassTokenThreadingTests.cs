@@ -215,8 +215,12 @@ public sealed class AnalysisPassTokenThreadingTests
 
         /* 27 collect methods guard their read this way; the number is stated so deleting one is a decision.
            The other four collect methods have no catch at all and never had one — their reads propagate
-           straight to the pass, which is the same outcome by a shorter route. */
-        Assert.Equal(27, AnalysisSources()
+           straight to the pass, which is the same outcome by a shorter route.
+           28 since #5630: the plan-input check's plan read is one more guarded read; it lets the pass's own abandonment
+           through and keeps the candidate, counted unverified, on a fault.
+           29 since #6267: the failure read of the plan-regression pass is one more; it lets the abandonment through and
+           records any other fault as a collection caveat. */
+        Assert.Equal(29, AnalysisSources()
             .Where(s => Path.GetFileName(s.File).StartsWith("PgFactCollector.", StringComparison.Ordinal))
             .SelectMany(s => s.Code)
             .Count(line => classified.IsMatch(line)));

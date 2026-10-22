@@ -77,7 +77,7 @@
         </Grid.RowDefinitions>
 
         <!-- Header Controls -->
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="10,8" Height="36">
+        <WrapPanel Grid.Row="0" Orientation="Horizontal" Margin="10,8" MinHeight="36">
             <TextBlock Text="Alert History" VerticalAlignment="Center" Margin="0,0,10,0" FontWeight="Bold" FontSize="14"
                        Foreground="{DynamicResource ForegroundBrush}"/>
             <TextBlock Text="Time Range:" VerticalAlignment="Center" Margin="5,0,4,0"
@@ -98,11 +98,14 @@
                     Margin="4,0,0,0" Padding="10,4" MinWidth="70"/>
             <Button Content="Manage Mute Rules…" Click="ManageMuteRules_Click"
                     Margin="8,0,0,0" Padding="10,4" MinWidth="90"/>
+            <Button x:Name="KnownPatternsButton" Content="Known Patterns…" Click="KnownPatterns_Click"
+                    Margin="8,0,0,0" Padding="10,4" MinWidth="90"
+                    ToolTip="Notes on patterns you already know about (a nightly job, a planned batch). A matching alert carries the note; it is not muted."/>
             <TextBlock x:Name="AlertCountIndicator" Text="" Margin="12,0,0,0" VerticalAlignment="Center"
                        FontStyle="Italic" Foreground="{DynamicResource AccentBrush}" FontWeight="SemiBold"/>
             <TextBlock x:Name="LastRefreshedIndicator" Text="" Margin="12,0,0,0" VerticalAlignment="Center"
                        FontSize="11" Foreground="{DynamicResource ForegroundMutedBrush}"/>
-        </StackPanel>
+        </WrapPanel>
 
         <!-- DataGrid -->
         <Grid Grid.Row="1" Margin="10,0,10,10">
@@ -142,7 +145,7 @@
                             </StackPanel>
                         </DataGridTextColumn.Header>
                     </DataGridTextColumn>
-                    <DataGridTextColumn Binding="{Binding CurrentValueDisplay}" Width="160">
+                    <DataGridTextColumn Binding="{Binding CurrentValueDisplay}" SortMemberPath="CurrentValue" Width="160">
                         <DataGridTextColumn.Header>
                             <StackPanel Orientation="Horizontal">
                                 <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="CurrentValueDisplay" Click="FilterButton_Click" Margin="0,0,4,0"/>
@@ -150,7 +153,7 @@
                             </StackPanel>
                         </DataGridTextColumn.Header>
                     </DataGridTextColumn>
-                    <DataGridTextColumn Binding="{Binding ThresholdValueDisplay}" Width="120">
+                    <DataGridTextColumn Binding="{Binding ThresholdValueDisplay}" SortMemberPath="ThresholdValue" Width="120">
                         <DataGridTextColumn.Header>
                             <StackPanel Orientation="Horizontal">
                                 <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="ThresholdValueDisplay" Click="FilterButton_Click" Margin="0,0,4,0"/>
@@ -158,11 +161,26 @@
                             </StackPanel>
                         </DataGridTextColumn.Header>
                     </DataGridTextColumn>
-                    <DataGridTextColumn Binding="{Binding NotificationType}" Width="80">
+                    <DataGridTextColumn Binding="{Binding NotificationType}" Width="110">
                         <DataGridTextColumn.Header>
                             <StackPanel Orientation="Horizontal">
                                 <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="NotificationType" Click="FilterButton_Click" Margin="0,0,4,0"/>
                                 <TextBlock Text="Channel" FontWeight="Bold" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </DataGridTextColumn.Header>
+                    </DataGridTextColumn>
+                    <!-- #5825: what a resolution row's send did, and where; blank on every other row. -->
+                    <DataGridTextColumn Binding="{Binding ResolutionDisplay}" Width="160">
+                        <DataGridTextColumn.Header>
+                            <TextBlock Text="Resolution" FontWeight="Bold" VerticalAlignment="Center"/>
+                        </DataGridTextColumn.Header>
+                    </DataGridTextColumn>
+                    <!-- #5642: the age of the newest sample the alert judged, as it was when the alert fired (Lite's twin column). -->
+                    <DataGridTextColumn Binding="{Binding NewestSampleDisplay}" SortMemberPath="NewestSample.Age" Width="270">
+                        <DataGridTextColumn.Header>
+                            <StackPanel Orientation="Horizontal">
+                                <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="NewestSampleDisplay" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                <TextBlock Text="Newest Sample" FontWeight="Bold" VerticalAlignment="Center"/>
                             </StackPanel>
                         </DataGridTextColumn.Header>
                     </DataGridTextColumn>

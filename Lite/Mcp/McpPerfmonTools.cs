@@ -10,6 +10,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpPerfmonTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_perfmon_stats"), Description("Gets the latest SQL Server performance counter values (batch requests/sec, compilations/sec, deadlocks/sec, and more). LATEST IS A TIME: the newest snapshot, not a window; captured_at is when it was collected; use get_perfmon_trend for history. counter_kind: gauge = value IS the reading, delta_value null; rate = value is cumulative, delta_value its per-interval change, per_second that change per second (null when unknowable); other = a non-rate per-interval change; null counter_kind predates the column, classify by name (ends in /sec = rate). <<GUIDE>> Gets the latest SQL Server performance counter values: batch requests/sec, compilations/sec, deadlocks/sec, and more. Provides throughput context to distinguish a busy server from a sick one. Use counter_name or instance_name to filter results. LATEST IS A TIME: this reads the newest counter snapshot, not a window, and captured_at is the instant it was collected; use get_perfmon_trend for a counter over time. Each row carries counter_kind from the stored cntr_type: 'gauge' means value IS the reading (a level such as Total Server Memory (KB); delta_value is null because a level has no delta), 'rate' means value is a cumulative count (a running total, not a rate), delta_value is its change over the last collection interval, and per_second is that change divided by the interval's seconds: the counter's rate, the figure to report for it, and null when no delta was knowable (a first collection, a counter reset or a restart), 'other' means an average/fraction numerator whose delta_value is a per-interval change and not a rate; null counter_kind is a row written before the type was stored — classify it by name (a counter whose name ends in /sec is a rate, and carries per_second).")]
     public static async Task<string> GetPerfmonStats(
         LocalDataService dataService,
@@ -26,7 +27,7 @@ public sealed class McpPerfmonTools
             var rows = await dataService.GetLatestPerfmonStatsAsync(resolved.ServerId);
             if (rows.Count == 0)
             {
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "perfmon_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "perfmon_stats")
                     ?? McpHelpers.Status("unavailable", "No perfmon stats available.");
             }
 
@@ -42,15 +43,11 @@ public sealed class McpPerfmonTools
                its delta over the stored interval, so the running total in value is never the only number a
                reader gets. */
             var result = filtered.Select(r => TrendPayloads.PerfmonLatestRow(
-                r.CounterName, r.InstanceName, r.Value, r.DeltaValue, r.SampleIntervalSeconds, r.CntrType));
+                r.CounterName, r.InstanceName, r.Value, r.DeltaValue, r.SampleIntervalSeconds, r.CntrType)).ToList();
 
-            return JsonSerializer.Serialize(new
-            {
-                server = resolved.ServerName,
-                /* #3541 A10: taken from the unfiltered snapshot, so a filter that matches nothing still says when. */
-                captured_at = rows[0].CollectionTime.ToString("o"),
-                counters = result
-            }, McpHelpers.JsonOptions);
+            /* #3541 A10: captured_at is taken from the unfiltered snapshot, so a filter that matches nothing still says when.
+               #6180: the page is cut to the shared response target (see TrendPayloads.PerfmonLatestReply). */
+            return TrendPayloads.PerfmonLatestReply(resolved.DisplayName, rows[0].CollectionTime.ToString("o"), result);
         }
         catch (Exception ex)
         {
@@ -89,7 +86,7 @@ public sealed class McpPerfmonTools
                    the miss path, so either order keeps the property that matters — but a permanently gated
                    engine takes this branch on every call, forever, and neither the probe nor the PLE branch
                    below could tell it anything. Asking first makes that case one query instead of two. */
-                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "perfmon_stats");
+                var gated = await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "perfmon_stats");
                 if (gated != null)
                 {
                     return gated;
@@ -135,7 +132,7 @@ public sealed class McpPerfmonTools
             var discontinuities = await dataService.GetBaselineDiscontinuitiesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
 
             return TrendPayloads.PerfmonTrend(
-                resolved.ServerName, counter_name, hours_back, points, bucketMinutes, bucket_minutes is not null,
+                resolved.DisplayName, counter_name, hours_back, points, bucketMinutes, bucket_minutes is not null,
                 budget.AutoPoints, BaselineDiscontinuities.ToPayload(discontinuities), bucketsResult.ArtifactsSetAside);
         }
         catch (Exception ex)

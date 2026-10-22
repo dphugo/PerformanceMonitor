@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
+using PerformanceMonitor.Common.QueryTags;
 
 namespace PerformanceMonitor.Collectors;
 
@@ -54,6 +55,13 @@ public interface ICollectorDefinition<TRow> : ICollectorSchemaInfo
     /// list as the server gave it.
     /// </summary>
     bool SkipsSeparatelyMonitoredDatabases { get; }
+
+    /// <summary>
+    /// True when the per-database read on an Azure SQL Database logical server leaves out <c>master</c>, which cannot
+    /// host a database-scoped Extended Events session (#6312). True for the collectors that read one and get nothing else from master (attention,
+    /// blocked_process_report); false for deadlocks, whose master item reads the server-wide telemetry blob, and for every other collector, which reads the list as the server gave it.
+    /// </summary>
+    bool SkipsMasterDatabase { get; }
 
     /// <summary>
     /// Time column the host should read its latest already-collected value of (from the host's
@@ -266,4 +274,16 @@ public interface ICollectorDefinition<TRow> : ICollectorSchemaInfo
     /// keeps the shared definition free of a table only one SKU has.</para>
     /// </summary>
     OversizedPlanObservation? DescribeOversizedPlan(TRow row) => null;
+
+    /// <summary>
+    /// Describes the query keys and caller fields one already-read row saw (#5980, part of #5971): a hash
+    /// sighting for a row with a query_hash, an object sighting for a procedure row, a caller sighting per
+    /// application, login and host for a row with no query_hash (blocking and deadlock rows). Null when the row
+    /// has no key, and for every collector that does not describe its rows, which is the default.
+    ///
+    /// <para><b>It reads a row; it writes nothing and never opens a connection.</b> Each store builds its tag
+    /// map from these sightings itself (#5985 Darling, #5990 Lite), the same split as
+    /// <see cref="DescribeOversizedPlan"/>.</para>
+    /// </summary>
+    IReadOnlyList<QueryTagSighting>? DescribeQueryTagSightings(TRow row) => null;
 }

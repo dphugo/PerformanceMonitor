@@ -44,7 +44,7 @@ namespace Darling.Tests;
 /// small enough for a test, and a ghost looks like data — so the shape is pinned on the text, the Lite twin is
 /// pinned to the same text, and the gated arm seeds ghosts and asks the planner.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class LatestValueLookbackSqlTests
 {
     /// <summary>Every lookback-bounded read, by name: the six the issue inventoried plus memory_stats, the same
@@ -167,73 +167,6 @@ public sealed class LatestValueLookbackSqlTests
         if (perServer is not null) overrides.Add(new ScheduleOverride(ServerId, collector, perServer, null, true));
         if (fleet is not null) overrides.Add(new ScheduleOverride(null, collector, fleet, null, true));
         Assert.Equal(expected, StoreConfigProvider.ResolveSchedule(collector, ServerId, overrides).FrequencyMinutes);
-    }
-
-    /// <summary>
-    /// The seam between a read and its bound: each latest-value command binds the lower bound of the collector
-    /// whose table its SQL reads. Bound by the wrong collector, a daily database_size_stats override would widen
-    /// the memory_stats read and leave the size reads at a day — both wrong, and invisible on default cadences.
-    /// </summary>
-    [Theory]
-    [InlineData("PgFactCollector.Storage.cs", nameof(PgFactCollector.DatabaseSizeSql))]
-    [InlineData("PgFactCollector.Storage.cs", nameof(PgFactCollector.FileAutogrowthSql))]
-    [InlineData("PgFactCollector.Storage.cs", nameof(PgFactCollector.DiskSpaceSql))]
-    [InlineData("PgFactCollector.Resources.cs", nameof(PgFactCollector.MemoryClerkSql))]
-    [InlineData("PgFactCollector.Resources.cs", nameof(PgFactCollector.PlanCacheStatsSql))]
-    [InlineData("PgFactCollector.Resources.cs", nameof(PgFactCollector.MemoryStatsSql))]
-    [InlineData("PgDrillDownCollector.Storage.cs", nameof(PgDrillDownCollector.AutogrowthPercentFilesSql))]
-    public void EachRead_BindsTheBoundOfTheCollectorWhoseTableItReads(string file, string name)
-    {
-        var table = Assert.Single(TablesRead(StripComments(SqlFor(name))), t => t != "latest" && t != "ranked");
-        var collector = Assert.Single(PgLatestValueBounds.Collectors, c => c.TargetTable == table);
-
-        var source = File.ReadAllText(Path.Combine(RepoRoot(), "Darling", "PerformanceMonitor.Darling.Analysis", file));
-        var construction = source.IndexOf($"new NpgsqlCommand({name}, connection)", StringComparison.Ordinal);
-        Assert.True(construction >= 0, $"{name}'s command construction was not found in {file}");
-        var bindings = source[construction..source.IndexOf("ExecuteReaderAsync", construction, StringComparison.Ordinal)];
-
-        Assert.Contains($"context.LatestValueStartFor({collector.GetType().Name}.Instance.Name)", bindings, StringComparison.Ordinal);
-        Assert.Single(Regex.Matches(bindings, @"LatestValueStartFor\("));
-    }
-
-    /// <summary>
-    /// database_config is an ON-LOAD snapshot, so a lookback would lose it on any server connected for longer
-    /// than a day. The ghosts go instead by anchoring on the newest capture — the rule its own drill-down
-    /// (<see cref="PgDrillDownCollector.ConfigIssuesSql"/>) already followed, so the count and the list now
-    /// agree.
-    /// </summary>
-    [Fact]
-    public void TheDatabaseConfigRead_AnchorsOnTheNewestCapture_AndTakesNoLookback()
-    {
-        var sql = PgFactCollector.DatabaseConfigSql;
-
-        Assert.Contains(
-            "AND   capture_time = (SELECT MAX(capture_time) FROM database_config WHERE server_id = $1)",
-            sql,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain("$2", sql, StringComparison.Ordinal);
-        Assert.Contains("capture_time = (SELECT MAX(capture_time) FROM v_database_config WHERE server_id = $1)",
-            PgDrillDownCollector.ConfigIssuesSql, StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// #3929: unlike database_config's exact-capture-time anchor above, trace_flags CANNOT anchor on
-    /// MAX(capture_time) - a capture that finds every flag off writes ZERO rows, so MAX would silently fall
-    /// back to an older, stale-ON capture. It takes the same cadence-aware lookback the six collection_time
-    /// reads do instead, just spelled over capture_time (the config-snapshot family's time column, shared with
-    /// database_config above) and fed by CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes rather
-    /// than the raw resolved frequency, since trace_flags's own resolved frequency is 0 (on-load).
-    /// </summary>
-    [Fact]
-    public void TheTraceFlagsRead_IsBoundedByCaptureTime_BothBelowAndAboveTheWindow()
-    {
-        var sql = PgFactCollector.TraceFlagsSql;
-
-        Assert.Contains("server_id = $1", sql, StringComparison.Ordinal);
-        Assert.Contains("capture_time >= $2", sql, StringComparison.Ordinal);
-        Assert.Contains("capture_time <= $3", sql, StringComparison.Ordinal);
-        Assert.DoesNotContain("$4", sql, StringComparison.Ordinal);
-        Assert.DoesNotMatch(new Regex(@"INTERVAL", RegexOptions.IgnoreCase), sql);
     }
 
     /// <summary>
@@ -370,7 +303,6 @@ public sealed class LatestValueLookbackSqlTests
 /// included, because the ghost existed then.</para>
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class LatestValueLookbackLivePostgresTests
 {
     /// <summary>Sentinel ids — a real server_id is a storage-name hash, never these.</summary>

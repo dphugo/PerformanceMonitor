@@ -17,6 +17,7 @@ namespace PerformanceMonitorLite.Mcp;
 [McpServerToolType]
 public sealed class McpPlanCacheSchedulerTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.SearchBound)]
     [McpServerTool(Name = "get_plan_cache_bloat"), Description("Gets plan cache composition showing single-use vs multi-use plans per cache/object type, with a bloat-level classification. High single-use plan counts indicate ad-hoc query bloat consuming buffer pool memory. Consider enabling 'optimize for ad hoc workloads' or Forced Parameterization. LATEST IS A TIME: this is the newest plan-cache snapshot found within hours_back of as_of, not an aggregate over those hours - captured_at is the instant the snapshot was collected and age_seconds its distance from the window's end.")]
     public static async Task<string> GetPlanCacheBloat(
         LocalDataService dataService,
@@ -38,7 +39,7 @@ public sealed class McpPlanCacheSchedulerTools
             /* The summary's stamp is null exactly when the window held no snapshot, which is the same state
                the (0 plans, no groups) test below names — one branch, so a stamped payload always has rows. */
             if (summary.CollectionTime is not DateTime capturedAt || (summary.TotalPlans == 0 && cacheTypes.Count == 0))
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "plan_cache_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "plan_cache_stats")
                     ?? McpHelpers.Status("unavailable", "No plan cache statistics available in the requested time range.");
 
             var bloat = LocalDataService.ClassifyPlanCacheBloat(summary.TotalPlans, summary.SingleUsePlans);
@@ -48,7 +49,7 @@ public sealed class McpPlanCacheSchedulerTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = capturedAt.ToString("o"),
                 age_seconds = McpLatestSnapshotStamp.AgeSeconds(capturedAt, windowEnd),
                 summary = new
@@ -90,6 +91,7 @@ public sealed class McpPlanCacheSchedulerTools
     internal const string CpuSchedulerPressureDescription =
         "Gets CPU scheduler pressure from the latest snapshot: runnable task queue depth, worker thread utilization, queued/blocked requests, the collector's pressure warning flags, and the banded pressure_level verdict with its recommendation. Shows whether the server has enough worker threads and if tasks are queuing for CPU time. LATEST IS A TIME: this is the newest scheduler snapshot found within hours_back of as_of, not an aggregate over those hours - captured_at is the instant it was collected and age_seconds its distance from the window's end; the verdict is that instant's, so read age_seconds before reading pressure_level as current.";
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.SearchBound)]
     [McpServerTool(Name = "get_cpu_scheduler_pressure"), Description(CpuSchedulerPressureDescription)]
     public static async Task<string> GetCpuSchedulerPressure(
         LocalDataService dataService,
@@ -108,7 +110,7 @@ public sealed class McpPlanCacheSchedulerTools
 
             var item = await dataService.GetCpuSchedulerSnapshotAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
             if (item == null)
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "cpu_scheduler_stats")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "cpu_scheduler_stats")
                     ?? McpHelpers.Status("unavailable", "No CPU scheduler snapshot in the requested time range. The scheduler collector may not have run yet, or its newest snapshot is older than hours_back.");
 
             var workerUtilizationPercent = item.MaxWorkersCount > 0
@@ -122,7 +124,7 @@ public sealed class McpPlanCacheSchedulerTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = item.CollectionTime.ToString("o"),
                 age_seconds = McpLatestSnapshotStamp.AgeSeconds(item.CollectionTime, windowEnd),
                 schedulers = item.SchedulerCount,

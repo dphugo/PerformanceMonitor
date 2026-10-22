@@ -41,7 +41,6 @@ namespace Darling.Tests;
 /// down), and the counts are asserted in both directions so a walk that silently stopped reaching cannot
 /// report clean.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class AlertReadFailureSurfaceTests
 {
     /* ---------------- the counter's own behaviour ---------------- */
@@ -915,15 +914,21 @@ public sealed class AlertReadFailureSurfaceTests
     /// </summary>
     private static readonly (string Path, int Counted, int Exempt)[] s_wholeFileScopes =
     {
-        (Path.Combine("PerformanceMonitor.Alerting", "AlertEngine.cs"), 14, 6),
+        (Path.Combine("PerformanceMonitor.Alerting", "AlertEngine.cs"), 18, 8),
+        /* 7th AlertEngine exempt since #5910: the threshold-override fallback in Threshold(), an in-memory lookup and
+           not a read; the check it serves still reads, and counts, exactly as before. 8th since #6005: the deadlock
+           rollup's catch, a write after the deadlock read, which counts its own failure. */
         /* 14th exempt since #4215: EvaluateStoreSettingsAsync's wrapper catch — the store-settings
            self-alert's report is a parameter, exactly like its StaleMute/WebTls siblings. 15th exempt
            since #4299: EvaluateRawPurgeOverHorizonAsync's wrapper catch — the raw-purge-over-horizon
            self-alert's evidence (the readings) is a parameter too, with the read counted in
            DarlingWorker. 16th exempt since #4750: EvaluateNotificationChannelsAsync's wrapper catch — the
            webhook channels' failure counts are read from the webhook service's memory, so there is no store
-           read for the condition to swallow. */
-        (Path.Combine("Darling", "PerformanceMonitor.Darling.Service", "DarlingSelfAlertEvaluator.cs"), 13, 18),
+           read for the condition to swallow. 19th exempt since #5654: EvaluateExternalAlertsAsync's wrapper
+           catch - the delivery self-alert's report is a parameter, with the count read counted in DarlingWorker. 20th exempt since
+           #5867: EvaluateComposeHoursStuckAsync's wrapper catch - the compose rollup self-alert's failure record is a parameter,
+           with the read exempt in DarlingWorker (it holds the alert on a failed read). */
+        (Path.Combine("Darling", "PerformanceMonitor.Darling.Service", "DarlingSelfAlertEvaluator.cs"), 13, 20),
     };
 
     /// <summary>
@@ -957,18 +962,34 @@ public sealed class AlertReadFailureSurfaceTests
            ReadStoreSizeBytesAsync's size figure, a RejectedValue row is one of the three conditions the
            alert fires on, so a swallowed read here leaves that condition unjudgeable, not merely undescribed. */
         "ReadRejectedManagedConfSettingNamesAsync",
+        /* #5654: the external-alert delivery self-alert's one store read, the count of rows the drain gave up on. COUNTED:
+           a swallowed read would leave the standing alert unjudged, and the worker holds it (sends no report) rather than
+           resolving it. */
+        "EvaluateExternalAlertsAsync",
+        /* #5867: the compose rollup self-alert's one store read, the compose builder's failure record. EXEMPT: a failed read
+           sends no report, so the worker holds the standing alert rather than resolving it, and the next hourly tick reads again. */
+        "EvaluateComposeHoursStuckAsync",
         /* #3354: the mute-rule reload. Not an alert pass — a control-plane read — but its swallowed
            failure decides what the engine suppresses on every following sweep, so it belongs to this
            population. It is also the member whose scope this list was designed to admit: an alerting read
            arriving in a new member of this file cannot inherit clean status, because the totals stop
            matching the moment its catch block is neither counted nor exempt. */
         "LoadMuteRulesAsync",
+        /* #5916: the threshold-override reload, the mute-rule reload's twin: a control-plane read whose swallowed failure keeps the
+           overrides already in force, so a changed override waits unseen. COUNTED. */
+        "LoadThresholdOverridesAsync",
     };
 
+    /* 12th since #5654: EvaluateExternalAlertsAsync's catch, the external-alert delivery count. */
     /* 11th since #4215: ReadRejectedManagedConfSettingNamesAsync's catch — COUNTED,
        not exempt, because a RejectedValue row is judgeable evidence for the alert, not context for its text. */
-    private const int WorkerCountedSites = 11;
-    private const int WorkerExemptSites = 12;
+    /* 13th since #5916: LoadThresholdOverridesAsync's catch, the threshold-override reload. */
+    private const int WorkerCountedSites = 13;
+    /* 13th: the deadlock text repair pass's catch in SweepStoreSelfMetricsAsync, exempt like the re-mask pass beside it.
+       14th: the collection log hourly rollup's catch there (#5810), a maintenance write no alert is judged on.
+       15th: EvaluateComposeHoursStuckAsync's catch (#5867), the compose builder's failure record read for its self-alert, which
+       holds the standing alert on a failed read. */
+    private const int WorkerExemptSites = 15;
 
     /// <summary>
     /// Counted sites tree-wide. ONE numeral with several readers rather than the same number written out at
@@ -1013,9 +1034,16 @@ public sealed class AlertReadFailureSurfaceTests
     /// the three conditions the alert fires on — losing it leaves that condition unjudgeable, and the original
     /// exempt classification would let one failed read write a false "Store Settings Resolved". And a
     /// THIRTY-EIGHTH since #5450: the daily retained-history audit's per-rollup read, counted because a swallowed
-    /// read skips that rollup for the day, and the audit is the only place the day's thin hours are ever named.</para>
+    /// read skips that rollup for the day, and the audit is the only place the day's thin hours are ever named.
+    /// And a THIRTY-NINTH since #5641: the Runnable Queue window read ("runnable queue"), counted because a swallowed
+    /// read neither fires nor clears the alert, so a population of them would leave a saturated scheduler queue
+    /// unreported for as long as the store stayed unreadable. And a FORTIETH since #5641: the Runnable Queue card's top-request
+    /// read ("runnable queue top requests"), counted because it IS a store read the alert pass swallowed, though only
+    /// the card's request items go missing and the fire does not. And a FORTY-FIRST since #5640: the Client Timeouts window read ("client timeouts"), counted because a swallowed read neither fires nor clears the alert. And a FORTY-SECOND since #5654: the external-alert delivery self-alert's count of undelivered rows, counted because a
+    /// swallowed read leaves the standing alert unjudged (the worker holds it rather than resolving it). And a FORTY-THIRD since #5715 part B: the escalation-tier seed read ("escalation tier seed"), counted because a swallowed read leaves a Warning delivered before a restart unknown to the engine, so the Critical that follows waits out the cooldown instead of escalating; it seeds nothing, never blocks a fire, and is retried on the next sweep.</para>
+    /// And a FORTY-FOURTH since #5916: the threshold-override reload ("threshold-override reload"), counted because a swallowed read keeps the overrides already in force, so a nonzero count says a changed override has not yet taken effect.
     /// </summary>
-    private const int CountedSites = 38;
+    private const int CountedSites = 44;
 
     /// <summary>
     /// Log-message fragments that identify a catch block DELIBERATELY not counted, each paired with the
@@ -1026,11 +1054,13 @@ public sealed class AlertReadFailureSurfaceTests
     {
         ["Could not load incident occurrences"] = "bookkeeping about an alert, not the condition read it is judged on",
         ["Could not persist incident occurrences"] = "a write",
+        ["The deadlock rollup failed for {Server}: {Message}"] = "#6005: the daily signature rollup, a write (and its own bookkeeping read) after the deadlock read it counts, which is counted where it is made; the alert is judged on that read, not on this",
         ["Could not persist the {Metric} persistence gate"] = "a write (#3282; one save path for every gated built-in since #3653 A5 put tempdb Space behind the same gate as High CPU); the gate has already decided the observation from its in-memory record, so a dropped save costs the streak across a restart and never an alert - the seeding LOADs beside it are the reads, and they are counted",
         ["Alert resolution callback failed"] = "the delivery path",
         ["Connection-change self-alert delivery failed"] = "the delivery path",
         ["Store disk-pressure self-alert failed"] = "handed its evidence as parameters; the read is counted in DarlingWorker",
         ["Custom-alert rule-health self-alert failed"] = "handed its evidence (the report) as a parameter; the report-building read is in CustomAlertEvaluator, outside this census",
+        ["External-alert delivery self-alert failed"] = "handed its evidence (the report) as a parameter; the count read is counted in DarlingWorker (#5654)",
         ["Store runtime upgrade self-alert failed"] = "handed its evidence as parameters",
         ["Collection gap at start self-alert failed"] = "handed its evidence as parameters",
         ["Store TimescaleDB self-alert failed"] = "handed its evidence as parameters; the version was read by the bootstrap (#3908)",
@@ -1040,6 +1070,8 @@ public sealed class AlertReadFailureSurfaceTests
         ["Store-job cadence self-alert failed"] = "handed its evidence as parameters; the read is counted in DarlingWorker",
         ["Retention-held self-alert failed"] = "handed its evidence as parameters; the read is counted in DarlingWorker",
         ["Raw-purge-over-horizon self-alert failed"] = "handed its evidence as parameters; the read is counted in DarlingWorker",
+        ["Compose-rollup-hours-stuck self-alert failed"] = "handed its evidence as parameters; the read is isolated in DarlingWorker.EvaluateComposeHoursStuckAsync",
+        ["Query Store compose rollup: the failure record could not be read for the self-alert"] = "an unreadable failure record sends no report, so the alert's standing state is held as it was, and the next hourly compose tick reads it again",
         ["Notification-channel self-alert failed"] = "reads the webhook channels' failure counts from the webhook service's memory and performs no store read at all - there is no read for this condition to be the swallowing of",
         ["Stale-mute self-alert failed"] = "handed its evidence (the live MuteRuleService cache) as a parameter and performs no store read at all - there is no read anywhere for this condition to be the swallowing of",
         ["Fleet gate self-alert failed"] = "handed its evidence (the worker's in-memory gate counts) as a parameter and performs no store read at all",
@@ -1054,6 +1086,7 @@ public sealed class AlertReadFailureSurfaceTests
         ["Store log capture failed"] = "a telemetry write sweep (#3021); no alert is judged on its result, and the capture gap it leaves is reported by get_store_log's own denominator",
         ["Store log: re-masking rows captured before this build failed"] = "a maintenance rewrite of stored store-log text (#3915); no alert is judged on it, it is idempotent and resumes next hour, and until it finishes the store-log reader masks every row on the way out",
         ["PostgreSQL deadlocks: re-masking alerts, reports and findings stored before this build failed"] = "a maintenance rewrite of stored deadlock reports, deadlock-alert history and analysis findings (#4012); no alert is judged on it, it rewrites only rows still raw and resumes next hour (each stage counts and caps its own failures, #4012's review), and until it finishes every deadlock read normalizes the rows on the way out",
+        ["PostgreSQL deadlocks: repairing stored deadlock text failed"] = "a maintenance rewrite of stored deadlock text to the current masking rules; no alert is judged on it, its marker is written only after a complete pass so it resumes next hour, and until it finishes every deadlock read masks the rows on the way out",
         ["Recently-failed-job check errored"] = "reads the monitored server's msdb on its own connection and timeout",
         ["Skipping recently-failed-job check"] = "the same msdb read, permission-denied arm; not a store read",
         ["Failed to check failed jobs"] = "the fetcher reads the monitored server's msdb; the block's only store op is a write both stores swallow",
@@ -1061,7 +1094,9 @@ public sealed class AlertReadFailureSurfaceTests
         ["Could not resolve Agent job names"] = "reads the monitored server's msdb through the host resolver, not the store - the Recently-failed-job precedent one seam over; the card degrades to the unresolved form whose raw marker keeps the gap visible, and the page still delivers",
         ["delivery stamp could not be written"] = "a write (#3580): the daily document was already delivered and process memory already gates it; the dropped stamp costs one re-announcement at the next restart and never a delivery - the stamp READ beside it is the read, and it is counted",
         ["Store statement history is still failing"] = "the Debug repeat of a telemetry write sweep (#5097); the first failure warns, no alert is judged on its result",
-        ["Read-latency flush failed"] = "the read-latency histogram flush writes instrumentation; losing an hour's rows can't hide an alert condition",
+        ["Collection log hourly rollup failed"] = "a maintenance write (#5810): the pass upserts the hourly rollup and no alert is judged on its result; a failed pass is redone by the next, and get_collection_health reads the hours after the newest rolled hour from the raw log",
+        ["The threshold override for"] = "an in-memory override lookup (#5910), not a read: the global value applies and the check's own read is counted as before",
+        ["Read-latency flush failed"] ="the read-latency histogram flush writes instrumentation; losing an hour's rows can't hide an alert condition",
     };
 
     /// <summary>
@@ -1249,8 +1284,15 @@ public sealed class AlertReadFailureSurfaceTests
            self-alert's wrapper catch, whose counts come from the worker's in-memory gate statistics. 35th since
            #5097: the store statement history snapshot's catch, a telemetry write sweep whose loss costs an hour's
            capture and never an alert. 36th since #5450: the Collection Gap At Start self-alert's catch, handed
-           its evidence as a parameter. */
-        Assert.Equal(36, totalExempt);
+           its evidence as a parameter. 37th: the deadlock text repair pass, the second stage beside the re-mask pass (the same
+           maintenance rewrite, marker-gated, resumed next hour). 38th since #5654: the external-alert delivery self-alert's
+           wrapper catch, handed its report as a parameter. 39th since #5810: the collection log hourly rollup's catch, a
+           maintenance write no alert is judged on, redone by the next pass. 40th since #5867: the Compose Rollup Hours Stuck
+           self-alert's wrapper catch, handed its failure record as a parameter. 41st since #5867: the worker's read of that
+           record, which holds the standing alert on a failure. 42nd since #5910: the engine's threshold-override
+           fallback, an in-memory lookup and not a read. 43rd since #6005: the deadlock rollup's catch, a write after the deadlock read, which counts its own
+           failure. */
+        Assert.Equal(43, totalExempt);
 
         /* Every exemption in the table is actually used. An exemption for a message that no longer exists
            is a hole this pin would otherwise keep open indefinitely — the shape that lets a real new catch
@@ -2444,7 +2486,7 @@ public sealed class AlertReadFailureSurfaceTests
         Assert.Equal(2, panelUses);
 
         Assert.Contains("subtitle: \"since this service started", js, StringComparison.Ordinal);
-        Assert.Contains("NOT the trailing 7 days", js, StringComparison.Ordinal);
+        Assert.Contains("not the trailing 7 days", js, StringComparison.Ordinal);
 
         /* DERIVED from the tool's own payload, not listed. A hardcoded key list here was blind to the
            field this pin exists to protect: #3099 added last_failure_elapsed_ms to the tool and to the
@@ -2504,8 +2546,9 @@ public sealed class AlertReadFailureSurfaceTests
         /* 10 since #3240 added extensionMissingCount (a run-class count, not an alert-read term); 9 since
            #4000 removed isOnLoad, because callers now resolve an on-load collector's cadence to daily; 10
            since #4748 appended latestRunNote (the newest run's partial-failure note - a run outcome, not an
-           alert-read term, which the no-"alert" assertion below still holds). */
-        Assert.Equal(10, classify!.GetParameters().Length);
+           alert-read term, which the no-"alert" assertion below still holds); 11 since #5646 appended
+           trailingSuccessRuns (the newest runs' success streak - again a run outcome). */
+        Assert.Equal(11, classify!.GetParameters().Length);
         Assert.DoesNotContain(
             "alert",
             string.Join("|", classify.GetParameters().Select(p => p.Name)),

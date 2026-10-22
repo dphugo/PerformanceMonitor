@@ -32,6 +32,7 @@ namespace Darling.Tests;
 /// create_custom_view / update_custom_view run the SAME DarlingWebEndpoints.ValidateDefinition authority BEFORE
 /// any persistence — an invalid definition never reaches the store. The live CRUD + run round-trip is gated below.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpCustomViewToolsSurfaceTests
 {
     /// <summary>A dead data source (unroutable port) — proves the validate-before-persist tools bail on a bad
@@ -580,6 +581,24 @@ public sealed class DarlingMcpCustomViewToolsLivePostgresTests
                 Assert.True(scoped.RootElement.GetProperty("rows").GetArrayLength() >= 1, scoped.RootElement.GetRawText());
             }
 
+            /* #5633 item 17: the spec's server may be the registry's DISPLAY name (or the storage name in another case); it used to
+               match only the stored server_name and answered 0 rows. The shared resolver places it, so the same rows come back. */
+            var seedDisplayName = "Display " + Guid.NewGuid().ToString("N");
+            await using (var rename = new NpgsqlConnection(dataSourceConnectionString))
+            {
+                await rename.OpenAsync(ct);
+                await DarlingMcpTestData.ExecAsync(rename, ct,
+                    "UPDATE servers SET display_name = $1 WHERE server_id = $2", seedDisplayName, seedServerId);
+            }
+
+            foreach (var spelling in new[] { seedDisplayName, seedServerName.ToUpperInvariant() })
+            {
+                using var byAlias = JsonDocument.Parse(await DarlingMcpCustomViewTools.RunCustomViewPanel(
+                    postgres, "{\"server\":\"" + spelling + "\",\"panel\":{\"source\":\"wait_stats\",\"measure\":\"wait_time_ms\",\"aggregate\":\"sum\",\"timeBucket\":\"hour\",\"viz\":\"line\"}}"));
+                Assert.True(byAlias.RootElement.GetProperty("rows").GetArrayLength() >= 1,
+                    $"scoping by '{spelling}' must resolve to the registered server: " + byAlias.RootElement.GetRawText());
+            }
+
             /* delete — deleted; then get + delete-again — not_found. */
             Assert.Equal("deleted", DarlingMcpTestData.StatusOf(await DarlingMcpCustomViewTools.DeleteCustomView(postgres, id)));
             Assert.Equal("not_found", DarlingMcpTestData.StatusOf(await DarlingMcpCustomViewTools.GetCustomView(postgres, id)));
@@ -660,7 +679,7 @@ public sealed class ComposeUnknownServerMessageTests
     {
         var outcome = DarlingWebEndpoints.ComposeRunOutcome.NotFound("No server named 'x' is registered, and nothing is stored under that name in this time range.");
         Assert.True(outcome.IsNotFound);
-        var result = DarlingWebEndpoints.ComposeRunFailureResult(outcome, "/api/compose/run", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, 1);
+        var result = DarlingWebEndpoints.ComposeRunFailureResult(outcome, "/api/compose/run", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, 1, System.Threading.CancellationToken.None);
         Assert.Equal(404, (result as Microsoft.AspNetCore.Http.IStatusCodeHttpResult)?.StatusCode);
     }
 }

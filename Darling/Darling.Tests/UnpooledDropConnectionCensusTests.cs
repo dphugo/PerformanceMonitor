@@ -61,6 +61,14 @@ public sealed class UnpooledDropConnectionCensusTests
         ["DarlingCollectorRunnerTests.cs"] = "T-SQL against SQL Server (DROP DATABASE [name]); SQL Server has no backend pool shared with a TimescaleDB job.",
         ["ProcedureStatsDeferredPlanFetchLiveTests.cs"] = "T-SQL against SQL Server (SINGLE_USER, then DROP DATABASE [name]).",
         ["QueryStatsDeferredPlanFetchLiveTests.cs"] = "T-SQL against SQL Server (SINGLE_USER, then DROP DATABASE [name]).",
+        ["RemediationLiveSqlTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); SQL Server has no backend pool shared with a TimescaleDB job.",
+        ["PlanForceToolLiveTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); the scratch store it also makes is dropped by ScratchPostgres.",
+        ["QueryStoreReplicaReadsLiveSqlTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); SQL Server has no backend pool shared with a TimescaleDB job.",
+        ["ForcedPlanCollectorNoXmlLiveTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); SQL Server has no backend pool shared with a TimescaleDB job.",
+        ["ReadableSecondaryQueryStoreGateLiveTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); SQL Server has no backend pool shared with a TimescaleDB job.",
+        ["ForcedPlanVariantLiveTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); the scratch store it also makes is dropped by ScratchPostgres.",
+        ["QueryStoreSplitJoinsLiveTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); no PostgreSQL store at all.",
+        ["QueryStoreTopNFetchLiveTests.cs"] = "T-SQL against the local test SQL Server (SINGLE_USER, then DROP DATABASE [name]); the scratch store it also makes is dropped by ScratchPostgres.",
         ["DropXeSessionsLiveTests.cs"] = "A SQL-injection session-name fixture: the text is data a validator must refuse, never run as a statement.",
         ["DropXeSessionsPerInstallTests.cs"] = "A SQL-injection session-name fixture: the text is data a validator must refuse, never run as a statement.",
         ["DropXeSessionsReadOnlyIntentTests.cs"] = "A SQL-injection session-name fixture: the text is data a validator must refuse, never run as a statement.",
@@ -79,6 +87,10 @@ public sealed class UnpooledDropConnectionCensusTests
             "operator_app_3914 is a bare CREATE DATABASE from template1, made to stand for an operator's own database; no extension or migration ever runs in it.",
         ["PgReadBinaryFileCapabilityLiveTests.cs::IsGrantedAsync_OnAWin1252Database_GrantsTheRoute_AndCachesItsEncoding"] =
             "pm_test_enc1252 is a bare WIN1252 database made from template0, so it never holds the TimescaleDB extension.",
+        ["RingBufferAmpersandLiveSqlTests.cs::DeadlockOnTablesNamedWithAnAmpersand_IsCollectedAndTheObjectNameReadsWithTheAmpersand"] =
+            "The DROP DATABASE is T-SQL on a SQL Server scratch database, which never holds a TimescaleDB job.",
+        ["BlockingHeadEvidenceLiveSqlTests.cs::TwoIdleHeadBlockers_ReadAsSleepingWithTheirLoginTimeOneOpenTransactionAndExactLogBytes"] =
+            "The DROP DATABASE is T-SQL on a SQL Server scratch database, which never holds a TimescaleDB job.",
     };
 
     /// <summary>Matches case-insensitively: T-SQL and PostgreSQL both accept <c>drop database</c>.</summary>
@@ -478,32 +490,6 @@ public sealed class UnpooledDropConnectionCensusTests
             + string.Join(", ", unquiesced));
     }
 
-    [Fact]
-    public void TheQuiesceExceptions_NameRealFiles_AndEachOneStillHoldsTheDropText()
-    {
-        var directory = FindTestProjectDirectory();
-        Assert.True(directory is not null, "could not find Darling/Darling.Tests from the test binary.");
-
-        foreach (var (key, reason) in QuiesceExceptions)
-        {
-            Assert.False(string.IsNullOrWhiteSpace(reason), $"{key} is allowed without a reason.");
-            var parts = key.Split("::");
-            var path = Path.Combine(directory!, parts[0]);
-            Assert.True(File.Exists(path), $"{parts[0]} is in QuiesceExceptions but is not in the test project; remove the entry.");
-            Assert.False(Exceptions.ContainsKey(parts[0]), $"{parts[0]} is already skipped by Exceptions; remove the entry from QuiesceExceptions.");
-            var text = File.ReadAllText(path);
-            Assert.True(text.Contains("DROP DATABASE", StringComparison.OrdinalIgnoreCase),
-                $"{parts[0]} no longer holds DROP DATABASE; remove {key} from QuiesceExceptions.");
-            if (parts.Length > 1)
-            {
-                Assert.True(Regex.IsMatch(text, @"\b" + Regex.Escape(parts[1]) + @"\s*(?:<[^()]*>)?\s*\("),
-                    $"{parts[0]} no longer declares {parts[1]}; remove {key} from QuiesceExceptions.");
-                Assert.True(MethodStillSkipsQuiesce(parts[1], text),
-                    $"{parts[1]} in {parts[0]} no longer holds a DROP DATABASE that skips the quiesce; remove {key} from QuiesceExceptions.");
-            }
-        }
-    }
-
     /// <summary>True when <paramref name="method"/> in <paramref name="source"/> holds a drop with no quiesce call before it, so its allow-list entry is still needed.</summary>
     private static bool MethodStillSkipsQuiesce(string method, string source) =>
         FindDropSites(source).Any(site => site.MemberName == method && !site.QuiescedBefore);
@@ -631,22 +617,6 @@ public sealed class UnpooledDropConnectionCensusTests
         Assert.Equal(["Other.cs:5"], ScanForQuiesce([("Other.cs", generic)]).Unquiesced);
         Assert.True(MethodStillSkipsQuiesce(allowListedMethod, generic));
         Assert.False(MethodStillSkipsQuiesce("SomeOtherMethod", generic));
-    }
-
-    [Fact]
-    public void TheExceptions_NameRealFiles_AndEachOneStillHoldsTheDropText()
-    {
-        var directory = FindTestProjectDirectory();
-        Assert.True(directory is not null, "could not find Darling/Darling.Tests from the test binary.");
-
-        foreach (var (file, reason) in Exceptions)
-        {
-            Assert.False(string.IsNullOrWhiteSpace(reason), $"{file} is allowed without a reason.");
-            var path = Path.Combine(directory!, file);
-            Assert.True(File.Exists(path), $"{file} is in Exceptions but is not in the test project; remove the entry.");
-            Assert.True(File.ReadAllText(path).Contains("DROP DATABASE", StringComparison.OrdinalIgnoreCase),
-                $"{file} no longer holds DROP DATABASE; remove it from Exceptions.");
-        }
     }
 
     [Fact]

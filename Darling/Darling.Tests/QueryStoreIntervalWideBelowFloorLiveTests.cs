@@ -168,7 +168,7 @@ ON CONFLICT (server_id) DO UPDATE SET is_enabled = TRUE;", null, ct);
 
     internal static Task<QueryStoreIntervalWide.WideReadPlan> ResolveAsync(Rig rig, CancellationToken ct) =>
         QueryStoreIntervalWide.ResolveReadAsync(
-            rig.Connection, ServerId, S, rig.End, rig.End, DarlingDataReader.QueryStoreTopMinWindow, 60, null, ct);
+            rig.Connection, ServerId, S, rig.End, rig.End, DarlingDataReader.QueryStoreTopMinWindow, 60, null, legacyRows: QueryStoreIntervalWide.LegacyRows.Allow, ct);
 
     internal static Task DropRawChunksOlderThanAsync(Rig rig, DateTime cutoff, CancellationToken ct) =>
         ExecAsync(rig.Connection, "SELECT drop_chunks('collect.query_store_stats', older_than => @cutoff)", cutoff, ct);
@@ -450,7 +450,7 @@ AND   hypertable_name = 'query_store_stats';";
         var edge = JsonDocument.Parse(await DarlingMcpDataTools.GetQueryStoreTop(rig.Postgres, ServerName, 168, TestTop, cancellationToken: ct)).RootElement;
         Assert.Equal("interval_table", edge.GetProperty("history_source").GetString());
         Assert.Equal(S.AddHours(2).Add(QueryStoreIntervalWide.PurgeEdgeMargin), DateTime.Parse(edge.GetProperty("effective_start").GetString()!, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind));
-        Assert.Contains("keeps 9 days", edge.GetProperty("truncation_note").GetString(), StringComparison.Ordinal);
+        Assert.Contains("keeps 10 days", edge.GetProperty("truncation_note").GetString(), StringComparison.Ordinal);
         AssertTheNoteNamesTheField(edge);
     }
 

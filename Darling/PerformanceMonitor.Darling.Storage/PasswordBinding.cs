@@ -39,11 +39,17 @@ public sealed class PasswordBinding
     public const string WebhookPurpose = "webhook";
 
     /// <summary>The webhook slots, in the order the notification row lists its columns: the Teams URL, the Slack URL,
-    /// the generic URL, the PagerDuty routing key and the generic headers.</summary>
+    /// the generic URL, the PagerDuty routing key and the generic headers, then the generic webhook's signing key (#5998).
+    /// The signing key and the previous signing key share the one slot: a rotation moves the sealed text from one column to
+    /// the other without opening it, and both are bound to the same row, proxy and generic URL.</summary>
     public static readonly IReadOnlyList<string> WebhookSlots = new[]
     {
-        "teams", "slack", "generic", "pagerduty", "generic_headers",
+        "teams", "slack", "generic", "pagerduty", "generic_headers", SigningKeySlot,
     };
+
+    /// <summary>The slot of a generic webhook signing key (#5998), current or previous. Its bound URL is the stored text of
+    /// the same row's generic URL, as for the headers.</summary>
+    public const string SigningKeySlot = "signing_key";
 
     /// <summary>The row id of the notification settings row, for <see cref="ForWebhook"/>.</summary>
     public const string WebhookSettingsRow = "notification";
@@ -60,6 +66,8 @@ public sealed class PasswordBinding
         nameof(ServerConnectionIdentity.Auth), nameof(ServerConnectionIdentity.Username),
         nameof(ServerConnectionIdentity.EncryptMode), nameof(ServerConnectionIdentity.TrustServerCertificate),
         nameof(ServerConnectionIdentity.MultiSubnetFailover), nameof(ServerConnectionIdentity.Engine),
+        /* The eleventh field, bound only when the setting is not empty (#6254). */
+        nameof(ServerConnectionIdentity.QueryStoreReplica),
     };
 
     /// <summary>The names of the remediation purpose's fields, in the order <see cref="ForRemediation"/> binds them. The
@@ -80,9 +88,13 @@ public sealed class PasswordBinding
         [WebhookPurpose] = 4,
     };
 
+    /// <summary>The server purpose's field count when a Query Store replica host is bound as an eleventh field (#6254).</summary>
+    private const int ServerFieldCountWithReplica = 11;
+
     private PasswordBinding(string purpose, string?[] fields)
     {
-        if (!FieldCounts.TryGetValue(purpose, out var expected) || fields.Length != expected)
+        if (!FieldCounts.TryGetValue(purpose, out var expected)
+            || (fields.Length != expected && !(purpose == ServerPurpose && fields.Length == ServerFieldCountWithReplica)))
         {
             throw new InvalidOperationException("A password binding has a fixed number of fields for each purpose.");
         }
@@ -99,14 +111,27 @@ public sealed class PasswordBinding
 
     /// <summary>
     /// The binding for a server's SQL password or service-principal secret: host, port, database, read-only intent,
-    /// authentication, username, encrypt mode, certificate trust, multi-subnet failover and engine. The server id is not
-    /// bound, so a row keeps its password when it is renumbered.
+    /// authentication, username, encrypt mode, certificate trust, multi-subnet failover and engine, and, ONLY when the server has
+    /// a Query Store replica (#6254, <see cref="QueryStoreReplicaSetting.Normalize"/>), that host as an eleventh field. With no
+    /// replica the fields, and so every seal stored before the setting existed, are exactly the ten. With a replica the binding
+    /// differs, so a password sealed without it, or for another replica host, does not open: whoever sets or changes the replica
+    /// must enter the password again, and cannot make the service send the stored one to a host of their choice. The server id is
+    /// not bound, so a row keeps its password when it is renumbered.
     /// </summary>
-    public static PasswordBinding ForServer(ServerConnectionIdentity c) => new(ServerPurpose, new string?[]
+    public static PasswordBinding ForServer(ServerConnectionIdentity c)
     {
-        c.Host, Number(c.Port), c.Database, Flag(c.ReadOnlyIntent), Lower(c.Auth), c.Username,
-        Lower(c.EncryptMode), Flag(c.TrustServerCertificate), Flag(c.MultiSubnetFailover), Lower(c.Engine),
-    });
+        var fields = new List<string?>
+        {
+            c.Host, Number(c.Port), c.Database, Flag(c.ReadOnlyIntent), Lower(c.Auth), c.Username,
+            Lower(c.EncryptMode), Flag(c.TrustServerCertificate), Flag(c.MultiSubnetFailover), Lower(c.Engine),
+        };
+        if (QueryStoreReplicaSetting.Normalize(c.QueryStoreReplica) is { } replica)
+        {
+            fields.Add(replica);
+        }
+
+        return new(ServerPurpose, fields.ToArray());
+    }
 
     /// <summary>The binding for a server's remediation password: host, database, encrypt mode, certificate trust,
     /// multi-subnet failover, the remediation username and engine.</summary>

@@ -42,7 +42,7 @@ public sealed partial class ViewerDataService
     /// last collection too; unbounded, because that "last collected" may be weeks old and is still the
     /// answer. The two callers look up registry ids only, so the rows they read are identical.</para>
     /// </summary>
-    public const string ServerFreshnessSql = @"
+    public const string ServerFreshnessSql = $@"
 SELECT
     s.server_id,
     latest.collection_time
@@ -52,6 +52,7 @@ CROSS JOIN LATERAL
     SELECT collection_time
     FROM v_collection_log
     WHERE server_id = s.server_id
+    AND   {CollectionCycleRow.NotCycleRowSql}
     ORDER BY collection_time DESC
     LIMIT 1
 ) AS latest
@@ -88,6 +89,14 @@ WHERE s.server_id <> 0";
     private readonly SingleFlightTtlCache<long?> _storeSizeCache = new(StoreSizeCacheLifetime);
 
 
+
+    /// <summary>
+    /// Each service host's recorded product version (#5655), from <c>config.service_version</c>. No rows when the table is
+    /// empty (a store whose service has not started since the upgrade) and when the table is missing (an older service's
+    /// store): <see cref="ServiceVersionTable.ReadAsync"/> answers only the undefined-table error (42P01) that way.
+    /// </summary>
+    public Task<IReadOnlyList<ServiceVersionRow>> GetServiceVersionsAsync(CancellationToken cancellationToken = default) =>
+        ServiceVersionTable.ReadAsync(_dataSource, ViewerCommandDeadlines.CurrentInteractiveReadSeconds, cancellationToken);
 
     /// <summary>
     /// Reads MAX(collection_time) for every server in a single query, keyed by server_id. A server with no
@@ -231,7 +240,16 @@ WHERE s.server_id <> 0";
         await using var recorded = _dataSource.CreateCommand(StoreSelfMetrics.LatestStoreSizeSql);
         recorded.CommandTimeout = ViewerCommandDeadlines.CurrentInteractiveReadSeconds;
         var recordedBytes = await recorded.ExecuteScalarAsync(CancellationToken.None);
-        return recordedBytes is null || recordedBytes == DBNull.Value ? (long?)null : Convert.ToInt64(recordedBytes);
+        if (recordedBytes is null || recordedBytes == DBNull.Value)
+        {
+            return null;
+        }
+
+        /* #6245: the hourly sweep records a catalog estimate and one sweep a day the exact size, so say which this is. */
+        await using var estimated = _dataSource.CreateCommand(StoreSelfMetrics.LatestStoreSizeEstimatedSql);
+        estimated.CommandTimeout = ViewerCommandDeadlines.CurrentInteractiveReadSeconds;
+        StoreSizeIsEstimate = await estimated.ExecuteScalarAsync(CancellationToken.None) is true;
+        return Convert.ToInt64(recordedBytes);
     }
 
     private async Task<long?> ReadLiveStoreSizeAsync()
@@ -239,6 +257,11 @@ WHERE s.server_id <> 0";
         await using var command = _dataSource.CreateCommand(StoreSizeSql);
         command.CommandTimeout = ViewerCommandDeadlines.CurrentInteractiveReadSeconds;
         var result = await command.ExecuteScalarAsync(CancellationToken.None);
+        StoreSizeIsEstimate = false;
         return result is null || result == DBNull.Value ? (long?)null : Convert.ToInt64(result);
     }
+
+    /// <summary>True when the size <see cref="GetStoreSizeBytesAsync"/> last returned is the hourly catalog estimate
+    /// (#6245) rather than the exact size: the status bar says so.</summary>
+    public bool StoreSizeIsEstimate { get; private set; }
 }

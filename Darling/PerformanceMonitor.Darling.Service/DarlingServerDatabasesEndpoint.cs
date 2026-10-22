@@ -50,34 +50,49 @@ internal static class DarlingServerDatabasesEndpoint
     internal const string Route = "/api/server-databases";
 
     /// <summary>Maps <see cref="Route"/>. Called once from <see cref="DarlingWebEndpoints.MapAll"/>.</summary>
-    internal static void Map(WebApplication app, NpgsqlDataSource postgres, ILogger logger) =>
-        Map(app, postgres, logger, MaxDatabases);
+    internal static void Map(WebApplication app, NpgsqlDataSource postgres, ILogger logger,
+        ReadAdmission? readAdmission = null, ReadLatencyRecorder? readLatencyRecorder = null) =>
+        Map(app, postgres, logger, MaxDatabases, readAdmission, readLatencyRecorder);
+
+    /// <summary>The name the picker is admitted and recorded under (#5506 part 3, round 1 M3): it has no MCP twin.</summary>
+    internal const string AdmissionRoute = "server_databases";
 
     /// <summary>
     /// <see cref="Map(WebApplication, NpgsqlDataSource, ILogger)"/> with the row cap as an argument. The production call
     /// passes <see cref="MaxDatabases"/>; a test passes a small cap, so the route's row counts and its truncated flag are
     /// asserted over a handful of rows and fail on their own, not only through the constant's value. #5314.
     /// </summary>
-    internal static void Map(WebApplication app, NpgsqlDataSource postgres, ILogger logger, int cap)
+    internal static void Map(WebApplication app, NpgsqlDataSource postgres, ILogger logger, int cap,
+        ReadAdmission? readAdmission = null, ReadLatencyRecorder? readLatencyRecorder = null)
     {
         app.MapGet(Route, async (HttpContext context) =>
         {
             var stopwatch = Stopwatch.StartNew();
             if (!TryBindSearch(context.Request.Query, out var search, out var refusal))
             {
-                return DarlingWebEndpoints.ToHttpResult(refusal!, Route, logger, stopwatch.ElapsedMilliseconds);
+                return DarlingWebEndpoints.ToHttpResult(refusal!, Route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
             }
 
             var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(
                 postgres, DarlingWebEndpoints.First(context, "server"), context.RequestAborted);
             if (error is not null)
             {
-                return DarlingWebEndpoints.ToHttpResult(error, Route, logger, stopwatch.ElapsedMilliseconds);
+                return DarlingWebEndpoints.ToHttpResult(error, Route, logger, stopwatch.ElapsedMilliseconds, context.RequestAborted);
             }
 
+            /* #5506 part 3 (round 1, M3): admitted, and recorded, under its own name (it has no MCP twin), like /api/fleet (D8). */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await DarlingWebEndpoints.AdmitWebRouteAsync(readAdmission, AdmissionRoute, ReadWindowBand.None, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } busy)
+            {
+                return DarlingWebEndpoints.BusyResult(busy);
+            }
+
+            using var run = new DarlingWebEndpoints.WebRouteRun(readLatencyRecorder, AdmissionRoute, ReadWindowBand.None, context, readScope.Scope);
             try
             {
                 var (names, truncated) = await ReadAsync(postgres, resolved.ServerId, cap, context.RequestAborted, search);
+                run.Complete(ReadOutcome.Ok);
                 return Results.Text(Render(resolved.ServerName, names, truncated), "application/json");
             }
             catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
@@ -86,8 +101,12 @@ internal static class DarlingServerDatabasesEndpoint
             }
             catch (Exception ex)
             {
+                /* #5678: a connect timeout raised for an already-cancelled token is the browser leaving, not a fault. (The registry
+                   lookup above needs no such line: under a fired token its fault becomes a cancellation inside the resolver.) */
+                context.RequestAborted.ThrowIfCancellationRequested();
+
                 /* The real exception reaches the service log once; the body is the fixed message, never ex.Message. */
-                DarlingWebFailureLog.Report(logger, Route, stopwatch.ElapsedMilliseconds, ex);
+                DarlingWebFailureLog.Report(logger, Route, stopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
                 return Results.Json(DarlingWebFailureLog.Body(ex), statusCode: DarlingWebFailureLog.StatusCode(ex));
             }
         });

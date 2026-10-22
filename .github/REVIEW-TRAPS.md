@@ -73,12 +73,13 @@ reviewer is reading. Keep each line one line — the review quotes them.
 
 ## Tests and censuses
 
-- A census fires on any NEW string constant in `PgTargetFactKeys`: `PgTargetMcpSurfaceTests.EveryPgRecommendation_NamesARegisteredTool_…` requires a `PgTargetToolRecommendations.ByFactKey` row for every key, and `PgTargetKnobsTests`' "other lanes' keys fall to 0" pin grades every key (#3688). A non-key alias is excluded by predicate, with the reason inline.
+- **Ruling (#5833): tests are load-bearing.** The censuses, pins and rosters named in this section are being deleted under #5833. Never add one, and never answer a trap with a test that reads source text or asserts how code is spelled (a signature at a line, a SQL fragment's wording, a comment's text, a trait roster, a coverage percentage). A trap is answered with a behaviour test that fails on the defect and passes on the fix, or with one sentence in the PR body saying why none is needed.
+- A NEW string constant in `PgTargetFactKeys` without a `PgTargetToolRecommendations.ByFactKey` row is a fact whose recommendation names no registered tool (#3688); `PgTargetMcpSurfaceTests.EveryPgRecommendation_NamesARegisteredTool_…` and `PgTargetKnobsTests`' "other lanes' keys fall to 0" check fail on it. The fix is the row the fact needs; a non-key alias is not a fact and is excluded by predicate, with the reason inline.
 - `InternalsVisibleTo` on PerformanceMonitor.Analysis names Lite.Tests only — a helper Darling.Tests must call has to be public (#3688).
-- A pin that encodes the lie: `ACappedResult_WithholdsTheUnsatisfiedSummary_…` handed the builder two facets at `limit = 2` and asserted `truncated` — the `>= limit` inference as its own proof (#3699). Ask what a pin would fail ON.
-- A roster-based census does not see the file it does not roster: `EveryPagedTool_ObservesTruncation_…` walked ten tools and missed three in another file (#3699). An anti-pattern census sweeps the class (every tool body); rosters are for the positive contract only.
+- A test that encodes the lie: `ACappedResult_WithholdsTheUnsatisfiedSummary_…` handed the builder two facets at `limit = 2` and asserted `truncated` — the `>= limit` inference as its own proof (#3699). Ask what defect a test would fail ON.
+- A roster-based census does not see the file it does not roster: `EveryPagedTool_ObservesTruncation_…` walked ten tools and missed three in another file (#3699). A wider roster or a class-sweeping census is not the answer: each tool gets a behaviour test that fails when its page is cut without `truncated`.
 - A test that reads the clock twice measures the CI scheduler: the delta-seeder tests failed at 123 and 243 on unrelated PRs (#3676). One anchor owns both ends of an interval.
-- An expression-bodied member holding a `{ }` property pattern is read SHORT by the T-SQL convention guard's member walk (#3667; the #3607 precedent) — a member the walk cannot read whole is one no census can see into.
+- An expression-bodied member holding a `{ }` property pattern is read SHORT by the T-SQL convention guard's member walk (#3667; the #3607 precedent) — a source-reading guard is blind to any shape it cannot parse, which is one reason it is not coverage.
 - A test that constructs a "four maintenance anomalies in one run" fixture is testing a shape no live run produces (#3709, the one-profile-per-run line above). Fixtures should carry the population the engine actually emits, or say they do not.
 
 ## Workflows and CI
@@ -88,6 +89,7 @@ reviewer is reading. Keep each line one line — the review quotes them.
 - `gh api --paginate --jq` runs the filter once PER PAGE: a `max_by` or `last` is per-page, not global; the newest row is the last LINE of the emitted stream (claude-review-guard.yml's verdict scan).
 - A summary helper reading `"$1"` truncates every message whose `echo` wraps with a trailing backslash — the wrapped pieces are separate arguments; read `"$*"` (claude-review-guard.yml).
 - `claude-code-action` refuses to run when `.github/workflows/claude-review.yml` differs from the DEFAULT branch's copy, exits SUCCESS in seconds and sets no output (#2229 cause 1); a PR that edits that file cannot be Claude-reviewed until it merges, and every dev PR after it goes unreviewed until the next release sync (#3657's pending-release arm).
+- Our wrong test is a bug we introduced, never a flake: a test that dev's own push broke (a pinned date that aged out, a census that two merged PRs broke together) failed ten unrelated PRs in a week (#5942). It gets an issue and a fix, and a line in `.github/ci-quarantine.txt` only while that fix lands: `<Namespace.Class.Method> | <dev push run id> | <UTC time> | #<issue>`, honored for 72 hours, only while the latest completed dev push run failed that exact test, and never on a PR that touches the test's file or one the test map says reaches it. A line without an issue is not a quarantine, it is a hidden failure; do not add a retry or a skip in the test instead.
 
 ## Repository mechanics
 

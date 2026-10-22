@@ -72,7 +72,7 @@ public sealed class McpToolGuideHeadsAlertingTests
         var head = McpToolGuideTests.Served("get_notification_routes").Served;
         Assert.Contains("Zero routes is the ordinary state", head, StringComparison.Ordinal);
         Assert.Contains("EMPTY channel on a route INHERITS the parent's", head, StringComparison.Ordinal);
-        Assert.Contains("routes_supported is false", head, StringComparison.Ordinal);
+        Assert.Contains("Lite and Darling report the same fields", head, StringComparison.Ordinal);
         Assert.Contains("Routing decides WHERE a post lands, never WHETHER it is sent", head, StringComparison.Ordinal);
     }
 
@@ -91,7 +91,9 @@ public sealed class McpToolGuideHeadsAlertingTests
         Assert.Contains("7-day read of one large production store", settingsTail, StringComparison.Ordinal);
 
         var routesTail = McpToolGuideTests.Served("get_notification_routes").Tail!;
-        Assert.Contains("matching the metric EXACTLY, then one matching its FAMILY, then the parent", routesTail, StringComparison.Ordinal);
+        /* #5632: the analysis category level sits between the exact and the family levels. */
+        Assert.Contains("matching the metric EXACTLY, then an analysis finding's CATEGORY", routesTail, StringComparison.Ordinal);
+        Assert.Contains("FAMILY, then * (scoped routes only), then the parent", routesTail, StringComparison.Ordinal);
         Assert.Contains("Routing sits AFTER the cooldown", routesTail, StringComparison.Ordinal);
         Assert.Contains("are NOT reported", routesTail, StringComparison.Ordinal);
     }
@@ -237,7 +239,7 @@ public sealed class McpToolGuideHeadsAlertingTests
         var routeTail = McpToolGuideTests.Served("set_notification_route_enabled").Tail!;
         Assert.Contains("the reversible form of", routeTail, StringComparison.Ordinal);
         Assert.Contains("The running service picks the change up on its next collection sweep", routeTail, StringComparison.Ordinal);
-        Assert.Contains("destinations are bearer secrets and are set only in the Viewer's Settings window", routeTail, StringComparison.Ordinal);
+        Assert.Contains("destinations are bearer secrets, set with create_notification_route / update_notification_route or in the Viewer's Settings window", routeTail, StringComparison.Ordinal);
 
         var createTail = McpToolGuideTests.Served("create_mute_rule").Tail!;
         Assert.Contains("the same rules get_mute_rules lists and the Viewer's Manage Mute Rules surface writes", createTail, StringComparison.Ordinal);

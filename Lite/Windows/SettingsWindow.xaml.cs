@@ -35,13 +35,19 @@ public partial class SettingsWindow : Window
     private readonly CollectionBackgroundService? _backgroundService;
     private readonly McpHostService? _mcpService;
     private readonly MuteRuleService? _muteRuleService;
+    private readonly DuckDbNotificationRouteStore? _routeStore;
+    private readonly LocalDataService? _dataService;
+    private readonly PerformanceMonitor.Common.IInvestigationNoteStore? _noteStore;
 
     public SettingsWindow(
         ScheduleManager scheduleManager,
         ServerManager serverManager,
         CollectionBackgroundService? backgroundService = null,
         McpHostService? mcpService = null,
-        MuteRuleService? muteRuleService = null)
+        MuteRuleService? muteRuleService = null,
+        DuckDbNotificationRouteStore? routeStore = null,
+        LocalDataService? dataService = null,
+        PerformanceMonitor.Common.IInvestigationNoteStore? noteStore = null)
     {
         InitializeComponent();
         /* The window asks for 750 DIPs of height; on a work area shorter than that (a small laptop screen with the taskbar up)
@@ -54,6 +60,9 @@ public partial class SettingsWindow : Window
         _backgroundService = backgroundService;
         _mcpService = mcpService;
         _muteRuleService = muteRuleService;
+        _routeStore = routeStore;
+        _dataService = dataService;
+        _noteStore = noteStore;
 
         LoadServerScheduleSummary();
         UpdateCollectionStatus();
@@ -69,6 +78,88 @@ public partial class SettingsWindow : Window
         LoadAlertSettings();
         LoadSmtpSettings();
         LoadWebhookSettings();
+        SelectTabByName(App.SettingsWindowTab);
+    }
+
+    // ── Tabs (#5846) ──
+
+    /// <summary>The tab that holds <paramref name="element"/>, or null for the window-wide parts (the title, Save and
+    /// Close). Walks the LOGICAL tree: a tab that is not selected keeps its content as a logical child, while that
+    /// content is out of the visual tree.</summary>
+    internal static TabItem? TabOf(DependencyObject? element)
+    {
+        for (var node = element; node is not null; node = LogicalTreeHelper.GetParent(node))
+        {
+            if (node is TabItem tab)
+            {
+                return tab;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The invalid values the Save in progress found, across every writer that checks one. Each writer's
+    /// own dialog still names its problem; when Save is done, the first of these tabs (left to right) is opened.</summary>
+    private SettingsValidationErrors _saveErrors = new();
+
+    /// <summary>Records an invalid value for this Save and opens its tab, so the dialog that follows is about a field
+    /// the operator can see.</summary>
+    private void NoteInvalid(string message, DependencyObject source)
+    {
+        _saveErrors.Add(message, source);
+        if (TabOf(source) is { } tab)
+        {
+            SettingsTabs.SelectedItem = tab;
+        }
+    }
+
+    /// <summary>Opens the first tab, in tab order, that holds a control with an invalid value, and returns it (null
+    /// when no error sits on a tab). Tab order, not the order Save checked the fields in, so the operator starts from
+    /// the left.</summary>
+    internal TabItem? SelectFirstTabWithError(SettingsValidationErrors errors)
+    {
+        var first = errors.Sources
+            .Select(TabOf)
+            .OfType<TabItem>()
+            .OrderBy(tab => SettingsTabs.Items.IndexOf(tab))
+            .FirstOrDefault();
+        if (first is not null)
+        {
+            SettingsTabs.SelectedItem = first;
+        }
+        return first;
+    }
+
+    /// <summary>Each message prefixed with the name of the tab its field is on.</summary>
+    private static IEnumerable<string> DescribeErrors(SettingsValidationErrors errors) =>
+        errors.Messages.Zip(errors.Sources, (message, source) =>
+            TabOf(source) is { } tab ? $"{tab.Header}: {message}" : message);
+
+    private void SelectTabByName(string? name)
+    {
+        var tab = SettingsTabs.Items.OfType<TabItem>().FirstOrDefault(t => t.Name == name);
+        if (tab is not null)
+        {
+            SettingsTabs.SelectedItem = tab;
+        }
+    }
+
+    /// <summary>Writes one settings.json key for the remembered tab. A seam so a test can keep the write off the
+    /// real settings file; the app writes it the way the overview sort is kept (<see cref="App.WriteSetting"/>).</summary>
+    internal Action<string> PersistSelectedTab { get; set; } =
+        name => App.WriteSetting("settings window tab", root => root["settings_window_tab"] = name);
+
+    /// <summary>Keeps the open tab (#5846) so the window reopens on it. Runs on close, and writes only on a change.</summary>
+    internal void RememberSelectedTab()
+    {
+        var current = (SettingsTabs.SelectedItem as TabItem)?.Name ?? "";
+        if (App.SettingsWindowTab == current)
+        {
+            return;
+        }
+        App.SettingsWindowTab = current;
+        /* A failed write only means the window opens on another tab next time; WriteSetting logs why. */
+        PersistSelectedTab(current);
     }
 
     private void LoadServerScheduleSummary()
@@ -271,6 +362,32 @@ public partial class SettingsWindow : Window
     /// </summary>
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
     {
+        _saveErrors = new SettingsValidationErrors();
+        try
+        {
+            await SaveCoreAsync();
+        }
+        finally
+        {
+            /* #5846: each writer's dialog opened its own field's tab; once they are all answered, land on the
+               leftmost tab with a problem, the way the operator reads the tab strip. */
+            SelectFirstTabWithError(_saveErrors);
+        }
+    }
+
+    private async Task SaveCoreAsync()
+    {
+        _credentialFailures.Clear();
+        _webhookValueHeld = false;
+
+        /* An SMTP login that would go to the mail server unencrypted is confirmed before anything is applied:
+           No cancels the whole save and leaves the window open to fix it. Not blocked - an internal relay on
+           port 25 is a real setup. */
+        if (!ConfirmCleartextSmtp("Save"))
+        {
+            return;
+        }
+
         JsonNode root;
         bool mcpChanged, mcpValid, alertsValid, webhooksValid, memoryLimitValid;
 
@@ -334,20 +451,29 @@ public partial class SettingsWindow : Window
             UpdateMcpStatus();
         }
 
-        switch (SettingsSaveReport.Classify(written, mcpChanged, alertsValid, mcpValid, webhooksValid, memoryLimitValid))
+        /* #5772: the password, webhook URL and routing key writes go to Credential Manager, not to
+           settings.json, and they happen inside the mutators above. Their failures are reported here, after
+           `written` is known, so the one dialog can say what happened to the rest of the page. */
+        var credentialText = SettingsSaveReport.CredentialFailureText(written, _credentialFailures, _webhookValueHeld);
+
+        switch (SettingsSaveReport.Classify(written, mcpChanged, alertsValid, mcpValid, webhooksValid, memoryLimitValid,
+                    credentialsSaved: _credentialFailures.Count == 0))
         {
             case SettingsSaveOutcome.NothingWritten:
                 MessageBox.Show(
-                    "Your settings could not be written to settings.json, so nothing was saved and the "
-                    + "changes on this page will be gone when the window closes. The application log says "
-                    + "why.",
+                    credentialText ?? SettingsSaveReport.NothingWrittenText,
                     "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
 
             case SettingsSaveOutcome.WrittenWithObjections:
-                /* The objecting writer has already raised its own dialog naming what it rejected, and the
+                /* A writer that objected has already raised its own dialog naming what it rejected, and the
                    rest of the document DID reach disk. Adding a second dialog here would either repeat it
-                   or contradict it. */
+                   or contradict it. The one thing no writer could say yet is that a value did not reach
+                   Credential Manager, so that is shown here. */
+                if (credentialText != null)
+                {
+                    MessageBox.Show(credentialText, "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
                 return;
 
             case SettingsSaveOutcome.SavedAndMcpNeedsRestart:
@@ -362,6 +488,12 @@ public partial class SettingsWindow : Window
                 return;
         }
     }
+
+    /* #5772: values the Save click could not store in Windows Credential Manager, one sentence each, and
+       whether one of them is a webhook value Lite keeps in memory for this run. Filled by the SMTP and
+       webhook mutators, reported by SaveButton_Click after the settings.json write is known. */
+    private readonly System.Collections.Generic.List<string> _credentialFailures = new();
+    private bool _webhookValueHeld;
 
     /* #5457: the DuckDB memory limit last saved on this page when it differs from the value the running
        process started with. memory_limit belongs to a DuckDB instance, so a change takes effect at the next
@@ -404,6 +536,7 @@ public partial class SettingsWindow : Window
         if (!int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var gb)
             || !DuckDbMemoryLimitSetting.IsInRange(gb, physical))
         {
+            NoteInvalid("DuckDB memory limit", DuckDbMemoryLimitBox);
             MessageBox.Show(
                 $"The DuckDB memory limit must be {DuckDbMemoryLimitSetting.RangeText(physical)}. "
                 + $"\"{DuckDbMemoryLimitBox.Text}\" was not saved; the other settings were.",
@@ -434,6 +567,7 @@ public partial class SettingsWindow : Window
             {
                 if (newPort < 1024 || newPort > IPEndPoint.MaxPort)
                 {
+                    NoteInvalid("MCP port", McpPortTextBox);
                     MessageBox.Show(
                         $"MCP port must be between 1024 and {IPEndPoint.MaxPort}.\nPorts 0–1023 are well-known privileged ports reserved by the operating system.",
                         "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -445,6 +579,7 @@ public partial class SettingsWindow : Window
                 bool canBind = await PortUtilityService.CanBindTcpPortAsync(newPort, IPAddress.Loopback);
                 if (!canBind)
                 {
+                    NoteInvalid("MCP port", McpPortTextBox);
                     MessageBox.Show(
                         $"Port {newPort} is already in use. Choose a different port for the MCP server.",
                         "Port Conflict", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -466,6 +601,7 @@ public partial class SettingsWindow : Window
 
             if (!portValid)
             {
+                NoteInvalid("MCP port", McpPortTextBox);
                 MessageBox.Show(
                     "MCP port failed validation - must be a valid TCP port number.\nOther MCP settings were saved.",
                     "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -701,6 +837,14 @@ public partial class SettingsWindow : Window
         AlertDeadlockCheckBox.IsChecked = App.AlertDeadlockEnabled;
         AlertDeadlockThresholdBox.Text = App.AlertDeadlockThreshold.ToString();
         AlertPoisonWaitCheckBox.IsChecked = App.AlertPoisonWaitEnabled;
+        AlertRunnableQueueCheckBox.IsChecked = App.AlertRunnableQueueEnabled;
+        AlertRunnableQueueWarningBox.Text = App.AlertRunnableQueueWarningPerScheduler.ToString();
+        AlertRunnableQueueCriticalBox.Text = App.AlertRunnableQueueCriticalPerScheduler.ToString();
+        AlertClientTimeoutsCheckBox.IsChecked = App.AlertClientTimeoutsEnabled;
+        AlertClientTimeoutsWarningBox.Text = App.AlertClientTimeoutsWarningPerMinute.ToString();
+        AlertClientTimeoutsCriticalBox.Text = App.AlertClientTimeoutsCriticalPerMinute.ToString();
+        AlertClientTimeoutsWarningMultipleBox.Text = App.AlertClientTimeoutsWarningMultiple.ToString();
+        AlertClientTimeoutsCriticalMultipleBox.Text = App.AlertClientTimeoutsCriticalMultiple.ToString();
         AlertLongRunningQueryCheckBox.IsChecked = App.AlertLongRunningQueryEnabled;
         AlertLongRunningQueryThresholdBox.Text = App.AlertLongRunningQueryThresholdMinutes.ToString();
         AlertLongRunningQueryMaxResultsBox.Text = App.AlertLongRunningQueryMaxResults.ToString();
@@ -711,7 +855,8 @@ public partial class SettingsWindow : Window
         LrqExcludeCdcCheckBox.IsChecked = App.AlertLongRunningQueryExcludeCdc;
         AlertLrqExcludedProgramNamePrefixesBox.Text = string.Join(", ", App.AlertLongRunningQueryExcludedProgramNamePrefixes);
         AlertLrqExcludedLoginsBox.Text = string.Join(", ", App.AlertLongRunningQueryExcludedLogins);
-        AlertExcludedDatabasesBox.Text = string.Join(", ", App.AlertExcludedDatabases);
+        AlertExcludedDatabasesBox.Text = SettingsListText.Join(App.AlertExcludedDatabases);
+        AlertExcludedVolumesBox.Text = SettingsListText.Join(App.AlertExcludedVolumes);
         AlertTempDbSpaceCheckBox.IsChecked = App.AlertTempDbSpaceEnabled;
         AlertTempDbSpaceThresholdBox.Text = App.AlertTempDbSpaceThresholdPercent.ToString();
         AlertLowDiskCheckBox.IsChecked = App.AlertLowDiskEnabled;
@@ -759,6 +904,33 @@ public partial class SettingsWindow : Window
     /// </summary>
     private bool SaveAlertSettings(JsonNode root)
     {
+        var validationErrors = new SettingsValidationErrors();
+        ApplyAlertSettings(root, validationErrors);
+
+        if (validationErrors.Count > 0)
+        {
+            foreach (var (message, source) in validationErrors.Messages.Zip(validationErrors.Sources))
+            {
+                _saveErrors.Add(message, source);
+            }
+            /* #5846: the field may sit on a tab that is not showing. Open the first tab holding one, and name each
+               message's tab, so the warning never points at a page the operator cannot see. */
+            SelectFirstTabWithError(validationErrors);
+            MessageBox.Show(
+                "Some alert settings have invalid values and were not changed:\n\n" +
+                string.Join("\n", DescribeErrors(validationErrors)),
+                "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>Applies the alert and analysis controls to <see cref="App"/> and <paramref name="root"/>, adding each
+    /// value it refuses to <paramref name="validationErrors"/> with the control it came from (a refused value keeps
+    /// its stored one).</summary>
+    internal void ApplyAlertSettings(JsonNode root, SettingsValidationErrors validationErrors)
+    {
         App.MinimizeToTray = MinimizeToTrayCheckBox.IsChecked == true;
         App.AlertsEnabled = AlertsEnabledCheckBox.IsChecked == true;
         App.NotifyConnectionChanges = NotifyConnectionCheckBox.IsChecked == true;
@@ -790,6 +962,48 @@ public partial class SettingsWindow : Window
         if (int.TryParse(AlertDeadlockThresholdBox.Text, out var deadlock) && deadlock > 0)
             App.AlertDeadlockThreshold = deadlock;
         App.AlertPoisonWaitEnabled = AlertPoisonWaitCheckBox.IsChecked == true;
+        App.AlertRunnableQueueEnabled = AlertRunnableQueueCheckBox.IsChecked == true;
+        /* #5641: the pair is checked together (RunnableQueueBarsInput): the engine's ClampBars rules, refused with a
+           message instead of clamped silently, and applied both-or-neither. */
+        var queueErrors = new List<string>();
+        var (queueWarning, queueCritical) = RunnableQueueBarsInput.Validate(
+            AlertRunnableQueueWarningBox.Text, AlertRunnableQueueCriticalBox.Text, queueErrors);
+        if (queueErrors.Count == 0)
+        {
+            App.AlertRunnableQueueWarningPerScheduler = queueWarning;
+            App.AlertRunnableQueueCriticalPerScheduler = queueCritical;
+        }
+        else
+        {
+            validationErrors.AddRange(queueErrors, AlertRunnableQueueWarningBox);
+        }
+        /* #5640: the Client Timeouts pair, the same both-or-neither check (ClientTimeoutsBarsInput), whatever the switch says. */
+        App.AlertClientTimeoutsEnabled = AlertClientTimeoutsCheckBox.IsChecked == true;
+        var timeoutErrors = new List<string>();
+        var (timeoutWarning, timeoutCritical) = ClientTimeoutsBarsInput.Validate(
+            AlertClientTimeoutsWarningBox.Text, AlertClientTimeoutsCriticalBox.Text, timeoutErrors);
+        if (timeoutErrors.Count == 0)
+        {
+            App.AlertClientTimeoutsWarningPerMinute = timeoutWarning;
+            App.AlertClientTimeoutsCriticalPerMinute = timeoutCritical;
+        }
+        else
+        {
+            validationErrors.AddRange(timeoutErrors, AlertClientTimeoutsWarningBox);
+        }
+        /* #5736: the two multiples, the same both-or-neither rule (each a whole number of at least 1, Critical never below Warning). */
+        var multipleErrors = new List<string>();
+        var (multipleWarning, multipleCritical) = ClientTimeoutsBarsInput.ValidateMultiples(
+            AlertClientTimeoutsWarningMultipleBox.Text, AlertClientTimeoutsCriticalMultipleBox.Text, multipleErrors);
+        if (multipleErrors.Count == 0)
+        {
+            App.AlertClientTimeoutsWarningMultiple = multipleWarning;
+            App.AlertClientTimeoutsCriticalMultiple = multipleCritical;
+        }
+        else
+        {
+            validationErrors.AddRange(multipleErrors, AlertClientTimeoutsWarningMultipleBox);
+        }
         App.AlertLongRunningQueryEnabled = AlertLongRunningQueryCheckBox.IsChecked == true;
         if (int.TryParse(AlertLongRunningQueryThresholdBox.Text, out var lrq) && lrq > 0)
             App.AlertLongRunningQueryThresholdMinutes = lrq;
@@ -806,12 +1020,9 @@ public partial class SettingsWindow : Window
            operator's decision to evaluate that arm's sessions. */
         App.AlertLongRunningQueryExcludedProgramNamePrefixes = LongRunningQueryExclusions.Normalize(AlertLrqExcludedProgramNamePrefixesBox.Text.Split(',')).ToList();
         App.AlertLongRunningQueryExcludedLogins = LongRunningQueryExclusions.Normalize(AlertLrqExcludedLoginsBox.Text.Split(',')).ToList();
-        App.AlertExcludedDatabases = AlertExcludedDatabasesBox.Text
-            .Split(',')
-            .Select(s => s.Trim())
-            .Where(s => s.Length > 0)
-            .ToList();
-        App.AlertTempDbSpaceEnabled = AlertTempDbSpaceCheckBox.IsChecked == true;
+        App.AlertExcludedDatabases = SettingsListText.SplitLines(AlertExcludedDatabasesBox.Text);
+        App.AlertExcludedVolumes = VolumeExclusions.Normalize(SettingsListText.SplitLinesAndCommas(AlertExcludedVolumesBox.Text)).ToList();
+        App.AlertTempDbSpaceEnabled =AlertTempDbSpaceCheckBox.IsChecked == true;
         if (int.TryParse(AlertTempDbSpaceThresholdBox.Text, out var tempDb) && tempDb > 0 && tempDb <= 100)
             App.AlertTempDbSpaceThresholdPercent = tempDb;
         App.AlertLowDiskEnabled = AlertLowDiskCheckBox.IsChecked == true;
@@ -838,20 +1049,26 @@ public partial class SettingsWindow : Window
         if (int.TryParse(AlertFailedJobLookbackBox.Text, out var failedJobLookback) && failedJobLookback >= 1 && failedJobLookback <= 1440)
             App.AlertFailedJobLookbackMinutes = failedJobLookback;
         App.AlertDatabaseStateEnabled = AlertDatabaseStateCheckBox.IsChecked == true;
-        var validationErrors = new List<string>();
+        /* #5881: the value saved is held in a local, not read back from App.AlertCooldownMinutes at the root write below:
+           another thread can rewrite that process-wide static between the parse and the write, and the file then carries
+           a value the operator never typed. A refused value keeps the stored one. */
+        var alertCooldownToSave = App.AlertCooldownMinutes;
         if (int.TryParse(AlertCooldownBox.Text, out var alertCooldown) && alertCooldown >= 1 && alertCooldown <= 120)
+        {
+            alertCooldownToSave = alertCooldown;
             App.AlertCooldownMinutes = alertCooldown;
+        }
         else
-            validationErrors.Add("Tray notification cooldown must be between 1 and 120 minutes.");
+            validationErrors.Add("Tray notification cooldown must be between 1 and 120 minutes.", AlertCooldownBox);
         if (int.TryParse(EmailCooldownBox.Text, out var emailCooldown) && emailCooldown >= 1 && emailCooldown <= 120)
             App.EmailCooldownMinutes = emailCooldown;
         else
-            validationErrors.Add("Email alert cooldown must be between 1 and 120 minutes.");
+            validationErrors.Add("Email alert cooldown must be between 1 and 120 minutes.", EmailCooldownBox);
         App.AlertDeliveryMode = AlertDeliveryModeBox.SelectedIndex == 1 ? AlertNotificationMode.PerEvent : AlertNotificationMode.Summary;
         if (int.TryParse(AlertPerEventMaxBox.Text, out var perEventMax) && perEventMax >= 1 && perEventMax <= 100)
             App.AlertPerEventMaxPerCycle = perEventMax;
         else
-            validationErrors.Add("Per-event max-per-cycle must be between 1 and 100.");
+            validationErrors.Add("Per-event max-per-cycle must be between 1 and 100.", AlertPerEventMaxBox);
         App.MuteRuleDefaultExpiration = (MuteRuleDefaultExpirationCombo.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "24 hours";
         App.LogAlertDismissals = LogAlertDismissalsCheckBox.IsChecked == true;
         App.AnalysisEnabled = AnalysisEnabledCheckBox.IsChecked == true;
@@ -860,19 +1077,19 @@ public partial class SettingsWindow : Window
         if (int.TryParse(AnalysisIntervalBox.Text, out var analysisInterval) && analysisInterval >= 5 && analysisInterval <= 360)
             App.AnalysisIntervalMinutes = analysisInterval;
         else
-            validationErrors.Add("Analysis interval must be between 5 and 360 minutes.");
+            validationErrors.Add("Analysis interval must be between 5 and 360 minutes.", AnalysisIntervalBox);
         if (double.TryParse(AnalysisNotifySeverityBox.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var analysisSeverity)
             && analysisSeverity >= 0.0 && analysisSeverity <= 2.0)
             App.AnalysisNotifySeverity = analysisSeverity;
         else
-            validationErrors.Add("Analysis notify severity must be between 0.0 and 2.0.");
+            validationErrors.Add("Analysis notify severity must be between 0.0 and 2.0.", AnalysisNotifySeverityBox);
         /* Same range App.LoadAlertSettings clamps this key to on read, so the value the box accepts and the
            value the next launch honors can never disagree -- Lite's settings adapter passes the static
            straight through to AnalysisNotificationService without a second clamp. */
         if (int.TryParse(AnalysisNotifyCooldownBox.Text, out var analysisCooldown) && analysisCooldown >= 30 && analysisCooldown <= 10080)
             App.AnalysisNotifyCooldownMinutes = analysisCooldown;
         else
-            validationErrors.Add("Analysis re-notify cooldown must be between 30 and 10080 minutes.");
+            validationErrors.Add("Analysis re-notify cooldown must be between 30 and 10080 minutes.", AnalysisNotifyCooldownBox);
         /* #3712: the checkbox IS the route — no third state, so no validation arm. */
         App.AnalysisUncorroboratedRoute = AnalysisUncorroboratedDigestCheckBox.IsChecked == true
             ? FindingRoute.Digest
@@ -898,6 +1115,14 @@ public partial class SettingsWindow : Window
         root["alert_database_state_enabled"] = App.AlertDatabaseStateEnabled;
         root["alert_poison_wait_enabled"] = App.AlertPoisonWaitEnabled;
         root["alert_poison_wait_threshold_ms"] = App.AlertPoisonWaitThresholdMs;
+        root["alert_runnable_queue_enabled"] = App.AlertRunnableQueueEnabled;
+        root["alert_runnable_queue_warning_per_scheduler"] = App.AlertRunnableQueueWarningPerScheduler;
+        root["alert_runnable_queue_critical_per_scheduler"] = App.AlertRunnableQueueCriticalPerScheduler;
+        root["alert_client_timeouts_enabled"] = App.AlertClientTimeoutsEnabled;
+        root["alert_client_timeouts_warning_per_minute"] = App.AlertClientTimeoutsWarningPerMinute;
+        root["alert_client_timeouts_critical_per_minute"] = App.AlertClientTimeoutsCriticalPerMinute;
+        root["alert_client_timeouts_warning_multiple"] = App.AlertClientTimeoutsWarningMultiple;
+        root["alert_client_timeouts_critical_multiple"] = App.AlertClientTimeoutsCriticalMultiple;
         root["alert_long_running_query_enabled"] = App.AlertLongRunningQueryEnabled;
         root["alert_long_running_query_threshold_minutes"] = App.AlertLongRunningQueryThresholdMinutes;
         root["alert_long_running_query_max_results"] = App.AlertLongRunningQueryMaxResults;
@@ -909,6 +1134,9 @@ public partial class SettingsWindow : Window
         var dbArray = new System.Text.Json.Nodes.JsonArray();
         foreach (var db in App.AlertExcludedDatabases) dbArray.Add(db);
         root["alert_excluded_databases"] = dbArray;
+        var volumeArray = new System.Text.Json.Nodes.JsonArray();
+        foreach (var volume in App.AlertExcludedVolumes) volumeArray.Add(volume);
+        root["alert_excluded_volumes"] = volumeArray;
         var lrqProgramArray = new System.Text.Json.Nodes.JsonArray();
         foreach (var name in App.AlertLongRunningQueryExcludedProgramNamePrefixes) lrqProgramArray.Add(name);
         root["alert_long_running_query_excluded_program_name_prefixes"] = lrqProgramArray;
@@ -933,7 +1161,7 @@ public partial class SettingsWindow : Window
         root["alert_long_running_job_multiplier"] = App.AlertLongRunningJobMultiplier;
         root["alert_failed_job_enabled"] = App.AlertFailedJobEnabled;
         root["alert_failed_job_lookback_minutes"] = App.AlertFailedJobLookbackMinutes;
-        root["alert_cooldown_minutes"] = App.AlertCooldownMinutes;
+        root["alert_cooldown_minutes"] = alertCooldownToSave;
         root["email_cooldown_minutes"] = App.EmailCooldownMinutes;
         root["alert_delivery_mode"] = App.AlertDeliveryMode.ToString();
         root["alert_per_event_max_per_cycle"] = App.AlertPerEventMaxPerCycle;
@@ -947,17 +1175,6 @@ public partial class SettingsWindow : Window
         root["analysis_notify_cooldown_minutes"] = App.AnalysisNotifyCooldownMinutes;
         /* #3712: persisted as its wire spelling ('digest' / 'page'), the one App.LoadAlertSettings parses back. */
         root["analysis_uncorroborated_route"] = App.AnalysisUncorroboratedRoute.ToWireText();
-
-        if (validationErrors.Count > 0)
-        {
-            MessageBox.Show(
-                "Some alert settings have invalid values and were not changed:\n\n" +
-                string.Join("\n", validationErrors),
-                "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
-            return false;
-        }
-
-        return true;
     }
 
     private void AlertsEnabledCheckBox_Changed(object sender, RoutedEventArgs e)
@@ -972,6 +1189,12 @@ public partial class SettingsWindow : Window
         AlertBlockingThresholdBox.Text = "1";
         AlertBlockingWaitSecondsBox.Text = "0";
         AlertDeadlockThresholdBox.Text = "1";
+        AlertRunnableQueueWarningBox.Text = RunnableQueueEvaluator.DefaultWarningPerScheduler.ToString(CultureInfo.InvariantCulture);
+        AlertRunnableQueueCriticalBox.Text = RunnableQueueEvaluator.DefaultCriticalPerScheduler.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsWarningBox.Text = AttentionEvaluator.DefaultWarningPerMinute.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCriticalBox.Text = AttentionEvaluator.DefaultCriticalPerMinute.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsWarningMultipleBox.Text = AttentionBaselineMath.DefaultWarningMultiple.ToString(CultureInfo.InvariantCulture);
+        AlertClientTimeoutsCriticalMultipleBox.Text = AttentionBaselineMath.DefaultCriticalMultiple.ToString(CultureInfo.InvariantCulture);
         AlertLongRunningQueryThresholdBox.Text = "30";
         AlertLongRunningQueryMaxResultsBox.Text = "5";
         AlertTempDbSpaceThresholdBox.Text = "80";
@@ -993,6 +1216,7 @@ public partial class SettingsWindow : Window
         AnalysisNotifyCooldownBox.Text = "360";
         AnalysisUncorroboratedDigestCheckBox.IsChecked = true;
         AlertExcludedDatabasesBox.Text = "";
+        AlertExcludedVolumesBox.Text = "";
         /* #3653 (A5, Q5): "defaults" for the opt-out knob are the SEEDS, not empty boxes. */
         AlertLrqExcludedProgramNamePrefixesBox.Text = string.Join(", ", LongRunningQueryExclusions.DefaultProgramNamePrefixes);
         AlertLrqExcludedLoginsBox.Text = string.Join(", ", LongRunningQueryExclusions.DefaultLogins);
@@ -1004,6 +1228,20 @@ public partial class SettingsWindow : Window
     {
         if (_muteRuleService == null) return;
         var window = new ManageMuteRulesWindow(_muteRuleService) { Owner = this };
+        window.ShowDialog();
+    }
+
+    private void ManageNotificationRoutesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_routeStore == null || _dataService == null) return;
+        var window = new NotificationRoutesWindow(_routeStore, _dataService, _serverManager) { Owner = this };
+        window.ShowDialog();
+    }
+
+    private void ReviewAgentNotesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_noteStore == null) return;
+        var window = new InvestigationNotesWindow(_noteStore) { Owner = this };
         window.ShowDialog();
     }
 
@@ -1035,6 +1273,10 @@ public partial class SettingsWindow : Window
             /* #3539 A4: the live bar, from the shared constants — not the retired ms box, which nothing reads. */
             parts.Add(string.Create(CultureInfo.InvariantCulture,
                 $"poison waits >= {PoisonWaitEvaluator.WarningAvgWaiters * PoisonWaitEvaluator.WindowMinutes * 60:N0}s accumulated in {PoisonWaitEvaluator.WindowMinutes}min"));
+        if (AlertRunnableQueueCheckBox.IsChecked == true)
+            parts.Add($"runnable tasks per scheduler >= {AlertRunnableQueueWarningBox.Text} (critical {AlertRunnableQueueCriticalBox.Text}) over {RunnableQueueEvaluator.WindowMinutes}min");
+        if (AlertClientTimeoutsCheckBox.IsChecked == true)
+            parts.Add($"client timeouts >= max({AlertClientTimeoutsWarningBox.Text} per minute (critical {AlertClientTimeoutsCriticalBox.Text}), {AlertClientTimeoutsWarningMultipleBox.Text}x (critical {AlertClientTimeoutsCriticalMultipleBox.Text}x) the server's own baseline) over {AttentionEvaluator.WindowMinutes}min");
         if (AlertLongRunningQueryCheckBox.IsChecked == true)
             parts.Add($"queries > {AlertLongRunningQueryThresholdBox.Text}min");
         if (AlertTempDbSpaceCheckBox.IsChecked == true)
@@ -1071,6 +1313,14 @@ public partial class SettingsWindow : Window
         AlertDeadlockCheckBox.IsEnabled = enabled;
         AlertDeadlockThresholdBox.IsEnabled = enabled;
         AlertPoisonWaitCheckBox.IsEnabled = enabled;
+        AlertRunnableQueueCheckBox.IsEnabled = enabled;
+        AlertRunnableQueueWarningBox.IsEnabled = enabled;
+        AlertRunnableQueueCriticalBox.IsEnabled = enabled;
+        AlertClientTimeoutsCheckBox.IsEnabled = enabled;
+        AlertClientTimeoutsWarningBox.IsEnabled = enabled;
+        AlertClientTimeoutsCriticalBox.IsEnabled = enabled;
+        AlertClientTimeoutsWarningMultipleBox.IsEnabled = enabled;
+        AlertClientTimeoutsCriticalMultipleBox.IsEnabled = enabled;
         AlertLongRunningQueryCheckBox.IsEnabled = enabled;
         AlertLongRunningQueryThresholdBox.IsEnabled = enabled;
         AlertLongRunningQueryMaxResultsBox.IsEnabled = enabled;
@@ -1135,7 +1385,10 @@ public partial class SettingsWindow : Window
         /* Save password securely */
         if (!string.IsNullOrEmpty(SmtpPasswordBox.Password))
         {
-            App.SaveSmtpPassword(SmtpPasswordBox.Password);
+            if (App.SaveSmtpPassword(SmtpPasswordBox.Password) is { } smtpFailure)
+            {
+                _credentialFailures.Add(smtpFailure);
+            }
         }
 
         root["smtp_enabled"] = App.SmtpEnabled;
@@ -1183,7 +1436,8 @@ public partial class SettingsWindow : Window
 
         if (errors.Count == 0)
         {
-            SmtpStatusText.Text = "Settings look good. Use 'Send Test Email' to verify delivery.";
+            SmtpStatusText.Text = CleartextSmtpWarning()
+                ?? "Settings look good. Use 'Send Test Email' to verify delivery.";
         }
         else
         {
@@ -1194,8 +1448,50 @@ public partial class SettingsWindow : Window
         }
     }
 
+    /// <summary>
+    /// Whether a password will be sent with the login: the one typed here, or the one already in the
+    /// credential store (Save never clears the stored password when the box is empty).
+    /// </summary>
+    private bool SmtpPasswordIsSet() =>
+        !string.IsNullOrEmpty(SmtpPasswordBox.Password) || !string.IsNullOrEmpty(App.GetSmtpPassword());
+
+    /// <summary>The unencrypted-login warning for the SMTP settings as they stand in the boxes, or null.</summary>
+    private string? CleartextSmtpWarning() =>
+        EmailSendCore.CleartextCredentialsWarning(
+            SmtpSslCheckBox.IsChecked == true, SmtpUsernameBox.Text?.Trim(), SmtpPasswordIsSet());
+
+    /// <summary>
+    /// Non-blocking confirm shown at Save and Send Test when SSL is off and a login is set, so the username
+    /// and password would go to the mail server unencrypted. Yes proceeds; No cancels the action.
+    /// <paramref name="action"/> is the verb ("Save" / "Send"). Not blocked outright: an internal relay on
+    /// port 25 is a real setup.
+    /// </summary>
+    private bool ConfirmCleartextSmtp(string action)
+    {
+        if (SmtpEnabledCheckBox.IsChecked != true)
+        {
+            return true;
+        }
+
+        var warning = CleartextSmtpWarning();
+        if (warning == null)
+        {
+            return true;
+        }
+
+        var result = MessageBox.Show(
+            $"{warning}\n\n{action} anyway?",
+            "Unencrypted SMTP Login", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        return result == MessageBoxResult.Yes;
+    }
+
     private async void TestEmailButton_Click(object sender, RoutedEventArgs e)
     {
+        if (!ConfirmCleartextSmtp("Send"))
+        {
+            return;
+        }
+
         /* Save current App values so we can restore after the test */
         var origServer = App.SmtpServer;
         var origPort = App.SmtpPort;
@@ -1275,6 +1571,97 @@ public partial class SettingsWindow : Window
         UpdateSlackControlStates();
         UpdateGenericControlStates();
         UpdatePagerDutyControlStates();
+        ShowGenericSigning();
+    }
+
+    // ── Generic webhook signing key (#6012) ──
+
+    private static LiteSigningState GenericSigningState() => new(App.GenericSigningSet, App.GenericSigningUntilUtc);
+
+    /// <summary>Shows only that a key is saved and when a rotation ends; never the key. The new-key box is cleared and hidden.</summary>
+    private void ShowGenericSigning()
+    {
+        var state = GenericSigningState();
+        var unreadable = state.HasKey && new AppAlertSettings().GenericSigningKeyUnreadable;
+        GenericSigningStatusText.Text = LiteWebhookSigningKeys.StatusText(state, DateTime.UtcNow, unreadable);
+        GenericSigningGenerateButton.Content = LiteWebhookSigningKeys.ActionText(state);
+        GenericSigningRemoveButton.IsEnabled = state.HasKey;
+        GenericSigningNewKeyBox.Text = "";
+        GenericSigningNewKeyBox.Visibility = Visibility.Collapsed;
+        GenericSigningShownOnceText.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>Writes the two plain facts to settings.json now: a key was just saved to Credential Manager, so the flag that says so
+    /// is saved with it, not left for the Save button. True only when the file was written.</summary>
+    private static bool PersistGenericSigning(LiteSigningState state) =>
+        App.TryWriteSetting("generic signing key", root =>
+        {
+            root["generic_signing_set"] = state.HasKey;
+            root["generic_signing_until"] = state.PreviousUntilUtc?.ToString("o", System.Globalization.CultureInfo.InvariantCulture) ?? "";
+        });
+
+    /// <summary>The flag's save for a Generate or Rotate: the in-memory flag moves with the file, and goes back when the file is not
+    /// written. Null when saved, else why not (#6012).</summary>
+    private static string? SaveGenericSigningState(LiteSigningState next)
+    {
+        var before = GenericSigningState();
+        App.GenericSigningSet = next.HasKey;
+        App.GenericSigningUntilUtc = next.PreviousUntilUtc;
+        if (PersistGenericSigning(next))
+        {
+            return null;
+        }
+
+        App.GenericSigningSet = before.HasKey;
+        App.GenericSigningUntilUtc = before.PreviousUntilUtc;
+        return "settings.json could not be written";
+    }
+
+    private void GenericSigningGenerate_Click(object sender, RoutedEventArgs e)
+    {
+        var result = LiteWebhookSigningKeys.Generate(
+            RouteSecretAccess.CredentialManager(), LiteWebhookSigningKeys.SettingsName(false), LiteWebhookSigningKeys.SettingsName(true),
+            GenericSigningState(), DateTime.UtcNow, SaveGenericSigningState);
+        if (result.Error is { } error)
+        {
+            MessageBox.Show(error, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        ShowGenericSigning();
+
+        /* The key is shown once, in a read-only box to copy from. It is in no label, tooltip or log, and not on the clipboard. */
+        GenericSigningShownOnceText.Text = LiteWebhookSigningKeys.ShownOnceText;
+        GenericSigningShownOnceText.Visibility = Visibility.Visible;
+        GenericSigningNewKeyBox.Text = result.NewKey;
+        GenericSigningNewKeyBox.Visibility = Visibility.Visible;
+        GenericSigningNewKeyBox.Focus();
+        GenericSigningNewKeyBox.SelectAll();
+    }
+
+    private void GenericSigningRemove_Click(object sender, RoutedEventArgs e)
+    {
+        var state = LiteWebhookSigningKeys.Remove(
+            RouteSecretAccess.CredentialManager(), LiteWebhookSigningKeys.SettingsName(false), LiteWebhookSigningKeys.SettingsName(true),
+            GenericSigningState(), out var error);
+        if (error is not null)
+        {
+            MessageBox.Show(error, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!PersistGenericSigning(state))
+        {
+            /* The keys are gone and settings.json still says one is saved. Keep the flag as the file has it (fail closed): the
+               destination reads as unreadable and posts to it are held back until Remove is tried again. */
+            ShowGenericSigning();
+            MessageBox.Show(LiteWebhookSigningKeys.RemoveNotSavedText, "Signing key", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        App.GenericSigningSet = state.HasKey;
+        App.GenericSigningUntilUtc = state.PreviousUntilUtc;
+        ShowGenericSigning();
     }
 
     /// <summary>
@@ -1322,11 +1709,25 @@ public partial class SettingsWindow : Window
         /* Save webhook URLs to Credential Manager instead of settings.json. The generic channel's headers
            JSON goes there too — it carries the Authorization bearer token (#1506). The PagerDuty routing
            key is a bearer secret like the webhook URLs. */
-        App.SaveWebhookUrl("TeamsWebhook", App.TeamsWebhookUrl);
-        App.SaveWebhookUrl("SlackWebhook", App.SlackWebhookUrl);
-        App.SaveWebhookUrl("GenericWebhook", App.GenericWebhookUrl);
-        App.SaveWebhookUrl("GenericWebhookHeaders", App.GenericWebhookHeadersJson);
-        App.SaveWebhookUrl("PagerDutyWebhook", App.PagerDutyRoutingKey);
+        foreach (var failure in new[]
+        {
+            App.SaveWebhookUrl("TeamsWebhook", App.TeamsWebhookUrl),
+            App.SaveWebhookUrl("SlackWebhook", App.SlackWebhookUrl),
+            App.SaveWebhookUrl("GenericWebhook", App.GenericWebhookUrl),
+            App.SaveWebhookUrl("GenericWebhookHeaders", App.GenericWebhookHeadersJson),
+            App.SaveWebhookUrl("PagerDutyWebhook", App.PagerDutyRoutingKey)
+        })
+        {
+            if (failure != null)
+            {
+                _credentialFailures.Add(failure);
+                _webhookValueHeld = true;
+            }
+        }
+
+        /* #5772: a refused Credential Manager write used to vanish. The failures are collected here and
+           shown by SaveButton_Click once the settings.json write is known, so no dialog raised from this
+           method claims anything about the rest of the page. */
 
         root["teams_webhook_enabled"] = App.TeamsWebhookEnabled;
         root["teams_proxy_address"] = App.TeamsProxyAddress;
@@ -1339,6 +1740,9 @@ public partial class SettingsWindow : Window
         root["generic_webhook_enabled"] = App.GenericWebhookEnabled;
         root["generic_proxy_address"] = App.GenericWebhookProxyAddress;
         root["generic_body_template"] = App.GenericWebhookBodyTemplate;
+        /* #6012: the signing key's two plain facts; the keys are in Credential Manager. */
+        root["generic_signing_set"] = App.GenericSigningSet;
+        root["generic_signing_until"] = App.GenericSigningUntilUtc?.ToString("o", System.Globalization.CultureInfo.InvariantCulture) ?? "";
 
         root["pagerduty_webhook_enabled"] = App.PagerDutyWebhookEnabled;
         root["pagerduty_use_eu_region"] = App.PagerDutyUseEuRegion;
@@ -1359,6 +1763,7 @@ public partial class SettingsWindow : Window
 
             if (configError != null)
             {
+                NoteInvalid(configError, GenericWebhookHeadersBox);
                 MessageBox.Show(
                     $"The generic webhook is enabled but its configuration is not valid, so it will not deliver alerts:\n\n{configError}",
                     "Generic Webhook", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -1557,7 +1962,13 @@ public partial class SettingsWindow : Window
         {
             var body = GenericWebhookBodyBox.Text?.Trim();
             var proxy = GenericWebhookProxyAddressBox.Text?.Trim();
-            var error = await WebhookAlertService.SendTestGenericAsync(url, headers, body, proxy, EmailAlertService.Branding);
+            /* #6012: Lite is the sender, so its test is signed with the saved key. A saved key that will not open sends nothing. */
+            var signing = LiteWebhookSigningKeys.Open(
+                RouteSecretAccess.CredentialManager(), LiteWebhookSigningKeys.SettingsName(false), LiteWebhookSigningKeys.SettingsName(true),
+                GenericSigningState(), DateTime.UtcNow, out var signingUnreadable);
+            var error = signingUnreadable
+                ? LiteWebhookSigningKeys.UnreadableText
+                : await WebhookAlertService.SendTestGenericAsync(url, headers, body, proxy, EmailAlertService.Branding, signing);
 
             if (error == null)
             {
@@ -1603,6 +2014,8 @@ public partial class SettingsWindow : Window
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
+        RememberSelectedTab();
+
         if (!_saved)
             ThemeManager.Apply(_originalTheme);
         base.OnClosing(e);

@@ -8,6 +8,7 @@
 
 using System;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -27,6 +28,10 @@ public partial class NotificationRoutesWindow : Window
 {
     private readonly ViewerDataService _dataService;
     private readonly ObservableCollection<NotificationRouteRow> _routes = new();
+
+    /// <summary>The servers and tags the scope picker offers and the Status column checks against (#5750); null when they
+    /// could not be read, which the Status column says and the picker survives (All servers, plus the route's own scope).</summary>
+    private ViewerRouteScopeInputs? _scopeInputs;
 
     /// <summary>False on the read-only <c>viewer</c> role — bound by the Enabled checkbox's <c>IsEnabled</c>.
     /// Set once at construction (the connection's role does not change while the window is open).</summary>
@@ -53,13 +58,33 @@ public partial class NotificationRoutesWindow : Window
         try
         {
             var routes = await _dataService.GetNotificationRoutesAsync();
+
+            /* Orphan status uses the shared expander on the same three inputs dispatch uses, read through the viewer's own
+               connection (the viewer cannot call the service's loader). A failed read leaves them null: scoped routes then read
+               "Not active", never "OK". */
+            string? scopeReadError = null;
+            try
+            {
+                _scopeInputs = await _dataService.GetNotificationRouteScopeInputsAsync();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _scopeInputs = null;
+                scopeReadError = ex.Message;
+            }
+
+            ViewerNotificationRouteScope.Annotate(routes, _scopeInputs);
             _routes.Clear();
-            foreach (var route in routes)
+            foreach (var route in routes.OrderByDescending(r => r.RouteId))
             {
                 _routes.Add(route);
             }
 
             NoRoutesMessage.Visibility = _routes.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (scopeReadError is not null)
+            {
+                ShowError("Could not read the servers and tags", new InvalidOperationException(scopeReadError));
+            }
         }
         catch (Exception ex)
         {
@@ -69,7 +94,7 @@ public partial class NotificationRoutesWindow : Window
 
     private async void AddRoute_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new NotificationRouteEditDialog { Owner = this };
+        var dialog = new NotificationRouteEditDialog(_scopeInputs, null, null, _routes) { Owner = this };
         if (dialog.ShowDialog() != true)
         {
             return;
@@ -108,7 +133,7 @@ public partial class NotificationRoutesWindow : Window
 
         try
         {
-            await _dataService.SaveNotificationRouteSealedAsync(route, stored, parent, sealer, refusal);
+            await _dataService.SaveNotificationRouteSealedAsync(route, stored, parent, sealer, refusal, Environment.UserName, default);
         }
         catch (ViewerPasswordRefusedException ex)
         {
@@ -123,7 +148,7 @@ public partial class NotificationRoutesWindow : Window
             return;
         }
 
-        var dialog = new NotificationRouteEditDialog(selected) { Owner = this };
+        var dialog = new NotificationRouteEditDialog(_scopeInputs, selected, _dataService, _routes) { Owner = this };
         if (dialog.ShowDialog() != true)
         {
             return;
@@ -149,7 +174,7 @@ public partial class NotificationRoutesWindow : Window
 
         try
         {
-            await _dataService.SetNotificationRouteEnabledAsync(selected.RouteId, !selected.Enabled);
+            await _dataService.SetNotificationRouteEnabledAsync(selected.RouteId, !selected.Enabled, Environment.UserName);
             await LoadRoutesAsync();
         }
         catch (Exception ex)
@@ -166,7 +191,7 @@ public partial class NotificationRoutesWindow : Window
         }
 
         var result = MessageBox.Show(
-            $"Delete this route?\n\n{selected.MetricMatch} → {selected.ChannelsDisplay}\n\nAlerts it matched will fall back to the family route, if any, then to the Notifications channels.",
+            $"Delete this route?\n\n{selected.MetricMatch} ({selected.ScopeDisplay}) → {selected.ChannelsDisplay}\n\nAlerts it matched will fall back to the next most specific route, if any, then to the Notifications channels.",
             "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (result != MessageBoxResult.Yes)
         {
@@ -175,7 +200,7 @@ public partial class NotificationRoutesWindow : Window
 
         try
         {
-            await _dataService.DeleteNotificationRouteAsync(selected.RouteId);
+            await _dataService.DeleteNotificationRouteAsync(selected.RouteId, Environment.UserName);
             await LoadRoutesAsync();
         }
         catch (Exception ex)
@@ -193,7 +218,7 @@ public partial class NotificationRoutesWindow : Window
 
         try
         {
-            await _dataService.SetNotificationRouteEnabledAsync(route.RouteId, cb.IsChecked == true);
+            await _dataService.SetNotificationRouteEnabledAsync(route.RouteId, cb.IsChecked == true, Environment.UserName);
         }
         catch (Exception ex)
         {

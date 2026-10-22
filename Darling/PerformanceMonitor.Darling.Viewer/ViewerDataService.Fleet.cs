@@ -86,7 +86,22 @@ public sealed partial class ViewerDataService
     /// chunk to count the last hour — 69.8 ms on DARLING01, 1.1 ms with it. The PostgreSQL arm is already
     /// windowed on <c>collection_time</c> and needs no floor.</para>
     /// </summary>
-    public const string FleetTotalsSql = @"
+    /* #5644 W1: the blocking total sums WAITS (BlockingWaits.WaitsCteSql), not report rows, as the service's fleet
+       tile does, so the viewer and the web UI show the same number. */
+    public static readonly string FleetTotalsSql = @"
+WITH " + BlockingWaits.WaitsCteSql(
+        BlockingWaits.SqlDialect.Postgres, "xe_waits",
+        @"SELECT server_id, blocked_spid, blocking_spid, event_time, wait_time_ms
+    FROM v_blocked_process_reports
+    WHERE event_time >= $1
+    AND   event_time <= $2
+    AND   collection_time >= $3", new[] { "server_id" }) + "," + BlockingWaits.WaitsCteSql(
+        BlockingWaits.SqlDialect.Postgres, "dmv_waits",
+        @"SELECT server_id, blocked_spid, blocking_spid, event_time, wait_time_ms
+    FROM v_dmv_blocking_snapshots
+    WHERE event_time >= $1
+    AND   event_time <= $2
+    AND   collection_time >= $3", new[] { "server_id" }) + @"
 SELECT
     (
         SELECT COALESCE(SUM(CASE WHEN per_server.xe_count > 0 THEN per_server.xe_count ELSE per_server.dmv_count END), 0)
@@ -99,19 +114,13 @@ SELECT
             FROM
             (
                 SELECT server_id, COUNT(*) AS cnt
-                FROM v_blocked_process_reports
-                WHERE event_time >= $1
-                AND   event_time <= $2
-                AND   collection_time >= $3
+                FROM xe_waits
                 GROUP BY server_id
             ) AS xe
             FULL OUTER JOIN
             (
                 SELECT server_id, COUNT(*) AS cnt
-                FROM v_dmv_blocking_snapshots
-                WHERE event_time >= $1
-                AND   event_time <= $2
-                AND   collection_time >= $3
+                FROM dmv_waits
                 GROUP BY server_id
             ) AS dmv ON xe.server_id = dmv.server_id
         ) AS per_server
@@ -232,6 +241,12 @@ public sealed class FleetRankedServer
     /// default text is the type name ("PerformanceMonitor.Darling.Viewer.FleetRankedServer").</summary>
     public override string ToString() => DisplayName;
 
+    /// <summary>What a screen reader announces for the row (#6138): the server and why it needs attention, since the painted row
+    /// reads as a dot, a band word, a name and a reason that a reader would otherwise say as unrelated pieces.</summary>
+    public string AutomationName => string.IsNullOrWhiteSpace(Reason)
+        ? DisplayName + ", needs attention"
+        : DisplayName + ", needs attention: " + Reason;
+
     public FleetHealthBand Band { get; init; }
 
     /// <summary>The composite worst-first ordering score (band rank + severity magnitude + incident tiebreak).</summary>
@@ -268,6 +283,10 @@ public sealed class FleetRankedServer
 /// </summary>
 public sealed class FleetRollup
 {
+    /// <summary>The one sentence every viewer surface uses for an offline server: the Overview card, the server tab's
+    /// header and the Recommendations tab (#6135).</summary>
+    public const string OfflineNote = "Offline — no recent collection";
+
     /// <summary>
     /// The default depth of the worst-first ranking (the "Needs attention" list caps at this).
     ///
@@ -729,7 +748,7 @@ public sealed class FleetRollup
            its first collection — see ServerCollectionStatus. */
         if (s.CardStatus == ServerCollectionStatus.Offline)
         {
-            return "Offline — no recent collection";
+            return OfflineNote;
         }
 
         if (s.CardStatus == ServerCollectionStatus.AwaitingFirstCollection)

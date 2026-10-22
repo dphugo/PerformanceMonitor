@@ -17,6 +17,11 @@
  */
 
 import { el, mount, parseUtc, axisTime, emptyStrip, setQueryWaitFilter, waitIsLinked } from "./util.js";
+import { gapThresholdMs, splitAtGaps } from "./chart-gaps.js";
+import { focusSnapshotAt } from "./snapshot-pick.js";
+
+/* Re-exported so every existing import of the gap rule from charts.js keeps working (it moved to chart-gaps.js, #6291). */
+export { gapThresholdMs, splitAtGaps };
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -40,6 +45,8 @@ const BAR_CHAR_BUDGET_PX = BAR_CHAR_PX * 1.16;
 const BAR_TRACK_MIN = 40;
 /* Top margin leaves headroom for the y-axis unit caption to sit fully clear of the top tick's label. */
 const M = { l: 58, r: 16, t: 26, b: 30 };
+/* The margins as declared; a chart whose tick labels are wider than the left margin keeps a copy of its own named M (#6158). */
+const MARGINS = M;
 const PLOT_H = H - M.t - M.b;
 const Y_TICKS = 4;
 let clipSeq = 0;
@@ -281,6 +288,8 @@ export function renderLineChart(spec) {
   const tMin = hasWindow ? windowStart : dataTMin;
   const tMax = hasWindow ? windowEnd : dataTMax;
   const spanMs = tMax - tMin;
+  const rowTimes = rows.map((p) => p.t.getTime());
+  const gapMs = gapThresholdMs(rowTimes);
 
   /* A numeric reader: null/NaN reads as null for line/area (a gap), or 0 for a stacked mode (a continuous baseline). */
   const readVal = (r, key) => {
@@ -329,6 +338,32 @@ export function renderLineChart(spec) {
   const yMin = scale.min;
   const yMax = scale.max;
 
+  /* Axis labels, and the room each side needs for its widest (#6158): a five-digit tick ("80,000.0") used to run out of the
+     fixed 58 px left margin and the 56 px right gutter and lose its leading digits. The right axis scale is worked out
+     here, from the rows, so its gutter is known before the plot is built. */
+  const yLabels = axisTickLabels(scale.ticks, scale.step, formatValue);
+  const M = { ...MARGINS, l: axisGutterPx(yLabels, MARGINS.l) };
+  let scale2 = null;
+  let yLabels2 = [];
+  let rightGutter = 56;
+  if (series2) {
+    let m2 = -Infinity;
+    let n2 = Infinity;
+    for (const { r } of rows) {
+      const v = r[series2.key];
+      if (v == null || isNaN(v)) continue;
+      const num = Number(v);
+      if (num > m2) m2 = num;
+      if (num < n2) n2 = num;
+    }
+    if (m2 === -Infinity) { m2 = 1; n2 = 0; }
+    n2 = Math.min(0, n2);
+    if (m2 === n2) m2 = n2 + 1;
+    scale2 = niceScale(n2, m2, Y_TICKS, null, series2.integerTicks === true);
+    yLabels2 = axisTickLabels(scale2.ticks, scale2.step, series2.formatValue || ((v) => String(v)));
+    rightGutter = axisGutterPx(yLabels2, 56);
+  }
+
   const scaleY = (v) => M.t + (1 - (v - yMin) / (yMax - yMin)) * PLOT_H;
   /* Plotted points clamp into the plot box so a value above a clamped (pct) domain can't draw outside it. */
   const plotY = (v) => Math.max(M.t, Math.min(M.t + PLOT_H, scaleY(v)));
@@ -344,7 +379,7 @@ export function renderLineChart(spec) {
   const buildPlot = (W) => {
     /* A dual-axis overlay reserves a right gutter for its own tick labels + unit caption (#1606); without
        one the geometry is byte-for-byte the original. All right-edge math below uses these, never M.r. */
-    const plotRight = series2 ? W - 56 : W - M.r;
+    const plotRight = series2 ? W - rightGutter : W - M.r;
     const plotW = plotRight - M.l;
     /* A single bucket spans no time (spanMs === 0), so every point shares tMin; center it rather than pinning
        it to the left axis, where a lone dot reads as a glitch. */
@@ -360,11 +395,11 @@ export function renderLineChart(spec) {
 
     /* Horizontal gridlines + y labels (on the nice tick values). */
     const axis = svg("g", { class: "axis" });
-    for (const val of scale.ticks) {
-      const y = scaleY(val);
+    for (let ti = 0; ti < scale.ticks.length; ti++) {
+      const y = scaleY(scale.ticks[ti]);
       axis.appendChild(svg("line", { class: "grid-line", x1: M.l, y1: y, x2: plotRight, y2: y }));
       const label = svg("text", { x: M.l - 8, y: y + 4, "text-anchor": "end" });
-      label.textContent = formatValue(val);
+      label.textContent = yLabels[ti];
       axis.appendChild(label);
     }
 
@@ -410,25 +445,12 @@ export function renderLineChart(spec) {
        together without either flattening the other. */
     let scaleY2 = null;
     if (series2) {
-      let m2 = -Infinity;
-      let n2 = Infinity;
-      for (const { r } of rows) {
-        const v = r[series2.key];
-        if (v == null || isNaN(v)) continue;
-        const num = Number(v);
-        if (num > m2) m2 = num;
-        if (num < n2) n2 = num;
-      }
-      if (m2 === -Infinity) { m2 = 1; n2 = 0; }
-      n2 = Math.min(0, n2);
-      if (m2 === n2) m2 = n2 + 1;
-      const s2 = niceScale(n2, m2, Y_TICKS, null, series2.integerTicks === true);
+      const s2 = scale2;
       scaleY2 = (v) => M.t + (1 - (v - s2.min) / (s2.max - s2.min)) * PLOT_H;
-      const fmt2 = series2.formatValue || ((v) => String(v));
-      for (const val of s2.ticks) {
-        const y = scaleY2(val);
+      for (let ti = 0; ti < s2.ticks.length; ti++) {
+        const y = scaleY2(s2.ticks[ti]);
         const label = svg("text", { x: plotRight + 8, y: y + 4, "text-anchor": "start", fill: normalizeColor(series2.color) });
-        label.textContent = fmt2(val);
+        label.textContent = yLabels2[ti];
         axis.appendChild(label);
       }
       if (series2.unit && series2.unit !== "%") {
@@ -485,76 +507,94 @@ export function renderLineChart(spec) {
       } else {
         /* Filled bands drawn top series first so lower bands paint over the seams; each band is bounded above by its
            own cumulative top and below by the previous series' cumulative top (the x-axis for series 0). */
+        /* A collection gap (#5644 W7) ends one run of bands and starts the next, so the bands do not ramp across it;
+           a run of one bucket has no extent, so it is dots at the stack tops, as the single-bucket case above. */
+        const runs = splitAtGaps(rows.map((_, i) => i), rowTimes, gapMs);
         for (let k = series.length - 1; k >= 0; k--) {
-          const top = [];
-          const bottom = [];
-          for (let i = 0; i < rows.length; i++) {
-            top.push(xs[i] + "," + plotY(stackTops[i][k]));
-            bottom.push(xs[i] + "," + plotY(k === 0 ? 0 : stackTops[i][k - 1]));
+          for (const run of runs) {
+            if (run.length === 1) {
+              root.appendChild(svg("circle", { class: "series-dot", cx: xs[run[0]], cy: plotY(stackTops[run[0]][k]), r: 4, fill: normalizeColor(series[k].color) }));
+              continue;
+            }
+            const top = [];
+            const bottom = [];
+            for (const i of run) {
+              top.push(xs[i] + "," + plotY(stackTops[i][k]));
+              bottom.push(xs[i] + "," + plotY(k === 0 ? 0 : stackTops[i][k - 1]));
+            }
+            bottom.reverse();
+            root.appendChild(
+              svg("polygon", {
+                class: "series-area",
+                "clip-path": clipAttr,
+                points: top.concat(bottom).join(" "),
+                fill: normalizeColor(series[k].color),
+                "fill-opacity": "0.72",
+              })
+            );
           }
-          bottom.reverse();
-          root.appendChild(
-            svg("polygon", {
-              class: "series-area",
-              "clip-path": clipAttr,
-              points: top.concat(bottom).join(" "),
-              fill: normalizeColor(series[k].color),
-              "fill-opacity": "0.72",
-            })
-          );
         }
       }
     } else {
       /* Area fill (each series to the baseline) then the line on top; or just the line. Nulls drop the gap. */
       for (const s of series) {
-        const linePts = [];
+        const plottable = [];
         for (let i = 0; i < rows.length; i++) {
           const v = readVal(rows[i].r, s.key);
           if (v == null) continue;
-          linePts.push(xs[i] + "," + plotY(v));
+          plottable.push(i);
         }
-        /* A lone plottable point has no segment to stroke, so draw it as a dot — one bucket still shows its
-           reading. (Its resting marker matches the hover dot; static class so it does not vanish on mouseout.) */
-        if (linePts.length === 1) {
-          const [cx, cy] = linePts[0].split(",");
-          root.appendChild(svg("circle", { class: "series-dot", cx, cy, r: 4, fill: normalizeColor(s.color) }));
-          continue;
+        /* One run per stretch with samples (#5644 W7): a collection gap ends a run, so no line or fill crosses it. The
+           threshold comes from THIS series' own spacing: a 15-minute series on a chart of 1-minute buckets is not a
+           run of gaps. */
+        for (const run of splitAtGaps(plottable, rowTimes, gapThresholdMs(plottable.map((i) => rowTimes[i])))) {
+          const linePts = run.map((i) => xs[i] + "," + plotY(readVal(rows[i].r, s.key)));
+          /* A lone plottable point has no segment to stroke, so draw it as a dot — one bucket still shows its
+             reading. (Its resting marker matches the hover dot; static class so it does not vanish on mouseout.) */
+          if (linePts.length === 1) {
+            const [cx, cy] = linePts[0].split(",");
+            root.appendChild(svg("circle", { class: "series-dot", cx, cy, r: 4, fill: normalizeColor(s.color) }));
+            continue;
+          }
+          if (filled) {
+            const first = linePts[0].split(",")[0];
+            const last = linePts[linePts.length - 1].split(",")[0];
+            root.appendChild(
+              svg("polygon", {
+                class: "series-area",
+                "clip-path": clipAttr,
+                points: `${first},${baseY} ${linePts.join(" ")} ${last},${baseY}`,
+                fill: normalizeColor(s.color),
+                "fill-opacity": "0.15",
+              })
+            );
+          }
+          root.appendChild(svg("polyline", { class: "series-line", "clip-path": clipAttr, points: linePts.join(" "), stroke: normalizeColor(s.color) }));
         }
-        if (linePts.length < 2) continue;
-        if (filled) {
-          const first = linePts[0].split(",")[0];
-          const last = linePts[linePts.length - 1].split(",")[0];
-          root.appendChild(
-            svg("polygon", {
-              class: "series-area",
-              "clip-path": clipAttr,
-              points: `${first},${baseY} ${linePts.join(" ")} ${last},${baseY}`,
-              fill: normalizeColor(s.color),
-              "fill-opacity": "0.15",
-            })
-          );
-        }
-        root.appendChild(svg("polyline", { class: "series-line", "clip-path": clipAttr, points: linePts.join(" "), stroke: normalizeColor(s.color) }));
       }
     }
 
     /* The dual-axis overlay line (#1606): plotted against ITS axis (scaleY2), clamped into the plot box,
        nulls dropped as gaps — same discipline as a primary line. Always a plain line (never filled/stacked). */
     if (series2 && scaleY2) {
-      const pts2 = [];
+      const plottable2 = [];
       for (let i = 0; i < rows.length; i++) {
         const v = rows[i].r[series2.key];
         if (v == null || isNaN(v)) continue;
-        const y2 = Math.max(M.t, Math.min(M.t + PLOT_H, scaleY2(Number(v))));
-        pts2.push(xs[i] + "," + y2);
+        plottable2.push(i);
       }
-      if (pts2.length === 1) {
-        /* Same single-bucket rule as the primary series: a lone overlay reading draws as a dot, not a dropped
-           series, so "a dot per series" holds for the right axis too. */
-        const [cx, cy] = pts2[0].split(",");
-        root.appendChild(svg("circle", { class: "series-dot", cx, cy, r: 4, fill: normalizeColor(series2.color) }));
-      } else if (pts2.length >= 2) {
-        root.appendChild(svg("polyline", { class: "series-line series-line-overlay", "clip-path": clipAttr, points: pts2.join(" "), stroke: normalizeColor(series2.color) }));
+      /* Broken at collection gaps like a primary line (#5644 W7), by its own spacing (a 15-minute overlay over
+         1-minute buckets draws one line, not a dot per sample). */
+      for (const run of splitAtGaps(plottable2, rowTimes, gapThresholdMs(plottable2.map((i) => rowTimes[i])))) {
+        const pts2 = run.map((i) => xs[i] + "," + Math.max(M.t, Math.min(M.t + PLOT_H, scaleY2(Number(rows[i].r[series2.key])))));
+        if (pts2.length === 1) {
+          /* Same single-bucket rule as the primary series: a lone overlay reading draws as a dot, not a dropped
+             series, so "a dot per series" holds for the right axis too. */
+          const [cx, cy] = pts2[0].split(",");
+          root.appendChild(svg("circle", { class: "series-dot", cx, cy, r: 4, fill: normalizeColor(series2.color) }));
+        } else {
+          root.appendChild(svg("polyline", { class: "series-line series-line-overlay", "clip-path": clipAttr, points: pts2.join(" "), stroke: normalizeColor(series2.color) }));
+        }
       }
     }
 
@@ -981,6 +1021,10 @@ export function renderScatterChart(spec) {
   const yMax = Math.max(...pts.map((d) => Number(d.y)));
   const sx = niceScale(0, xMax > 0 ? xMax : 1, Y_TICKS, null);
   const sy = niceScale(0, yMax > 0 ? yMax : 1, Y_TICKS, null);
+  /* Tick labels with the step each axis moved by, and the room the widest y label needs (#6158). */
+  const yLabels = axisTickLabels(sy.ticks, sy.step, formatY);
+  const xLabels = axisTickLabels(sx.ticks, sx.step, formatX);
+  const M = { ...MARGINS, l: axisGutterPx(yLabels, MARGINS.l) };
   const buildPlot = (W) => {
     const plotRight = W - M.r;
     const plotW = plotRight - M.l;
@@ -989,18 +1033,18 @@ export function renderScatterChart(spec) {
 
     const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, style: `width:${W}px;height:${H}px`, class: "plot-svg", role: "img" });
     const axis = svg("g", { class: "axis" });
-    for (const val of sy.ticks) {
-      const y = scaleY(val);
+    for (let yi = 0; yi < sy.ticks.length; yi++) {
+      const y = scaleY(sy.ticks[yi]);
       axis.appendChild(svg("line", { class: "grid-line", x1: M.l, y1: y, x2: plotRight, y2: y }));
       const label = svg("text", { x: M.l - 8, y: y + 4, "text-anchor": "end" });
-      label.textContent = formatY(val);
+      label.textContent = yLabels[yi];
       axis.appendChild(label);
     }
     /* Every x gridline is drawn at any width; a narrow plot labels every second (third, ...) tick so the value labels do not
        overlap (#5586). The first and the last tick always keep their label: the stride counts from the first, and a stride
        tick too close to the last gives way to it. */
     const lastTick = sx.ticks.length - 1;
-    const xStride = Math.max(1, Math.ceil((1.5 * labelsPx(sx.ticks.map((v) => formatX(v))) + X_LABEL_GAP_PX) / (plotW / Math.max(1, lastTick))));
+    const xStride = Math.max(1, Math.ceil((1.5 * labelsPx(xLabels) + X_LABEL_GAP_PX) / (plotW / Math.max(1, lastTick))));
     for (let ti = 0; ti < sx.ticks.length; ti++) {
       const val = sx.ticks[ti];
       const x = scaleX(val);
@@ -1009,7 +1053,7 @@ export function renderScatterChart(spec) {
       if (!labelled) continue;
       /* The first and the last label are anchored inward, as the line chart's are, so the last never runs off the right edge. */
       const label = svg("text", { x: ti === 0 ? M.l : ti === lastTick ? plotRight : x, y: H - 8, "text-anchor": ti === 0 ? "start" : ti === lastTick ? "end" : "middle" });
-      label.textContent = formatX(val);
+      label.textContent = xLabels[ti];
       axis.appendChild(label);
     }
     if (unitY && unitY !== "%") {
@@ -1229,6 +1273,26 @@ function niceNum(range, round) {
 }
 
 /**
+ * The labels for one axis's ticks (#6158): each tick formatted with its step (so a small range prints the decimals it
+ * needs), and a label that repeats one already drawn is left blank, so no two ticks on an axis ever read the same even
+ * when a custom formatter ignores the step. The gridline of a blanked tick stays.
+ */
+export function axisTickLabels(ticks, step, format) {
+  const seen = new Set();
+  return ticks.map((t) => {
+    const text = String(format(t, { step }));
+    if (seen.has(text)) return "";
+    seen.add(text);
+    return text;
+  });
+}
+
+/** The room in px an axis needs for its widest label, plus the gap to the plot and to the box edge. */
+export function axisGutterPx(labels, minPx) {
+  return Math.max(minPx, Math.ceil(labelsPx(labels)) + 14);
+}
+
+/**
  * A "nice" y-axis over [min, max]: rounded bounds and evenly-spaced tick values that land on round numbers.
  * `clampMax` caps the top (percentage charts pass 100 so the axis never exceeds 100%).
  * `integer` keeps every tick on a whole number: a domain narrower than about five units would otherwise step by
@@ -1236,7 +1300,7 @@ function niceNum(range, round) {
  * 0-1 axis read "1 1 1 0 0 0". With the step held at 1 or more the ticks are distinct whole numbers, and a
  * small-count chart shows a few honest gridlines (0, 1, 2) instead of a column of repeated labels.
  */
-function niceScale(min, max, maxTicks, clampMax, integer = false) {
+export function niceScale(min, max, maxTicks, clampMax, integer = false) {
   const range = niceNum(max - min || 1, false);
   const niceStep = niceNum(range / Math.max(1, maxTicks), true) || 1;
   const step = integer ? Math.max(1, Math.ceil(niceStep)) : niceStep;
@@ -1246,7 +1310,8 @@ function niceScale(min, max, maxTicks, clampMax, integer = false) {
   const n = Math.max(1, Math.round((niceMax - niceMin) / step));
   const ticks = [];
   for (let i = 0; i <= n; i++) {
-    const v = niceMin + i * step;
+    /* toPrecision drops the float noise of the multiply (0.6000000000000001), which a bare String() label would print. */
+    const v = Number((niceMin + i * step).toPrecision(12));
     ticks.push(v > niceMax ? niceMax : v);
   }
   return { min: niceMin, max: niceMax, step, ticks };
@@ -1309,10 +1374,12 @@ export async function openServerTabAt(server, tMs, item, { beforeRoute = null, s
         return err;
       }
     }
+    /* #6302: Active Queries opens on the snapshot nearest the moment (it is a picker over the window's snapshots now). */
+    if (g.tab === "queries" && Number.isFinite(tMs)) focusSnapshotAt(server, tMs);
     if (typeof beforeRoute === "function") beforeRoute();
     /* Bring the item's own grid into view once the router has built the tab. The router's hashchange listener was
        added first (app.js), and for a server already on screen renderServer paints the tab synchronously, so the new
-       panels are in place when this one runs. A chart and a grid share the title "Deadlocks"; the grid is the later one.
+       panels are in place when this one runs. The Blocking tab's chart is "Deadlock trend" (#5644 W16), so the grid is the one "Deadlocks" panel there.
        The listener is once-only, and added after the range is taken, so a refused range leaves none behind. */
     if (typeof window.addEventListener === "function") {
       window.addEventListener(

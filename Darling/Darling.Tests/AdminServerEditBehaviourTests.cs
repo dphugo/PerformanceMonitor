@@ -7,6 +7,7 @@
  */
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -97,10 +98,77 @@ public sealed class AdminServerEditBehaviourTests
         Run("pure", JsonSerializer.Serialize(new { calls = calls.Select(c => new { fn = c.Fn, args = c.Args }) }))
             .GetProperty("results").EnumerateArray().ToArray();
 
+    // #5912: the Notification Routes tab's Agent column names every level; Level 2 reads "Act", not "Off" (same words as the viewers).
+    [Fact]
+    public void TheRouteAgentColumn_NamesEveryLevel_ActIsNotOff_Pure()
+    {
+        var limits = new { agent_max_per_hour = 7, agent_max_per_day = 70 };
+        var text = PureAll(
+            ("routeAgentText", [new { agent_level = (int?)null, limits.agent_max_per_hour, limits.agent_max_per_day }]),
+            ("routeAgentText", [new { agent_level = 0, limits.agent_max_per_hour, limits.agent_max_per_day }]),
+            ("routeAgentText", [new { agent_level = 1, limits.agent_max_per_hour, limits.agent_max_per_day }]),
+            ("routeAgentText", [new { agent_level = 2, limits.agent_max_per_hour, limits.agent_max_per_day }]))
+            .Select(r => r.GetString()).ToArray();
+        Assert.Equal(["Inherit", "Off", "Investigate (7/h, 70/day)", "Act (7/h, 70/day)"], text);
+    }
+
+    // #6269: the Server actions tab labels the engine from the service's engine_kind (never by parsing the spelling), and lists a switch
+    // that is on but that the engine cannot run, with a note, so it can be turned off.
+    [Fact]
+    public void TheServerActionRows_LabelTheEngineFromTheServicesKind_AndListAnOnSwitchTheEngineCannotRunWithTheNote_Pure()
+    {
+        var data = new
+        {
+            servers = new object[]
+            {
+                new { server_id = 1, server_name = "alpha-sql-01", engine = "sqlserver", engine_kind = "sqlserver", actions = new object[]
+                {
+                    new { action = "force_plan", valid = true, enabled = false },
+                } },
+                new { server_id = 2, server_name = "beta-pg-01", engine = "pg", engine_kind = "postgresql", actions = new object[]
+                {
+                    new { action = "force_plan", valid = false, enabled = true },
+                    new { action = "evict_plan", valid = false, enabled = false },
+                    new { action = "kill_session", valid = true, enabled = false },
+                } },
+            },
+        };
+        var rows = Pure("serverActionRows", data).EnumerateArray().ToArray();
+        Assert.Equal(["alpha-sql-01 SQL Server force_plan", "beta-pg-01 PostgreSQL force_plan", "beta-pg-01 PostgreSQL kill_session"],
+            rows.Select(r => r.GetProperty("server").GetString() + " " + r.GetProperty("engine").GetString() + " " + r.GetProperty("action_key").GetString()).ToArray());
+        Assert.Equal("", rows[0].GetProperty("note").GetString());
+        Assert.Equal("This server's engine can't run this action. Turn it off to clear it.", rows[1].GetProperty("note").GetString());
+        Assert.True(rows[1].GetProperty("enabled").GetBoolean());
+        Assert.Equal("", rows[2].GetProperty("note").GetString());
+    }
+
+    // #6269: the Changed by cell shows the person's name without the journal's "person:" prefix; any other caller keeps its own spelling.
+    [Fact]
+    public void TheServerActionRows_ShowTheChangerWithoutThePersonPrefix_Pure()
+    {
+        var data = new
+        {
+            servers = new object[]
+            {
+                new { server_id = 1, server_name = "alpha-sql-01", engine = "sqlserver", engine_kind = "sqlserver", actions = new object[]
+                {
+                    new { action = "force_plan", valid = true, enabled = true, set_by = "person:erik@example.com" },
+                    new { action = "evict_plan", valid = true, enabled = true, set_by = "mcp:token-1 client" },
+                    new { action = "kill_session", valid = true, enabled = false },
+                } },
+            },
+        };
+        var rows = Pure("serverActionRows", data).EnumerateArray().ToArray();
+        Assert.Equal("erik@example.com", rows[0].GetProperty("set_by").GetString());
+        Assert.Equal("mcp:token-1 client", rows[1].GetProperty("set_by").GetString());
+        Assert.Equal(JsonValueKind.Null, rows[2].GetProperty("set_by").ValueKind);
+        Assert.Equal("Force or unforce plans", rows[0].GetProperty("action").GetString());
+    }
+
     // The form's values for one kind of server, shaped as editFormValues returns them (the engine rides along).
     private static JsonObject Base(string kind)
     {
-        var form = JsonNode.Parse("""{"engine":"sqlserver","host":"sql-a","display_name":"Orders","port":"","auth":"Windows","username":"","encrypt_mode":"Mandatory","trust_server_certificate":false,"database":"","read_only_intent":false,"multi_subnet_failover":false,"monthly_cost_usd":"100"}""")!.AsObject();
+        var form = JsonNode.Parse("""{"engine":"sqlserver","host":"sql-a","display_name":"Orders","port":"","auth":"Windows","username":"","encrypt_mode":"Mandatory","trust_server_certificate":false,"database":"","read_only_intent":false,"multi_subnet_failover":false,"query_store_replica":"","monthly_cost_usd":"100"}""")!.AsObject();
         switch (kind)
         {
             case "windows":
@@ -190,6 +258,12 @@ public sealed class AdminServerEditBehaviourTests
     [InlineData("postgres", """{"port":"5434"}""", "typed", """{"port":5434,"password":"typed","expected_modified_at":"TOKEN"}""")]
     [InlineData("postgres", """{"port":"abc","display_name":"Payments"}""", "", """{"display_name":"Payments","expected_modified_at":"TOKEN"}""")]
     [InlineData("postgres", """{"host":"pg-b"}""", "typed", """{"host":"pg-b","password":"typed","expected_modified_at":"TOKEN"}""")]
+    // #6254: a SQL Server Query Store replica is trimmed and sent when it differs, with the password; blank is sent as an empty text (a removal
+    // the service reads) only once one is stored; a PostgreSQL target never sends one.
+    [InlineData("sql", """{"query_store_replica":" replica-a,1433 "}""", "typed", """{"query_store_replica":"replica-a,1433","password":"typed","expected_modified_at":"TOKEN"}""")]
+    [InlineData("windows", """{"query_store_replica":"replica-a"}""", "", """{"query_store_replica":"replica-a","expected_modified_at":"TOKEN"}""")]
+    [InlineData("sql", """{"query_store_replica":"   "}""", "", "null")]
+    [InlineData("postgres", """{"query_store_replica":"replica-a"}""", "", "null")]
     public void TheEditBody_CarriesOnlyChangedEditableFields_AndTheToken_Pure(string kind, string changes, string password, string expected)
     {
         var body = Pure("buildEditBody", Base(kind), Edited(kind, changes), Token, password);
@@ -232,6 +306,7 @@ public sealed class AdminServerEditBehaviourTests
     [InlineData("sql", """{"trust_server_certificate":true}""", true)]
     [InlineData("sql", """{"read_only_intent":true}""", true)]
     [InlineData("sql", """{"multi_subnet_failover":true}""", true)]
+    [InlineData("sql", """{"query_store_replica":"replica-a"}""", true)]
     [InlineData("windows", """{"auth":"SQL","username":"sa"}""", true)]
     [InlineData("windows", """{"auth":"ServicePrincipal","username":"app-id"}""", true)]
     [InlineData("managed", """{"auth":"SQL","username":"sa"}""", true)]
@@ -244,6 +319,8 @@ public sealed class AdminServerEditBehaviourTests
     [InlineData("sql", """{"monthly_cost_usd":"250"}""", false)]
     [InlineData("sql", """{"encrypt_mode":"mandatory"}""", false)]
     [InlineData("sql", """{"host":" sql-a "}""", false)]
+    [InlineData("sql", """{"query_store_replica":"  "}""", false)]
+    [InlineData("postgres", """{"query_store_replica":"replica-a"}""", false)]
     [InlineData("sp", """{"display_name":"Payments"}""", false)]
     [InlineData("postgres", """{"display_name":"Payments"}""", false)]
     [InlineData("postgres", """{"port":"5433"}""", false)]
@@ -339,6 +416,35 @@ public sealed class AdminServerEditBehaviourTests
             var actual = JsonNode.Parse(results[i].GetRawText());
             Assert.True(JsonNode.DeepEquals(JsonNode.Parse(Answers[i].Expected), actual), Answers[i].Name + ": got " + results[i].GetRawText());
         }
+    }
+
+    // #6254: the edit tested the Query Store replica beside the primary. The notice carries the replica's result, a replica that would not
+    // open is a warning in the same "Saved" notice (the save went through), and a server with no replica says nothing about one.
+    [Fact]
+    public void ASavedEdit_SaysWhetherTheQueryStoreReplicaOpened_AndSaysNothingWhenThereIsNone_Pure()
+    {
+        static JsonNode Body(string? replica) => JsonNode.Parse(JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["status"] = "updated",
+            ["display_name"] = "Charlie",
+            ["note"] = "Takes effect at the next collection cycle.",
+            ["tested"] = true,
+            ["query_store_replica_test"] = replica,
+        }))!;
+
+        const string failed = "Query Store replica r1: could not connect. Collection reads Query Store from the primary until it can. The service log has the details.";
+        var results = PureAll(
+            ("interpretEdit", new object?[] { 200, Body("Query Store replica r1: connected."), null }),
+            ("interpretEdit", new object?[] { 200, Body(failed), null }),
+            ("interpretEdit", new object?[] { 200, Body(null), null }));
+
+        const string lead = "Saved \"Charlie\". Takes effect at the next collection cycle. The connection was tested before saving.";
+        Assert.Equal("updated", results[0].GetProperty("kind").GetString());
+        Assert.Equal(lead + " Query Store replica r1: connected.", results[0].GetProperty("notice").GetString());
+        Assert.Equal("updated", results[1].GetProperty("kind").GetString());
+        Assert.True(results[1].GetProperty("close").GetBoolean());
+        Assert.Equal(lead + " " + failed, results[1].GetProperty("notice").GetString());
+        Assert.Equal(lead, results[2].GetProperty("notice").GetString());
     }
 
     private const string UnexpectedAnswer = "The service gave an answer this page does not understand, so it is not known whether anything was saved. Your entries are kept; check the server list before saving again.";
@@ -529,7 +635,7 @@ public sealed class AdminServerEditBehaviourTests
     // ------------------------------------------------------------------ the rest of the exports
 
     [Fact]
-    public void TheEditFields_AreTheTwelveEditableKeysInFormOrder_AndNeverTheSecretOrTheToken_Pure()
+    public void TheEditFields_AreTheThirteenEditableKeysInFormOrder_AndNeverTheSecretOrTheToken_Pure()
     {
         var fields = Pure("EDIT_FIELDS").EnumerateArray().Select(f => (f.GetProperty("key").GetString(), f.GetProperty("label").GetString())).ToArray();
 
@@ -538,7 +644,7 @@ public sealed class AdminServerEditBehaviourTests
             {
                 ("host", "Server Name / Address"), ("display_name", "Display Name"), ("port", "Port"), ("auth", "Authentication"),
                 ("username", "Username"), ("encrypt_mode", "Encryption"), ("trust_server_certificate", "Trust server certificate"),
-                ("database", "Database"), ("read_only_intent", "Read-only intent"), ("multi_subnet_failover", "Multi-subnet failover"),
+                ("database", "Database"), ("read_only_intent", "Read-only intent"), ("multi_subnet_failover", "Multi-subnet failover"), ("query_store_replica", "QS replica"),
                 ("monthly_cost_usd", "Monthly Cost ($)"), ("aws_role_arn", "AWS role ARN"),
             },
             fields);
@@ -551,18 +657,18 @@ public sealed class AdminServerEditBehaviourTests
     // true only when exactly true, and no secret, id or token comes along.
     [InlineData(
         """{"server_id":7,"display_name":"Orders","engine":"sqlserver","host":"sql-a","port":0,"database":null,"read_only_intent":true,"auth":"SQL","username":"sa","encrypt_mode":"mandatory","trust_server_certificate":true,"multi_subnet_failover":false,"monthly_cost_usd":1234.5,"modified_at":"2026-01-02T03:04:05.1234567Z"}""",
-        """{"engine":"sqlserver","host":"sql-a","display_name":"Orders","port":"","auth":"SQL","username":"sa","encrypt_mode":"Mandatory","trust_server_certificate":true,"database":"","read_only_intent":true,"multi_subnet_failover":false,"monthly_cost_usd":"1234.5","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
+        """{"engine":"sqlserver","host":"sql-a","display_name":"Orders","port":"","auth":"SQL","username":"sa","encrypt_mode":"Mandatory","trust_server_certificate":true,"database":"","read_only_intent":true,"multi_subnet_failover":false,"query_store_replica":"","monthly_cost_usd":"1234.5","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
     // PostgreSQL always shows auth "SQL" and its port; an engine that is not sqlserver is PostgreSQL, whatever its case or spelling.
     [InlineData(
         """{"display_name":"Pg","engine":"postgres","host":"pg-a","port":5433,"database":"mon","read_only_intent":false,"auth":"Windows","username":"pgmon","encrypt_mode":"Optional","trust_server_certificate":"true","multi_subnet_failover":1,"monthly_cost_usd":0}""",
-        """{"engine":"postgres","host":"pg-a","display_name":"Pg","port":"5433","auth":"SQL","username":"pgmon","encrypt_mode":"Optional","trust_server_certificate":false,"database":"mon","read_only_intent":false,"multi_subnet_failover":false,"monthly_cost_usd":"0","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
+        """{"engine":"postgres","host":"pg-a","display_name":"Pg","port":"5433","auth":"SQL","username":"pgmon","encrypt_mode":"Optional","trust_server_certificate":false,"database":"mon","read_only_intent":false,"multi_subnet_failover":false,"query_store_replica":"","monthly_cost_usd":"0","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
     [InlineData(
         """{"display_name":"X","engine":"MySQL","host":"h","port":3306,"auth":"SQL","username":"u","encrypt_mode":"Optional"}""",
-        """{"engine":"postgres","host":"h","display_name":"X","port":"3306","auth":"SQL","username":"u","encrypt_mode":"Optional","trust_server_certificate":false,"database":"","read_only_intent":false,"multi_subnet_failover":false,"monthly_cost_usd":"0","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
+        """{"engine":"postgres","host":"h","display_name":"X","port":"3306","auth":"SQL","username":"u","encrypt_mode":"Optional","trust_server_certificate":false,"database":"","read_only_intent":false,"multi_subnet_failover":false,"query_store_replica":"","monthly_cost_usd":"0","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
     // An auth the list does not know shows as Windows, as the service's own word for it does; an unknown encryption mode stays as text.
     [InlineData(
         """{"display_name":"X","engine":"SQLServer","host":"h","auth":"Kerberos","username":null,"encrypt_mode":"Weird","monthly_cost_usd":12}""",
-        """{"engine":"sqlserver","host":"h","display_name":"X","port":"","auth":"Windows","username":"","encrypt_mode":"Weird","trust_server_certificate":false,"database":"","read_only_intent":false,"multi_subnet_failover":false,"monthly_cost_usd":"12","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
+        """{"engine":"sqlserver","host":"h","display_name":"X","port":"","auth":"Windows","username":"","encrypt_mode":"Weird","trust_server_certificate":false,"database":"","read_only_intent":false,"multi_subnet_failover":false,"query_store_replica":"","monthly_cost_usd":"12","aws_role_arn":"","aws_external_id_set":false,"aws_remove_role":false,"aws_clear_external_id":false}""")]
     public void TheFormValues_AreTheReadAsTheFormHoldsIt_Pure(string read, string expected)
     {
         var values = Pure("editFormValues", JsonNode.Parse(read));
@@ -722,7 +828,7 @@ public sealed class AdminServerEditBehaviourTests
         Assert.Equal("-1", form.GetProperty("headingTabindex").GetString());
         Assert.Equal("SQL Server", form.GetProperty("engine").GetString());
         Assert.Equal(
-            new[] { "engine", "host", "display_name", "auth", "username", "password", "encrypt_mode", "trust_server_certificate", "database", "read_only_intent", "multi_subnet_failover", "monthly_cost_usd" },
+            new[] { "engine", "host", "display_name", "auth", "username", "password", "encrypt_mode", "trust_server_certificate", "database", "read_only_intent", "multi_subnet_failover", "query_store_replica", "monthly_cost_usd" },
             Strings(form.GetProperty("keys")));
         var values = form.GetProperty("values");
         Assert.Equal("charlie", values.GetProperty("host").GetString());
@@ -937,7 +1043,7 @@ public sealed class AdminServerEditBehaviourTests
         var page = Run("frame");
 
         Assert.Equal(
-            new[] { "Display Name", "Server", "Auth", "Engine", "Version", "Status", "Freshness", "Monthly Cost ($)", "Read only", "Added", "Last Collected" },
+            new[] { "Display Name", "Server", "Auth", "Engine", "Version", "Status", "Freshness", "Monthly Cost ($)", "Read only", "Added", "Last Collected", "Same machine as" },
             page.GetProperty("headers").EnumerateArray().Select(h => h.GetString()).ToArray());
         var cells = page.GetProperty("cells").EnumerateArray().Select(r => r.EnumerateArray().Select(c => c.GetString()).ToArray()).ToArray();
         Assert.Equal(2, cells.Length);
@@ -945,7 +1051,8 @@ public sealed class AdminServerEditBehaviourTests
         Assert.Equal(new[] { "Bravo", "bravo", "SQL Server", "postgres", "PostgreSQL 18", "Disabled", "AwaitingFirstCollection", "—" }, cells[1].Take(8).ToArray());
         // The grid's time cells follow the process zone, so the harness pins UTC; the cell text itself depends on the locale.
         Assert.Equal(0, page.GetProperty("utcOffsetMinutes").GetInt32());
-        Assert.Equal(11, cells[0].Length);
+        Assert.Equal(12, cells[0].Length);
+        Assert.Equal("—", cells[0][11]);
         Assert.Equal(new[] { "", "band-Offline" }, page.GetProperty("rowClasses").EnumerateArray().Select(c => c.GetString()).ToArray());
         Assert.StartsWith("2 servers.", Assert.Single(page.GetProperty("notice").EnumerateArray()).GetString());
         Assert.Equal(0, page.GetProperty("editHeaders").GetInt32());

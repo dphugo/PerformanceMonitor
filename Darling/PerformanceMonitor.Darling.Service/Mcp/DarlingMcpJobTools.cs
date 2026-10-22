@@ -33,6 +33,7 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 [McpServerToolType]
 public sealed class DarlingMcpJobTools
 {
+    [ReadsLatestSnapshot(LatestSnapshotShape.Stamped)]
     [McpServerTool(Name = "get_running_jobs"), Description("Gets currently running SQL Agent jobs with duration comparison. Shows each job's current duration vs its historical average and p95, flagging jobs that are running longer than usual. start_time is UTC, matching the captured_at on this payload (msdb records the Agent start in the monitored server's local clock; this read de-skews it), so start_time and current_duration_seconds agree. LATEST IS A TIME: this reads the newest running-jobs snapshot, not a window, and captured_at is the instant it was collected - a job listed here was running AT that stamp, and current_duration_seconds is how long it had been running AT that stamp, not now.")]
     public static async Task<string> GetRunningJobs(
         NpgsqlDataSource postgres,
@@ -47,13 +48,13 @@ public sealed class DarlingMcpJobTools
             var read = await DarlingJobReader.ReadRunningJobsAsync(postgres, resolved.ServerId, cancellationToken);
             var rows = read.Jobs;
             if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "running_jobs", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "running_jobs", cancellationToken)
                     /* #2546: the msdb case. "No running SQL Agent jobs found" is an affirmative claim about
                        the server's Agent, and it is the wrong one when the monitoring login was refused the
                        job tables — the collector runs, is denied, and records that denial with the GRANT to
                        issue. Reporting it here is the difference between "nothing is running" and "we cannot
                        see what is running". */
-                    ?? await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.ServerName, "running_jobs", cancellationToken)
+                    ?? await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "running_jobs", cancellationToken)
                     /* #2559: the case the line above cannot see. StatusAsync reports what the collector's last
                        run RECORDED, and a collector whose AppliesTo gate is off never runs — the runner returns
                        before writing any collection_log row, deliberately, because a per-cycle fake row was
@@ -67,7 +68,7 @@ public sealed class DarlingMcpJobTools
                        The message still names it as a possible cause: a run that is merely late looks the same
                        from here. The text is shared with Lite, so the two tools cannot drift. */
                     ?? await DarlingRuntimePrecondition.GatedOffStatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "running_jobs",
+                        postgres, resolved.ServerId, resolved.DisplayName, "running_jobs",
                         CollectorRuntimePrecondition.RunningJobsPossibleCauses,
                         cancellationToken)
                     /* The freshness bound (#1812): the last good collection is older than three missed cycles, so "none found" would be
@@ -97,7 +98,7 @@ public sealed class DarlingMcpJobTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* #3653: captured_at, the #3637 census's one spelling for a latest read's stamp - see
                    DarlingMcpDataTools.GetServerProperties for why it is a cut-over and not an alias. */
                 captured_at = rows[0].CollectionTime.ToString("o"),
@@ -127,7 +128,7 @@ public sealed class DarlingMcpJobTools
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         CancellationToken cancellationToken = default)
     {
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd)
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd)
             ?? McpHelpers.ValidateTop(limit)
             ?? McpHelpers.ValidateChoice(status, HistoryStatuses, "status");
         if (validation != null) return validation;
@@ -175,6 +176,13 @@ public sealed class DarlingMcpJobTools
                 {
                     var notCollected = await DarlingEngineCapability.NotCollectedStatusAsync(postgres, s1.ServerId, s1.ServerName, "job_history", cancellationToken);
                     if (notCollected != null) return notCollected;
+                }
+                else
+                {
+                    /* #6178: no server named. When no registered server can have an Agent (every one an Azure SQL Database),
+                       "no runs matched" is not_collected, not a true negative. One server that could have jobs keeps the empty answer. */
+                    var fleetNotCollected = await DarlingEngineCapability.FleetNotCollectedStatusAsync(postgres, "job_history", cancellationToken);
+                    if (fleetNotCollected != null) return fleetNotCollected;
                 }
 
                 /* An empty answer is where "the Agent was stopped" matters most, so its hints carry the Agent state too. */

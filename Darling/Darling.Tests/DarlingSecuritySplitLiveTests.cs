@@ -286,7 +286,7 @@ public sealed class DarlingSecuritySplitLiveTests
             Assert.Equal("42501", denied.SqlState);
 
             var beaconOnly = await Assert.ThrowsAsync<PostgresException>(async () =>
-                await ExecAsync(viewer, "UPDATE config.config_service SET paused = NOT paused WHERE id = 1", ct));
+                await ExecAsync(viewer, "UPDATE config.config_service SET capture_plans = NOT capture_plans WHERE id = 1", ct));
             Assert.Equal("42501", beaconOnly.SqlState);
 
             bodySucceeded = true;
@@ -329,8 +329,11 @@ public sealed class DarlingSecuritySplitLiveTests
                silently exposing the credential columns over the network MCP surface (Round 4 #5). */
             foreach (var acl in DarlingManagedRoles.ViewerRestrictedConfigTables)
             {
-                await ExecAsync(mcp, $"SELECT {string.Join(", ", acl.NonSecretColumns)} FROM config.{acl.Table} LIMIT 1", ct);
-                foreach (var secret in acl.SecretColumns)
+                var readable = DarlingManagedRoles.McpWithheldColumns.TryGetValue(acl.Table, out var withheld)
+                    ? acl.NonSecretColumns.Where(c => !withheld.Contains(c, StringComparer.Ordinal))
+                    : acl.NonSecretColumns;
+                await ExecAsync(mcp, $"SELECT {string.Join(", ", readable)} FROM config.{acl.Table} LIMIT 1", ct);
+                foreach (var secret in acl.SecretColumns.Concat(withheld ?? []))
                 {
                     var denied = await Assert.ThrowsAsync<PostgresException>(async () =>
                         await ExecAsync(mcp, $"SELECT {secret} FROM config.{acl.Table} LIMIT 1", ct));
@@ -340,12 +343,18 @@ public sealed class DarlingSecuritySplitLiveTests
 
             /* The two narrow analysis INSERTs are granted (has_table_privilege avoids needing the tables'
                column shapes) — and NOTHING wider on them: no config_command write (the service-credential
-               pivot), no analysis_muted DELETE (no MCP unmute tool), no analysis_findings UPDATE. */
+               pivot), no analysis_findings UPDATE; analysis_muted DELETE is granted for the unmute tool (#6383). */
             Assert.True(await HasPrivAsync(mcp, "collect.analysis_findings", "INSERT", ct));
             Assert.True(await HasPrivAsync(mcp, "config.analysis_muted", "INSERT", ct));
             Assert.False(await HasPrivAsync(mcp, "config.config_command", "INSERT", ct));
-            Assert.False(await HasPrivAsync(mcp, "config.analysis_muted", "DELETE", ct));
+            Assert.True(await HasPrivAsync(mcp, "config.analysis_muted", "DELETE", ct));
+            Assert.False(await HasPrivAsync(mcp, "config.analysis_muted", "UPDATE", ct));
             Assert.False(await HasPrivAsync(mcp, "collect.analysis_findings", "UPDATE", ct));
+            /* #5633 item 13: the caveat table is the scheduled pass's state; mcp reads it and writes nothing. */
+            foreach (var privilege in new[] { "INSERT", "UPDATE", "DELETE", "TRUNCATE", "TRIGGER", "REFERENCES" })
+            {
+                Assert.False(await HasPrivAsync(mcp, "collect.analysis_collection_caveats", privilege, ct), privilege);
+            }
 
             /* #1599: mcp gets the SAME single-table custom_views write viewer has (the MCP custom-view tools) —
                proven by a real INSERT/UPDATE/DELETE round-trip as the mcp role (IDENTITY id needs no sequence
@@ -415,9 +424,9 @@ public sealed class DarlingSecuritySplitLiveTests
             Assert.Equal("42501", stillDenied.SqlState);
 
             /* And the config_service beacon grant is strictly COLUMN-level: mcp can bump config_version/updated_at
-               (proven above) but CANNOT flip a real service flag like paused. */
+               (proven above) but CANNOT flip a real service flag like capture_plans (paused is the one other column mcp holds, #6230). */
             var beaconOnly = await Assert.ThrowsAsync<PostgresException>(async () =>
-                await ExecAsync(mcp, "UPDATE config.config_service SET paused = NOT paused WHERE id = 1", ct));
+                await ExecAsync(mcp, "UPDATE config.config_service SET capture_plans = NOT capture_plans WHERE id = 1", ct));
             Assert.Equal("42501", beaconOnly.SqlState);
 
             bodySucceeded = true;
@@ -689,9 +698,9 @@ ALTER DEFAULT PRIVILEGES FOR ROLE {OwnerRoleOf(owner)} IN SCHEMA collect GRANT S
 GRANT USAGE ON SCHEMA collect, config TO {McpRole};
 GRANT SELECT ON ALL TABLES IN SCHEMA collect TO {McpRole};
 GRANT SELECT ON ALL TABLES IN SCHEMA config  TO {McpRole};
-{DarlingManagedRoles.BuildViewerColumnAclSql("config", McpRole)}
+{DarlingManagedRoles.BuildMcpColumnAclSql("config", McpRole)}
 GRANT INSERT ON collect.analysis_findings TO {McpRole};
-GRANT INSERT ON config.analysis_muted TO {McpRole};
+GRANT INSERT, DELETE ON config.analysis_muted TO {McpRole};
 -- The mcp custom_views write (#1599): the MCP custom-view tools CRUD config.custom_views, so mcp gets the SAME
 -- single-table write viewer has (DarlingManagedRoles section 7). Never widens to a schema-wide config write.
 GRANT INSERT, UPDATE, DELETE ON config.custom_views TO {McpRole};

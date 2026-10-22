@@ -144,6 +144,8 @@ namespace PerformanceMonitor.Common
                     HostName = proc.Attribute("hostname")?.Value ?? string.Empty,
                     IsolationLevel = proc.Attribute("isolationlevel")?.Value ?? string.Empty,
                     ProcName = ExtractProcName(proc),
+                    StackFrames = ExtractStackFrames(proc),
+                    ProcessHandle = ExtractProcessHandle(proc),
                     Status = proc.Attribute("status")?.Value ?? string.Empty
                 });
             }
@@ -250,6 +252,71 @@ namespace PerformanceMonitor.Common
                 .Select(f => f.Value?.Trim())
                 .FirstOrDefault(v => !string.IsNullOrEmpty(v));
             return frame ?? string.Empty;
+        }
+
+        /// <summary>
+        /// The execution-stack frames that carry a usable <c>sqlhandle</c>, in stack order (#6205), each with its
+        /// <c>stmtstart</c>/<c>stmtend</c> (a missing start reads as 0 and a missing end as -1, to the end of the
+        /// batch), <c>procname</c> and <c>line</c>. A frame with no handle, or a handle whose hex digits are all
+        /// zeros (the sentinel SQL Server writes for dynamic SQL and system contexts, of any length), is skipped but
+        /// still counts in <see cref="DeadlockStackFrame.Position"/>. Every other frame is listed, repeats included.
+        /// </summary>
+        internal static IReadOnlyList<DeadlockStackFrame> ExtractStackFrames(XElement proc)
+        {
+            var stack = proc.Element("executionStack");
+            if (stack == null)
+                return Array.Empty<DeadlockStackFrame>();
+
+            var frames = new List<DeadlockStackFrame>();
+            var position = 0;
+            foreach (var frame in stack.Elements("frame"))
+            {
+                position++;
+                var handle = frame.Attribute("sqlhandle")?.Value?.Trim();
+                if (string.IsNullOrEmpty(handle) || IsZeroSqlHandle(handle))
+                    continue;
+
+                var start = int.TryParse(frame.Attribute("stmtstart")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) ? s : 0;
+                var end = int.TryParse(frame.Attribute("stmtend")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var e) ? e : -1;
+                var procName = frame.Attribute("procname")?.Value;
+                int? line = int.TryParse(frame.Attribute("line")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l) ? l : null;
+                frames.Add(new DeadlockStackFrame(position, handle, start, end, procName ?? string.Empty, line));
+            }
+            return frames;
+        }
+
+        /// <summary>
+        /// The <c>sqlhandle</c> a deadlock graph can put on the <c>&lt;process&gt;</c> element itself (#6205), with that
+        /// element's <c>stmtstart</c>/<c>stmtend</c> (a missing start reads as 0 and a missing end as -1), the same read
+        /// the plan lookups make. <c>null</c> when there is none, when it is all zeros, or when an execution-stack frame
+        /// already lists the same handle with the same offsets (it would be a repeat line).
+        /// </summary>
+        internal static DeadlockProcessHandle? ExtractProcessHandle(XElement proc)
+        {
+            var handle = proc.Attribute("sqlhandle")?.Value?.Trim();
+            if (string.IsNullOrEmpty(handle) || IsZeroSqlHandle(handle))
+                return null;
+
+            var start = int.TryParse(proc.Attribute("stmtstart")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) ? s : 0;
+            var end = int.TryParse(proc.Attribute("stmtend")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var e) ? e : -1;
+            foreach (var frame in ExtractStackFrames(proc))
+            {
+                if (string.Equals(frame.SqlHandle, handle, StringComparison.OrdinalIgnoreCase) &&
+                    frame.StmtStart == start && frame.StmtEnd == end)
+                    return null;
+            }
+            return new DeadlockProcessHandle(handle, start, end);
+        }
+
+        /// <summary>True for <c>0x</c> followed only by zeros (any length): the "no persistent handle" sentinel. The one
+        /// zero test the deadlock pane and every plan lookup share, so a short or a long all-zero handle is skipped alike.</summary>
+        public static bool IsZeroSqlHandle(string handle)
+        {
+            var trimmed = handle.AsSpan().Trim();
+            var digits = trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? trimmed.Slice(2) : trimmed;
+            foreach (var c in digits)
+                if (c != '0') return false;
+            return true;
         }
 
         /// <summary>The first real procedure on the execution stack (skipping adhoc/unknown); blank for ad hoc.</summary>

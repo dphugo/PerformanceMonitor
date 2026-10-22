@@ -98,6 +98,13 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
         /* On collection_time, as the blocked-process read above: a delivery cursor, so a late-collected deadlock
            still alerts. */
         var rows = await Task.Run(() => _dataService.GetRecentDeadlocksAsync(serverId, hoursBack, windowOnCollectionTime: true), cancellationToken);
+        /* #5642: the row's own collection_time (a naive-UTC store stamp) is the newest-sample instant the alert's age
+           line reads. The DeadlockRow grid type carries it already; the shared DTO had no place for it. */
+        foreach (var row in rows)
+        {
+            row.NewestSampleUtc = DateTime.SpecifyKind(row.CollectionTime, DateTimeKind.Utc);
+        }
+
         return new List<DeadlockAlertRow>(rows);
     }
 
@@ -108,6 +115,30 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
     {
         var serverId = ParseServerKey(serverKey);
         return await Task.Run(() => _dataService.GetPoisonWaitAccumulationAsync(serverId, windowMinutes), cancellationToken);
+    }
+
+    /// <summary>#5641: the Runnable Queue samples (one per collection), delegated like every other member so the engine stays free of DuckDB.</summary>
+    public async Task<IReadOnlyList<RunnableQueueSample>> GetRunnableQueueSamplesAsync(
+        string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+        return await Task.Run(() => _dataService.GetRunnableQueueSamplesAsync(serverId, lookbackMinutes), cancellationToken);
+    }
+
+    /// <summary>#5640: the Client Timeouts window (runs, count rows, sample groups, top lists), delegated like every other member so the engine stays free of DuckDB.</summary>
+    public async Task<AttentionWindow> GetAttentionWindowAsync(
+        string serverKey, int lookbackMinutes, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+        return await Task.Run(() => _dataService.GetAttentionWindowAsync(serverId, lookbackMinutes), cancellationToken);
+    }
+
+    /// <summary>#5736: the server's Client Timeouts baseline, delegated like every other member.</summary>
+    public async Task<AttentionBaseline?> GetAttentionBaselineAsync(
+        string serverKey, DateTime nowUtc, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+        return await Task.Run(() => _dataService.GetAttentionBaselineAsync(serverId, nowUtc), cancellationToken);
     }
 
     public async Task<LongRunningQueryReadResult> GetLongRunningQueriesAsync(
@@ -121,6 +152,7 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
         bool excludeCdc,
         IReadOnlyList<string> excludedDatabases,
         LongRunningQueryExclusions exclusions,
+        bool orderByCpu = false,
         CancellationToken cancellationToken = default)
     {
         var serverId = ParseServerKey(serverKey);
@@ -132,7 +164,7 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
            as its third CTE flag and counts what it removed; nothing is filtered on this side of the seam. */
         return await Task.Run(() => _dataService.GetLongRunningQueriesAsync(
             serverId, thresholdMinutes, maxResults, excludeSpServerDiagnostics, excludeWaitFor,
-            excludeBackups, excludeMiscWaits, excludeCdc, exclusions, excludedDatabases), cancellationToken);
+            excludeBackups, excludeMiscWaits, excludeCdc, exclusions, excludedDatabases, orderByCpu), cancellationToken);
     }
 
     public async Task<List<VolumeFreeSpaceInfo>> GetVolumeFreeSpaceAsync(
@@ -183,6 +215,13 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
         }
 
         var jobs = await Task.Run(() => _dataService.GetAnomalousJobsAsync(serverId, multiplier), cancellationToken);
+        /* #5642: the snapshot time read above is the newest collection_time this check reads; the rows come from that
+           same newest snapshot, so it is each row's newest-sample instant for the alert's age line. */
+        foreach (var job in jobs)
+        {
+            job.NewestSampleUtc = DateTime.SpecifyKind(snapshotTime.Value, DateTimeKind.Utc);
+        }
+
         return new AnomalousJobsResult(SnapshotIsFresh: true, jobs);
     }
 

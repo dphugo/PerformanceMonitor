@@ -199,14 +199,14 @@ public sealed class WebDatabaseFilterReadsTests
     }
 
     /// <summary>
-    /// plain-text.js lists every MCP tool name in <c>MCP_TOOL_NAMES</c> so the plain-text rule knows which get_ words to rewrite.
-    /// That is a list of names the page never calls, not a read, so it is cut out of the text before the scan. Only that one
-    /// declaration is cut: a module that really names a read keeps being scanned, and the declaration must be there to cut, so
+    /// plain-text.js lists every MCP tool name in <c>MCP_TOOL_NAMES</c> and <c>MCP_ACTION_TOOL_NAMES</c> so the plain-text rule knows which tool words to rewrite.
+    /// That is a list of names the page never calls, not a read, so it is cut out of the text before the scan. Only those two
+    /// declarations are cut: a module that really names a read keeps being scanned, and the declaration must be there to cut, so
     /// renaming it fails this census instead of quietly scanning the list again.
     /// </summary>
     private static string WithoutToolNameList(string text)
     {
-        var declaration = new Regex(@"export\s+const\s+MCP_TOOL_NAMES\s*=\s*\[[^\]]*\]\s*;", RegexOptions.None, TimeSpan.FromSeconds(5));
+        var declaration = new Regex(@"export\s+const\s+MCP_(?:ACTION_)?TOOL_NAMES\s*=\s*\[[^\]]*\]\s*;", RegexOptions.None, TimeSpan.FromSeconds(5));
         return declaration.Replace(text, "");
     }
 
@@ -239,17 +239,17 @@ public sealed class WebDatabaseFilterReadsTests
     }
 
     /// <summary>The identity reads are the query drill and the seven plan-viewer reads, and no others: the filter is never injected
-    /// into them, so a tenth would silently lose its panel's filter. The database-scoped reads are 34 in all (FILTERED and UNFILTERED
+    /// into them, so a tenth would silently lose its panel's filter. The database-scoped reads are 35 in all (FILTERED and UNFILTERED
     /// together; moving a read from one to the other keeps the total), and FILTERED is a subset of what the plan filters: none of
     /// the three deadlock reads.</summary>
     [Fact]
-    public void TheIdentityReads_AreTheNineRowIdentityReads_AndTheDatabaseScopedReadsAreThirtyFour()
+    public void TheIdentityReads_AreTheTenRowIdentityReads_AndTheDatabaseScopedReadsAreThirtyFive()
     {
         var classes = Classes();
         Assert.Equal(
-            Sorted(new[] { "get_query_trend", "get_plan_xml", "get_query_store_plan_xml", "get_active_query_plan_xml", "get_procedure_plan_xml", "get_query_store_query_history", "get_blocking_plan_xml", "get_deadlock_plan_xml", "get_query_repro_script" }),
+            Sorted(new[] { "get_query_trend", "get_plan_xml", "get_query_store_plan_xml", "get_active_query_plan_xml", "get_procedure_plan_xml", "get_query_store_query_history", "get_plan_force_precheck", "get_blocking_plan_xml", "get_deadlock_plan_xml", "get_query_repro_script" }),
             Sorted(classes["IDENTITY"]));
-        Assert.Equal(34, classes["FILTERED"].Length + classes["UNFILTERED"].Length);
+        Assert.Equal(35, classes["FILTERED"].Length + classes["UNFILTERED"].Length);
         Assert.DoesNotContain(classes["FILTERED"], read => read is "get_deadlock_trend" or "get_deadlocks" or "get_deadlock_detail");
         foreach (var deadlock in new[] { "get_deadlock_trend", "get_deadlocks", "get_deadlock_detail" })
         {

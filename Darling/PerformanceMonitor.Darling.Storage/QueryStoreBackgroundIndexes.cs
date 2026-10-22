@@ -18,8 +18,10 @@ namespace PerformanceMonitor.Darling.Storage;
 
 /// <summary>
 /// The Query Store read indexes that are built in the background after the service is up rather than by a
-/// migration rung (#4605's BRIN, #4952's and #5507's btrees), and the one piece of machinery they share: the state read,
-/// the build-or-skip decision, the invalid-leftover drop, the build and the delayed start.
+/// migration rung (#4605's BRIN, #4952's, #5507's, #5807's and #5957's btrees), and the one piece of machinery they share: the state read,
+/// the build-or-skip decision, the invalid-leftover drop, the build and the delayed start. This step also builds the
+/// #6043 statement-text index: <c>collect.pg_statement_text</c> is a plain table, so a migration rung would build it
+/// with a write-blocking <c>CREATE INDEX</c>, and the same background step builds it <c>CONCURRENTLY</c> instead.
 ///
 /// <para><b>Why not a migration rung.</b> Migrations run in one transaction and block startup, and
 /// <c>CREATE INDEX CONCURRENTLY</c> cannot run inside a transaction (25001). A plain in-rung build would hold a lock
@@ -56,7 +58,7 @@ public static class QueryStoreBackgroundIndexes
 
     /// <summary>
     /// Command deadline for a build and a drop, in seconds. A build reads a whole heap (about 108 s at 25 GB for the
-    /// BRIN, several minutes at a full 9 days' retention). Two hours leaves headroom on a slow volume while still
+    /// BRIN, several minutes at a full 10 days' retention, 9 before #5809). Two hours leaves headroom on a slow volume while still
     /// bounding a build stuck behind a long transaction; shutdown cancels it sooner.
     /// </summary>
     public const int BuildTimeoutSeconds = 7200;
@@ -69,6 +71,18 @@ public static class QueryStoreBackgroundIndexes
 
     /// <summary>Name of the btree that lets the per-day plan regression build range-scan <c>first_execution_time</c> on the latest table (#5507).</summary>
     public const string LatestServerFirstExecIndexName = "collect.ix_query_store_interval_latest_server_first_exec";
+
+    /// <summary>Name of the partial btree over the wide table's non-Regular rows (#5506).</summary>
+    public const string WideNonRegularFirstExecIndexName = "collect.ix_query_store_interval_wide_nonregular_first_exec";
+
+    /// <summary>Name of the btree that lets the one-query history read seek its query on the wide table (#5807).</summary>
+    public const string WideDatabaseQueryFirstExecIndexName = "collect.ix_query_store_interval_wide_db_query_first_exec";
+
+    /// <summary>Name of the btree that lets the PLAN_REGRESSION drill-down seek its offenders on the latest table (#5957).</summary>
+    public const string LatestDatabaseQueryFirstExecIndexName = "collect.ix_query_store_interval_latest_db_query_first_exec";
+
+    /// <summary>Name of the btree that lets the statement-text due check seek its server's newest row (#6043).</summary>
+    public const string StatementTextServerLastSeenIndexName = "collect.ix_pg_statement_text_server_last_seen";
 
     /// <summary>What the ensure does about one index.</summary>
     public enum IndexAction
@@ -132,6 +146,35 @@ public static class QueryStoreBackgroundIndexes
         IndexDefinition: "(server_id, first_execution_time)");
 
     /// <summary>
+    /// A PARTIAL btree on <c>collect.query_store_interval_wide (server_id, first_execution_time) WHERE execution_type_desc &lt;&gt;
+    /// 'Regular'</c> (#5506), built per partition by the partitioned path.
+    ///
+    /// <para><b>Why.</b> The Query Store regressions read reports Aborted and Exception runs beside the Regular cost, for the
+    /// 7-day baseline and the recent window (<see cref="QueryStoreRegressionBaseline.WideArmsSql"/>, its
+    /// <c>nonregular_rows</c> arm). Those rows are a small share of the table, but without this index the arm walks every row
+    /// the server has in the window to find them. With it the arm is one range over only those rows, so adding the
+    /// side-by-side groups costs the baseline almost nothing. The read's predicate is
+    /// <see cref="QueryStoreRegressionBaseline.NonRegularPredicate"/>, the index's own text, so the planner can match them.</para>
+    ///
+    /// <para><b>No INCLUDE list, on purpose.</b> The read also needs <c>execution_count</c>, <c>avg_cpu_time_us</c>,
+    /// <c>avg_duration_us</c> and <c>last_execution_time</c>, but the upsert's DO UPDATE rewrites every one of them, and a
+    /// column in an index's key, INCLUDE list or predicate makes every update of that row non-HOT, whatever the predicate
+    /// says (the #4250 class; <c>QueryStoreIntervalWideBrinIndexLiveTests</c> censuses every spec in <see cref="All"/> for
+    /// it). The index holds only identity columns (<c>server_id</c>, <c>first_execution_time</c>, and
+    /// <c>execution_type_desc</c> in the predicate), so the upsert stays HOT. The few non-Regular rows the range finds are
+    /// then read from the heap.</para>
+    ///
+    /// <para><b>Until it is built</b> the read still answers, just more slowly: the statement names no index.</para>
+    /// </summary>
+    public static readonly IndexSpec WideNonRegularFirstExec = new(
+        WideNonRegularFirstExecIndexName,
+        "collect.query_store_interval_wide",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_query_store_interval_wide_nonregular_first_exec "
+        + "ON collect.query_store_interval_wide (server_id, first_execution_time) WHERE " + QueryStoreRegressionBaseline.NonRegularPredicate + ";",
+        "DROP INDEX CONCURRENTLY IF EXISTS collect.ix_query_store_interval_wide_nonregular_first_exec;",
+        IndexDefinition: "(server_id, first_execution_time) WHERE " + QueryStoreRegressionBaseline.NonRegularPredicate);
+
+    /// <summary>
     /// A btree on <c>collect.query_store_interval_latest (server_id, first_execution_time)</c> (#5507), built
     /// <c>CONCURRENTLY</c> (the table is a plain heap), the twin of <see cref="WideServerFirstExec"/>.
     ///
@@ -163,12 +206,101 @@ public static class QueryStoreBackgroundIndexes
         "DROP INDEX CONCURRENTLY IF EXISTS collect.ix_query_store_interval_latest_server_first_exec;",
         IndexDefinition: "(server_id, first_execution_time)");
 
+    /// <summary>
+    /// A btree on <c>collect.query_store_interval_wide (server_id, database_name, query_id, first_execution_time)</c>
+    /// (#5807), built per partition by the partitioned path (the table is day-partitioned since V171).
+    ///
+    /// <para><b>Why.</b> <c>get_query_store_query_history</c>'s table read (<c>DarlingMcpQueryStoreHistoryTools.HistoryTableSql</c>)
+    /// asks for ONE query: <c>server_id</c>, <c>database_name</c> and <c>query_id</c> by equality, <c>first_execution_time</c>
+    /// bounded both sides. In <c>ux_query_store_interval_wide</c> <c>query_id</c> is the fifth column, behind
+    /// <c>runtime_stats_interval_id</c> and <c>plan_id</c>, so that index narrows on the server and the database only and
+    /// the read tests <c>query_id</c> on every entry the database has in the window; <see cref="WideServerFirstExec"/>
+    /// narrows on the server and the time range only. Either way the read's cost tracks the database's row count, not the
+    /// query's (25.5 s on one call on a large store). This index puts the three equalities first and the bound last, so the
+    /// read is one range per partition its bound reaches, holding only that query's rows.</para>
+    ///
+    /// <para><b>Why not reorder the unique key.</b> The upsert's ON CONFLICT names the key's columns, not its order, so a
+    /// reordered unique index would serve too, but changing it means building a second unique index of all eight columns
+    /// (about three times this index's size on the live test's rows), swapping it in as the arbiter while the writer runs,
+    /// and dropping the first: a larger build and a riskier step than adding this four-column index.</para>
+    ///
+    /// <para><b>HOT.</b> All four columns are part of the upsert's identity (<c>QueryStoreIntervalWide.IdentityColumns</c>),
+    /// so <c>ON CONFLICT ... DO UPDATE</c> rewrites none of them and an update stays heap-only; the HOT census in
+    /// <c>QueryStoreIntervalWideBrinIndexLiveTests</c> covers every spec in <see cref="All"/>.</para>
+    ///
+    /// <para><b>Until it is built</b> the read is unchanged: the statement names no index, so the planner keeps its
+    /// old plan on a store that lacks this one.</para>
+    /// </summary>
+    public static readonly IndexSpec WideDatabaseQueryFirstExec = new(
+        WideDatabaseQueryFirstExecIndexName,
+        "collect.query_store_interval_wide",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_query_store_interval_wide_db_query_first_exec "
+        + "ON collect.query_store_interval_wide (server_id, database_name, query_id, first_execution_time);",
+        "DROP INDEX CONCURRENTLY IF EXISTS collect.ix_query_store_interval_wide_db_query_first_exec;",
+        IndexDefinition: "(server_id, database_name, query_id, first_execution_time)");
+
+    /// <summary>
+    /// A btree on <c>collect.query_store_interval_latest (server_id, database_name, query_id, first_execution_time)</c>
+    /// (#5957), the latest table's twin of <see cref="WideDatabaseQueryFirstExec"/>, built per partition by the partitioned
+    /// path (the table is day-partitioned like the wide one).
+    ///
+    /// <para><b>Why.</b> The PLAN_REGRESSION drill-down's table read (<c>PgDrillDownCollector.RegressedQueriesTableSql</c>)
+    /// re-runs the detection for the fact's top offenders only (#3902): <c>server_id</c> by equality, <c>database_name</c>
+    /// and <c>query_id</c> by <c>= ANY</c>, and <c>first_execution_time</c> bounded below over the 14-day comparison window.
+    /// In <c>ux_query_store_interval_latest</c> <c>query_id</c> is the fifth column, behind <c>runtime_stats_interval_id</c>
+    /// and <c>plan_id</c>, and <see cref="LatestServerFirstExec"/> narrows on the server and the time only, so the read took
+    /// every row the server had in 14 days and kept five queries' rows: 50,464 pages read from disk per call on a 42-server
+    /// store, run on almost every pass of every server. This index puts the equalities first and the bound last, so the read
+    /// is one range per offender per partition the bound reaches.</para>
+    ///
+    /// <para><b>Write cost.</b> The table already carries the unique key, V153's <c>first_execution_time</c> index and
+    /// <see cref="LatestServerFirstExec"/>; this is a fourth btree of four narrow columns, maintained on each new interval row.
+    /// An update of an existing interval stays heap-only (HOT): all four columns are part of the upsert's identity, so
+    /// <c>ON CONFLICT ... DO UPDATE</c> rewrites none of them. Pinned by
+    /// <c>QueryStoreBackgroundIndexesLiveTests.TheLatestUpsertsWholeSetList_StaysHotWithTheLatestBtreePresent_AndNotWithABtreeOnASetColumn</c>,
+    /// which builds every spec in <see cref="All"/> and asserts the whole SET list updates HOT (a btree on a SET column is
+    /// its control); the wide census does not cover this table.</para>
+    ///
+    /// <para><b>Until it is built</b> the read is unchanged: the statement names no index, so the planner keeps its old plan
+    /// on a store that lacks this one.</para>
+    /// </summary>
+    public static readonly IndexSpec LatestDatabaseQueryFirstExec = new(
+        LatestDatabaseQueryFirstExecIndexName,
+        "collect.query_store_interval_latest",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_query_store_interval_latest_db_query_first_exec "
+        + "ON collect.query_store_interval_latest (server_id, database_name, query_id, first_execution_time);",
+        "DROP INDEX CONCURRENTLY IF EXISTS collect.ix_query_store_interval_latest_db_query_first_exec;",
+        IndexDefinition: "(server_id, database_name, query_id, first_execution_time)");
+
+    /// <summary>
+    /// A btree on <c>collect.pg_statement_text (server_id, last_seen)</c> (#6043), built <c>CONCURRENTLY</c> (a plain table).
+    ///
+    /// <para><b>Why.</b> <see cref="PgStatementText.IsDueSql"/> asks <c>max(last_seen) ... WHERE server_id = $1</c>. The only
+    /// index on <c>last_seen</c> (<c>idx_pg_statement_text_last_seen</c>) does not lead with <c>server_id</c>, so the planner
+    /// walked it backwards through every other server's newer rows: 19.7 million pages a day on a 50-server store, a 114 ms
+    /// mean and a 6.8 s worst case. With <c>server_id</c> first the max is the last entry of one server's range. The older
+    /// index stays: <c>PruneSql</c> reads by <c>last_seen</c> across all servers.</para>
+    ///
+    /// <para><b>Until it is built</b> the statement is unchanged and the planner keeps its old plan.</para>
+    /// </summary>
+    public static readonly IndexSpec StatementTextServerLastSeen = new(
+        StatementTextServerLastSeenIndexName,
+        "collect.pg_statement_text",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_pg_statement_text_server_last_seen "
+        + "ON collect.pg_statement_text (server_id, last_seen);",
+        "DROP INDEX CONCURRENTLY IF EXISTS collect.ix_pg_statement_text_server_last_seen;",
+        IndexDefinition: "(server_id, last_seen)");
+
     /// <summary>Every background index, in the order the one delayed task ensures them.</summary>
     public static readonly IReadOnlyList<IndexSpec> All = new[]
     {
         QueryStoreIntervalWideBrinIndex.Spec,
         WideServerFirstExec,
         LatestServerFirstExec,
+        WideNonRegularFirstExec,
+        WideDatabaseQueryFirstExec,
+        LatestDatabaseQueryFirstExec,
+        StatementTextServerLastSeen,
     };
 
     /* One read of everything the decision needs. The names are bound, never interpolated. */
@@ -317,7 +449,7 @@ SELECT EXISTS
     private static string IndexNames(IReadOnlyList<IndexSpec> specs) => string.Join(", ", specs.Select(spec => spec.IndexName));
 
     /* ", SQLSTATE 53100" for a server error that carries a SQLSTATE (a full disk reads differently from a lock timeout),
-       nothing otherwise. A block body, because TsqlConventionGuardTests' member scan stops short of an expression-bodied
+       nothing otherwise. A block body, because a C# member scan stops short of an expression-bodied
        member that has a property pattern in it. */
     private static string SqlStateSuffix(Exception ex)
     {
@@ -456,7 +588,8 @@ ORDER BY c.relname;";
     /// timeout is an error here (the delayed task logs it and the next start retries).
     /// </summary>
     internal static async Task EnsurePartitionedAsync(
-        NpgsqlConnection connection, IndexSpec spec, ILogger logger, CancellationToken cancellationToken)
+        NpgsqlConnection connection, IndexSpec spec, ILogger logger, CancellationToken cancellationToken,
+        Func<string, CancellationToken, Task>? beforeLeafBuild = null)
     {
         if (string.IsNullOrEmpty(spec.IndexDefinition))
         {
@@ -500,37 +633,56 @@ ORDER BY c.relname;";
                 throw new InvalidOperationException($"The leaf index name {childName} is longer than 63 characters.");
             }
 
-            var childQualified = $"{indexSchema}.{childName}";
-            bool? childValid = null;
-            await using (var probe = new NpgsqlCommand(
-                "SELECT i.indisvalid FROM pg_index AS i WHERE i.indexrelid = to_regclass($1);", connection) { CommandTimeout = CatalogReadTimeoutSeconds })
+            if (beforeLeafBuild is not null)
             {
-                probe.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text, Value = childQualified });
-                if (await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is bool valid)
+                await beforeLeafBuild(leaf, cancellationToken).ConfigureAwait(false);
+            }
+
+            try
+            {
+                var childQualified = $"{indexSchema}.{childName}";
+                bool? childValid = null;
+                await using (var probe = new NpgsqlCommand(
+                    "SELECT i.indisvalid FROM pg_index AS i WHERE i.indexrelid = to_regclass($1);", connection) { CommandTimeout = CatalogReadTimeoutSeconds })
                 {
-                    childValid = valid;
+                    probe.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text, Value = childQualified });
+                    if (await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is bool valid)
+                    {
+                        childValid = valid;
+                    }
                 }
-            }
 
-            if (childValid == false)
+                if (childValid == false)
+                {
+                    logger.LogWarning(
+                        "Query Store index {Index} exists but is INVALID (an interrupted build); dropping it and rebuilding.", childQualified);
+                    await using var drop = new NpgsqlCommand($"DROP INDEX CONCURRENTLY IF EXISTS {childQualified};", connection) { CommandTimeout = BuildTimeoutSeconds };
+                    await drop.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    childValid = null;
+                }
+
+                if (childValid is null)
+                {
+                    await using var build = new NpgsqlCommand(
+                        $"CREATE INDEX CONCURRENTLY IF NOT EXISTS {childName} ON {leaf} {spec.IndexDefinition};", connection) { CommandTimeout = BuildTimeoutSeconds };
+                    await build.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                await ExecuteInLockTimeoutAsync(
+                    connection, $"ALTER INDEX {spec.IndexName} ATTACH PARTITION {childQualified};", cancellationToken).ConfigureAwait(false);
+                built++;
+            }
+            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
             {
-                logger.LogWarning(
-                    "Query Store index {Index} exists but is INVALID (an interrupted build); dropping it and rebuilding.", childQualified);
-                await using var drop = new NpgsqlCommand($"DROP INDEX CONCURRENTLY IF EXISTS {childQualified};", connection) { CommandTimeout = BuildTimeoutSeconds };
-                await drop.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                childValid = null;
+                /* #5807: retention dropped this leaf between the leaf list and its build or ATTACH (the oldest leaf is built
+                   first and is the next one retention drops). Its index went with it; the others still need theirs, and the
+                   delayed task does not run this again until the next start, so skip the leaf instead of ending the spec.
+                   When the skipped leaf was the last unattached one, no further ATTACH runs and the parent index stays INVALID
+                   until the next hourly create-ahead attaches a new leaf; the leaf indexes still serve the scans. */
+                logger.LogInformation(
+                    "Query Store index {Index}: leaf {Leaf} was dropped by retention before its index was built; skipping it.",
+                    spec.IndexName, leaf);
             }
-
-            if (childValid is null)
-            {
-                await using var build = new NpgsqlCommand(
-                    $"CREATE INDEX CONCURRENTLY IF NOT EXISTS {childName} ON {leaf} {spec.IndexDefinition};", connection) { CommandTimeout = BuildTimeoutSeconds };
-                await build.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            await ExecuteInLockTimeoutAsync(
-                connection, $"ALTER INDEX {spec.IndexName} ATTACH PARTITION {childQualified};", cancellationToken).ConfigureAwait(false);
-            built++;
         }
 
         bool parentValid;

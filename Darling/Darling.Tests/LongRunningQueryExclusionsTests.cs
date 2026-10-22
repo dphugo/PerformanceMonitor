@@ -22,7 +22,6 @@ namespace Darling.Tests;
 /// Lite and Darling drift in what a setting means, which is the #1839/#1911 class of bug. Also pins the SEEDED
 /// DEFAULTS to the read's four classes, because a default nobody pins is a default that quietly changes.
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class LongRunningQueryExclusionsTests
 {
     [Theory]
@@ -295,9 +294,9 @@ public sealed class LongRunningQueryExclusionsTests
 
         /* Lite's adapter forwards the list INTO the DuckDB read (the data service's new trailing parameter), and the
            data service is where the predicate lives. */
-        Assert.Contains("excludeBackups, excludeMiscWaits, excludeCdc, exclusions, excludedDatabases), cancellationToken);", liteAdapter, StringComparison.Ordinal);
+        Assert.Contains("excludeBackups, excludeMiscWaits, excludeCdc, exclusions, excludedDatabases, orderByCpu), cancellationToken);", liteAdapter, StringComparison.Ordinal);
         var liteRead = ReadRepoFile("Lite", "Services", "LocalDataService.WaitStats.cs");
-        Assert.Contains("IReadOnlyList<string>? excludedDatabases = null)", liteRead, StringComparison.Ordinal);
+        Assert.Contains("IReadOnlyList<string>? excludedDatabases = null,", liteRead, StringComparison.Ordinal);
         Assert.Contains("{exclusionSql.DatabasePredicate} AS excluded_by_database", liteRead, StringComparison.Ordinal);
 
         /* Darling's template carries the third placeholder and the adapter splices it. */

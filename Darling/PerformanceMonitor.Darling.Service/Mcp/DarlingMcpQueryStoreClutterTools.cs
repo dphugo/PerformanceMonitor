@@ -14,6 +14,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
 using Npgsql;
 using PerformanceMonitor.Collectors;
@@ -70,8 +71,8 @@ namespace PerformanceMonitor.Darling.Service.Mcp;
 /// points at the workload.</para>
 ///
 /// <para><b>What it does NOT do.</b> No Lite twin: Lite has every input and no port, which is why
-/// <c>get_query_store_clutter</c> sits on <c>CrossAppMcpToolInventoryPinTests.KnownLiteMissingMcpTools</c>
-/// with the port written out rather than being quietly absent. The fleet reference is opt-in
+/// <c>get_query_store_clutter</c> is Darling-only by decision
+/// rather than by omission. The fleet reference is opt-in
 /// (<c>include_fleet_median</c>): it costs a fleet-wide walk of two raw hypertables over the window, which
 /// the default call keeps off so the per-server answer stays inside the read deadline (30 s client-side on
 /// the shared storage reader, 15 s <c>statement_timeout</c> on the managed store's <c>mcp</c> role).</para>
@@ -99,8 +100,9 @@ public sealed class DarlingMcpQueryStoreClutterTools
         [Description("If true, also computes fleet_median: the discrete median of each headline arm over every enabled non-replica SQL Server target. Default false; see the reading guide for the read-cost detail.")] bool include_fleet_median = false,
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         [Description("Limit to one database. Omit for all databases.")] string? database_name = null,
+        ILogger? logger = null,
         CancellationToken cancellationToken = default)
-        => GetQueryStoreClutter(postgres, server_name, hours_back, limit, include_fleet_median, as_of, DatabaseFilter.One(database_name), cancellationToken);
+        => GetQueryStoreClutter(postgres, server_name, hours_back, limit, include_fleet_median, as_of, DatabaseFilter.One(database_name), logger, cancellationToken);
 
     /// <summary>
     /// #5244: the get_query_store_clutter read over a LIST of databases. The MCP tool passes <c>DatabaseFilter.One(database_name)</c>
@@ -110,7 +112,7 @@ public sealed class DarlingMcpQueryStoreClutterTools
     /// an empty answer for chosen databases is <c>empty</c> and says "for the database X" (one name) or "for the chosen databases" (two or more) (never a verdict on the
     /// server), and <c>server_is_replica</c> is read off the server's WHOLE config, not the chosen databases' rows.
     /// </summary>
-    internal static async Task<string> GetQueryStoreClutter(
+    internal static Task<string> GetQueryStoreClutter(
         NpgsqlDataSource postgres,
         string? server_name,
         int hours_back,
@@ -119,22 +121,42 @@ public sealed class DarlingMcpQueryStoreClutterTools
         string? as_of,
         DatabaseFilter databaseFilter,
         CancellationToken cancellationToken)
+        => GetQueryStoreClutter(postgres, server_name, hours_back, limit, include_fleet_median, as_of, databaseFilter, logger: null, cancellationToken);
+
+    /// <summary>#5633 review: <see cref="GetQueryStoreClutter(NpgsqlDataSource,string,int,int,bool,string,DatabaseFilter,CancellationToken)"/>
+    /// with the host's logger, so the dropped-database lookup's fail-open (CurrentDatabaseScope) is logged at Warning.</summary>
+    internal static async Task<string> GetQueryStoreClutter(
+        NpgsqlDataSource postgres,
+        string? server_name,
+        int hours_back,
+        int limit,
+        bool include_fleet_median,
+        string? as_of,
+        DatabaseFilter databaseFilter,
+        ILogger? logger,
+        CancellationToken cancellationToken)
     {
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd) ?? McpHelpers.ValidateTop(limit);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd) ?? McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
 
         try
         {
             var now = windowEnd;
+            /* Review M3: an as_of read keeps a database dropped since the window (the newest snapshot at or before the anchor decides). */
+            DateTime? asOfUtc = string.IsNullOrWhiteSpace(as_of) ? null : windowEnd;
             var requestedStart = now.AddHours(-hours_back);
             var serverIds = new[] { resolved.ServerId };
 
-            var readCost = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, serverIds, requestedStart, now, databaseFilter, cancellationToken);
-            var planChurn = await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, serverIds, requestedStart, now, databaseFilter, cancellationToken);
-            var config = await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, serverIds, requestedStart, now, databaseFilter, cancellationToken);
+            /* #5633 review (finding D): the reads omit a database the server no longer lists; the names they left out ride the envelope of
+               an empty page and of a page with rows, and an empty page does not read as "Query Store is off everywhere". */
+            var omitted = new HashSet<string>(StringComparer.Ordinal);
+            var readCost = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, serverIds, requestedStart, now, databaseFilter, asOfUtc, omitted, logger, cancellationToken);
+            var planChurn = await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, serverIds, requestedStart, now, databaseFilter, asOfUtc, omitted, logger, cancellationToken);
+            var config = await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, serverIds, requestedStart, now, databaseFilter, asOfUtc, omitted, logger, cancellationToken);
+            var leftOut = DatabasesLeftOut.Distinct(omitted);
             var waits = await DarlingQueryStoreClutterReader.GetQdsWaitsAsync(postgres, serverIds, requestedStart, now, cancellationToken);
             var clerk = await DarlingQueryStoreClutterReader.GetQueryStoreClerkAsync(postgres, resolved.ServerId, requestedStart, now, cancellationToken);
 
@@ -145,20 +167,25 @@ public sealed class DarlingMcpQueryStoreClutterTools
                    collector's own last run recorded a precondition; and only then the plain miss. Waits and
                    the clerk are not consulted here — a server with QDS waits and no Query Store rows is a
                    server whose Query Store this tool cannot see, which is what the miss says. */
-                return McpHelpers.WithDatabase(await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, DarlingQueryStoreClutterReader.CollectorName, cancellationToken), databaseFilter.Describe())
-                    ?? McpHelpers.WithDatabase(await DarlingRuntimePrecondition.QueryStoreStatusAsync(postgres, resolved.ServerId, resolved.ServerName, databaseFilter, cancellationToken), databaseFilter.Describe())
-                    ?? McpHelpers.WithDatabase(await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.ServerName, DarlingQueryStoreClutterReader.CollectorName, cancellationToken), databaseFilter.Describe())
+                return McpHelpers.WithDatabasesLeftOut(McpHelpers.WithDatabase(await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, DarlingQueryStoreClutterReader.CollectorName, cancellationToken), databaseFilter.Describe())
+                    ?? McpHelpers.WithDatabase(await DarlingRuntimePrecondition.QueryStoreStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, databaseFilter, cancellationToken), databaseFilter.Describe())
+                    ?? McpHelpers.WithDatabase(await DarlingRuntimePrecondition.StatusAsync(postgres, resolved.ServerId, resolved.DisplayName, DarlingQueryStoreClutterReader.CollectorName, cancellationToken), databaseFilter.Describe())
                     ?? (!databaseFilter.IsAll
                         ? McpHelpers.StatusForDatabase(
                             "empty",
                             $"No Query Store rows, no query_store fan-out run and no query_store_health capture{DarlingMcpBlockingTools.ForChosenDatabases(databaseFilter)} in the {hours_back}-hour window. "
                             + "A chosen database either has Query Store OFF, is not on this server, or has not completed a cycle yet. Widen the selection to read the whole server.", databaseFilter.Describe())
                         : null)
-                    ?? McpHelpers.StatusForDatabase(
-                        "unavailable",
-                        $"No Query Store rows, no query_store fan-out run and no query_store_health capture for this server in the {hours_back}-hour window. "
-                        + "The query_store collector runs every 5 minutes and query_store_health hourly on SQL Server 2016+; a server with none of the three either predates Query Store, has it OFF everywhere, or has not completed a cycle yet. "
-                        + "The plan-churn arm reads the raw tier, which a store with the rollups armed drops at 4 days — try a shorter window before concluding nothing ran.", databaseFilter.Describe());
+                    ?? (leftOut is not null
+                        ? McpHelpers.StatusForDatabase(
+                            "empty",
+                            $"No Query Store rows in the {hours_back}-hour window for a database this server still has. {leftOut.Count} database(s) the server no longer lists were left out of this read (see databases_left_out).",
+                            databaseFilter.Describe())
+                        : McpHelpers.StatusForDatabase(
+                            "unavailable",
+                            $"No Query Store rows, no query_store fan-out run and no query_store_health capture for this server in the {hours_back}-hour window. "
+                            + "The query_store collector runs every 5 minutes and query_store_health hourly on SQL Server 2016+; a server with none of the three either predates Query Store, has it OFF everywhere, or has not completed a cycle yet. "
+                            + "The plan-churn arm reads the raw tier, which a store with the rollups armed drops at 4 days — try a shorter window before concluding nothing ran.", databaseFilter.Describe())), leftOut)!;
             }
 
             /* #2364 / #3653 item 17: what the raw tier actually held, beside what was asked for. The
@@ -179,9 +206,9 @@ public sealed class DarlingMcpQueryStoreClutterTools
             if (include_fleet_median)
             {
                 var fleetIds = await DarlingQueryStoreClutterReader.GetEnabledSqlServerTargetsAsync(postgres, MonitoredEngineKind.SqlServer, cancellationToken);
-                var fleetReadCost = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, fleetIds, requestedStart, now, cancellationToken: cancellationToken);
-                var fleetChurn = await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, fleetIds, requestedStart, now, cancellationToken: cancellationToken);
-                var fleetConfig = await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, fleetIds, requestedStart, now, cancellationToken: cancellationToken);
+                var fleetReadCost = await DarlingQueryStoreClutterReader.GetReadCostAsync(postgres, fleetIds, requestedStart, now, asOfUtc: asOfUtc, cancellationToken: cancellationToken);
+                var fleetChurn = await DarlingQueryStoreClutterReader.GetPlanChurnAsync(postgres, fleetIds, requestedStart, now, asOfUtc: asOfUtc, cancellationToken: cancellationToken);
+                var fleetConfig = await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, fleetIds, requestedStart, now, asOfUtc: asOfUtc, cancellationToken: cancellationToken);
                 var fleetWaits = await DarlingQueryStoreClutterReader.GetQdsWaitsAsync(postgres, fleetIds, requestedStart, now, cancellationToken);
                 var median = QueryStoreClutter.ComputeFleetMedian(fleetIds, fleetReadCost, fleetChurn, fleetConfig, fleetWaits);
                 fleetMedian = new
@@ -216,7 +243,7 @@ public sealed class DarlingMcpQueryStoreClutterTools
             var serverIsReplica = QueryStoreClutter.IsReplicaServer(
                 databaseFilter.IsAll
                     ? config
-                    : await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, serverIds, requestedStart, now, cancellationToken: cancellationToken));
+                    : await DarlingQueryStoreClutterReader.GetConfigAsync(postgres, serverIds, requestedStart, now, asOfUtc: asOfUtc, cancellationToken: cancellationToken));
 
             var databases = page.Select(r => new
             {
@@ -281,15 +308,18 @@ public sealed class DarlingMcpQueryStoreClutterTools
                     }
                     : null,
                 recommendations = QueryStoreClutter.Recommendations(r),
-                next_tools = NextTools(resolved.ServerName, r, hours_back),
+                next_tools = NextTools(resolved.DisplayName, r, hours_back),
             }).ToList();
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #5244: which databases the rows are limited to: the name for one, "the chosen databases" for two or more, null for all. */
                 database_name = databaseFilter.Describe(),
+                /* #5633 review (finding D): null when the read left no database out. */
+                databases_left_out = DatabasesLeftOut.Named(leftOut),
+                databases_left_out_note = DatabasesLeftOut.Note(leftOut),
                 /* The window as its own block: the requested edges and, beside them, the raw tier's reach under
                    the window floor's spelling (#2364 / #3653 item 17). Nested rather than flat because this
                    payload ALSO carries a page cut (`truncated`, below), and the two facts must not share a
@@ -438,7 +468,7 @@ public sealed class DarlingMcpQueryStoreClutterTools
 
     /// <summary>Rounds a nullable figure, keeping null as null — an unmeasured quantity never becomes 0. Spelled
     /// with <c>HasValue</c> rather than a property pattern so the T-SQL guard's member walk reads it whole
-    /// (<c>TsqlConventionGuardTests.KnownTruncatedRanges</c> names the <c>is { }</c> shape as where it stops).</summary>
+    /// (a <c>is { }</c> property pattern is where that walk stops).</summary>
     private static double? Round(double? value, int digits) => value.HasValue ? Math.Round(value.Value, digits) : null;
 
     /// <summary>A stored naive-UTC stamp as round-trip ISO-8601 with its offset, or null — the

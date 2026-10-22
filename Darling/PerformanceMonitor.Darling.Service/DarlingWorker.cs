@@ -52,7 +52,7 @@ namespace PerformanceMonitor.Darling.Service;
 /// A server that fails to connect is retried every sweep; a collector that errors is logged and
 /// retried on its next due time — the loop never dies for one bad cycle. Dispatch mirrors Lite's:
 /// the deadlock/blocked-process readers tolerate a missing XE session as zero rows, and
-/// trace_flags tolerates denied DBCC as zero rows with a warning. Every successful connect
+/// trace_flags has no tolerance of its own (#5633 item 19: a denied DBCC is a PERMISSIONS run, never a 0-row SUCCESS). Every successful connect
 /// upserts the servers registry and every collector run writes a collection_log row — both
 /// failure-isolated (<see cref="DarlingObservability"/>). On top of collection the loop runs
 /// the shared alert engine per server every 30 seconds and, since AN3, the analysis pipeline
@@ -82,6 +82,16 @@ public sealed class DarlingWorker : BackgroundService
        collection — the two loops share a cancellation token and the guarded server set only. */
     private static readonly TimeSpan s_commandPollInterval = TimeSpan.FromSeconds(5);
 
+    /// <summary>#5654: the external alert drain's cadence. A queued alert waits at most this long, plus its pass, for a send.</summary>
+    private static readonly TimeSpan s_externalAlertInterval = TimeSpan.FromSeconds(15);
+
+    /// <summary>#5632 Phase A: the investigation expiry sweep's tick (ruling R4).</summary>
+    private static readonly TimeSpan s_investigationSweepInterval = TimeSpan.FromSeconds(60);
+
+    /// <summary>#6001: the evidence capture's tick. Short, so a High CPU request's evidence is frozen soon after the open and a
+    /// pending section is picked up soon after its collector lands.</summary>
+    private static readonly TimeSpan s_investigationEvidenceInterval = TimeSpan.FromSeconds(20);
+
     /* The store disk-pressure self-alert's poll cadence (fleet-level, Stage 4). Disk fills slowly, and the
        check is one volume free-space read (a few file-system calls, no directory walk) plus one narrow
        store_metrics lookup, so 5 minutes is ample and cheap —
@@ -108,6 +118,11 @@ public sealed class DarlingWorker : BackgroundService
        of rows on any real store) and the alert itself is rate-limited to once a day inside the evaluator,
        so matching its #3304 neighbour costs nothing. */
     private static readonly TimeSpan s_staleMuteCheckInterval = TimeSpan.FromMinutes(5);
+
+    /* #5654: how often the external-alert delivery check reads the count of rows the drain gave up on. The count looks back
+       DarlingSelfAlertEvaluator.ExternalAlertsWindow (an hour), so a slower tick only delays the alert and its clear by
+       minutes; the read is one grouped count over a table the retention job keeps short. */
+    private static readonly TimeSpan s_externalAlertsCheckInterval = TimeSpan.FromMinutes(5);
 
     /// <summary>#3514: how often the sweep re-evaluates the web-dashboard TLS certificate's expiry. Hourly is
     /// ample for a day-granularity fact (the evaluator's own daily refire gates the actual firing); the check
@@ -196,6 +211,15 @@ public sealed class DarlingWorker : BackgroundService
        EXTENSION IF NOT EXISTS inside ten seconds is not one this hour's probe was going to heal; the next
        hour retries, and the latch stays exactly where it was meanwhile. */
     private static readonly TimeSpan s_timescaleReprobeBudget = TimeSpan.FromSeconds(10);
+
+    /* The whole-attempt budget for the hourly retry of a failed start-path role provisioning. The attempt is
+       three credential-file reads, one connection, a stored-secret read, a settings read and one DDL batch, each
+       command carrying the bootstrap deadline (ServiceCommandDeadlines.BootstrapSeconds, 60 s), and that batch
+       was measured at under a tenth of a second on a store of production size. Two minutes is two of those
+       deadlines: a store that cannot answer inside it is not one this hour's attempt was going to heal, and the
+       next hour tries again. It runs behind the compression read and every other tenant of the tick, so it
+       spends none of the compression check's phase guard band. */
+    private static readonly TimeSpan s_roleProvisioningRetryBudget = TimeSpan.FromMinutes(2);
 
     /* ─────────────── store-object convergence (#3817) ─────────────── */
 
@@ -381,6 +405,13 @@ public sealed class DarlingWorker : BackgroundService
            and it selects only policies whose stored value differs, so a converged store issues no DDL. */
         new("aggregate batching converge", StoreObjectConvergenceStage.Timescale, StoreObjectChangeSignal.Delta,
             (connection, logger, ct) => TimescaleSupport.ConvergeContinuousAggregateBatchingAsync(connection, logger, ct)),
+
+        /* #6070: a daily whose parent is another daily keeps a window one bucket wider than the 3-day one, so the
+           day its parent writes after it ran is still in its window the next run. config only (start_offset),
+           no schedule, so the daily tier keeps finish-to-start. Before the ensure for the same 22023 reason as
+           the window converge above. */
+        new("daily child window converge", StoreObjectConvergenceStage.Timescale, StoreObjectChangeSignal.Delta,
+            (connection, logger, ct) => TimescaleSupport.ConvergeDailyChildRefreshWindowAsync(connection, logger, ct)),
 
         /* CREATE MATERIALIZED VIEW IF NOT EXISTS per aggregate plus its refresh policy (a quiet -1 once the
            converge above has made the windows match). THE step the issue is loudest about: its per-aggregate
@@ -578,6 +609,19 @@ public sealed class DarlingWorker : BackgroundService
     /// return stands for a run that failed (the real run records its failure and returns 0).
     /// </summary>
     internal Func<ServerLoopState, ServerRuntime, string, CancellationToken, Task<int>>? RunOneBodyOverride { get; set; }
+
+    /// <summary>
+    /// Test seam (#6186): with <see cref="RunOneBodyOverride"/> set, a non-null answer here stands for the monitored server
+    /// refusing that collector (a PERMISSIONS run with this message). The override's run is recorded the way the real
+    /// run's outcome is, so the backoff sees it.
+    /// </summary>
+    internal Func<string, string?>? RunOneRefusalOverride { get; set; }
+
+    /// <summary>
+    /// The fleet sweep gate (#5941), set once the collection loop builds it. A <c>snapshot_now</c> takes a permit from it
+    /// like a scheduled pass does. Null before the loop starts (and in tests that do not stand one in): no permit is taken.
+    /// </summary>
+    internal SemaphoreSlim? SweepGate { get; set; }
 
     /// <summary>
     /// Test seam: awaited by <see cref="RecomputeNextDueAsync"/> right after it reads the persisted watermarks for a
@@ -805,6 +849,11 @@ public sealed class DarlingWorker : BackgroundService
 
     /* Set once by ExecuteAsync before the loop starts; the observability writes need it. */
     private NpgsqlDataSource? _postgres;
+
+    /* #5916: the per-server and per-database threshold overrides the engine and the two PostgreSQL count checks resolve
+       through. Loaded at start and on every control-plane reload (the table is on the config_version beacon); empty until then,
+       which is the global threshold everywhere. */
+    private DarlingThresholdOverrides _thresholdOverrides = new();
     /* #5366: the service's password key at run time, set once at start; null before it. */
     private DarlingPasswordKeyRuntime? _passwordKeyRuntime;
 
@@ -873,6 +922,13 @@ public sealed class DarlingWorker : BackgroundService
     /* #3914: this process provisioned the least-privilege roles on the compose distribution's own store, so the
        reload keeps their statement_timeout current as it does on a managed store. Set only on success. */
     private bool _composeStoreRolesProvisioned;
+
+    /* The managed store's data directory while the start-path role provisioning has failed and not yet succeeded;
+       null when it succeeded or does not apply. Non-null makes the hourly store-maintenance tick retry it
+       (RetryRoleProvisioningAsync), because provisioning otherwise runs once per start: a failed attempt left the
+       roles, and the credential files the web and MCP hosts wait for, unset until the next restart. Written by
+       the start path before the loop and then only by that tick, so it is never written concurrently. */
+    private string? _roleProvisioningRetryDirectory;
     private IReadOnlyList<ScheduleOverride> _scheduleOverrides = Array.Empty<ScheduleOverride>();
 
     /* The service-pause flag (Stage 2): read from config_service.paused on every reload and honored by
@@ -895,6 +951,11 @@ public sealed class DarlingWorker : BackgroundService
        finishes leaves this marker set FOREVER and the server is then skipped in silence on every
        later cycle. */
     private readonly ConcurrentDictionary<int, AnalysisPassState> _analysisInFlight = new();
+
+    /* #5824: how many scheduled analysis passes are running right now inside a sweep body, so inside a fleet collection
+       slot (ProcessServerSweepAsync). A body that waited long for a slot says how many of the slots were held by a pass
+       when it got one. Interlocked. */
+    private int _analysisPassesInSlot;
 
     /* How far past its budget an in-flight pass must be before the sweep starts reporting it. The
        ordinary overrun already gets the "exceeded Ns" warning; this is for the pass that ignored the
@@ -930,6 +991,9 @@ public sealed class DarlingWorker : BackgroundService
     /* MinValue = the first sweep after startup runs the retention purge, then daily. */
     private DateTime _nextPurgeUtc = DateTime.MinValue;
 
+    /// <summary>The once-per-24-hours rule for the <c>collect.query_store_text</c> prune, shared by the scheduled passes (a pass the wall budget stopped brings the next one forward to within the hour).</summary>
+    private readonly QueryTextPruneGate _queryTextPruneGate = new();
+
     /* MinValue = the first sweep after startup evaluates the store disk-pressure self-alert, then every
        s_diskCheckInterval. Fleet-level (one shared store), so it is a single field, not per-server. */
     private DateTime _nextDiskCheckUtc = DateTime.MinValue;
@@ -941,6 +1005,10 @@ public sealed class DarlingWorker : BackgroundService
     /* MinValue = the first sweep after startup evaluates the stale-mute check (#3306), then every
        s_staleMuteCheckInterval. Fleet-level (mute rules are a store-wide concept), so a single field. */
     private DateTime _nextStaleMuteCheckUtc = DateTime.MinValue;
+
+    /* MinValue = the first sweep after startup runs the external-alert delivery check (#5654), then every
+       s_externalAlertsCheckInterval. Fleet-level, so a single field. */
+    private DateTime _nextExternalAlertsCheckUtc = DateTime.MinValue;
 
     /* #3514: next due time for the web-dashboard TLS certificate expiry self-alert. Fleet-level (the web
        certificate is a store-wide concept), so a single field like the stale-mute cadence above. */
@@ -996,10 +1064,30 @@ public sealed class DarlingWorker : BackgroundService
        a best-effort errand and there is nothing in it that a later hour cannot do. */
     private Task? _oversizedPlanSweep;
 
+    /* #5985: the query-tag map step (QueryTagMapBuilder), on its own due stamp and tracked task like the oversized-plan
+       sweep above. Fleet-level: the builder iterates the listed servers itself and keeps its extend cursors in memory.
+       A pass still running when its next slot comes round makes that slot skip, so two passes never overlap. */
+    private DateTime _nextQueryTagMapPassUtc = DateTime.MinValue;
+    private Task? _queryTagMapPass;
+    private QueryTagMapBuilder? _queryTagMapBuilder;
+    private static readonly TimeSpan s_queryTagMapPassInterval = TimeSpan.FromMinutes(1);
+
     /* #5479: the in-flight per-server self-alert pass (Collection Stopped and the other store-polled self-alerts, and the
        custom-alert rules), fire-and-tracked from the sweep loop whether or not any collection body launches. One at a
        time: a pass still running at the next tick makes that tick skip, so a server is never evaluated by two threads. */
     private Task? _selfAlertPass;
+
+    /* #5642: the in-flight engine pass (the shared alert engine's per-server reads and the pileup finding), fire-and-tracked
+       from the same tick as the self-alert pass but in a single-flight slot of its own, chained after the tick's
+       self-alert step. A slow alert read holds this slot, never the self-alert one, so Collection Stopped keeps its 30 s
+       beat. A pass still running at the next tick makes that tick skip the engine pass. */
+    private Task? _alertEnginePass;
+
+    /* The engine pass's own overrun Warning latch and start time, like the self-alert pass's two fields below. Written and
+       read on the sweep loop's thread only. */
+    private bool _alertEnginePassOverranWarned;
+
+    private DateTime _alertEnginePassStartedUtc;
 
     /* Set when the running pass has outrun the 30 s server cadence and a tick has said so, cleared when the next pass
        starts: one Warning per pass, not one per 15-second tick. */
@@ -1078,6 +1166,15 @@ public sealed class DarlingWorker : BackgroundService
 
     /* #4004 review, round 3: "the log-hash key was replaced at start", held for the first pg_log_events run. */
     private readonly LogHashKeyRotationNote _logHashKeyRotation = new();
+
+    /// <summary>#4004: lets a test arm the rotation note the way the service start does, then run the worker's real run path.</summary>
+    internal LogHashKeyRotationNote LogHashKeyRotationForTests => _logHashKeyRotation;
+
+    /// <summary>
+    /// Test seam: with this set, <see cref="RunOneAsync"/> dispatches every collector through it instead of the collector's own
+    /// run, and everything after the dispatch (the notes, the collection_log row) is the real path. Null in production.
+    /// </summary>
+    internal Func<string, ServerRuntime, CancellationToken, Task<CollectorRunResult>>? DispatchOverrideForTests { get; set; }
 
     /* The fleet-level memory launch guard (#1556, #5479): one per process, the whole process's memory rather than
        a per-server state, so it is a single worker field and not a ServerLoopState flag. It owns the trip, the
@@ -1262,9 +1359,9 @@ public sealed class DarlingWorker : BackgroundService
     /// <summary>
     /// Held for the same reason <see cref="_alertDeliverer"/> is: the Postgres Deadlocks/Blocking alerts
     /// (#2711) need to write a resolution history row on the active→inactive transition, exactly like
-    /// <see cref="BuildAlertEngine"/>'s <c>resolutionCallback</c> does for the SQL Server families - a
-    /// resolution has no send channel (<see cref="AlertResolution"/>'s own doc comment), so it goes
-    /// straight to history rather than through <see cref="_alertDeliverer"/>.
+    /// <see cref="BuildAlertEngine"/>'s <c>resolutionCallback</c> does for the SQL Server families. Since #5825 the
+    /// resolution goes through <see cref="_alertDeliverer"/>'s resolution send, which writes the same row; this store
+    /// is the fallback when no deliverer was built.
     /// </summary>
     private PgAlertHistoryStore? _historyStore;
 
@@ -1360,6 +1457,11 @@ LIMIT 1";
 
     private readonly MonitoredServerRegistryState _registryState;
 
+    /* #5632 step 7: where the worker publishes its store owner data source for the force and unforce tools. Null in a test-built worker. */
+    private readonly StoreOwnerSource? _ownerSource;
+    /* #6066: the store's pseudonym key, read over the owner connection the first time a metadataOnly webhook token needs it. */
+    private readonly PseudonymKeySource? _pseudonymKeys;
+
     /// <summary>
     /// True when another registration in the published registry carries this one's display name (ordinal), so
     /// its dedup key takes the store id. The population is the registry snapshot's enabled servers
@@ -1397,6 +1499,9 @@ LIMIT 1";
        the MCP and web hosts hand theirs. */
     private readonly BaselineCache _baselineCache;
 
+    /// <summary>The shared baseline cache this host holds (#5950): a test compares it with the container's one instance.</summary>
+    internal BaselineCache SharedBaselineCache => _baselineCache;
+
     /* #4442 scope 2: the same process-lifetime accumulator DarlingWebEndpoints.MapAll and RunComposedPanelAsync
        record into — the DI container hands this worker and the web host the SAME singleton instance, so a read
        recorded by either side is drained by this worker's hourly flush. */
@@ -1405,11 +1510,19 @@ LIMIT 1";
     /* #5097: the slow-read record's queue; its one writer runs from the startup path once the store is migrated. */
     private readonly SlowReadLog? _slowReads;
 
-    public DarlingWorker(ILogger<DarlingWorker> logger, ILoggerFactory loggerFactory, McpRuntimeState mcpState, WebRuntimeState webState, MonitoredServerRegistryState registryState, CollectorRuntimeState collectorState, WebTlsCertificateState webTlsCertState, BaselineCache baselineCache, ReadLatencyAccumulator readLatency, SlowReadLog? slowReads = null, McpTlsCertificateState? mcpTlsCertState = null)
+    /* #5506 part 3: the read admission the MCP and web hosts share. The worker only builds its long-read table (at start
+       and at each hourly flush); its own reads never go through admission. */
+    private readonly ReadAdmission? _readAdmission;
+
+    public DarlingWorker(ILogger<DarlingWorker> logger, ILoggerFactory loggerFactory, McpRuntimeState mcpState, WebRuntimeState webState, MonitoredServerRegistryState registryState, CollectorRuntimeState collectorState, WebTlsCertificateState webTlsCertState, BaselineCache baselineCache, ReadLatencyAccumulator readLatency, SlowReadLog? slowReads = null, McpTlsCertificateState? mcpTlsCertState = null, ReadAdmission? readAdmission = null, StoreOwnerSource? ownerSource = null, PseudonymKeySource? pseudonymKeys = null)
     {
+        _ownerSource = ownerSource;
+        _pseudonymKeys = pseudonymKeys;
         _slowReads = slowReads;
+        _readAdmission = readAdmission;
         _mcpTlsCertState = mcpTlsCertState;
         _logger = logger;
+        _thresholdOverrides = new DarlingThresholdOverrides(logger);
         _loggerFactory = loggerFactory;
         _mcpState = mcpState;
         _webState = webState;
@@ -1500,6 +1613,9 @@ LIMIT 1";
         public bool Succeeded { get; set; }
     }
 
+    /// <summary>The failed-jobs list the body read from msdb at <paramref name="FetchedUtc"/> (#5642).</summary>
+    internal sealed record MsdbCacheEntry(DateTime FetchedUtc, List<FailedJobInfo> Jobs);
+
     internal sealed class ServerLoopState
     {
         /* Settable so the reconcile can replace a still-connected server's definition on a config
@@ -1507,12 +1623,40 @@ LIMIT 1";
         public required MonitoredServer Config { get; set; }
         public ServerRuntime? Runtime { get; set; }
 
+        /* #5642: the runtime this server last connected with, kept when the connection drops (a liveness failure, a
+           memory-pressure drop) so the fleet pass still evaluates its alerts from the store with the last known
+           target: a server under enough pressure to drop is the case that needs the alert. Cleared when the server is
+           removed, retired or its definition changes, because that target is no longer the server's. */
+        public ServerRuntime? LastKnownRuntime { get; set; }
+
+        /// <summary>The runtime the alert step evaluates with: the live one, else the last known one (#5642).</summary>
+        public ServerRuntime? AlertRuntime => Runtime ?? LastKnownRuntime;
+
+        /* #5642: the instant (naive UTC) the CURRENT connection began collecting. A restart and a reconnect each set a
+           new value; a drop leaves the last one in place. Handed to the alert engine as AlertServerSnapshot.WatchingSinceUtc. */
+        public DateTime? WatchingSinceUtc { get; set; }
+
+        /* #5642: the msdb facts the alert engine reads, filled by the collection BODY (after its collectors) and only
+           served by the fleet pass, which makes store reads and nothing else. The failed-jobs list (with the instant it
+           was read), the lookback the engine last asked for, the Agent job step names resolved so far, and the step
+           keys a card asked for that are not resolved yet. */
+        public MsdbCacheEntry? FailedJobsCache { get; set; }
+        public int FailedJobsLookbackWanted { get; set; }
+        public ConcurrentDictionary<AgentJobStepKey, AgentJobStepNames> StepNamesCache { get; } = new();
+        public ConcurrentDictionary<AgentJobStepKey, byte> StepNamesWanted { get; } = new();
+        public DateTime NextMsdbRefresh { get; set; } = DateTime.MinValue;
+
         /* ConcurrentDictionary (#1553 D1): with the fire-and-track sweep the per-server body runs on a pool
            thread, so a reload's RecomputeNextDueAsync on the OUTER thread can touch this map concurrently with the
            body's RunDueCollectorsAsync read-and-advance. It is only ever INDEXED by the static collector-catalog
            keys (never enumerated), so a lock-free concurrent map is a drop-in and eliminates the one structure
            the old strict single-threaded invariant (INV-1) existed to protect from tearing. */
         public ConcurrentDictionary<string, DateTime> NextDue { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /* #6186: the collectors this server keeps refusing with the same answer, and how long each waits for its next try. In
+           memory, so a restart (and a changed definition, which clears NextDue beside it) tries every collector once at its
+           normal interval. */
+        public RefusedCollectorBackoff RefusedBackoff { get; } = new();
 
         /* #4938: what a daily collector's run-time stamp in NextDue was computed from: the run time, the clock and the
            last run. One entry per collector that has a run time on this server, replaced whole (the record is
@@ -1527,6 +1671,24 @@ LIMIT 1";
         /* #5479: the held-slot watermarks, one per collector, while the memory launch guard holds collection off. Read and
            written ONLY by the sweep loop's own thread (CountHeldSlots), so a plain map is enough. */
         public Dictionary<string, HeldSlotMark> HeldSlotMarks { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /* #5735: the slots this server has lost since its last collection_cycle row, fed by the three places that step over a
+           slot and flushed by the body (DarlingCycleSkip). */
+        public CycleSkipAccumulator CycleSkips { get; } = new();
+
+        /* #5735: the last finished body's length and its slowest collector, and the time the current body queued for a fleet
+           slot. Written by the body's own chain (bodies never overlap on one server), read by the next body when it words the
+           cause of the slots it stepped over. */
+        public long LastBodyMs;
+        public string? LastBodySlowestName;
+        public long LastBodySlowestMs;
+        public long LastGateWaitMs;
+
+        /* #5824: the last finished body's scheduled analysis pass length (0 when no pass ran in it), and how many analysis
+           passes held fleet slots when the current body got its slot. LastBodyMs ends with the collectors, before the
+           analysis pass, so without these a slot held by the pass read as "no single cause". */
+        public long LastAnalysisMs;
+        public int LastGateWaitAnalysisHolders;
 
         /// <summary>#5597: the UTC ticks at which the connect body finished seeding this server's collector due stamps (0 =
         /// never). The stamps are seeded from a clock read before the body's on-load snapshots, so a slot that came due
@@ -1770,6 +1932,18 @@ LIMIT 1";
            Debug, until a run of that collector succeeds. In memory, so a restart warns again. */
         public XeSessionMissingWarnings XeSessionMissingWarnings { get; } = new();
 
+        /* #5640 (H2): the message of the last ensure of the client-timeout session that the login was refused (no ALTER ANY EVENT
+           SESSION, or no CREATE ANY DATABASE EVENT SESSION on Azure SQL Database), or null. While it is set the attention run records
+           PERMISSIONS with it instead of reading a session that cannot exist, which would record SESSION_MISSING and fire a Capture
+           Down for a least-privilege posture. Replaced by every ensure (at connect, then hourly), so a grant clears it within the
+           hour or at the next reconnect. Written on the pool thread only (INV-2), like the long-query fault. */
+        public string? AttentionXePermissionFault { get; set; }
+
+        /* #5640 (L5): whether the last ensure ran with the attention collector enabled. An ensure that skipped the client-timeout
+           session because the collector was off leaves this false, so turning the collector on makes the next sweep ensure it at
+           once and not after the hour. Reset on every (re)connect. */
+        public bool AttentionXeEnsuredWhileEnabled { get; set; }
+
         /* #4961: the long-query latch and its hourly create clock, cleared when a collector run sees the instance's
            identity move (ForgetLongQueryTraceLatchOnRestart), so the next sweep runs the whole reconcile. Not the fault,
            the partial note or the retry count: the reconcile that follows replaces them. */
@@ -1794,24 +1968,38 @@ LIMIT 1";
     /// Extended Events and is left alone.
     /// </summary>
     internal static async Task EnsureAlwaysOnXeSessionsAsync(
-        ServerLoopState server, DarlingCollectorRunner runner, DateTime utcNow, ILogger logger, CancellationToken cancellationToken)
+        ServerLoopState server, DarlingCollectorRunner runner, DateTime utcNow, ILogger logger, CancellationToken cancellationToken,
+        bool attentionEnabled = true)
     {
         /* #4961: a retired server's ensure would create the sessions its removal has just dropped. */
         if (server.Runtime is null
             || server.Retired
-            || server.Runtime.Target.Engine != CollectorTargetEngine.SqlServer
-            || !AlwaysOnXeSessions.EnsureIsDue(server.XeSessionsEnsuredAtUtc, utcNow))
+            || server.Runtime.Target.Engine != CollectorTargetEngine.SqlServer)
+        {
+            return;
+        }
+
+        /* #5640 (L5): the client-timeout session follows its collector's switch. A collector that was just turned on does not wait
+           out the hour for its session. */
+        var attentionJustEnabled = attentionEnabled && !server.AttentionXeEnsuredWhileEnabled;
+        if (!attentionJustEnabled && !AlwaysOnXeSessions.EnsureIsDue(server.XeSessionsEnsuredAtUtc, utcNow))
         {
             return;
         }
 
         /* Stamped before the ensure, so a server that refuses it is asked once an hour and not on every sweep. */
         server.XeSessionsEnsuredAtUtc = utcNow;
-        await DarlingXeSessions.EnsureAllAsync(server.Runtime, runner, logger, cancellationToken);
+        server.AttentionXeEnsuredWhileEnabled = attentionEnabled;
+        var attentionFault = await DarlingXeSessions.EnsureAllAsync(server.Runtime, runner, logger, cancellationToken, attentionEnabled);
+        server.AttentionXePermissionFault = attentionFault?.Message;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        /* A file: secret whose target ordinary users can read is reported through the service log; the resolver
+           itself has no logger. Set before the first config read, which is the first resolve. */
+        DarlingSecretSource.ReportFileAccessTo(message => _logger.LogWarning("{Warning}", message));
+
         _executeStartedUtc = DateTime.UtcNow;
         /* #5477: build the statement filter's first-call costs off the startup path, so the first alert with a
            large report does not pay them. Never throws, logs nothing. */
@@ -1973,6 +2161,12 @@ LIMIT 1";
            Validate() passes and NEVER inside it (Validate is all-fatal; an optional-endpoint note must not
            abort startup). Covers BYO-mode network.* being ignored and the network.role=admin pivot risk. */
         foreach (var warning in GetNetworkStartupWarnings(config))
+        {
+            _logger.LogWarning("{Warning}", warning);
+        }
+
+        /* #6262: a remediation secret that is a DPAPI blob works for operator remediation but is refused by agent server actions. */
+        foreach (var warning in DarlingSecrets.RemediationSecretWarnings(config.Servers))
         {
             _logger.LogWarning("{Warning}", warning);
         }
@@ -2141,7 +2335,8 @@ LIMIT 1";
         {
             await RunCollectionLoopAsync(
                 config, storeConnectionString, storeUpgradeReport, storeTimescaleReport,
-                managedDataDirectory, managedConfWriteResult, managedUsedLastGoodConf, managedConfVerification, stoppingToken);
+                managedDataDirectory, managedConfWriteResult, managedUsedLastGoodConf, managedConfVerification,
+                OperatingSystem.IsWindows() && managedPostgres is not null ? managedPostgres.ReconcileNetworkAfterRoleProvisioningAsync : null, stoppingToken);
         }
         finally
         {
@@ -2199,7 +2394,7 @@ LIMIT 1";
                install re-homed to a domain account for integrated auth (#1823), granting the virtual
                account would be a fix that cannot work. */
             var remediation =
-                $"icacls \"{path}\" /inheritance:d   then   icacls \"{path}\" /remove:g \"BUILTIN\\Users\"   " +
+                $"icacls \"{path}\" /inheritance:d   then   icacls \"{path}\" {DarlingFileSecurity.RemoveOrdinaryUserGrantsArgument}   " +
                 $"then   icacls \"{path}\" /grant \"{DarlingFileSecurity.ServiceAccountDisplayName}:(F)\"";
 
             _logger.LogError(
@@ -2211,10 +2406,17 @@ LIMIT 1";
                 path, DarlingFileSecurity.DescribeOwnerAndExposure(path), ex.Message, remediation);
         }
 
+        /* Once per start, here rather than beside every credential file: the same group is missing for all of
+           them, and the harden above already ran without it (SYSTEM, Administrators and the service only). */
+        if (DarlingFileSecurity.OperatorGroup is null)
+        {
+            _logger.LogWarning("{Warning}", DarlingFileSecurity.OperatorGroupMissingWarning);
+        }
+
         if (DarlingFileSecurity.IsReadableByOrdinaryUsers(path))
         {
             _logger.LogCritical(
-                "{Path} is READABLE by Users/Authenticated Users/Everyone. It holds every monitored server's " +
+                "{Path} is READABLE by Users/Authenticated Users/Everyone/INTERACTIVE. It holds every monitored server's " +
                 "encrypted password plus the MCP and web access tokens, all protected with machine-scoped DPAPI — " +
                 "so any local user who can open this file can recover ALL of it. Remove the inherited read access " +
                 "(or move the install out of a world-readable folder such as one created directly under C:\\).",
@@ -2245,7 +2447,7 @@ LIMIT 1";
                 return;
             }
 
-            backups = Directory.GetFiles(directory, Path.GetFileName(configPath) + ".bak-*");
+            backups = DarlingConfigBackup.ListBackups(directory, Path.GetFileName(configPath));
         }
         catch (Exception ex)
         {
@@ -2278,7 +2480,7 @@ LIMIT 1";
                    runnable commands so an elevated human can finish the job the service cannot — naming
                    the identity the service runs as, which is not the virtual account on a re-homed install. */
                 var remediation =
-                    $"icacls \"{backup}\" /inheritance:d   then   icacls \"{backup}\" /remove:g \"BUILTIN\\Users\"   " +
+                    $"icacls \"{backup}\" /inheritance:d   then   icacls \"{backup}\" {DarlingFileSecurity.RemoveOrdinaryUserGrantsArgument}   " +
                     $"then   icacls \"{backup}\" /grant \"{DarlingFileSecurity.ServiceAccountDisplayName}:(F)\"";
 
                 logger.LogError(
@@ -2565,6 +2767,7 @@ LIMIT 1";
         ManagedConfWriteResult? managedConfWriteResult,
         bool managedUsedLastGoodConf,
         ManagedConfMigrationOutcome? managedConfVerification,
+        Func<CancellationToken, Task>? reconcileNetworkAfterRoleProvisioning,
         CancellationToken stoppingToken)
     {
         /* Carry the collect/config search path on the store connection string BEFORE the data
@@ -2578,12 +2781,28 @@ LIMIT 1";
            result rather than the two being one call), so the census below only has to look for the
            pin on the Create line itself — no reassignment in between for a future edit to slip
            an unpinned read behind. */
+
+        /* A string Npgsql cannot use throws from the Create below, leaves this method and ExecuteAsync, and the
+           host logs that exception to the console, the Event Log and the file log with its message and its inner
+           exception. Npgsql's text for that can quote part of the string (a password with an unquoted ';' makes the
+           text after it the "keyword", and a password tail that becomes a Host value with a ':' in it makes the text
+           after the ':' a bad port). So prove the string first, with Npgsql's own construction step (the guard builds
+           and disposes a data source, and opens nothing): the exception that leaves is the formatter's text, with no
+           inner exception, and the host still stops exactly as it did. The keywords added below (search path,
+           application name, session time zone) take part in none of Npgsql's construction checks, so a string that
+           passes here does not throw from the Create below for a parse or a validation reason. */
+        if (DarlingStoreConnection.TryDescribeParseFailure(storeConnectionString) is { } unusableStoreString)
+        {
+            throw new InvalidOperationException("postgres.connectionString could not be used: " + unusableStoreString);
+        }
+
         DarlingSelfAlertEvaluator.CollectionGapReport? collectionGapReport = null;
         await using var postgres = NpgsqlDataSource.Create(
             DarlingStoreConnection.PinSessionTimeZoneUtc(
                 DarlingStoreConnection.WithApplicationName(
                     EnsureStoreSearchPath(storeConnectionString), DarlingManagedPostgres.ServiceApplicationName)));
         _postgres = postgres;
+        _ownerSource?.Publish(postgres);
         /* #2936: a failure here is triaged rather than uniformly terminal. A store that is unreachable for
            a moment — restarting, failing over, still coming up alongside this service — and a sibling
            instance holding the migration advisory lock both succeed seconds later; a rung that cannot
@@ -2721,6 +2940,10 @@ LIMIT 1";
         /* #5097: the slow-read writer, drained at shutdown. Failure-isolated inside; it never ends before shutdown. */
         var slowReadWriter = _slowReads is null ? Task.CompletedTask : _slowReads.RunAsync(postgres, _logger, stoppingToken);
 
+        /* #5506 part 3: the long-read table, built once the store is migrated. Never throws; until it finishes, and if it
+           fails, the window-size rule decides which reads are long. */
+        var readAdmissionTable = _readAdmission is null ? Task.CompletedTask : _readAdmission.RefreshAsync(postgres, _readLatency, stoppingToken);
+
         /* #4348: the one-time scrub of collected statement text (collect.pg_statement_text,
            collect.pg_blocking_edges) an older build stored before the shared sensitive-statement filter
            existed. Same launch discipline as the setting scrub immediately above — after migrations
@@ -2739,9 +2962,11 @@ LIMIT 1";
            its own connection, its own catch, drained with the other background startup work below. */
         var planForceDetailScrub = RunPlanForceActionDetailScrubAsync(postgres, stoppingToken);
 
-        /* #4605, #4952, #5507: the Query Store read indexes - the BRIN on collect.query_store_interval_wide
-           (collection_time) and the btrees on (server_id, first_execution_time) of collect.query_store_interval_wide
-           and collect.query_store_interval_latest - built in the background
+        /* #4605, #4952, #5507, #5807, #5957: the Query Store read indexes - the BRIN on collect.query_store_interval_wide
+           (collection_time), the btrees on (server_id, first_execution_time) of collect.query_store_interval_wide
+           and collect.query_store_interval_latest, and the btrees on (server_id, database_name, query_id, first_execution_time) of
+           collect.query_store_interval_wide (WideDatabaseQueryFirstExec) and collect.query_store_interval_latest
+           (LatestDatabaseQueryFirstExec) - built in the background
            QueryStoreBackgroundIndexes.StartDelay after start so their heap reads stay off the post-restart IO burst,
            one after another, each failure-isolated. Launched after migrations confirm the tables exist, never awaited
            on the startup path, one attempt per start, and RunDelayedAsync never throws. Drained with the other
@@ -2779,9 +3004,11 @@ LIMIT 1";
            out-of-band via tools/provision-roles.sql. */
         if (config.Postgres.Managed && OperatingSystem.IsWindows())
         {
+            string? provisioningDirectory = null;
             try
             {
                 var dataDirectory = DarlingManagedPostgres.ResolveDataDirectory(config.Postgres);
+                provisioningDirectory = dataDirectory;
                 /* #2918: record what provisioning actually WROTE onto the roles, not what the store holds
                    afterwards. This runs BEFORE SeedIfEmptyAsync, so on a brand-new store there is no
                    config_service row to read and the roles get the 15 s default while the seed then inserts
@@ -2794,13 +3021,25 @@ LIMIT 1";
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                /* The hourly store-maintenance tick retries it (RetryRoleProvisioningAsync), and every start does. */
+                _roleProvisioningRetryDirectory = provisioningDirectory;
                 _logger.LogError(
-                    "Least-privilege role provisioning failed — the Viewer's admin/viewer roles may be stale " +
-                    "until the next successful start: {Message}", ex.Message);
+                    "Least-privilege role provisioning failed — the Viewer's admin/viewer roles may be stale, and " +
+                    "a role credential file the web and MCP hosts wait for is not written until an attempt " +
+                    "succeeds; it is retried on the hourly store-maintenance tick and on the next start: {Message}",
+                    ex.Message);
                 /* Provisioning stopped before its own rules section: a store that has never had the password rules
                    would keep none while the viewer and mcp roles keep their earlier credentials. Best effort; the
                    call warns for itself and never throws. */
                 await DarlingManagedRoles.EnsureServerPasswordRulesAsync(postgres, _logger, stoppingToken);
+            }
+
+            /* #5654: the pg_hba pass in the bootstrap leaves the alert sources line out while the group has members
+               beyond the registered source logins. Provisioning above revokes the extras it can, so a pass that left
+               the line out for that reason runs once more now, and the line lands on this start. */
+            if (reconcileNetworkAfterRoleProvisioning is not null)
+            {
+                await reconcileNetworkAfterRoleProvisioning(stoppingToken);
             }
         }
         else if (!config.Postgres.Managed && Hosting.DarlingHostBinding.IsRunningInContainer)
@@ -3056,6 +3295,14 @@ LIMIT 1";
            The initial server set comes from config_monitored_servers WHERE is_enabled = TRUE (post-seed
            equivalent to darling.json, but store-authoritative); the config_version read here is the
            reload baseline, so the seed's own version bumps do not trigger a spurious first-sweep reload. */
+        /* #5655: say in the store which version this service host runs and when the process started, so the viewers can show the
+           SERVICE's version (they used to show their own). Its own table, never config_service (that row's self-bump trigger would
+           reload every service). A failed write logs a warning and the start goes on; the sweep below tries it again until it lands. */
+        var serviceVersionStart = ProcessStartUtc();
+        var serviceVersionWriter = new DarlingServiceVersionWriter((retry, ct) =>
+            DarlingServiceVersionRecorder.RecordAsync(postgres, _logger, serviceVersionStart, ct, retry));
+        await serviceVersionWriter.TryAsync(stoppingToken);
+
         var configProvider = new StoreConfigProvider(postgres, _logger);
         await configProvider.SeedIfEmptyAsync(config, stoppingToken);
         /* #5366: the service's password key, after migrations, role provisioning and the seed, and before the first config view (#5455:
@@ -3075,6 +3322,7 @@ LIMIT 1";
         if (initialView is not null)
         {
             StoreConfigProvider.ApplyToConfig(config, initialView);
+            _collectorState.SigningStatus.Publish(config.Webhooks, config.NotificationRoutes, DateTime.UtcNow); // #5998: presence and dates for the web page, no key text
             _scheduleOverrides = initialView.ScheduleOverrides;
             _lastConfigVersion = initialView.ConfigVersion;
             /* Stage 2: honor config_service.paused from the very first sweep (a service that was paused
@@ -3097,10 +3345,15 @@ LIMIT 1";
            holds — including on a store-unreachable boot. Re-published on every reload below. */
         _mcpState.Publish(config.Mcp.Enabled, config.Mcp.Port);
         _webState.Publish(config.Web.Enabled, config.Web.Port);
+        /* The SMTP settings in force (the store's when the view loaded, else darling.json's): a setup that sends its
+           login without encryption is named in the log, because no settings window is open for it. */
+        DarlingSmtpWarning.Log(config.Smtp, _logger);
         /* #2298: publish the effective server set the same way — store-authoritative when the view loaded,
            else the darling.json servers, which is what this run will actually collect from either way. The
            MCP host's plan-fetch resolver reads this instead of re-reading the store as the mcp role. */
         _registryState.Publish(initialServers);
+        /* #5812 (L1): the PLAN_REGRESSION candidate cache evicts the entries of servers outside this set on its next store. */
+        PerformanceMonitor.Darling.Analysis.PgFactCollector.PlanRegressionCandidateCache.Shared.RetainServers(initialServers.Select(s => s.ServerId));
 
         /* Capture-plans is read live (() => config.CapturePlans) so a store reload of
            config_service.capture_plans is honored on the next collector cycle without rebuilding.
@@ -3155,7 +3408,9 @@ LIMIT 1";
                 runtime.Config.Database,
                 LiveAlertTargets(_registryState.Read()?.Servers)),
             /* #4961: this install's id, made at start before any worker runs. */
-            installId: () => _installId);
+            installId: () => _installId,
+            /* #6211: live provider like its siblings, so a store change to query_store_fetch_top_n takes effect on the next cycle, no restart. */
+            queryStoreFetchTopN: () => StoreConfigProvider.ClampQueryStoreFetchTopN(config.QueryStoreFetchTopN));
         _runner = runner;
         var servers = new List<ServerLoopState>();
         /* #1581 cold-start stagger: capture ONE startup instant so every initial server's first-sweep offset is
@@ -3188,6 +3443,33 @@ LIMIT 1";
         var muteRuleService = new MuteRuleService(
             new PgMuteRuleStore(postgres), _loggerFactory.CreateLogger<MuteRuleService>());
         await LoadMuteRulesAsync(muteRuleService);
+        await LoadThresholdOverridesAsync();
+
+        /* #5632 Phase A: Level 1 investigations. The dispatcher opens or joins a request after an alert row is written (the
+           deliverer and the finding sender below call it), and the sweep loop expires lapsed leases and old requests. Both
+           use a data source of their own whose connections carry a 5-second lock_timeout, so a held lock on the
+           investigation tables costs an alert pass at most that long and touches no other connection's settings. */
+        await using var investigationPostgres = NpgsqlDataSource.Create(
+            InvestigationDispatcher.WithLockTimeout(
+                DarlingStoreConnection.PinSessionTimeZoneUtc(
+                    DarlingStoreConnection.WithApplicationName(
+                        EnsureStoreSearchPath(storeConnectionString), DarlingManagedPostgres.ServiceApplicationName))));
+        var investigationStore = new InvestigationRequestStore(
+            investigationPostgres, DarlingAlertReadAdapter.AlertPassCommandTimeoutSeconds);
+        /* #5821: the generic webhook's {{investigation_json}} masks the stored brief at the level the MCP tools serve; an
+           unrecognized value runs at the strictest level, as the MCP host does (it logs that once, so this does not). */
+        /* #6005: the deadlock rollup (written by the alert pass), the agent gate it feeds and the 4-hour digest. */
+        var deadlockRollup = new PerformanceMonitor.Darling.Service.Investigations.DarlingDeadlockRollup(
+            new DeadlockSignatureStore(investigationPostgres, DarlingAlertReadAdapter.AlertPassCommandTimeoutSeconds));
+        var investigationDispatcher = new InvestigationDispatcher(
+            investigationStore, alertSettings, _logger,
+            McpDataDetailModes.TryParse(config.Mcp.DataDetail, out McpDataDetail dataDetail)
+                ? dataDetail
+                : McpDataDetail.MetadataOnly,
+            /* #5822: the long-poll's wake-up, fired when a request opens. */
+            openSignal: PerformanceMonitor.Darling.Service.Investigations.InvestigationOpenSignal.Shared,
+            agentGate: deadlockRollup.AllowsAgentRequestAsync,
+            keys: _pseudonymKeys);
 
         /* The shared record-and-send deliverer — hoisted so BOTH the shared alert engine and the Stage 4
            service self-alerts (DarlingSelfAlertEvaluator) fire through the SAME instance: identical
@@ -3210,8 +3492,11 @@ LIMIT 1";
                         .Find(s => s.Config.ServerId == id)
                         ?.Config.AlertDeliveryModeOverride;
                 }
-            });
-        var engine = BuildAlertEngine(config, servers, alertSettings, historyStore, muteRuleService, deliverer);
+            },
+            investigationDispatcher: investigationDispatcher,
+            /* #5825: the same mute rules the fires obey stop an alert's clear. */
+            isAlertMuted: muteRuleService.IsAlertMuted);
+        var engine = BuildAlertEngine(config, servers, alertSettings, historyStore, muteRuleService, deliverer, deadlockRollup);
 
         /* Held for the PostgreSQL predictors, which deliver alongside the shared engine rather than
            through it (see EvaluatePostgresAlertsAsync). Same deliverer instance, so a PostgreSQL alert
@@ -3361,7 +3646,7 @@ LIMIT 1";
            finding already passed the queue-time mute filter in PgFindingStore. */
         var muteReadStore = new PgFindingStore(postgres, _logger);
         var notificationService = new AnalysisNotificationService(
-            new DarlingFindingAlertSender(alertSettings, historyStore, webhookAlertService, _logger),
+            new DarlingFindingAlertSender(alertSettings, historyStore, webhookAlertService, _logger, investigationDispatcher),
             alertSettings,
             finding => finding.ServerId.ToString(CultureInfo.InvariantCulture),
             _loggerFactory.CreateLogger<AnalysisNotificationService>(),
@@ -3389,6 +3674,60 @@ LIMIT 1";
         var serviceInstance = $"{Environment.MachineName}:{Environment.ProcessId.ToString(CultureInfo.InvariantCulture)}";
         var commandExecutor = new DarlingCommandExecutor(postgres, commandHost, serviceInstance, _logger);
         var commandLoop = RunCommandLoopAsync(commandExecutor, stoppingToken);
+
+        /* #5654: the drain for alerts other services queue through config.submit_external_alert. The SAME deliverer, mute
+           check and history store as the custom alerts above, so an external alert obeys every route and mute rule and
+           lands in the same history. A registered server name maps to its id under the servers lock; an unregistered
+           name stays a label in the server_id 0 bucket. */
+        var externalAlertStore = new ExternalAlertStore(postgres, DarlingAlertReadAdapter.AlertPassCommandTimeoutSeconds);
+        var externalAlertDrain = new ExternalAlertDrain(
+            externalAlertStore,
+            alertsEnabled: () => alertSettings.AlertsEnabled,
+            (outcome, token) => deliverer.DeliverAndReportAsync(outcome, token),
+            (metric, serverName, serverKey, detail, token) => deliverer.TryResolvePagerDutyAsync(metric, serverName, serverKey, detail, token),
+            historyStore,
+            muteRuleService.IsAlertMuted,
+            name =>
+            {
+                lock (_serversLock)
+                {
+                    var match = servers.Find(s => string.Equals(s.Config.DisplayName, name, StringComparison.OrdinalIgnoreCase));
+                    return match is null ? null : new ExternalAlertServer(match.Config.ServerId, match.Config.DisplayName);
+                }
+            },
+            serviceInstance,
+            _loggerFactory.CreateLogger<ExternalAlertDrain>(),
+            /* #5825: an external alert's clear goes where its fire went, under the same setting as every clear. */
+            deliverResolution: (resolution, options, token) => deliverer.DeliverResolutionAsync(resolution, options, token));
+
+        /* #5654: the drain runs on its own 15-second loop, like the command loop, and is never awaited inside the fleet
+           loop, so collection, the custom alerts and the self alerts do not wait on a channel send or a store lock. The
+           loop honors the service pause and the master switch itself. Awaited with the command loop at shutdown. */
+        var externalAlertLoop = RunExternalAlertLoopAsync(externalAlertDrain, stoppingToken);
+
+        /* #5632 Phase A (ruling R4): the investigation expiry sweep, beside the external alert loop on its own 60-second
+           tick. It only expires: it journals a lapsed lease once per claim and moves a request past its expiry, or out of
+           claims, to expired. It never reopens a lease; a claim's own WHERE takes a lapsed lease over. */
+        /* #6003: after each sweep, the request events go out: the D8 fallback of a request that expired unclaimed, and the
+           signed POST of every new event to its agent route; the pass wakes the MCP long-poll for what it found. */
+        var investigationEvents = new PerformanceMonitor.Darling.Service.Investigations.InvestigationEventDelivery(
+            investigationStore, () => alertSettings.NotificationRoutes,
+            new PerformanceMonitor.Darling.Service.Investigations.ServiceInvestigationEventSends(
+                webhookAlertService, deliverer, () => _selfAlerts),
+            PerformanceMonitor.Darling.Service.Investigations.InvestigationOpenSignal.Shared, _logger);
+        /* #6234: the change watch rides the sweep's tick; its first pass runs at start, so a watch whose window ended while the service was down is evaluated then. */
+        var changeWatchPass = new PerformanceMonitor.Darling.Service.ChangeWatch.ChangeWatchPass(
+            postgres,
+            new ChangeWatchStore(investigationPostgres, DarlingAlertReadAdapter.AlertPassCommandTimeoutSeconds),
+            investigationDispatcher.Core, _logger, DarlingAlertReadAdapter.AlertPassCommandTimeoutSeconds);
+        var investigationSweepLoop = RunInvestigationSweepLoopAsync(investigationStore, investigationEvents, deadlockRollup, changeWatchPass, stoppingToken);
+
+        /* #6001: the evidence capture, on its own tick. It reads the store only and opens no connection to a monitored server. */
+        var investigationEvidenceLoop = RunInvestigationEvidenceLoopAsync(
+            new PerformanceMonitor.Darling.Service.Investigations.InvestigationEvidenceCapture(
+                investigationPostgres, investigationStore, _logger,
+                collectorIntervalMinutes: (collector, serverId) => PerformanceMonitor.Collectors.CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes(
+                    StoreConfigProvider.ResolveSchedule(collector, serverId, _scheduleOverrides).FrequencyMinutes)), stoppingToken);
 
         /* #2022 phase 2: the Query Store backfill worker, on its own tick (see s_queryStoreBackfillInterval).
            Fills the two windows the live path discards by design — the 60-minute first-contact tail and
@@ -3437,6 +3776,7 @@ LIMIT 1";
 #pragma warning disable CA2000
         var serverSweepGate = new SemaphoreSlim(initialSweepWidth, SweepGateCeiling);
 #pragma warning restore CA2000
+        SweepGate = serverSweepGate;
         lock (_gateLock)
         {
             /* The permits the gate was never given ARE the absorbed ones — seed both counts so the first
@@ -3480,6 +3820,13 @@ LIMIT 1";
             if (_passwordKeyRuntime is not null)
             {
                 await _passwordKeyRuntime.SweepCheckAsync(stoppingToken);
+            }
+
+            /* #5655: a service version write that failed at the start is tried again here on every pass until it succeeds, the way
+               the pin step above is, so the viewers do not say "unknown (older than 3.11)" about this service until the next restart. */
+            if (serviceVersionWriter.Pending)
+            {
+                await serviceVersionWriter.TryAsync(stoppingToken);
             }
 
             /* Control-plane reload beacon: poll config_version at a SAFE point (top of the sweep, never
@@ -3584,7 +3931,9 @@ LIMIT 1";
                a launch guard that holds the bodies off, or a body that never finishes, no longer silences them. Each
                server keeps its own cadence stamps, which only this pass reads and writes, so no server is evaluated by two
                threads at once. */
-            TryStartSelfAlertPass(sweepTargets, stoppingToken, StoreConfigProvider.ClampConcurrentSweeps(config.MaxConcurrentSweeps));
+            TryStartSelfAlertPass(
+                sweepTargets, stoppingToken, StoreConfigProvider.ClampConcurrentSweeps(config.MaxConcurrentSweeps),
+                engine, config, notificationService);
 
             /* Fire-and-track launch loop (#1553 D2/D2b): LAUNCH each server's collection body WITHOUT awaiting
                it, so one slow or hung server can no longer stall the fleet or the fleet-level steps below (the
@@ -3826,6 +4175,26 @@ LIMIT 1";
                     postgres, backlogTargets, _logger, stoppingToken);
             }
 
+            /* #5985: the query-tag map step. Rebuilds every listed server's map when a tag, assignment or rule changed
+               (rules_version ahead of built_version), otherwise extends it for the keys sighted since the last pass,
+               capped per server per pass, and flushes the runner's in-memory sightings first. Fire-and-track like the
+               sweep above: it only talks to the store, but a rebuild over a large sighting history can run long and must not
+               hold the launch loop. The builder is failure-isolated per server; only a cancellation (shutdown) escapes it, and
+               the tracked task is never awaited, so that ends the task quietly. */
+            if (StampIsDue(_nextQueryTagMapPassUtc, s_queryTagMapPassInterval, DateTime.UtcNow)
+                && (_queryTagMapPass is null || _queryTagMapPass.IsCompleted))
+            {
+                _nextQueryTagMapPassUtc = DateTime.UtcNow.Add(s_queryTagMapPassInterval);
+                var mapServerIds = new List<int>(sweepTargets.Length);
+                foreach (var target in sweepTargets)
+                {
+                    mapServerIds.Add(target.Config.ServerId);
+                }
+
+                _queryTagMapBuilder ??= new QueryTagMapBuilder(postgres, _logger, sightings: runner.QueryTagSightings);
+                _queryTagMapPass = _queryTagMapBuilder.RunMapPassAsync(mapServerIds, stoppingToken);
+            }
+
             /* Stage 4 fleet-level self-alert: the store disk-pressure backstop. The daily purge is the ONLY
                other maintenance cadence and it is purely time-based (no disk-free check), so on its own the
                store can still fill between purges — this edge-fired condition is the flagship-appropriate
@@ -3870,6 +4239,17 @@ LIMIT 1";
             {
                 _nextStaleMuteCheckUtc = DateTime.UtcNow.Add(s_staleMuteCheckInterval);
                 await _selfAlerts.EvaluateStaleMuteRulesAsync(muteRuleService.GetRules(), stoppingToken);
+            }
+
+            /* #5654: external alerts the drain gave up on (expired, interrupted or failed every send). A source that queues
+               an alert believes it was delivered, and nothing else reports that it was not. The count is one store read per
+               tick; a failed read holds the standing alert rather than resolving it. Fleet-level, own slow cadence; the
+               Evaluate* wrapper is failure-isolated so a throw never stops the fleet loop. */
+            /* #4732: the stamp below is written as now + s_externalAlertsCheckInterval, so that is the span. */
+            if (_selfAlerts is not null && StampIsDue(_nextExternalAlertsCheckUtc, s_externalAlertsCheckInterval, DateTime.UtcNow))
+            {
+                _nextExternalAlertsCheckUtc = DateTime.UtcNow.Add(s_externalAlertsCheckInterval);
+                await EvaluateExternalAlertsAsync(externalAlertStore, stoppingToken);
             }
 
             /* #4750: a webhook channel that has failed three times in a row. A channel can fail for weeks while
@@ -4090,6 +4470,12 @@ LIMIT 1";
             inFlightSweeps.Add(_selfAlertPass);
         }
 
+        /* #5642: and so is the engine pass. */
+        if (_alertEnginePass is { IsCompleted: false })
+        {
+            inFlightSweeps.Add(_alertEnginePass);
+        }
+
         /* #5574: the perfmon_stats re-group loop ends on the same cancellation; its chunk in flight rolls back or is left
            for the compression policy, and the loop never faults. */
         if (_perfmonRegroupDrain?.Completion is { IsCompleted: false } regroupRun)
@@ -4099,6 +4485,10 @@ LIMIT 1";
 
         /* #4938: the daily runs detached from those bodies join the wait inside DrainInFlightAsync. */
         await DrainInFlightAsync(inFlightSweeps);
+
+        /* #5985: the last query-tag sightings flush. The collection bodies have drained, so nothing appends any more; what
+           they sighted since the map step's last pass is still in memory and would be lost with the process. */
+        await DrainQueryTagSightingsAsync(_queryTagMapPass, runner.QueryTagSightings);
 
         /* #4130: drain the in-flight daily purge the same way as the per-server sweeps above, rather than
            abandoning it mid-DELETE. RunTrackedAsync's own try/catch swallows the OperationCanceledException
@@ -4113,6 +4503,36 @@ LIMIT 1";
         try
         {
             await commandLoop;
+        }
+        catch (OperationCanceledException)
+        {
+            /* Expected on shutdown. */
+        }
+
+        /* #5654: the external alert loop observes the same token; its pass in flight gives back the rows it had not reached. */
+        try
+        {
+            await externalAlertLoop;
+        }
+        catch (OperationCanceledException)
+        {
+            /* Expected on shutdown. */
+        }
+
+        /* #5632 Phase A: the investigation sweep observes the same token. */
+        try
+        {
+            await investigationSweepLoop;
+        }
+        catch (OperationCanceledException)
+        {
+            /* Expected on shutdown. */
+        }
+
+        /* #6001: the evidence capture observes it too. */
+        try
+        {
+            await investigationEvidenceLoop;
         }
         catch (OperationCanceledException)
         {
@@ -4211,6 +4631,16 @@ LIMIT 1";
         try
         {
             await settingScrub;
+        }
+        catch (OperationCanceledException)
+        {
+            /* Expected on shutdown. */
+        }
+
+        /* And the long-read table's first build (#5506 part 3). */
+        try
+        {
+            await readAdmissionTable;
         }
         catch (OperationCanceledException)
         {
@@ -4320,7 +4750,10 @@ LIMIT 1";
            cancel records nothing (the throw skips the line below), like the permit it never took. */
         var gateWaitStarted = Stopwatch.GetTimestamp();
         await gate.WaitAsync(stoppingToken);
-        _fleetGateStats?.RecordQueueWait(Stopwatch.GetElapsedTime(gateWaitStarted));
+        var gateWaited = Stopwatch.GetElapsedTime(gateWaitStarted);
+        _fleetGateStats?.RecordQueueWait(gateWaited);
+        server.LastGateWaitMs = (long)gateWaited.TotalMilliseconds;
+        server.LastGateWaitAnalysisHolders = Volatile.Read(ref _analysisPassesInSlot);
 
         /* The permit is held: this body has STOPPED queueing and STARTED running. Stamp the run start so the
            outer launch loop's watchdog can tell a genuine hang from a body that was merely waiting its turn.
@@ -4368,35 +4801,20 @@ LIMIT 1";
 
             /* #4961: the always-on deadlock and blocked-process sessions are ensured at connect and then once an hour, so a
                session dropped from outside comes back within the hour. */
-            await EnsureAlwaysOnXeSessionsAsync(server, runner, DateTime.UtcNow, _logger, stoppingToken);
+            await EnsureAlwaysOnXeSessionsAsync(
+                server, runner, DateTime.UtcNow, _logger, stoppingToken,
+                attentionEnabled: StoreConfigProvider.ResolveSchedule("attention", server.Config.ServerId, _scheduleOverrides).Enabled);
 
             await RunDueCollectorsAsync(server, runner, stoppingToken);
 
-            /* After the server's collector sweep: evaluate alerts against the freshly collected store — on
-               Lite's 30-second overview cadence. */
-            if (StampIsDue(server.NextAlertSweep, s_alertSweepInterval, DateTime.UtcNow))
-            {
-                server.NextAlertSweep = DateTime.UtcNow.Add(s_alertSweepInterval);
-                await EvaluateAlertsAsync(engine, server, config, stoppingToken);
-            }
-
-            /* #3467: the same-statement-pileup finding, evaluated at collection cadence rather than the
-               analysis interval — the entire point of the finding is that the 20:10:31Z snapshot held
-               notify-grade evidence 21 minutes before the scheduled pass described it and ~28 before the
-               query_store-fed finding could exist. Alert-sweep cadence (30 s) over a one-minute snapshot
-               collector means a pileup is evaluated within one collection cycle of being visible.
-               Analysis-side gates, not alert-side: production rides config.Analysis.Enabled (D0 — the
-               pass runs and persists whatever the master switch says; delivery alone is gated inside,
-               via ShouldNotifyAnalysisFindings). SQL Server targets only — the shape is a
-               sys.dm_exec_requests statement pileup, and a PostgreSQL target never writes
-               query_snapshots rows. */
-            if (config.Analysis.Enabled
-                && server.Runtime?.Target.Engine != CollectorTargetEngine.PostgreSql
-                && StampIsDue(server.NextPileupSweep, s_alertSweepInterval, DateTime.UtcNow))
-            {
-                server.NextPileupSweep = DateTime.UtcNow.Add(s_alertSweepInterval);
-                await EvaluateSameStatementPileupAsync(server, config, notificationService, stoppingToken);
-            }
+            /* #5642: the alert evaluation and the same-statement-pileup finding (#3467) no longer run here. They ran
+               after the collector sweep, so a body that never finished (or a slow collector) silenced every alert on
+               its server, the same defect #5479 fixed for the self-alerts. They run in the fleet's
+               engine pass (RunAlertEnginePassAsync) on the same 30 s stamps, in a single-flight slot of its own chained
+               after the self-alert step, so alert reads never delay Collection Stopped. The pass makes store reads only,
+               so the two msdb facts the alert engine wants are read HERE, after the collectors, into a per-server cache
+               the pass serves. */
+            await RefreshMsdbCacheAsync(server, stoppingToken);
 
             /* AN3: the scheduled analysis pipeline, per-server. The cadence, the enabled gate, and the notify
                gate are now control-plane knobs read LIVE from config.Analysis (a reload takes effect on the next
@@ -4406,7 +4824,14 @@ LIMIT 1";
                AND analysis_notifications_enabled (ShouldNotifyAnalysisFindings — #3464; Lite's D0 split
                stands: production unconditional, delivery gated); the interval is clamped to Lite's 5-360
                range. */
+            /* #5824: the pass runs here, inside this body, so it holds this server's fleet collection slot for its whole
+               length (up to the 120 s budget plus the 5 s unwind grace, then the notify and force-plan steps). The next
+               body reads its length as a candidate cause of any slot this server steps over. */
+            server.LastAnalysisMs = 0;
             var analysisIntervalMinutes = Math.Clamp(config.Analysis.IntervalMinutes, MinAnalysisIntervalMinutes, MaxAnalysisIntervalMinutes);
+            /* #5812 (ruling R3): an MCP or viewer call reuses PLAN_REGRESSION candidates for one analysis cadence, never
+               longer than the scheduled pass that replaces them. */
+            PerformanceMonitor.Darling.Analysis.PgFactCollector.PlanRegressionCandidateCache.Shared.RefreshAfter = TimeSpan.FromMinutes(analysisIntervalMinutes);
             if (config.Analysis.Enabled && StampIsDue(server.NextAnalysisDue, TimeSpan.FromMinutes(analysisIntervalMinutes), DateTime.UtcNow))
             {
                 server.NextAnalysisDue = DateTime.UtcNow.AddMinutes(analysisIntervalMinutes);
@@ -4422,13 +4847,30 @@ LIMIT 1";
                    no longer knows or cares which engine it is scheduling. The first real pass then
                    overwrites any tombstone row still standing with the honest state (D7 — the lazy
                    overwrite, no migration). */
-                await RunScheduledAnalysisAsync(
-                    server, planFetcher, notificationService, ShouldNotifyAnalysisFindings(config), stoppingToken);
+                var analysisStarted = Stopwatch.GetTimestamp();
+                Interlocked.Increment(ref _analysisPassesInSlot);
+                try
+                {
+                    await RunScheduledAnalysisAsync(
+                        server, planFetcher, notificationService, ShouldNotifyAnalysisFindings(config), stoppingToken);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _analysisPassesInSlot);
+                    server.LastAnalysisMs = (long)Stopwatch.GetElapsedTime(analysisStarted).TotalMilliseconds;
+                }
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             /* Shutdown (a body-internal await observed the token) — quiet and expected. */
+        }
+        catch (OperationCanceledException ex)
+        {
+            /* #5642: a cancellation that is NOT the service stopping (an inner timeout token that escaped) used to be
+               swallowed here without a line, which is one of the silent ways a server's sweep ended. */
+            _logger.LogWarning("[{Server}] Collection sweep ended on a cancellation that was not the service stopping: {Message}",
+                server.Config.DisplayName, ex.Message);
         }
         catch (Exception ex)
         {
@@ -4996,6 +5438,12 @@ LIMIT 1";
                at the same time and collection never waits on it. Isolated in its own method: a heal failure
                never changes the stamp above, the summary line above, or the start. */
             await RunPartialDailyHealAsync(connection, stoppingToken);
+
+            /* #6070: then the days a daily-parented daily is missing although its parent daily has them, which
+               neither the hole scan (it skips a daily that has materialized nothing) nor the heal (it leaves a
+               source-with-rows, daily-without-row day to the scan) reaches. Same connection and flag, same
+               isolation: a failure here changes nothing above. */
+            await RunDailyChildHoleRepairAsync(connection, stoppingToken);
         }
         catch (OperationCanceledException)
         {
@@ -5046,6 +5494,34 @@ LIMIT 1";
             _logger.LogWarning(
                 "Partial-daily heal (#4716) could not run — a daily it had not finished has no marker, so the next start walks it again: {ExceptionType}{SqlState}",
                 ex.GetType().Name, sqlState is null ? "" : $", SQLSTATE {sqlState}");
+        }
+    }
+
+    /// <summary>
+    /// Runs <see cref="TimescaleSupport.RepairDailyChildHolesAsync"/> (#6070) on the hole repair's own connection and
+    /// writes ONE INFORMATION line whatever it found, so "nothing to do" differs from "never ran" (#3756). A
+    /// failure is one WARNING and stops nowhere else.
+    /// </summary>
+    private async Task RunDailyChildHoleRepairAsync(NpgsqlConnection connection, CancellationToken stoppingToken)
+    {
+        try
+        {
+            var summary = await TimescaleSupport.RepairDailyChildHolesAsync(connection, _logger, DateTime.UtcNow, stoppingToken);
+            _logger.LogInformation(
+                "Daily-child hole repair (#6070): {Scanned} daily-parented rollup(s) scanned, {Found} day(s) missing that the parent holds, {Refreshed} refreshed, {Failures} failure(s){More}, in {Seconds:F1} s",
+                summary.DailiesScanned, summary.DaysFound, summary.DaysRefreshed, summary.Failures,
+                summary.DaysRemaining ? " - more remain for the next start" : string.Empty, summary.Elapsed.TotalSeconds);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                "Daily-child hole repair (#6070) was cancelled before it could report - at shutdown that is expected, and the next start scans again.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "Daily-child hole repair (#6070) could not run - the next start scans again: {ExceptionType}",
+                ex.GetType().Name);
         }
     }
 
@@ -5542,6 +6018,22 @@ LIMIT 1";
         Math.Max(1, Math.Min(StoreConfigProvider.ClampConcurrentSweeps(sweepWidth), DailyRunPoolReserve / 2));
 
     /// <summary>
+    /// #5642: how many servers the engine's alert reads (and the pileup finding) run at once. The self-alert step and the
+    /// engine pass are two single-flight passes that can overlap when an engine pass outlasts a cadence, so they split
+    /// the <see cref="SelfAlertPassWidthFor"/> budget instead of each taking all of it: the engine pass takes half
+    /// (at least one), <see cref="SelfAlertStepWidthFor"/> takes the rest. At the widest setting that is 2 and 2 of the
+    /// 4 the pool's alert share allows, so the web viewer's and the MCP tools' half of the reserve stays free. The one
+    /// exception is a sweep width of 1: the budget is 1, both widths floor to 1, and the two passes hold 2 connections.
+    /// </summary>
+    internal static int AlertEnginePassWidthFor(int sweepWidth) =>
+        Math.Max(1, SelfAlertPassWidthFor(sweepWidth) / 2);
+
+    /// <summary>#5642: how many servers the self-alert step (Collection Stopped and its siblings, the custom rules) runs
+    /// at once: what <see cref="AlertEnginePassWidthFor"/> leaves of the <see cref="SelfAlertPassWidthFor"/> budget.</summary>
+    internal static int SelfAlertStepWidthFor(int sweepWidth) =>
+        Math.Max(1, SelfAlertPassWidthFor(sweepWidth) - AlertEnginePassWidthFor(sweepWidth));
+
+    /// <summary>
     /// #4999: the largest number of connections the store's data source will hold open, read from the connection
     /// string the data source was built with, so it is the operator's <c>Maximum Pool Size</c> and not the managed
     /// default. A string that names none gets Npgsql's own default (100). Null when the data source is null or
@@ -5793,6 +6285,21 @@ LIMIT 1";
     }
 
     /// <summary>
+    /// #5985: the shutdown drain's query-tag step. Waits (briefly) for the map pass in flight, which on the stop's cancellation
+    /// puts back the sightings its own flush had taken, and then flushes the buffer once more under its own time limit
+    /// (<see cref="QueryTagSightingBuffer.ShutdownFlushLimit"/>), because the service's token is already cancelled. Never throws.
+    /// </summary>
+    internal static async Task DrainQueryTagSightingsAsync(Task? mapPass, QueryTagSightingBuffer sightings)
+    {
+        if (mapPass is { IsCompleted: false })
+        {
+            await Task.WhenAny(mapPass, Task.Delay(QueryTagSightingBuffer.ShutdownFlushLimit, CancellationToken.None));
+        }
+
+        await sightings.FlushOnShutdownAsync(QueryTagSightingBuffer.ShutdownFlushLimit);
+    }
+
+    /// <summary>
     /// The shutdown wait for the work that is still going when the sweep loop ends (#1553): the per-server bodies and
     /// the store ticks the caller collected (<paramref name="inFlight"/>) and, since #4938, the detached daily runs,
     /// which used to run inside those bodies and so inside this wait, and, since #4999, the three collectors that
@@ -5907,6 +6414,13 @@ LIMIT 1";
     /// </summary>
     internal static bool IsPlanCorrectionCollector(string collectorName) =>
         string.Equals(collectorName, PlanCorrectionCollector.Instance.Name, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>#5640 (H2): the permission fault the attention run records as PERMISSIONS, or null for any other collector and when the ensure was not denied.</summary>
+    internal static string? AttentionPermissionFaultFor(string collectorName, ServerLoopState server) =>
+        IsAttentionCollector(collectorName) ? server.AttentionXePermissionFault : null;
+
+    internal static bool IsAttentionCollector(string collectorName) =>
+        string.Equals(collectorName, AttentionCollector.Instance.Name, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// #3754: whether a dispatched collector name is <c>long_query_completions</c> — the one collector whose
@@ -6073,7 +6587,7 @@ LIMIT 1";
     /// forever, and made test_hypothetical_index (#2612) unable to resolve a statement on the one platform
     /// it can be tested against.</para>
     /// </summary>
-    private static async Task<(List<long> QueryIds, List<string> Texts)> ReadPgStatementTextAsync(
+    internal static async Task<(List<long> QueryIds, List<string> Texts)> ReadPgStatementTextAsync(
         ServerRuntime runtime, CancellationToken cancellationToken)
     {
         var queryIds = new List<long>();
@@ -6091,10 +6605,23 @@ LIMIT 1";
            occurrence of a queryid is the row the SQL already chose. */
         var seen = new HashSet<long>();
 
-        await using var connection = new Npgsql.NpgsqlConnection(runtime.ConnectionString);
+        await using var connection = PostgresTargetProvider.CreatePinnedConnection(runtime.ConnectionString);
         await connection.OpenAsync(cancellationToken);
+
+        /* #6143: the view and the Aurora function are named by the schema read on this connection, as the collectors
+           name them, never by public. */
+        var schemas = new CollectorContext
+        {
+            ServerId = runtime.ServerId,
+            ServerName = runtime.Config.DisplayName,
+            CollectionTime = DateTime.UtcNow,
+            Deltas = new CollectorDeltaCalculator(),
+            Target = runtime.Target,
+        };
+        await DarlingCollectorRunner.ResolvePgExtensionSchemasAsync(
+            schemas, PgStatementStatsCollector.Instance, connection, logger: null, cancellationToken);
         await using var command = new Npgsql.NpgsqlCommand(
-            PgStatementText.FetchSqlFor(runtime.Target.IsAurora, runtime.Target.PostgresMajorVersion),
+            PgStatementText.FetchSqlFor(runtime.Target.IsAurora, runtime.Target.PostgresMajorVersion, schemas),
             connection) { CommandTimeout = PgStatementText.FetchCommandTimeoutSeconds };
         command.Parameters.AddWithValue(PgStatementTextRowCap);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -6184,6 +6711,169 @@ LIMIT 1";
     }
 
     /// <summary>
+    /// #5632 Phase A (ruling R4): every <see cref="s_investigationSweepInterval"/>, <see cref="InvestigationRequestStore.SweepAsync"/>
+    /// expires lapsed leases and old requests, through the shared <see cref="InvestigationDispatchCore.SweepOnceAsync"/> (#5820). It honors the service pause as the external alert loop does, and a failed
+    /// pass is logged and tried again next tick.
+    /// </summary>
+    private async Task RunInvestigationSweepLoopAsync(InvestigationRequestStore store,
+        PerformanceMonitor.Darling.Service.Investigations.InvestigationEventDelivery events,
+        PerformanceMonitor.Darling.Service.Investigations.DarlingDeadlockRollup deadlockRollup,
+        PerformanceMonitor.Darling.Service.ChangeWatch.ChangeWatchPass changeWatchPass, CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            if (ShouldRunCollection(_paused))
+            {
+                /* #6234: its own try, like the passes below. */
+                try
+                {
+                    await changeWatchPass.RunOnceAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Change watch pass failed; it is tried again next pass");
+                }
+
+                /* #6005: the deadlock digest, once per 4-hour bucket; its own try, like the two below. */
+                try
+                {
+                    await deadlockRollup.RunDigestAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Deadlock digest failed; it is tried again next pass");
+                }
+
+                try
+                {
+                    await InvestigationDispatchCore.SweepOnceAsync(store, _logger, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Investigation sweep failed; it is tried again next pass");
+                }
+
+                /* #6003: its own try, so a failed sweep still delivers what is already journaled, and the reverse. */
+                try
+                {
+                    await events.RunOnceAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Investigation event delivery failed; it is tried again next pass");
+                }
+            }
+
+            try
+            {
+                await Task.Delay(s_investigationSweepInterval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// #6001: every <see cref="s_investigationEvidenceInterval"/>, the evidence capture freezes the evidence of the High CPU
+    /// requests that still need it, from the store's own rows. It honors the service pause as the sweep does, and a failed
+    /// pass is logged and tried again next tick.
+    /// </summary>
+    private async Task RunInvestigationEvidenceLoopAsync(
+        PerformanceMonitor.Darling.Service.Investigations.InvestigationEvidenceCapture capture, CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            if (ShouldRunCollection(_paused))
+            {
+                try
+                {
+                    await capture.CaptureOnceAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Investigation evidence capture failed; it is tried again next pass");
+                }
+            }
+
+            try
+            {
+                await Task.Delay(s_investigationEvidenceInterval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// #5654: the external alert drain's loop, one pass every <see cref="s_externalAlertInterval"/> on its own task, beside
+    /// the command loop. While the service is paused a tick does nothing at all (no expiry, no reap, no claim, no send), the
+    /// same as every other alert family; rows that waited out a pause expire on the first pass after the resume. With the
+    /// master switch off a pass still expires and reaps but claims and sends nothing (the switch is read inside the drain).
+    /// A failed pass is logged and tried again on the next tick; only cancellation ends the loop.
+    /// </summary>
+    private async Task RunExternalAlertLoopAsync(ExternalAlertDrain drain, CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            if (ShouldRunCollection(_paused))
+            {
+                try
+                {
+                    var pass = await drain.RunPassAsync(stoppingToken);
+                    if (pass.Claimed > 0 || pass.Expired > 0)
+                    {
+                        _logger.LogInformation(
+                            "External alerts: claimed {Claimed} (delivered {Delivered}, muted {Muted}, no channel {NoChannel}, retry {Retried}, failed {Failed}, ignored {Ignored}, interrupted {Interrupted}), expired {Expired}",
+                            pass.Claimed, pass.Delivered, pass.Muted, pass.NoChannel,
+                            pass.Retried, pass.Failed, pass.Ignored, pass.Interrupted, pass.Expired);
+                    }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "External alert pass failed; it is tried again next pass");
+                }
+            }
+
+            try
+            {
+                await Task.Delay(s_externalAlertInterval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
     /// Applies a control-plane reload at a SAFE point (top of a sweep, never mid-collection): re-reads the
     /// store, hot-swaps the held config's alert/SMTP/webhook/capture/analysis settings IN PLACE (the
     /// by-reference DarlingAlertSettings seam + the runner's capture provider reflect it immediately),
@@ -6219,6 +6909,8 @@ LIMIT 1";
         }
 
         StoreConfigProvider.ApplyToConfig(config, view);
+        _collectorState.SigningStatus.Publish(config.Webhooks, config.NotificationRoutes, DateTime.UtcNow); // #5998: presence and dates for the web page, no key text
+        DarlingSmtpWarning.Log(config.Smtp, _logger); // the reloaded SMTP settings, same warning as at start
         /* #1560/#1562: the MCP + web host supervisors pick these up within their poll interval — the viewer's
            Settings toggles round-trip to a live start/stop/rebind with no service restart. */
         _mcpState.Publish(config.Mcp.Enabled, config.Mcp.Port);
@@ -6249,6 +6941,7 @@ LIMIT 1";
         /* #2298: re-publish the server set on every reload, so a server added through add_servers or the
            Viewer reaches the MCP host's plan-fetch resolver on its next resolution — no MCP restart. */
         _registryState.Publish(view.EnabledServers);
+        PerformanceMonitor.Darling.Analysis.PgFactCollector.PlanRegressionCandidateCache.Shared.RetainServers(view.EnabledServers.Select(s => s.ServerId));
         _scheduleOverrides = view.ScheduleOverrides;
         /* Stage 2: honor a pause/resume issued through the store (config_service.paused) — the collection
            loop reads this on its next tick. Single writer (this reload), so no interlock needed. */
@@ -6281,6 +6974,7 @@ LIMIT 1";
         await DarlingObservability.SyncServerEnabledStatesAsync(_postgres!, _logger, cancellationToken);
 
         await LoadMuteRulesAsync(muteRuleService);
+        await LoadThresholdOverridesAsync();
 
         /* view.ConfigVersion rather than _lastConfigVersion: the caller has not advanced the watermark yet
            (it advances from this method's RETURN value), so the field still holds the PREVIOUS version
@@ -6365,6 +7059,33 @@ LIMIT 1";
     }
 
     /// <summary>
+    /// Reloads the threshold overrides (#5916). A failed read keeps the overrides already in force and is counted, as the
+    /// mute-rule reload is, so a store blip never drops a tuned threshold back to the global one.
+    /// </summary>
+    private async Task LoadThresholdOverridesAsync()
+    {
+        var postgres = _postgres;
+        if (postgres is null)
+        {
+            return;
+        }
+
+        var readClock = Stopwatch.StartNew();
+        try
+        {
+            await _thresholdOverrides.LoadAsync(postgres);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "Could not reload threshold overrides after {ElapsedMs} ms - the {Overrides} override(s) already in force "
+                + "stay in force until a read succeeds: {Message}",
+                readClock.ElapsedMilliseconds, _thresholdOverrides.Count, ex.Message);
+            _readFailures.RecordReadFailure(null, "threshold-override reload", readClock.ElapsedMilliseconds);
+        }
+    }
+
+    /// <summary>
     /// Reconciles the live <see cref="ServerLoopState"/> set to the store's desired enabled set, keyed by the
     /// shared server_id. ADD: a new enabled server gets a disconnected state that connects on its next tick
     /// exactly like a startup server (via <see cref="TryConnectAsync"/> — no novel connection logic). REMOVE:
@@ -6393,6 +7114,7 @@ LIMIT 1";
                     "[{Server}] Removed from the monitored set (disabled/deleted) — stopping collection",
                     state.Config.DisplayName);
                 state.Runtime = null;
+                state.LastKnownRuntime = null;
                 /* Retired containment (#1553 D1): mark this state retired so any in-flight or gate-queued
                    fire-and-track body for it no-ops at its entry check (and its connect path bails before any
                    durable side-effect) instead of connecting / upserting / running XE DDL against a just-disabled
@@ -6434,9 +7156,11 @@ LIMIT 1";
                     "[{Server}] Definition changed — reconnecting with the new configuration; delta baselines forgotten, "
                     + "the first pass on the new connection re-baselines (#3653 A5)", desiredServer.DisplayName);
                 state.Runtime = null;
+                state.LastKnownRuntime = null;
                 state.NextConnectAttempt = DateTime.MinValue;
                 state.ConsecutiveConnectFailures = 0;
                 state.NextDue.Clear();
+                state.RefusedBackoff.Clear();
                 /* #3653 A5 (the adjacency #3540 A4 named and left): a same-id reconnect is a new epoch. The
                    fields ServerDefinitionEquals compares are the ones that decide WHICH instance the
                    connection reaches (host, port, engine, database, auth, intent, subnet failover) or WHAT it collects
@@ -6680,6 +7404,7 @@ LIMIT 1";
         && a.TrustServerCertificate == b.TrustServerCertificate
         && a.ReadOnlyIntent == b.ReadOnlyIntent
         && a.MultiSubnetFailover == b.MultiSubnetFailover
+        && !QueryStoreReplicaSetting.Differ(a.QueryStoreReplica, b.QueryStoreReplica)
         && a.Port == b.Port
         && a.TargetEngine == b.TargetEngine
         && a.AwsRoleKey == b.AwsRoleKey
@@ -6710,6 +7435,7 @@ LIMIT 1";
         if (ReferenceEquals(server.Runtime, runtime))
         {
             server.Runtime = null;
+            server.LastKnownRuntime = null;
         }
 
         server.NextConnectAttempt = DateTime.MinValue;
@@ -7145,7 +7871,8 @@ LIMIT 1";
     private AlertEngine BuildAlertEngine(
         DarlingConfig config, List<ServerLoopState> servers,
         DarlingAlertSettings alertSettings, PgAlertHistoryStore historyStore,
-        MuteRuleService muteRuleService, DarlingAlertDeliverer deliverer)
+        MuteRuleService muteRuleService, DarlingAlertDeliverer deliverer,
+        PerformanceMonitor.Darling.Service.Investigations.DarlingDeadlockRollup? deadlockRollup = null)
     {
         var postgres = _postgres!;
         var stateStore = new PgAlertStateStore(postgres, _logger);
@@ -7179,14 +7906,16 @@ LIMIT 1";
             stateStore,
             deliverer,
             muteRuleService.IsAlertMuted,
+            /* #5642: served from the cache the collection body fills, so the alert pass reads the store and nothing
+               else. The live read itself is FetchFailedJobsAsync, called by RefreshMsdbCacheAsync. */
             failedJobsFetcher: (serverKey, lookbackMinutes, ct) =>
-                FetchFailedJobsAsync(servers, serverKey, lookbackMinutes, ct),
+                Task.FromResult(ServeFailedJobsFromCache(servers, serverKey, lookbackMinutes)),
             /* #3497: the Long-Running Query card's Agent-job name lookup — the same live-msdb seam shape
                as the failed-jobs feed above, and the same degrade discipline: every failure is an empty
                map, so a denied or broken msdb read costs a card its job NAME and never the card. */
             agentJobStepResolver: (serverKey, keys, ct) =>
-                FetchAgentJobStepNamesAsync(servers, serverKey, keys, ct),
-            resolutionCallback: async (resolution, _) =>
+                Task.FromResult(ServeStepNamesFromCache(servers, serverKey, keys)),
+            resolutionCallback: async (resolution, token) =>
             {
                 /* #1681: same shared shape as the firing line the engine's funnel writes, so an engine
                    alert's TRIGGERED and RESOLVED halves pair up in the log. */
@@ -7194,29 +7923,40 @@ LIMIT 1";
                     AlertFiringLog.Resolved(resolution.ServerName, resolution.Title, resolution.Message));
                 /* Stage 4 parity-gap fix: record a resolved-flavored history row so an operator reviewing
                    alert history sees the paired "Detected" then "Cleared/Resolved" entries (the Dashboard
-                   records these explicitly; Darling previously only logged them). A resolution has no send
-                   channel, so this never emails/webhooks; RecordAlertAsync is failure-isolated so it can
-                   never break the sweep. */
-                await historyStore.RecordAlertAsync(DarlingSelfAlertEvaluator.BuildResolutionRecord(resolution));
+                   records these explicitly; Darling previously only logged them). #5825: the deliverer also sends the
+                   clear to the destinations its delivered fire reached when the store sends resolutions, and records
+                   the send on the row. A failed send is recorded, not thrown, and RecordAlertAsync is failure-isolated,
+                   so neither can break the sweep. */
+                await deliverer.DeliverResolutionAsync(resolution, cancellationToken: token);
             },
             logger: _logger,
+            /* #5715 part B: a Warning delivered before a restart still lets the Critical through at once. */
+            escalationSeedReader: EscalationSeed.ReaderFor(historyStore),
             /* #3013: the process counter every swallowed condition read is tallied on. Passed explicitly
                rather than defaulted inside the engine so a test constructs its own and cannot pollute it. */
-            readFailures: AlertReadFailureCounter.Shared);
+            readFailures: AlertReadFailureCounter.Shared,
+            /* #5916: a threshold held for one server or database. Lite passes none. */
+            overrides: _thresholdOverrides,
+            deadlockRollup: deadlockRollup);
     }
 
     /// <summary>
     /// Builds this sweep's <see cref="AlertServerSnapshot"/> and runs the engine for one
-    /// connected server. The CPU pair mirrors what Lite's overview summary carries (the latest
+    /// server with a runtime (#5642: the live one, else the last known one, so a dropped connection is still
+    /// evaluated from the store). The CPU pair mirrors what Lite's overview summary carries (the latest
     /// cpu_utilization_stats sample; total = SQL + other-process, null when no SQL sample);
-    /// isOnline is true by definition here (a connected runtime) and suppression is always false
+    /// isOnline is always passed true, which is NOT a statement that the server is connected: the only
+    /// consumer is the failed-jobs check, which reads the msdb cache and returns empty once the cache is
+    /// stale, so a dropped server yields no failed-jobs fire. Suppression is always false
     /// (headless — suppression is an engine INPUT owned by interactive hosts). Failure-isolated:
     /// a failed sweep logs and retries on the next cadence tick, mirroring the collector loop.
     /// </summary>
     private async Task EvaluateAlertsAsync(
         AlertEngine engine, ServerLoopState server, DarlingConfig config, CancellationToken cancellationToken)
     {
-        var runtime = server.Runtime;
+        /* #5642: the live runtime, else the last known one, so a server whose connection dropped is still evaluated from
+           the store. Null only for a server that never connected or was removed. */
+        var runtime = server.AlertRuntime;
         if (runtime is null)
         {
             return;
@@ -7243,11 +7983,20 @@ LIMIT 1";
         double? sqlCpu = null;
         double? totalCpu = null;
         DateTime? cpuSampleTime = null;
+        DateTime? cpuSampleUtcOnly = null;
+        IReadOnlyList<AlertCpuSample>? recentCpuSamples = null;
 
         var cpuReadClock = Stopwatch.StartNew();
         try
         {
-            (sqlCpu, totalCpu, cpuSampleTime) = await ReadLatestCpuAsync(runtime.ServerId, cancellationToken);
+            (sqlCpu, totalCpu, cpuSampleTime, cpuSampleUtcOnly) = await ReadLatestCpuAsync(runtime.ServerId, cancellationToken);
+
+            /* #5642: the recent samples (15 minutes, at most 32, oldest first) the engine feeds through the persistence
+               gate one by one. Inside this same counted block on purpose: it is one more read of the same pass step, so a
+               failure of either costs this tick its CPU alert and nothing else, and counts once under the latest-CPU name.
+               The clock restarts so a fault here records this read's elapsed, not the first read's too. */
+            cpuReadClock.Restart();
+            recentCpuSamples = await ReadRecentCpuSamplesAsync(runtime.ServerId, DateTime.UtcNow, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -7267,6 +8016,7 @@ LIMIT 1";
             var snapshot = new AlertServerSnapshot(
                 runtime.ServerId.ToString(CultureInfo.InvariantCulture),
                 runtime.Config.DisplayName,
+                /* Not "connected" (#5642): see the method summary. Gates only the cache-backed failed-jobs check. */
                 IsOnline: true,
                 SqlCpuPercent: sqlCpu,
                 TotalCpuPercent: totalCpu,
@@ -7287,6 +8037,11 @@ LIMIT 1";
                     LiveAlertTargets(_registryState.Read()?.Servers)))
             {
                 ServerId = runtime.ServerId,
+                /* #5642: the true UTC instant of the latest sample (null on a pre-V134 row), the recent samples, and when
+                   this connection began collecting. */
+                CpuSampleUtcOnly = cpuSampleUtcOnly,
+                RecentCpuSamples = recentCpuSamples,
+                WatchingSinceUtc = server.WatchingSinceUtc,
                 /* F14: the display name is not unique (a blank name falls back to the host, and two registrations
                    can be typed alike), so the dedup keys collided; the fingerprint adds the store id for
                    exactly the names another registration also carries. */
@@ -7318,6 +8073,26 @@ LIMIT 1";
                 "shared engine sweep", sweepReadClock.ElapsedMilliseconds);
         }
     }
+
+    /// <summary>
+    /// The collection time of the row a Tier 0 finding was judged on (#5642): the finding's own database row for
+    /// wraparound, its own slot row for slot retention, the winning row for the vacuum horizon. Null when the read
+    /// carried none, which gives no age line.
+    /// </summary>
+    internal static DateTime? Tier0NewestSample(
+        PostgresAlertEvaluator.Finding finding,
+        IReadOnlyList<PostgresWraparoundAlertInfo>? wraparound,
+        PostgresXminHorizonAlertInfo? xmin,
+        IReadOnlyList<PostgresSlotAlertInfo>? slots) =>
+        finding.MetricName switch
+        {
+            PostgresAlertEvaluator.WraparoundMetric =>
+                wraparound?.FirstOrDefault(w => string.Equals(w.DatabaseName, finding.Subject, StringComparison.Ordinal))?.NewestSampleUtc,
+            PostgresAlertEvaluator.XminHorizonMetric => xmin?.NewestSampleUtc,
+            PostgresAlertEvaluator.SlotRetentionMetric =>
+                slots?.FirstOrDefault(sl => string.Equals(sl.SlotName, finding.Subject, StringComparison.Ordinal))?.NewestSampleUtc,
+            _ => null,
+        };
 
     /// <summary>
     /// Runs after a PostgreSQL family's fire (#4795), the twin of <c>AlertEngine.AfterFire</c> (#4752) for the
@@ -7521,13 +8296,19 @@ LIMIT 1";
                            silently suppressed for the whole cooldown window. The DedupKey is identity only —
                            no ages or byte counts — so a recurrence of the SAME subject collapses while a
                            different subject does not. */
-                        Context: new AlertContext
-                        {
-                            Incidents = new List<AlertIncident>
+                        Context: AlertSampleAge.Stamp(
+                            new AlertContext
                             {
-                                new(finding.Subject, new[] { finding.Subject }),
+                                Incidents = new List<AlertIncident>
+                                {
+                                    new(finding.Subject, new[] { finding.Subject }),
+                                },
                             },
-                        },
+                            /* #5642, ruling 6: the age of the row this finding was judged on, counted once at fire
+                               time. Wraparound and slot findings are keyed by their own subject (database, slot);
+                               the horizon finding comes from the one winning row. */
+                            "collection",
+                            Tier0NewestSample(finding, wraparound, xmin, slots), now),
                         DetailText: null,
                         finding.NumericCurrentValue,
                         finding.NumericThresholdValue,
@@ -7885,7 +8666,7 @@ LIMIT 1";
                         metricName,
                         $"{lastCapacityPercent!.Value:F0}%",
                         $"{alertSettings.CpuThresholdPercent}%",
-                        Context: null,
+                        Context: AlertSampleAge.Stamp(null, "CPU", reading.SampleTimeUtc, now),
                         /* Both figures, each labelled with what it is a fraction OF — the whole defect
                            #3281 names is a reader taking one for the other. The sustained-for line is
                            #3282's: without it a reader cannot tell this from the single-sample alert that
@@ -8011,7 +8792,8 @@ LIMIT 1";
             /* #3444: read ONCE, then handed to the gate and the delivered message alike, so the two cannot
                quote different numbers when a store reload swaps config.Alerts mid-evaluation. The rate tiers
                the fire is GRADED on (#3653, below) are read at the same spot for the same reason. */
-            var threshold = alertSettings.PgDeadlockCountThreshold;
+            var threshold = _thresholdOverrides.ResolveWire(
+                DarlingThresholdKeys.PgDeadlockCount, snapshot.ServerKey, null, alertSettings.PgDeadlockCountThreshold);
             var rateTiers = alertSettings.DeadlockRateThresholds;
 
             var decision = RollingCountAlertGate.Evaluate(
@@ -8079,10 +8861,12 @@ LIMIT 1";
                         metricName,
                         count.ToString(CultureInfo.InvariantCulture),
                         threshold.ToString(CultureInfo.InvariantCulture),
-                        Context: new AlertContext
-                        {
-                            Incidents = rows.Select(BuildPgDeadlockIncident).ToList(),
-                        },
+                        Context: AlertSampleAge.Stamp(
+                            new AlertContext
+                            {
+                                Incidents = rows.Select(BuildPgDeadlockIncident).ToList(),
+                            },
+                            "deadlock", AlertSampleAge.Newest(rows.Select(r => r.OccurredAtUtc)), now),
                         DetailText: null,
                         NumericCurrentValue: count,
                         NumericThresholdValue: threshold,
@@ -8218,7 +9002,8 @@ LIMIT 1";
             var cooldownElapsed = !LastFiredStamp.TryGet(_lastPgBlockingAlert, key, now, out var last) || now - last >= cooldown;
 
             /* #3444: read ONCE, for the reason EvaluatePgDeadlocksAsync gives at the same spot. */
-            var threshold = alertSettings.PgBlockingCountThreshold;
+            var threshold = _thresholdOverrides.ResolveWire(
+                DarlingThresholdKeys.PgBlockingCount, snapshot.ServerKey, null, alertSettings.PgBlockingCountThreshold);
 
             var decision = RollingCountAlertGate.Evaluate(
                 count, threshold, watermark, cooldownElapsed, suppressed: false);
@@ -8255,10 +9040,12 @@ LIMIT 1";
                         metricName,
                         count.ToString(CultureInfo.InvariantCulture),
                         threshold.ToString(CultureInfo.InvariantCulture),
-                        Context: new AlertContext
-                        {
-                            Incidents = worstPerRoot.Select(BuildPgBlockingIncident).ToList(),
-                        },
+                        Context: AlertSampleAge.Stamp(
+                            new AlertContext
+                            {
+                                Incidents = worstPerRoot.Select(BuildPgBlockingIncident).ToList(),
+                            },
+                            "blocking capture", AlertSampleAge.Newest(worstPerRoot.Select(r => r.CapturedAt)), now),
                         DetailText: null,
                         NumericCurrentValue: count,
                         NumericThresholdValue: threshold,
@@ -8479,17 +9266,21 @@ LIMIT 1";
                         metricName,
                         $"{rows.Count} query(s), longest {elapsedMinutes}m",
                         $"{thresholdMinutes}m",
-                        Context: new AlertContext
-                        {
-                            Incidents = rows.Select(BuildPgLongRunningQueryIncident).ToList(),
-                            /* #3743: the knob's receipt, the SQL Server twin's item verbatim (same builder, same
-                               labels) and under the same rule — only when the knob is SET; a cleared knob has no
-                               footnote. #3742: the database list's receipt beside it, the twin's second item, only
-                               when the list is SET. See the method summary. */
-                            Details = BuildPgLongRunningQueryExclusionDetails(
-                                exclusions, read.ExcludedByProgramPrefix, read.ExcludedByLogin,
-                                alertSettings.ExcludedDatabases, read.ExcludedByDatabase),
-                        },
+                        Context: AlertSampleAge.Stamp(
+                            new AlertContext
+                            {
+                                Incidents = rows.Select(BuildPgLongRunningQueryIncident).ToList(),
+                                /* #3743: the knob's receipt, the SQL Server twin's item verbatim (same builder, same
+                                   labels) and under the same rule — only when the knob is SET; a cleared knob has no
+                                   footnote. #3742: the database list's receipt beside it, the twin's second item, only
+                                   when the list is SET. See the method summary. */
+                                Details = BuildPgLongRunningQueryExclusionDetails(
+                                    exclusions, read.ExcludedByProgramPrefix, read.ExcludedByLogin,
+                                    alertSettings.ExcludedDatabases, read.ExcludedByDatabase),
+                            },
+                            /* #5642, ruling 6: the capture these rows were read from, counted once at fire time. The
+                               same label the SQL Server twin uses for its snapshot. */
+                            "query snapshot", AlertSampleAge.Newest(rows.Select(r => r.NewestSampleUtc ?? default)), now),
                         DetailText: null,
                         NumericCurrentValue: elapsedMinutes,
                         NumericThresholdValue: thresholdMinutes,
@@ -8735,8 +9526,9 @@ LIMIT 1";
                         finding.ThresholdValue,
                         /* The subject as the #1140 incident fingerprint, identity only — same shape and
                            reasoning as the Tier 0 delivery loop above. */
-                        Context: new AlertContext
-                        {
+                        Context: AlertSampleAge.Stamp(
+                            new AlertContext
+                            {
                             Incidents = new List<AlertIncident>
                             {
                                 new(finding.Subject, new[] { finding.CurrentValue }),
@@ -8745,7 +9537,10 @@ LIMIT 1";
                                below already keys on (WaitType = finding.Subject) — an alert-notebook reader
                                can branch on it without parsing the subject back out of the incident. */
                             WaitType = finding.Subject,
-                        },
+                            },
+                            "wait stats",
+                            newestCollectionBySubject.TryGetValue(finding.Subject, out var newestWaitCollection) ? newestWaitCollection : null,
+                            now),
                         DetailText: null,
                         finding.NumericCurrentValue,
                         finding.NumericThresholdValue,
@@ -8828,9 +9623,8 @@ LIMIT 1";
     /// Writes a Postgres Deadlocks/Blocking resolution the same way <see cref="BuildAlertEngine"/>'s
     /// <c>resolutionCallback</c> does for the SQL Server families: a log line via
     /// <see cref="AlertFiringLog.Resolved"/> and a history row via
-    /// <see cref="DarlingSelfAlertEvaluator.BuildResolutionRecord"/> — never through
-    /// <see cref="_alertDeliverer"/>, because a resolution has no send channel
-    /// (<see cref="AlertResolution"/>'s own doc comment). Best-effort: a history-write failure here must
+    /// <see cref="DarlingSelfAlertEvaluator.BuildResolutionRecord"/>, written by <see cref="_alertDeliverer"/>'s
+    /// resolution send (#5825), which also posts the clear where the delivered fire went when the store sends resolutions. Best-effort: a history-write failure here must
     /// not be allowed to look like the alert itself failed, since the condition genuinely did clear.
     /// </summary>
     private async Task NotifyPgResolutionAsync(
@@ -8849,8 +9643,16 @@ LIMIT 1";
 
         try
         {
-            await _historyStore.RecordAlertAsync(DarlingSelfAlertEvaluator.BuildResolutionRecord(
-                new AlertResolution(serverKey, serverName, metricName, title, message)));
+            var resolution = new AlertResolution(serverKey, serverName, metricName, title, message);
+            /* #5825: through the deliverer, so a delivered fire's clear goes where the fire went. */
+            if (_alertDeliverer is not null)
+            {
+                await _alertDeliverer.DeliverResolutionAsync(resolution);
+            }
+            else
+            {
+                await _historyStore.RecordAlertAsync(DarlingSelfAlertEvaluator.BuildResolutionRecord(resolution));
+            }
         }
         catch (Exception ex)
         {
@@ -9057,7 +9859,7 @@ LIMIT 1";
     /// ServerSummaryItem.TotalCpuPercent derivation (:140-141): total = SQL + (other ?? 0),
     /// null when there is no SQL sample (Azure SQL DB stores other as 0; Linux stores NULL).
     /// </summary>
-    private Task<(double? SqlCpu, double? TotalCpu, DateTime? SampleTime)> ReadLatestCpuAsync(
+    private Task<(double? SqlCpu, double? TotalCpu, DateTime? SampleTime, DateTime? SampleUtcOnly)> ReadLatestCpuAsync(
         int serverId, CancellationToken cancellationToken)
         /* #3854: the seventh read on the alert pass, and the only one of the seven that lives outside the
            self-alert evaluator — routed through the SAME shared seam for the same reason. It runs on
@@ -9080,11 +9882,12 @@ LIMIT 1";
     internal const string LatestCpuReadName = "latest-CPU read";
 
     /// <summary>The read itself, byte-identical to what shipped before #3854 routed it through the seam.</summary>
-    private async Task<(double? SqlCpu, double? TotalCpu, DateTime? SampleTime)> ReadLatestCpuCoreAsync(int serverId, CancellationToken cancellationToken)
+    private async Task<(double? SqlCpu, double? TotalCpu, DateTime? SampleTime, DateTime? SampleUtcOnly)> ReadLatestCpuCoreAsync(int serverId, CancellationToken cancellationToken)
     {
         double? sqlCpu = null;
         double? otherCpu = null;
         DateTime? sampleTime = null;
+        DateTime? sampleUtcOnly = null;
 
         await using var connection = await _postgres!.OpenConnectionAsync(cancellationToken);
         using var command = new NpgsqlCommand(
@@ -9108,10 +9911,74 @@ LIMIT 1";
             var sampleTimeUtc = reader.IsDBNull(3) ? (DateTime?)null : reader.GetDateTime(3);
             var sampleTimeLocal = reader.IsDBNull(2) ? (DateTime?)null : reader.GetDateTime(2);
             sampleTime = sampleTimeUtc ?? sampleTimeLocal;
+            /* #5642: only a TRUE UTC instant can give an age; the local fallback above cannot. */
+            sampleUtcOnly = sampleTimeUtc;
         }
 
         double? totalCpu = sqlCpu.HasValue ? sqlCpu.Value + (otherCpu ?? 0) : null;
-        return (sqlCpu, totalCpu, sampleTime);
+        return (sqlCpu, totalCpu, sampleTime, sampleUtcOnly);
+    }
+
+    /// <summary>The counter's name for the recent-samples read (#5642), beside <see cref="LatestCpuReadName"/>.</summary>
+    internal const string RecentCpuReadName = "recent-CPU read";
+
+    /// <summary>How far back the recent-samples read looks (#5642): the PostgreSQL check's window.</summary>
+    internal static readonly TimeSpan RecentCpuLookback = TimeSpan.FromMinutes(15);
+
+    /// <summary>At most this many recent samples (#5642): the PostgreSQL check's batch bound
+    /// (<c>DarlingPgCpuUtilizationReader.GateBatchLimit</c>).</summary>
+    internal const int RecentCpuSampleLimit = 32;
+
+    /// <summary>
+    /// The CPU samples the engine's persistence gate sees one by one (#5642): the newest 32 rows collected in the last
+    /// 15 minutes that carry a true <c>sample_time_utc</c>. The window rides <c>collection_time</c> (the reliable
+    /// clock, a naive-UTC bound so the store session's TimeZone cannot re-frame it), newest first so the LIMIT keeps the
+    /// newest; the read returns them oldest first. A per-server index descent, never <c>DISTINCT ON</c> (measured more
+    /// than 30 times slower than the per-server <c>LIMIT 1</c>).
+    /// </summary>
+    internal const string RecentCpuSamplesSql = @"
+SELECT sample_time_utc, sqlserver_cpu_utilization, other_process_cpu_utilization
+FROM cpu_utilization_stats
+WHERE server_id = $1
+  AND collection_time >= $2
+  AND sample_time_utc IS NOT NULL
+ORDER BY collection_time DESC, sample_time DESC
+LIMIT $3";
+
+    internal Task<IReadOnlyList<AlertCpuSample>> ReadRecentCpuSamplesAsync(
+        int serverId, DateTime nowUtc, CancellationToken cancellationToken)
+        => DarlingAlertReadAdapter.ExecuteWithOneRetryAsync(
+            token => ReadRecentCpuSamplesCoreAsync(serverId, nowUtc, token),
+            serverId.ToString(CultureInfo.InvariantCulture),
+            RecentCpuReadName,
+            _readFailures,
+            Task.Delay,
+            cancellationToken);
+
+    private async Task<IReadOnlyList<AlertCpuSample>> ReadRecentCpuSamplesCoreAsync(
+        int serverId, DateTime nowUtc, CancellationToken cancellationToken)
+    {
+        var samples = new List<AlertCpuSample>();
+
+        await using var connection = await _postgres!.OpenConnectionAsync(cancellationToken);
+        using var command = new NpgsqlCommand(
+            RecentCpuSamplesSql, connection) { CommandTimeout = DarlingAlertReadAdapter.AlertPassCommandTimeoutSeconds };
+        command.Parameters.AddWithValue(serverId);
+        command.Parameters.AddWithValue(DateTime.SpecifyKind(nowUtc - RecentCpuLookback, DateTimeKind.Unspecified));
+        command.Parameters.AddWithValue(RecentCpuSampleLimit);
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var sqlCpu = reader.IsDBNull(1) ? (double?)null : Convert.ToDouble(reader.GetValue(1), CultureInfo.InvariantCulture);
+            var otherCpu = reader.IsDBNull(2) ? (double?)null : Convert.ToDouble(reader.GetValue(2), CultureInfo.InvariantCulture);
+            double? totalCpu = sqlCpu.HasValue ? sqlCpu.Value + (otherCpu ?? 0) : null;
+            samples.Add(new AlertCpuSample(reader.GetDateTime(0), sqlCpu, totalCpu));
+        }
+
+        /* Newest first out of the store (so the LIMIT keeps the newest); the engine wants them oldest first. */
+        samples.Reverse();
+        return samples;
     }
 
     /// <summary>
@@ -9127,7 +9994,7 @@ LIMIT 1";
     /// </summary>
     private async Task EvaluateStoreDiskPressureAsync(DarlingConfig config, CancellationToken cancellationToken)
     {
-        long? storeSizeBytes = await ReadStoreSizeBytesAsync(cancellationToken);
+        var (storeSizeBytes, storeSizeEstimated) = await ReadStoreSizeBytesAsync(cancellationToken);
 
         long? freeBytes = null;
         long? totalBytes = null;
@@ -9151,7 +10018,7 @@ LIMIT 1";
            Matches() in the pre-deliver mute check — is isolated inside the evaluator, exactly like the
            per-server EvaluateStoreAlertsAsync. This sweep-loop body has no catch-all of its own, so an
            un-isolated throw here would stop collection for the whole fleet. */
-        await _selfAlerts!.EvaluateDiskPressureAsync(freeBytes, totalBytes, storeSizeBytes, cancellationToken);
+        await _selfAlerts!.EvaluateDiskPressureAsync(freeBytes, totalBytes, storeSizeBytes, cancellationToken, storeSizeEstimated);
     }
 
     /// <summary>
@@ -9258,6 +10125,32 @@ LIMIT 1";
     }
 
     /// <summary>
+    /// #5654: reads the count of external alert rows the drain gave up on in the last
+    /// <see cref="DarlingSelfAlertEvaluator.ExternalAlertsWindow"/> and hands it to
+    /// <see cref="DarlingSelfAlertEvaluator.EvaluateExternalAlertsAsync"/>. A failed read is counted on #3013's swallowed-read
+    /// counter and sends no report, so the standing alert is held, never resolved on uncertainty.
+    /// </summary>
+    private async Task EvaluateExternalAlertsAsync(ExternalAlertStore store, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<ExternalAlertUndeliveredCount> counts;
+        var readClock = Stopwatch.StartNew();
+        try
+        {
+            counts = await store.CountUndeliveredAsync(DarlingSelfAlertEvaluator.ExternalAlertsWindow, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "External alert self-alert: could not count undelivered rows after {ElapsedMs} ms - the standing alert is held this tick: {Message}",
+                readClock.ElapsedMilliseconds, ex.Message);
+            _readFailures.RecordReadFailure(null, "external alert self-alert (undelivered count)", readClock.ElapsedMilliseconds);
+            return;
+        }
+
+        await _selfAlerts!.EvaluateExternalAlertsAsync(new DarlingSelfAlertEvaluator.ExternalAlertsReport(counts), cancellationToken);
+    }
+
+    /// <summary>
     /// #3305: the fleet-level custom-alert-state reconcile. Force-resolves and cleans the persisted state of
     /// DISABLED rules (whose open incidents the evaluator's enabled-only sweep would otherwise orphan forever)
     /// and of servers that have left a rule's scope. Deleted rules are handled on the delete path instead
@@ -9278,8 +10171,10 @@ LIMIT 1";
     /// <summary>
     /// The store database's on-disk size in bytes — context for the disk-pressure alert text, read from the
     /// whole-store row the hourly self-metrics sweep records
-    /// (<see cref="StoreSelfMetrics.LatestStoreSizeSql"/>). Failure-isolated to null (Debug) so a transient
-    /// store hiccup never breaks the disk-pressure check.
+    /// (<see cref="StoreSelfMetrics.LatestStoreSizeWithTimeSql"/>, the same predicate and ordering as
+    /// <see cref="StoreSelfMetrics.LatestStoreSizeSql"/>). #6245: the same row's <c>size_estimated</c> comes back with
+    /// the size, in the one statement, so the alert text can say when the figure is the hourly catalog estimate.
+    /// Failure-isolated to null (Debug) so a transient store hiccup never breaks the disk-pressure check.
     ///
     /// <para><b>Why this is not <c>pg_database_size_stats</c> (#3199).</b> This method is one of the ten commands
     /// awaited inline on the collection loop's serial thread, under
@@ -9317,14 +10212,20 @@ LIMIT 1";
     /// on this path (3,177 ms against 0.101 ms cold, same store) and is never the change's overall
     /// effect.</para>
     /// </summary>
-    private async Task<long?> ReadStoreSizeBytesAsync(CancellationToken cancellationToken)
+    internal async Task<(long? Bytes, bool Estimated)> ReadStoreSizeBytesAsync(CancellationToken cancellationToken)
     {
         try
         {
             await using var connection = await _postgres!.OpenConnectionAsync(cancellationToken);
-            using var command = new NpgsqlCommand(StoreSelfMetrics.LatestStoreSizeSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
-            var result = await command.ExecuteScalarAsync(cancellationToken);
-            return result is null || result == DBNull.Value ? null : Convert.ToInt64(result, CultureInfo.InvariantCulture);
+            using var command = new NpgsqlCommand(StoreSelfMetrics.LatestStoreSizeWithTimeSql, connection) { CommandTimeout = ServiceCommandDeadlines.SerialLoopSeconds };
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken) || reader.IsDBNull(0))
+            {
+                return (null, false);
+            }
+
+            /* size_estimated is NULL on a row from before the column: that figure is not marked, so it reads as exact. */
+            return (reader.GetInt64(0), !reader.IsDBNull(2) && reader.GetBoolean(2));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -9332,7 +10233,7 @@ LIMIT 1";
                evidence the alert is judged on - that is freeBytes/totalBytes above. Losing it costs the message a
                number; it does not make the condition unjudgeable. */
             _logger.LogDebug("Store disk-pressure check: could not read the recorded store size: {Message}", ex.Message);
-            return null;
+            return (null, false);
         }
     }
 
@@ -9661,6 +10562,69 @@ LIMIT 1";
     }
 
     /// <summary>
+    /// The hourly retry of a managed store's role provisioning that failed at start (fleet-level, on the
+    /// compression tick, outside the TimescaleDB gate). Provisioning runs once per start, and a failed attempt
+    /// left the roles' passwords unset and the credential files the web and MCP hosts wait for unwritten until the
+    /// next restart. This runs <see cref="DarlingManagedRoles.EnsureProvisionedAsync"/> again once per tick, on a
+    /// connection from the worker's pool, until one attempt succeeds.
+    ///
+    /// <para><b>What a retry does and does not carry over.</b> Nothing: a failed attempt writes no credential file
+    /// (see <see cref="DarlingManagedRoles.EnsureProvisionedAsync"/>), so each retry generates its passwords again.
+    /// A success writes the files, and the hosts, which poll for them, connect with the passwords the store now
+    /// holds; it also records what the roles were given as the reload baseline, exactly as the start path does, so
+    /// the first control-plane reload does not trust a value that never landed.</para>
+    ///
+    /// <para><b>Logged once per attempt.</b> The start path's error line is the first failure; each failed retry
+    /// writes one warning naming the message (the provisioning code reports a failed attempt by throwing, so this
+    /// is the only place that failure is logged). The outcomes read differently, as the other tenants' do: shutdown is quiet,
+    /// running out <see cref="s_roleProvisioningRetryBudget"/> is its own warning, anything else a warning naming
+    /// the message. No rethrow, so the sweep loop never sees this fail. A success clears the retry.</para>
+    ///
+    /// <para><b>Deadlines.</b> The commands inside carry the bootstrap deadline they always did. That is right on
+    /// this cadence, unlike the control-plane reload's: it runs at most once an hour, only after a failure, on its
+    /// own connection and under the whole-attempt budget above, and the batch is catalog DDL whose cost does not
+    /// grow with the store's data.</para>
+    /// </summary>
+    private async Task RetryRoleProvisioningAsync(CancellationToken cancellationToken)
+    {
+        var dataDirectory = _roleProvisioningRetryDirectory;
+        if (dataDirectory is null || _postgres is null || !OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var attemptClock = Stopwatch.StartNew();
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(s_roleProvisioningRetryBudget);
+
+        try
+        {
+            _appliedComposeStatementTimeoutSeconds =
+                await DarlingManagedRoles.EnsureProvisionedAsync(_postgres, dataDirectory, _logger, budget.Token);
+            _roleProvisioningRetryDirectory = null;
+            _logger.LogInformation(
+                "Least-privilege role provisioning succeeded on the hourly retry after {ElapsedMs} ms: the role credential files are written, so the web and MCP hosts connect with the passwords the store holds.",
+                attemptClock.ElapsedMilliseconds);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            /* Shutdown - quiet and expected. The next start provisions from scratch. */
+        }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Least-privilege role provisioning retry exceeded its {BudgetSeconds}s budget after {ElapsedMs} ms and was cut short; the next hourly tick tries again.",
+                (long)s_roleProvisioningRetryBudget.TotalSeconds, attemptClock.ElapsedMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "Least-privilege role provisioning retry failed after {ElapsedMs} ms; the next hourly tick tries again: {Message}",
+                attemptClock.ElapsedMilliseconds, ex.Message);
+        }
+    }
+
+    /// <summary>
     /// The #3812 hourly retention re-evaluation (fleet-level, Timescale-only, on the compression tick): run
     /// <see cref="TimescaleSupport.EnsureRetentionPoliciesAsync(NpgsqlConnection, ILogger, TimescaleSupport.RetentionSweepPass, CancellationToken)"/>
     /// as the <see cref="TimescaleSupport.RetentionSweepPass.Periodic"/> pass on a connection from the worker's
@@ -9787,7 +10751,8 @@ LIMIT 1";
             }
 
             await TimescaleSupport.EnsureRetentionPoliciesAsync(
-                connection, _logger, TimescaleSupport.RetentionSweepPass.Periodic, budget.Token);
+                connection, _logger, TimescaleSupport.RetentionSweepPass.Periodic,
+                otherRepairRunning: () => _materializationHoleRepairRunning, budget.Token);
 
             /* #4299: the service's own raw-purge trigger — ONLY reached from this Periodic pass, never
                from the start path. TriggerRawPurgeAsync re-reads the sweep's own verdict (config->>'darling_armed',
@@ -10543,6 +11508,32 @@ AND   j.hypertable_name = '{relation}'", connection))
                 }
             }
 
+            /* The deadlock text an earlier build's pass rewrote is brought to the current rules once per store
+               (PgDeadlockRemask.RulesVersion); it does not wait for the pass above, and the store's marker keeps it
+               from running again. Its own slice budget and catch, as the pass above has. */
+            if (_pgDeadlockRemask.RepairPending)
+            {
+                if (connection.State != ConnectionState.Open)
+                {
+                    await connection.CloseAsync();
+                    await connection.OpenAsync(budget.Token);
+                }
+
+                using var repairBudget = CancellationTokenSource.CreateLinkedTokenSource(budget.Token);
+                repairBudget.CancelAfter(PgDeadlockRemask.SliceBudget);
+                try
+                {
+                    await PgDeadlockRemask.RunRepairAsync(connection, _pgDeadlockRemask, _logger, repairBudget.Token);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException
+                    || (repairBudget.IsCancellationRequested && !budget.IsCancellationRequested))
+                {
+                    _logger.LogWarning(
+                        "PostgreSQL deadlocks: repairing stored deadlock text failed, and is retried next hour: {Message}",
+                        ex.Message);
+                }
+            }
+
             /* #5097: the store's own statement history, on this same hourly tick so it lands on the census' grid.
                ITS OWN catch, and a Warning once: a store whose owner cannot run the reader function (a bring-your-own
                store without the extension) repeats the same failure hourly, and none of it may cost the
@@ -10596,6 +11587,26 @@ AND   j.hypertable_name = '{relation}'", connection))
                failure — a bad read-latency flush must not cost the collector_cost series its hourly row, and
                vice versa (collector_cost's own catch above already isolates it from everything ABOVE this
                line). */
+            /* #5506 part 3: the long-read table is rebuilt BEFORE the flush drains this hour's samples, so it reads them
+               from memory and the stored hours from the table, and counts each once. A failed rebuild keeps the last one
+               and never costs the flush. */
+            if (_readAdmission is not null)
+            {
+                /* Its own slice of the budget, like the history above: the scan reads seven days, and a canceled slice must
+                   not cancel the flush below, which the same connection then runs. */
+                var readAdmission = _readAdmission;
+                await ReadAdmission.RunRebuildSliceAsync(
+                    token => readAdmission.RefreshAsync(connection, _readLatency, token),
+                    ReadAdmission.RebuildSliceBudget, _logger, budget.Token);
+
+                /* A canceled slice can leave the connection closed or broken. */
+                if (connection.State != ConnectionState.Open)
+                {
+                    await connection.CloseAsync();
+                    await connection.OpenAsync(budget.Token);
+                }
+            }
+
             try
             {
                 await _readLatency.FlushAsync(connection, DateTime.UtcNow, _logger, budget.Token);
@@ -10603,6 +11614,30 @@ AND   j.hypertable_name = '{relation}'", connection))
             catch (Exception ex) when (ex is not OperationCanceledException || !budget.IsCancellationRequested)
             {
                 _logger.LogWarning("Read-latency flush failed; this hour's histogram rows are dropped: {Message}", ex.Message);
+            }
+
+            /* #5810: the hourly rollup get_collection_health reads for its closed hours. Last on the tick and in its own slice
+               of the budget, so its first pass after the upgrade (a backfill of the whole window) cannot cost the flushes
+               above their rows. A failed or canceled pass loses nothing: the next one starts from the newest rolled hour,
+               and the read takes the hours after it from the raw log. */
+            if (connection.State != ConnectionState.Open)
+            {
+                await connection.CloseAsync();
+                await connection.OpenAsync(budget.Token);
+            }
+
+            using var hourlyBudget = CancellationTokenSource.CreateLinkedTokenSource(budget.Token);
+            hourlyBudget.CancelAfter(CollectionLogHourly.PassSliceBudget);
+            try
+            {
+                await CollectionLogHourly.RollUpAsync(connection, DateTime.UtcNow, _logger, hourlyBudget.Token);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException
+                || (hourlyBudget.IsCancellationRequested && !budget.IsCancellationRequested))
+            {
+                _logger.LogWarning(
+                    "Collection log hourly rollup failed (SqlState {SqlState}); the next pass retries from the newest rolled hour: {Message}",
+                    (ex as PostgresException)?.SqlState ?? "n/a", ex.Message);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -10839,15 +11874,79 @@ AND   j.hypertable_name = '{relation}'", connection))
                 ? findings => planForceBot.RunAfterAnalysisAsync(runtime, server.Config, findings, stoppingToken)
                 : null;
 
-        /* The scheduled caller discards the outcome — the analyze_now command maps it to a result. */
-        await RunAnalysisPassAsync(
+        /* #5824: the scheduled pass is recorded as one collection_log row (AnalysisPassRow), the only record of how long it
+           held this server's fleet slot. The analyze_now command maps the outcome to its result instead and writes none. */
+        DarlingAnalysisService? passService = null;
+        Task? passTask = null;
+        var started = Stopwatch.GetTimestamp();
+        var result = await RunAnalysisPassAsync(
             runtime.ServerId, runtime.StorageName, server.Config.DisplayName,
             planFetcher, notificationService, notifyFindings, postPassHook, stoppingToken,
-            AnalysisSeparatelyMonitoredDatabases(runtime));
+            AnalysisSeparatelyMonitoredDatabases(runtime), (service, task) => (passService, passTask) = (service, task));
+        var elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+
+        if (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        var planRegressionMs = PlanRegressionReadOfFinishedPass(passTask, () => passService?.LastPlanRegressionReadMs);
+        var (status, detail) = DescribeAnalysisPass(
+            result.Status, result.FindingCount, result.Message, elapsedMs, planRegressionMs, insideFleetSlot: true);
+        await DarlingObservability.LogAnalysisPassAsync(
+            _postgres!, runtime, status, result.FindingCount, elapsedMs, detail, _logger, stoppingToken);
     }
 
+    /// <summary>
+    /// #5824: the status word and the detail of a scheduled analysis pass's <c>collection_log</c> row. Never <c>SUCCESS</c>
+    /// (see <see cref="AnalysisPassRow"/>). The detail is one line, read per server through <c>get_collection_log</c>: the
+    /// outcome, the findings count, the PLAN_REGRESSION read's time, and whether the pass ran inside the server's fleet
+    /// collection slot. Pure, so a unit test pins the wording.
+    /// </summary>
+    internal static (string Status, string Detail) DescribeAnalysisPass(
+        AnalysisPassStatus status, int findingCount, string? message, long elapsedMs, long? planRegressionMs, bool insideFleetSlot)
+    {
+        var word = status switch
+        {
+            AnalysisPassStatus.Ran or AnalysisPassStatus.InsufficientData => AnalysisPassRow.Analyzed,
+            AnalysisPassStatus.TimedOut => AnalysisPassRow.Abandoned,
+            AnalysisPassStatus.Error => AnalysisPassRow.Error,
+            _ => AnalysisPassRow.Skipped,
+        };
+        var outcome = status switch
+        {
+            AnalysisPassStatus.Ran => "ran",
+            AnalysisPassStatus.InsufficientData => "ran on too little data",
+            AnalysisPassStatus.TimedOut => "timed out",
+            AnalysisPassStatus.Error => "failed",
+            _ => "did not run",
+        };
+        var planRegression = planRegressionMs is { } ms
+            ? "PLAN_REGRESSION read " + DarlingCycleSkip.Format(ms)
+            : "PLAN_REGRESSION read did not run or was not measured";
+        var slot = insideFleetSlot ? "inside this server's fleet collection slot" : "outside any fleet collection slot";
+        var detail = string.Create(CultureInfo.InvariantCulture,
+            $"Scheduled analysis pass {outcome} in {DarlingCycleSkip.Format(elapsedMs)}, {findingCount} finding(s), {planRegression}, {slot}.");
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            detail += " " + message;
+        }
+
+        return (word, detail);
+    }
+
+    /// <summary>
+    /// #5824: the PLAN_REGRESSION read time of a pass, read only once the pass's task has finished, because the service stamps
+    /// it in <c>AnalyzeAsync</c>'s <c>finally</c>. Keyed on the task, not on the status word: a pass that ran past its budget,
+    /// unwound and came back (status TimedOut, <c>EndedEarlyAs</c> Timeout) has finished and keeps its real figure; a pass the
+    /// sweep stopped waiting for may still be running, so its figure is null rather than whatever the pass has stamped so
+    /// far. A pass that never started (no task) is null too.
+    /// </summary>
+    internal static long? PlanRegressionReadOfFinishedPass(Task? passTask, Func<long?> read) =>
+        passTask is not null && passTask.IsCompleted ? read() : null;
+
     /// <summary>Terminal states of one analysis pass — surfaced to the analyze_now command result.</summary>
-    private enum AnalysisPassStatus { Ran, Skipped, TimedOut, InsufficientData, Error }
+    internal enum AnalysisPassStatus { Ran, Skipped, TimedOut, InsufficientData, Error }
 
     private sealed record AnalysisPassResult(AnalysisPassStatus Status, int FindingCount, string? Message);
 
@@ -10871,7 +11970,8 @@ AND   j.hypertable_name = '{relation}'", connection))
         bool notifyFindings,
         Func<IReadOnlyList<AnalysisFinding>, Task>? postPassHook,
         CancellationToken stoppingToken,
-        IReadOnlyList<string>? separatelyMonitoredDatabases = null)
+        IReadOnlyList<string>? separatelyMonitoredDatabases = null,
+        Action<DarlingAnalysisService, Task>? onPassStarted = null)
     {
         if (!_analysisInFlight.TryAdd(serverId, new AnalysisPassState(DateTime.UtcNow)))
         {
@@ -10908,8 +12008,10 @@ AND   j.hypertable_name = '{relation}'", connection))
             /* Both tokens, and they mean different things: the first is what the reads observe, the
                second is the only one that still means "the host is stopping". Handing the armed token
                to the classifier alone would log every ordinary overrun as "abandoned at shutdown". */
+            /* #5633 item 13: the scheduled pass is the ONE caller that writes collect.analysis_collection_caveats
+               (on-demand passes -- MCP analyze_server -- compute their caveats and never save them). */
             var analyzeTask = analysisService.AnalyzeAsync(
-                serverId, storageName, hoursBack: 4, cts.Token, stoppingToken);
+                serverId, storageName, hoursBack: 4, cts.Token, stoppingToken, persistCollectionCaveats: true);
 
             /* Clear the in-flight marker only when the task truly finishes — not
                when the timeout below moves us on — so a hung server is not relaunched. */
@@ -10925,6 +12027,9 @@ AND   j.hypertable_name = '{relation}'", connection))
                ContinueWith nor the call above throws, so there is no window in which the pass exists
                with nothing committed to cleaning up after it. */
             passStarted = true;
+            /* #5824: the scheduled caller reads the pass's PLAN_REGRESSION time off the service, and only once this task has
+               finished (PlanRegressionReadOfFinishedPass). */
+            onPassStarted?.Invoke(analysisService, analyzeTask);
 
             /* Wait the budget PLUS the unwind grace, so a pass that honours its cancellation is seen
                finishing here rather than racing this sweep's own timer. Losing that race now carries
@@ -11490,12 +12595,23 @@ AND   j.hypertable_name = '{relation}'", connection))
     /// </summary>
     internal Func<ServerLoopState, CancellationToken, Task>? SelfAlertServerOverride { get; set; }
 
+    /// <summary>Test seam (#5642): replaces the engine's alert evaluation for one server in the fleet pass, like
+    /// <see cref="SelfAlertServerOverride"/>. Production never sets it.</summary>
+    internal Func<ServerLoopState, CancellationToken, Task>? AlertServerOverride { get; set; }
+
+    /// <summary>Test seam (#5642): replaces the same-statement-pileup evaluation for one server in the fleet pass.
+    /// Production never sets it.</summary>
+    internal Func<ServerLoopState, CancellationToken, Task>? PileupServerOverride { get; set; }
+
     /// <summary>
     /// Test seam (#5481): the fleet pass's task, so a test that starts a second pass waits for the first to finish rather than
     /// for a counter the pass moves before it ends (a pass still running makes <see cref="TryStartSelfAlertPass"/> return false).
     /// Null before the first pass. Production never reads it.
     /// </summary>
     internal Task? SelfAlertPassForTests => _selfAlertPass;
+
+    /// <summary>Test seam (#5642): the engine pass's task, null until the first one starts. Production never reads it.</summary>
+    internal Task? AlertEnginePassForTests => _alertEnginePass;
 
     /// <summary>
     /// The per-server self-alert pass's launcher (#5479): Collection Stopped and the other store-polled self-alerts, and
@@ -11506,9 +12622,23 @@ AND   j.hypertable_name = '{relation}'", connection))
     /// pass still running at the next tick makes that tick skip (one Warning per pass, once it has outrun the 30 s cadence), so no server is ever
     /// evaluated by two threads at once, and the stamps in <see cref="ServerLoopState"/> are written by this pass only.
     /// </summary>
-    /// <param name="sweepWidth">The fleet gate's width (<c>max_concurrent_sweeps</c>). The pass evaluates that many servers at
-    /// once, capped by <see cref="SelfAlertPassWidthFor"/> so its reads stay inside the store pool's reserve.</param>
-    internal bool TryStartSelfAlertPass(ServerLoopState[] targets, CancellationToken stoppingToken, int sweepWidth = MaxConcurrentServerSweeps)
+    /// <param name="sweepWidth">The fleet gate's width (<c>max_concurrent_sweeps</c>). The self-alert pass and the engine pass split
+    /// <see cref="SelfAlertPassWidthFor"/> between them (<see cref="SelfAlertStepWidthFor"/> and <see cref="AlertEnginePassWidthFor"/>) so their reads stay inside the store pool's reserve.</param>
+    /// <returns>True when a new self-alert pass started. The engine pass (#5642) has its own slot, so this says nothing
+    /// about it: see <see cref="TryStartAlertEnginePass"/>.</returns>
+    internal bool TryStartSelfAlertPass(
+        ServerLoopState[] targets, CancellationToken stoppingToken, int sweepWidth = MaxConcurrentServerSweeps,
+        AlertEngine? engine = null, DarlingConfig? config = null, AnalysisNotificationService? notifications = null)
+    {
+        var started = TryStartSelfAlertStep(targets, sweepWidth, stoppingToken);
+
+        /* #5642: the engine's alert reads and the pileup finding run in their own single-flight pass, chained AFTER the
+           self-alert step of this tick, so Collection Stopped and its siblings never wait for them. */
+        TryStartAlertEnginePass(targets, sweepWidth, engine, config, notifications, stoppingToken);
+        return started;
+    }
+
+    private bool TryStartSelfAlertStep(ServerLoopState[] targets, int sweepWidth, CancellationToken stoppingToken)
     {
         if (_selfAlertPass is { IsCompleted: false })
         {
@@ -11534,10 +12664,61 @@ AND   j.hypertable_name = '{relation}'", connection))
     }
 
     /// <summary>
+    /// The engine pass's launcher (#5642): the shared alert engine's per-server reads (~22 store reads a server) and the
+    /// same-statement-pileup finding, in a single-flight slot of their own. They used to ride the self-alert pass, so
+    /// the pass's length, and with it Collection Stopped's cadence, grew with every alert read: a store in a slow write
+    /// band stretched it from a few seconds to a minute or more. Now the self-alert step ends and frees its slot first;
+    /// this pass waits for the step launched in the same tick (or the one still running) and only then starts its reads,
+    /// and a pass still running at the next tick makes that tick skip it, with one Warning per pass once it has outrun
+    /// the 30 s cadence, as the self-alert pass does. The servers' alert stamps do not move on a skip, so the next free
+    /// tick picks up what was due. Not started when no engine, seam or pileup finding is configured.
+    /// </summary>
+    internal bool TryStartAlertEnginePass(
+        ServerLoopState[] targets, int sweepWidth,
+        AlertEngine? engine, DarlingConfig? config, AnalysisNotificationService? notifications, CancellationToken stoppingToken)
+    {
+        var hasEngine = AlertServerOverride is not null || (engine is not null && config is not null);
+        var hasPileup = PileupServerOverride is not null || (config is { Analysis.Enabled: true } && notifications is not null);
+        if (!hasEngine && !hasPileup)
+        {
+            return false;
+        }
+
+        if (_alertEnginePass is { IsCompleted: false })
+        {
+            var runningFor = SelfAlertPassClock() - _alertEnginePassStartedUtc;
+            if (!_alertEnginePassOverranWarned && runningFor > s_alertSweepInterval)
+            {
+                _alertEnginePassOverranWarned = true;
+                _logger.LogWarning(
+                    "the previous per-server alert engine pass has been running for {RunningFor:F0}s, longer than its {Cadence:F0}s cadence, so this tick starts no second one; the self-alerts (Collection Stopped and the rest) are not waiting on it, and the next tick after it ends starts a new engine pass",
+                    runningFor.TotalSeconds, s_alertSweepInterval.TotalSeconds);
+            }
+
+            return false;
+        }
+
+        _alertEnginePassOverranWarned = false;
+        _alertEnginePassStartedUtc = SelfAlertPassClock();
+        var selfAlertStep = _selfAlertPass;
+        _alertEnginePass = RunTrackedTickAsync("per-server alert engine pass", async token =>
+        {
+            /* RunTrackedTickAsync swallows the step's own failures, so this wait only ends: it never throws. */
+            if (selfAlertStep is not null)
+            {
+                await selfAlertStep.WaitAsync(token);
+            }
+
+            await RunAlertEnginePassAsync(targets, sweepWidth, engine, config, notifications, token);
+        }, stoppingToken);
+        return true;
+    }
+
+    /// <summary>
     /// The pass itself (#5479): each non-retired server, up to <c>sweepWidth</c> at a time, on its own cadence stamps. A
     /// fleet pass that walked the servers one at a time took 3 or more sequential store reads per server (50 to 100 s at
     /// 500 servers), so every tick overran and Collection Stopped lagged the cadence several times over; the same calls
-    /// ran inside the bodies under the fleet gate before. The pass runs at <see cref="SelfAlertPassWidthFor"/> of the sweep width, which keeps its reads inside the store pool's reserve. Each server is still
+    /// ran inside the bodies under the fleet gate before. The pass runs at <see cref="SelfAlertStepWidthFor"/> of the sweep width (its share of the <see cref="SelfAlertPassWidthFor"/> budget, which keeps its reads inside the store pool's reserve); the engine's reads are the separate pass after it (#5642). Each server is still
     /// visited once per pass by one thread, so its stamps stay single-writer, and only one pass runs at a time.
     /// Collection-stopped is evaluated for EVERY server, connected or not and whether or not it has been seen online
     /// since this service started (#4757), because an unreachable server has stopped collecting, which is exactly the
@@ -11552,7 +12733,7 @@ AND   j.hypertable_name = '{relation}'", connection))
         var started = Stopwatch.StartNew();
         var options = new ParallelOptions
         {
-            MaxDegreeOfParallelism = SelfAlertPassWidthFor(sweepWidth),
+            MaxDegreeOfParallelism = SelfAlertStepWidthFor(sweepWidth),
             CancellationToken = stoppingToken,
         };
 
@@ -11579,7 +12760,8 @@ AND   j.hypertable_name = '{relation}'", connection))
                             server.Config.ServerId,
                             server.Config.DisplayName,
                             connected: server.Runtime is not null,
-                            stoppingToken);
+                            stoppingToken,
+                            engine: server.Runtime?.Target.Engine ?? CollectorTargetEngine.SqlServer);
                     }
                 }
 
@@ -11606,6 +12788,91 @@ AND   j.hypertable_name = '{relation}'", connection))
         {
             _logger.LogInformation(
                 "the per-server self-alert pass took {Elapsed:F1}s for {Servers} servers at {Width} at a time, longer than its {Cadence}s cadence",
+                started.Elapsed.TotalSeconds, targets.Length, options.MaxDegreeOfParallelism, s_alertSweepInterval.TotalSeconds);
+        }
+    }
+
+    /// <summary>
+    /// The engine pass itself (#5642): for each non-retired server, up to <see cref="AlertEnginePassWidthFor"/> at a time,
+    /// the shared engine's alert evaluation and then the same-statement-pileup finding, each on its own 30 s stamp. Runs
+    /// in its own single-flight slot after the self-alert step (see <see cref="TryStartAlertEnginePass"/>), so a slow
+    /// server's alert reads never delay Collection Stopped. The stamps are written by this pass only. One server's throw
+    /// is logged and does not skip the rest.
+    /// </summary>
+    private async Task RunAlertEnginePassAsync(
+        ServerLoopState[] targets, int sweepWidth, AlertEngine? engine, DarlingConfig? config,
+        AnalysisNotificationService? notifications, CancellationToken stoppingToken)
+    {
+        var started = Stopwatch.StartNew();
+        var options = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = AlertEnginePassWidthFor(sweepWidth),
+            CancellationToken = stoppingToken,
+        };
+
+        await Parallel.ForEachAsync(targets, options, async (server, _) =>
+        {
+            if (server.Retired)
+            {
+                return;
+            }
+
+            try
+            {
+                /* #5642: the engine's alert evaluation. It ran after the collection sweep inside the body, so a body that
+                   never finished silenced every alert on its server. A server whose runtime dropped is still evaluated,
+                   from the store, with its last known target (AlertRuntime): the server under enough pressure to drop is
+                   the one that needs the alert. */
+                if ((AlertServerOverride is not null || (engine is not null && config is not null))
+                    && StampIsDue(server.NextAlertSweep, s_alertSweepInterval, DateTime.UtcNow))
+                {
+                    server.NextAlertSweep = DateTime.UtcNow.Add(s_alertSweepInterval);
+                    if (server.AlertRuntime is not null)
+                    {
+                        if (AlertServerOverride is { } evaluateAlerts)
+                        {
+                            await evaluateAlerts(server, stoppingToken);
+                        }
+                        else
+                        {
+                            await EvaluateAlertsAsync(engine!, server, config!, stoppingToken);
+                        }
+                    }
+                }
+
+                /* #3467, moved here by #5642: the same-statement-pileup finding at the alert cadence. Analysis-side gates
+                   (config.Analysis.Enabled; delivery alone is gated inside via ShouldNotifyAnalysisFindings). SQL Server
+                   targets only, with a live runtime: the shape is a sys.dm_exec_requests statement pileup, and a
+                   PostgreSQL target never writes query_snapshots rows. */
+                if ((PileupServerOverride is not null || (config is { Analysis.Enabled: true } && notifications is not null))
+                    && server.Runtime is { } pileupRuntime
+                    && pileupRuntime.Target.Engine != CollectorTargetEngine.PostgreSql
+                    && StampIsDue(server.NextPileupSweep, s_alertSweepInterval, DateTime.UtcNow))
+                {
+                    server.NextPileupSweep = DateTime.UtcNow.Add(s_alertSweepInterval);
+                    if (PileupServerOverride is { } evaluatePileup)
+                    {
+                        await evaluatePileup(server, stoppingToken);
+                    }
+                    else
+                    {
+                        await EvaluateSameStatementPileupAsync(server, config!, notifications!, stoppingToken);
+                    }
+                }
+            }
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+            {
+                /* Any exception that is not the service shutting down, a cancellation inside one server's evaluator
+                   included (the custom-alert evaluator rethrows every OperationCanceledException): log it and go on, so
+                   the servers after it are still evaluated and a repeating one cannot starve them. */
+                _logger.LogError(ex, "[{Server}] alert engine pass failed; the remaining servers are still evaluated", server.Config.DisplayName);
+            }
+        });
+
+        if (started.Elapsed > s_alertSweepInterval)
+        {
+            _logger.LogInformation(
+                "the per-server alert engine pass took {Elapsed:F1}s for {Servers} servers at {Width} at a time, longer than its {Cadence}s cadence",
                 started.Elapsed.TotalSeconds, targets.Length, options.MaxDegreeOfParallelism, s_alertSweepInterval.TotalSeconds);
         }
     }
@@ -11657,8 +12924,12 @@ AND   j.hypertable_name = '{relation}'", connection))
                    with a run time loses its day once the grace after the stamp has passed (StepRunTimeCollector). */
                 var serveWindow = effective.RunAtMinute is not null ? CollectorRunTime.Grace : interval;
                 server.HeldSlotMarks.TryGetValue(name, out var mark);
-                counted += HeldSlots.Newly(due, nowUtc, floor, interval, serveWindow, ref mark);
+                var newlyHeld = HeldSlots.Newly(due, nowUtc, floor, interval, serveWindow, ref mark);
+                counted += newlyHeld;
                 server.HeldSlotMarks[name] = mark;
+                /* #5735: only fills the server's tally; the body that runs after the release writes the row (this runs on the
+                   sweep thread, under memory pressure). */
+                server.CycleSkips.AddHeld(name, newlyHeld, due);
             }
         }
 
@@ -11783,6 +13054,12 @@ AND   j.hypertable_name = '{relation}'", connection))
             await ConvergeStoreObjectsAsync(stoppingToken, timescaleAvailable: false);
         }
 
+        /* The retry of a start-path role provisioning that failed. Outside the TimescaleDB gate on
+           purpose: provisioning does not depend on the extension, so a plain-PostgreSQL store retries too.
+           Directly after the gate, ahead of the later tenants, so it spends none of the compression read's phase.
+           Its own method and its own catch-all; nothing to do (and nothing awaited) unless a start failed. */
+        await RetryRoleProvisioningAsync(stoppingToken);
+
         /* #5582: the ninth tenant, same contract - its own method, its own catch-all, one awaited statement. The exact stamp-grain
            rollup of the wide Query Store table (V173) needs no TimescaleDB (its tables are plain and the wide table is a plain
            partitioned table), so it sits outside the gate and runs on every store shape. It sits BEFORE the I/O rollup, not
@@ -11881,6 +13158,39 @@ AND   j.hypertable_name = '{relation}'", connection))
         {
             _logger.LogWarning("Query Store compose rollup could not run; the next hourly tick retries: {Message}", ex.Message);
         }
+
+        /* #5867: the hours whose build now waits a day between attempts raise the Compose Rollup Hours Stuck self-alert, from its own
+           read after the tick. */
+        if (_selfAlerts is not null)
+        {
+            await EvaluateComposeHoursStuckAsync(stoppingToken);
+        }
+    }
+
+    /// <summary>
+    /// #5867: reads the Query Store compose builder's failure record and hands it to
+    /// <see cref="DarlingSelfAlertEvaluator.EvaluateComposeHoursStuckAsync"/>. A failed read sends no report, so the standing alert
+    /// is held, never resolved on uncertainty, and the next hourly compose tick reads again. Exempt from #3013's swallowed-read
+    /// counter rather than counted (unlike #5654's): counting it would also add a read to the fleet-scoped inventory that both SKUs'
+    /// get_collection_health descriptions carry.
+    /// </summary>
+    private async Task EvaluateComposeHoursStuckAsync(CancellationToken cancellationToken)
+    {
+        IReadOnlyList<QueryStoreComposeStamp.HourFailure> failures;
+        try
+        {
+            await using var connection = await _postgres!.OpenConnectionAsync(cancellationToken);
+            failures = await QueryStoreComposeStamp.ReadFailuresAsync(connection, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Query Store compose rollup: the failure record could not be read for the self-alert; the standing alert is held this tick: {Message}",
+                ex.Message);
+            return;
+        }
+
+        await _selfAlerts!.EvaluateComposeHoursStuckAsync(failures, cancellationToken);
     }
 
     /// <summary>
@@ -11947,6 +13257,34 @@ AND   j.hypertable_name = '{relation}'", connection))
         }
     }
 
+    /// <summary>#6044: the module map repair runs at most once per this span.</summary>
+    internal static readonly TimeSpan ModuleMapRepairInterval = TimeSpan.FromHours(24);
+
+    private DateTime? _lastModuleMapRepairUtc;
+
+    /// <summary>#6044: whether the repair is due. Never run (this process), or a run at least
+    /// <see cref="ModuleMapRepairInterval"/> ago, or a clock that stepped back past the stamp. Internal so a test can pin it.</summary>
+    internal static bool IsModuleMapRepairDue(DateTime? lastSuccessUtc, DateTime nowUtc) =>
+        lastSuccessUtc is not { } last || nowUtc < last || nowUtc - last >= ModuleMapRepairInterval;
+
+    /// <summary>#6044: runs <paramref name="repair"/> when due and stamps the run only when it returns true (a failed
+    /// or cancelled repair leaves the stamp, so the next pass retries). The purge slot is single, so passes do not overlap.
+    /// Returns whether it ran.</summary>
+    internal async Task<bool> RunModuleMapRepairIfDueAsync(DateTime nowUtc, Func<CancellationToken, Task<bool>> repair, CancellationToken cancellationToken)
+    {
+        if (!IsModuleMapRepairDue(_lastModuleMapRepairUtc, nowUtc))
+        {
+            return false;
+        }
+
+        if (await repair(cancellationToken))
+        {
+            _lastModuleMapRepairUtc = nowUtc;
+        }
+
+        return true;
+    }
+
     /// <summary>
     /// The daily retention purge's actual work — <see cref="DarlingRetention.PurgeAsync"/>, then the AN3
     /// findings cleanup, the #1652 log-file sweep, and the module-map refresh — moved out of the launch loop
@@ -11968,7 +13306,8 @@ AND   j.hypertable_name = '{relation}'", connection))
             name => StoreConfigProvider.ResolveFleetRetentionDays(name, overrides),
             config.PlanContentRetentionDays,
             paceWal: true,
-            collectionPressure: _collectionPressure);
+            collectionPressure: _collectionPressure,
+            queryTextPruneGate: _queryTextPruneGate);
 
         /* #5592: a pass the wall budget stopped brings the next scheduled pass forward to within the hour. */
         NotePurgePassEnded(purgeSummary, DateTime.UtcNow);
@@ -11991,11 +13330,22 @@ AND   j.hypertable_name = '{relation}'", connection))
         DarlingFileLoggerProvider.SweepOldFiles(DarlingFileLoggerProvider.DefaultLogDirectory());
 
         /* Keep the retained sql_handle->module map current (object_name attribution for old query_stats
-           CAGG windows). Rides the daily purge; failure-isolated inside RefreshAsync. #5519: with a watermark
-           it re-reads from DailyRepairSlack behind it, not a flat two days; that span is the repair for rows
-           the hourly path missed by committing more than WatermarkSlack late. */
-        await using var moduleMapConnection = await postgres.OpenConnectionAsync(stoppingToken);
-        await DarlingModuleMap.RefreshAsync(moduleMapConnection, _logger, stoppingToken);
+           CAGG windows). #6044: the repair is once per 24 hours, not once per pass: a pass the wall budget stopped
+           brings the next one forward (#5592), and each repair read 13 to 17 GB, so six a day on a large store.
+           The pass still does all its purge work; only this step is skipped. Failure-isolated inside RefreshAsync,
+           which reports a failed read so it does not count as a run. #5519: with a watermark it re-reads from
+           DailyRepairSlack behind it, not a flat two days; that span is the repair for rows the hourly path
+           missed by committing more than WatermarkSlack late. */
+        await RunModuleMapRepairIfDueAsync(
+            DateTime.UtcNow,
+            async token =>
+            {
+                await using var moduleMapConnection = await postgres.OpenConnectionAsync(token);
+                var outcome = new ModuleMapRefreshOutcome();
+                await DarlingModuleMap.RefreshAsync(moduleMapConnection, _logger, outcome, token);
+                return !outcome.Failed;
+            },
+            stoppingToken);
 
         /* #4211: the raw hypertable chunk-interval reconcile. Rides the daily purge tick like every other
            maintenance chore above — first pass after startup (TryStartScheduledPurge's own MinValue seed),
@@ -12327,8 +13677,8 @@ AND   j.hypertable_name = '{relation}'", connection))
             _stoppingToken = stoppingToken;
         }
 
-        public Task<CommandOutcome> SnapshotNowAsync(int serverId, CancellationToken cancellationToken)
-            => _worker.RunSnapshotAsync(_servers, _runner, serverId, cancellationToken);
+        public Task<CommandOutcome> SnapshotNowAsync(int serverId, IReadOnlyList<string>? collectors, CancellationToken cancellationToken)
+            => _worker.RunSnapshotAsync(_servers, _runner, serverId, cancellationToken, collectors);
 
         public Task<CommandOutcome> AnalyzeNowAsync(int serverId, CancellationToken cancellationToken)
             => _worker.RunAnalyzeNowAsync(_servers, _planFetcher, _notificationService, _config, serverId, cancellationToken);
@@ -12440,7 +13790,7 @@ AND   j.hypertable_name = '{relation}'", connection))
     /// fired before this read ran), anything else → Warning + empty map.
     /// </summary>
     private async Task<IReadOnlyDictionary<AgentJobStepKey, AgentJobStepNames>> FetchAgentJobStepNamesAsync(
-        List<ServerLoopState> servers, string serverKey, IReadOnlyList<AgentJobStepKey> keys, CancellationToken cancellationToken)
+        List<ServerLoopState> servers, string serverKey, List<AgentJobStepKey> keys, CancellationToken cancellationToken)
     {
         /* Lookup only — held briefly under the lock (the command loop reconciles the list concurrently),
            then the connection I/O runs outside it. */
@@ -12504,6 +13854,120 @@ AND   j.hypertable_name = '{relation}'", connection))
         }
     }
 
+    /// <summary>How old a cached failed-jobs list may be and still be served (#5642). Older than this the body has
+    /// stopped refreshing it (a stuck body, a dropped server), and an old list must not read as the current one.</summary>
+    internal static readonly TimeSpan s_msdbCacheMaxAge = TimeSpan.FromMinutes(10);
+
+    private static ServerLoopState? FindStateByServerKey(List<ServerLoopState> servers, string serverKey, object gate)
+    {
+        lock (gate)
+        {
+            return servers.FirstOrDefault(s => s.AlertRuntime is { } r
+                && string.Equals(r.ServerId.ToString(CultureInfo.InvariantCulture), serverKey, StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>
+    /// The engine's failed-jobs feed (#5642): the list the collection body last read from msdb, no I/O. Records the
+    /// lookback the engine asked for so the body reads with it. Empty when nothing has been read yet or the list is
+    /// older than <see cref="s_msdbCacheMaxAge"/>, the same degrade a denied or failed msdb read always gave.
+    /// </summary>
+    internal List<FailedJobInfo> ServeFailedJobsFromCache(List<ServerLoopState> servers, string serverKey, int lookbackMinutes)
+    {
+        var state = FindStateByServerKey(servers, serverKey, _serversLock);
+        if (state is null)
+        {
+            return new List<FailedJobInfo>();
+        }
+
+        state.FailedJobsLookbackWanted = lookbackMinutes;
+        var entry = state.FailedJobsCache;
+        if (entry is null || DateTime.UtcNow - entry.FetchedUtc > s_msdbCacheMaxAge)
+        {
+            return new List<FailedJobInfo>();
+        }
+
+        return new List<FailedJobInfo>(entry.Jobs);
+    }
+
+    /// <summary>
+    /// The engine's Agent-job name lookup (#5642), from the cache the body fills. A key not resolved yet is recorded as
+    /// wanted for the body's next refresh and left out of the answer, so that card renders the unresolved form once
+    /// (annotation, never suppression) and the next one carries the name.
+    /// </summary>
+    internal IReadOnlyDictionary<AgentJobStepKey, AgentJobStepNames> ServeStepNamesFromCache(
+        List<ServerLoopState> servers, string serverKey, IReadOnlyList<AgentJobStepKey> keys)
+    {
+        var found = new Dictionary<AgentJobStepKey, AgentJobStepNames>();
+        var state = FindStateByServerKey(servers, serverKey, _serversLock);
+        if (state is null)
+        {
+            return found;
+        }
+
+        foreach (var key in keys)
+        {
+            if (state.StepNamesCache.TryGetValue(key, out var names))
+            {
+                found[key] = names;
+            }
+            else
+            {
+                state.StepNamesWanted[key] = 0;
+            }
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// Reads the two msdb facts the alert engine wants (#5642) into the server's cache: the recently failed jobs, with the
+    /// lookback the engine last asked for, and the Agent job step names the cards asked for. Runs in the collection body
+    /// after the collectors, at the alert cadence, so the fleet pass stays store reads only. Both reads keep their own
+    /// degrade (permission denied or any failure gives an empty answer).
+    /// </summary>
+    private async Task RefreshMsdbCacheAsync(ServerLoopState server, CancellationToken cancellationToken)
+    {
+        var runtime = server.Runtime;
+        if (runtime is null
+            || runtime.Target.Engine != CollectorTargetEngine.SqlServer
+            || runtime.Target.IsAzureSqlDb
+            || !StampIsDue(server.NextMsdbRefresh, s_alertSweepInterval, DateTime.UtcNow))
+        {
+            return;
+        }
+
+        server.NextMsdbRefresh = DateTime.UtcNow.Add(s_alertSweepInterval);
+        var one = new List<ServerLoopState> { server };
+        var serverKey = runtime.ServerId.ToString(CultureInfo.InvariantCulture);
+
+        if (server.FailedJobsLookbackWanted > 0)
+        {
+            var jobs = await FetchFailedJobsAsync(one, serverKey, server.FailedJobsLookbackWanted, cancellationToken);
+            server.FailedJobsCache = new MsdbCacheEntry(DateTime.UtcNow, jobs);
+        }
+
+        if (!server.StepNamesWanted.IsEmpty)
+        {
+            var wanted = server.StepNamesWanted.Keys.Take(16).ToList();
+            var names = await FetchAgentJobStepNamesAsync(one, serverKey, wanted, cancellationToken);
+            if (server.StepNamesCache.Count > 1000)
+            {
+                server.StepNamesCache.Clear();
+            }
+
+            foreach (var pair in names)
+            {
+                server.StepNamesCache[pair.Key] = pair.Value;
+            }
+
+            foreach (var key in wanted)
+            {
+                server.StepNamesWanted.TryRemove(key, out _);
+            }
+        }
+    }
+
     private async Task TryConnectAsync(ServerLoopState server, DarlingCollectorRunner runner, DarlingConfig config, ConnectAttempt? attempt, CancellationToken cancellationToken)
     {
         /* #4710: the attempt was made before the fleet gate (see ProcessServerSweepAsync), and the due check
@@ -12539,6 +14003,8 @@ AND   j.hypertable_name = '{relation}'", connection))
 
             var runtime = attempt.Value.Runtime!;
             server.Runtime = runtime;
+            server.LastKnownRuntime = runtime;
+            server.WatchingSinceUtc = DateTime.UtcNow;
 
             /* #4732: the definition comparison again, now that the runtime is on the state. ReconcileServers runs on
                the loop thread and clears Runtime when it replaces a definition, so an edit that lands between the check
@@ -12623,6 +14089,7 @@ AND   j.hypertable_name = '{relation}'", connection))
             if (server.Retired)
             {
                 server.Runtime = null;
+                server.LastKnownRuntime = null;
                 return;
             }
 
@@ -12665,7 +14132,10 @@ AND   j.hypertable_name = '{relation}'", connection))
                collectors are engine-gated off anyway. Confirmed on a live PostgreSQL target. */
             if (runtime.Target.Engine == CollectorTargetEngine.SqlServer)
             {
-                await DarlingXeSessions.EnsureAllAsync(runtime, runner, _logger, cancellationToken);
+                var attentionEnabled = StoreConfigProvider.ResolveSchedule("attention", server.Config.ServerId, _scheduleOverrides).Enabled;
+                var attentionFault = await DarlingXeSessions.EnsureAllAsync(runtime, runner, _logger, cancellationToken, attentionEnabled);
+                server.AttentionXePermissionFault = attentionFault?.Message;
+                server.AttentionXeEnsuredWhileEnabled = attentionEnabled;
                 server.XeSessionsEnsuredAtUtc = DateTime.UtcNow;
             }
 
@@ -12841,8 +14311,21 @@ AND   j.hypertable_name = '{relation}'", connection))
             /* #2255: full text on a NEW cause, one line while it persists. A credential that cannot be
                decrypted on this host is not a transient connect failure, so its explanation is worth Error
                once and worth almost nothing on the 1,440th repeat. */
-            var failure = ex.Message;
-            if (!string.Equals(server.LastConnectFailureLogged, failure, StringComparison.Ordinal))
+            /* #6183: SqlClient's native network library not loading breaks every SQL Server connection from this
+               install, and "The type initializer for 'TdsParser' threw an exception" does not say why. The shared
+               explanation replaces the raw text, and it is logged once for the whole process (it is the same cause
+               for every server), not once per server with a retry line. The retry loop itself is unchanged. */
+            var nativeLoadFailure = SqlClientNativeLoadFailure.Describe(ex, AppContext.BaseDirectory);
+            var failure = nativeLoadFailure ?? ex.Message;
+            if (nativeLoadFailure is not null)
+            {
+                server.LastConnectFailureLogged = failure;
+                if (Interlocked.Exchange(ref _nativeLoadFailureLogged, 1) == 0)
+                {
+                    _logger.LogError("Connect failed and will keep failing until fixed: {Message}", failure);
+                }
+            }
+            else if (!string.Equals(server.LastConnectFailureLogged, failure, StringComparison.Ordinal))
             {
                 server.LastConnectFailureLogged = failure;
                 if (ex is InvalidOperationException && failure.Contains("DPAPI-decrypt", StringComparison.Ordinal))
@@ -12871,9 +14354,12 @@ AND   j.hypertable_name = '{relation}'", connection))
                history does. */
             await _selfAlerts!.ApplyConnectionOutcomeAsync(
                 server.Config.ServerId,
-                server.Config.DisplayName, online: false, error: ex.Message, cancellationToken);
+                server.Config.DisplayName, online: false, error: failure, cancellationToken);
         }
     }
+
+    /// <summary>1 once the native-library load failure (#6183) has been logged. It is one cause for every server.</summary>
+    private int _nativeLoadFailureLogged;
 
     /// <summary>
     /// #4999: the at-connect run of ONE on-load collector (effective frequency 0), inline in
@@ -12965,6 +14451,15 @@ AND   j.hypertable_name = '{relation}'", connection))
         try
         {
             var now = DateTime.UtcNow;
+
+            /* #5735: what the PREVIOUS body measured is the cause of any slot this one steps over, so it is read before this
+               body overwrites it. */
+            var priorCauses = new CycleSkipCauses(
+                server.LastBodyMs, server.LastBodySlowestName, server.LastBodySlowestMs, server.LastGateWaitMs,
+                server.LastAnalysisMs, server.LastGateWaitAnalysisHolders);
+            var bodyStarted = Stopwatch.GetTimestamp();
+            var bodySlowestName = (string?)null;
+            var bodySlowestMs = 0L;
 
             /* #2864: the peer high-water mark describes ONE body. Reset here rather than decayed, because
                the comparison it feeds is 'were this sweep's other collectors slow', and a mark carried
@@ -13093,6 +14588,7 @@ AND   j.hypertable_name = '{relation}'", connection))
                     if (step.Action == RunTimeAction.SkipDay)
                     {
                         _fleetGateStats?.RecordSkippedSlots(step.Skipped);
+                        server.CycleSkips.AddDailyLost(name, step.Skipped, due);
                         _logger.LogInformation(
                             "  [{Server}] {Collector} skipped today's run: the pass could not hand it off within {Grace} minutes of its run time, so it waits for its next run time, {Next:u} (#4938)",
                             server.Config.DisplayName, name, CollectorRunTime.GraceMinutes, step.NextDue);
@@ -13137,8 +14633,25 @@ AND   j.hypertable_name = '{relation}'", connection))
                        skipped by a gate that was too narrow. A body that starts late because the gate was full, while the
                        loop keeps ticking, still counts them all. */
                     var seeded = new DateTime(SkipCreditFloor.ClampSeedStamp(ref server.SeedFinishedTicks, now), DateTimeKind.Utc);
-                    _fleetGateStats?.RecordSlot(_skipCreditFloor.Skipped(due, now, intervalSpan, seeded));
+                    var gridSkipped = _skipCreditFloor.Skipped(due, now, intervalSpan, seeded);
+                    _fleetGateStats?.RecordSlot(gridSkipped);
+                    server.CycleSkips.AddGrid(name, gridSkipped, due);
                     server.NextDue[name] = CollectorCadence.NextDue(due, now, intervalSpan);
+
+                    /* #6186: a collector the server refused with the same answer run after run waits out its backoff instead
+                       of writing a PERMISSIONS row every interval. The slot is served like any other: counted above, with the
+                       grid slots the loop stepped over, and the stamp moved on, because the fleet gate measures whether the
+                       sweep loop keeps cadence and those slots are real whether or not this collector then runs. The backoff
+                       only decides not to run it, so the first try after the wait is an ordinary slot, not a burst of missed
+                       ones. The continue skips the whole run for this pass (the detached query_store and daily dispatches
+                       below included), so no collection_log row is written. */
+                    if (server.RefusedBackoff.IsBackedOff(name, now, intervalSpan))
+                    {
+                        _logger.LogDebug(
+                            "  [{Server}] {Collector} not run this slot: the server has refused it {Streak} times in a row, so it is tried less often until that changes (#6186)",
+                            server.Config.DisplayName, name, server.RefusedBackoff.Streak(name));
+                        continue;
+                    }
                 }
 
                 /* #2700: query_store is split off this sequential body rather than awaited inline. Its
@@ -13182,7 +14695,14 @@ AND   j.hypertable_name = '{relation}'", connection))
                    disagree about what runs in the body. */
                 if (!RunsDetached(name, interval))
                 {
+                    var collectorStarted = Stopwatch.GetTimestamp();
                     await RunOneAsync(server, runner, name, peerMaxAtDispatchMs, cancellationToken, runTimeHandOff: handOff);
+                    var collectorMs = (long)Stopwatch.GetElapsedTime(collectorStarted).TotalMilliseconds;
+                    if (collectorMs > bodySlowestMs)
+                    {
+                        bodySlowestMs = collectorMs;
+                        bodySlowestName = name;
+                    }
                 }
                 else if (IsDetachedByName(name))
                 {
@@ -13208,10 +14728,49 @@ AND   j.hypertable_name = '{relation}'", connection))
                     TrackDetachedRun(RunDetachedAsync(server, runner, name, peerMaxAtDispatchMs, cancellationToken, detachedDaily: true, runTimeHandOff: handOff));
                 }
             }
+
+            /* #5735: the slots this server lost since its last row, written as one row by the body that noticed (at most one in
+               DarlingCycleSkip.RowMinInterval), then this body's own length is kept for the next one's cause. */
+            await FlushCycleSkipAsync(server, runtime, priorCauses, cancellationToken);
+            server.LastBodyMs = (long)Stopwatch.GetElapsedTime(bodyStarted).TotalMilliseconds;
+            server.LastBodySlowestName = bodySlowestName;
+            server.LastBodySlowestMs = bodySlowestMs;
         }
         finally
         {
             server.CollectionGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// #5735: writes the server's pending stepped-over slots as one <c>collection_cycle</c> row, or nothing when there are
+    /// none, the last row is under <see cref="DarlingCycleSkip.RowMinInterval"/> old, or the server is retired. A failed
+    /// write keeps the pending counts for the next body. A restart loses them (the in-memory gate stats do too).
+    /// </summary>
+    internal async Task FlushCycleSkipAsync(ServerLoopState server, ServerRuntime runtime, CycleSkipCauses causes, CancellationToken cancellationToken)
+    {
+        var postgres = _postgres;
+        if (postgres is null || server.Retired)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var taken = server.CycleSkips.TryTake(now, DarlingCycleSkip.RowMinInterval);
+        if (taken is null)
+        {
+            return;
+        }
+
+        var report = DarlingCycleSkip.Build(taken, causes, now);
+        if (report is null)
+        {
+            return;
+        }
+
+        if (await DarlingObservability.LogCycleSkipAsync(postgres, runtime, now, report, _logger, cancellationToken))
+        {
+            server.CycleSkips.Commit(taken, now);
         }
     }
 
@@ -13223,8 +14782,55 @@ AND   j.hypertable_name = '{relation}'", connection))
     /// gate (unlike the main loop, which skips) because an explicit operator snapshot should not be dropped.
     /// </summary>
     internal async Task<CommandOutcome> RunSnapshotAsync(
-        List<ServerLoopState> servers, DarlingCollectorRunner runner, int serverId, CancellationToken cancellationToken)
+        List<ServerLoopState> servers, DarlingCollectorRunner runner, int serverId, CancellationToken cancellationToken,
+        IReadOnlyList<string>? collectors = null)
     {
+        /* #5941: an optional collector list. Empty or absent = the run-all form (every ENABLED collector). A list is
+           the per-collector form: only those collectors, each run even when disabled (its enabled state and its
+           schedule are not touched; the override map is only read). Every name is checked against the catalog first,
+           so a typo refuses the whole command and names the bad name instead of running part of it. */
+        var requested = new List<string>();
+        foreach (var raw in collectors ?? [])
+        {
+            var name = raw?.Trim() ?? string.Empty;
+            if (!CollectorScheduleDefaults.All.ContainsKey(name))
+            {
+                return new CommandOutcome(false, "unknown collector",
+                    JsonError($"unknown collector '{name}'. Use a name from the collector list."));
+            }
+
+            if (!requested.Contains(name, StringComparer.Ordinal))
+            {
+                requested.Add(name);
+            }
+        }
+
+        /* #5941 fleet cap: the snapshot takes a permit from the same gate (width 4 by default) a scheduled pass takes, so
+           clicks on several servers cannot run more collection than the sweeps do. The permit comes BEFORE the
+           per-server collection gate; the scheduled pass holds a permit and only TRIES the collection gate, so the two
+           cannot wait on each other. */
+        var sweepGate = SweepGate;
+        if (sweepGate is not null)
+        {
+            await sweepGate.WaitAsync(cancellationToken);
+        }
+
+        try
+        {
+            return await RunSnapshotUnderPermitAsync(servers, runner, serverId, requested, cancellationToken);
+        }
+        finally
+        {
+            sweepGate?.Release();
+        }
+    }
+
+    private async Task<CommandOutcome> RunSnapshotUnderPermitAsync(
+        List<ServerLoopState> servers, DarlingCollectorRunner runner, int serverId, List<string> requested,
+        CancellationToken cancellationToken)
+    {
+        var explicitList = requested.Count > 0;
+
         ServerLoopState? server;
         lock (_serversLock)
         {
@@ -13257,14 +14863,17 @@ AND   j.hypertable_name = '{relation}'", connection))
             var collectorsRun = 0;
             var totalRows = 0;
             var skippedDaily = new List<string>();
-            foreach (var name in CollectorScheduleDefaults.All.Keys)
+            var skippedOther = new List<(string Collector, string Reason)>();
+            foreach (var name in explicitList ? requested : CollectorScheduleDefaults.All.Keys.ToList())
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
                 /* Honor a disabled-by-override collector (mirrors the on-load/scheduled gates); run every
-                   enabled one NOW regardless of frequency or NextDue — that is what "snapshot" means. */
+                   enabled one NOW regardless of frequency or NextDue — that is what "snapshot" means. A collector the
+                   operator NAMED is run even when disabled (#5941): that is an explicit choice, and nothing is written
+                   to the override map. */
                 var effective = StoreConfigProvider.ResolveSchedule(name, runtime.ServerId, _scheduleOverrides);
-                if (!effective.Enabled)
+                if (!effective.Enabled && !explicitList)
                 {
                     continue;
                 }
@@ -13279,6 +14888,13 @@ AND   j.hypertable_name = '{relation}'", connection))
                 if (!CollectorCatalog.EngineMatches(name, runtime.Target)
                     || !CollectorCatalog.AppliesTo(name, runtime.Target))
                 {
+                    /* The run-all form leaves these out without a word (a PostgreSQL target has dozens of them); a
+                       collector the operator named is reported, with the reason (#5941). */
+                    if (explicitList)
+                    {
+                        skippedOther.Add((name, "it does not apply to this server's engine"));
+                    }
+
                     continue;
                 }
 
@@ -13321,13 +14937,14 @@ AND   j.hypertable_name = '{relation}'", connection))
                 {
                     collector,
                     reason = "its scheduled daily run is still going",
-                }).ToList(),
+                }).Concat(skippedOther.Select(o => new { collector = o.Collector, reason = o.Reason })).ToList(),
             });
+            var skippedCount = skippedDaily.Count + skippedOther.Count;
             return new CommandOutcome(
                 true,
-                skippedDaily.Count == 0
+                skippedCount == 0
                     ? "snapshot complete"
-                    : $"snapshot complete; {skippedDaily.Count} collector(s) skipped because their scheduled daily run is still going",
+                    : $"snapshot complete; {skippedCount} collector(s) skipped",
                 json);
         }
         finally
@@ -13440,15 +15057,19 @@ AND   j.hypertable_name = '{relation}'", connection))
     {
         ServerLoopState? server;
         ServerRuntime? runtime;
+        MonitoredServer? config;
         string displayName;
         lock (_serversLock)
         {
             server = servers.Find(s => s.Config.ServerId == serverId);
             runtime = server?.Runtime;
-            displayName = server?.Config.DisplayName ?? serverId.ToString(CultureInfo.InvariantCulture);
+            /* #6170: the definition is read with the runtime, in one hold of the lock: the login pair below must be the one the
+               address in the runtime was made from, not a later edit's. */
+            config = server?.Config;
+            displayName = config?.DisplayName ?? serverId.ToString(CultureInfo.InvariantCulture);
         }
 
-        if (server is null)
+        if (server is null || config is null)
         {
             return new CommandOutcome(false, "server not monitored", JsonError($"no monitored server with server_id {serverId}"));
         }
@@ -13457,6 +15078,12 @@ AND   j.hypertable_name = '{relation}'", connection))
         {
             return new CommandOutcome(false, "server not connected",
                 JsonError($"server '{displayName}' is not currently connected — a hypothetical index has to be tested against the server's own statistics, so there is nothing to answer from while it is unreachable"));
+        }
+
+        if (!ServerDefinitionEquals(config, runtime.Config))
+        {
+            return new CommandOutcome(false, "server definition changed",
+                JsonError($"server '{displayName}' was edited and is reconnecting; try again once it has reconnected"));
         }
 
         if (runtime.Target.Engine != CollectorTargetEngine.PostgreSql)
@@ -13486,9 +15113,21 @@ AND   j.hypertable_name = '{relation}'", connection))
                 JsonError($"no statement text is stored for queryid {queryId} on '{displayName}'. Text is refreshed on its own cadence and a major-version upgrade re-keys every queryid, so a statement first seen minutes ago genuinely has none yet — there is nothing to re-plan until it does."));
         }
 
+        /* #6170: the check runs under its own login, never the monitoring login. Planning can evaluate a function a database role created
+           when its arguments are constants, and the monitoring login usually holds pg_monitor or pg_read_all_stats. With no login set up
+           the check is refused with what to set up, and nothing is sent to the monitored server. */
+        var (hypotheticalIndexConnectionString, loginRefusal) = Targets.HypotheticalIndexLogin.Resolve(
+            config, runtime.ConnectionString);
+        if (hypotheticalIndexConnectionString is null)
+        {
+            return new CommandOutcome(false, "hypothetical-index login not set up", JsonError(loginRefusal ?? "no login"));
+        }
+
         try
         {
-            await using var connection = new NpgsqlConnection(runtime.ConnectionString);
+            /* #6143: pinned like every other monitoring connection. The experiment sets the database's own
+               search_path only around the EXPLAIN and the hypothetical index it plans against. */
+            await using var connection = PostgresTargetProvider.CreatePinnedConnection(hypotheticalIndexConnectionString);
             await connection.OpenAsync(cancellationToken);
 
             var result = await Targets.HypotheticalIndexExperiment.RunAsync(
@@ -13518,20 +15157,33 @@ AND   j.hypertable_name = '{relation}'", connection))
         {
             throw;
         }
+        catch (NpgsqlException ex) when (Targets.HypotheticalIndexLogin.IsSignInRuleRefusal(ex))
+        {
+            /* #6170: the server asked for a sign-in the check does not accept (clear text, MD5, none, or SCRAM without channel binding). Refused
+               before the password was sent, with what to change. */
+            return new CommandOutcome(false, "hypothetical-index sign-in refused",
+                JsonError($"the hypothetical-index connection to '{displayName}' did not sign in: "
+                    + $"{CustomAlertEvaluator.SanitizeDisplayText(ex.Message, HypotheticalIndexErrorMaxLength).TrimEnd('.')}. "
+                    + Targets.HypotheticalIndexLogin.SignInRule));
+        }
         catch (PostgresException ex)
         {
             /* Reported rather than thrown, and the SQLSTATE travels: 42P01 here means the table named in the
                candidate does not exist, which is a caller mistake, and 42501 means the login cannot plan
-               against it — two different conversations that a bare failure would merge. */
+               against it — two different conversations that a bare failure would merge. The server's text goes to the
+               Viewer, so it is cleaned and capped like the pooler text is (#6165). */
             return new CommandOutcome(false, "experiment failed",
-                JsonError($"planning on '{displayName}' failed: {ex.MessageText} (SQLSTATE {ex.SqlState})"));
+                JsonError($"planning on '{displayName}' failed: {CustomAlertEvaluator.SanitizeDisplayText(ex.MessageText, HypotheticalIndexErrorMaxLength)} (SQLSTATE {ex.SqlState})"));
         }
         catch (Exception ex)
         {
             return new CommandOutcome(false, "experiment failed",
-                JsonError($"planning on '{displayName}' failed: {ex.Message}"));
+                JsonError($"planning on '{displayName}' failed: {CustomAlertEvaluator.SanitizeDisplayText(ex.Message, HypotheticalIndexErrorMaxLength)}"));
         }
     }
+
+    /// <summary>The longest server or driver text the hypothetical-index result carries to the Viewer (#6170).</summary>
+    private const int HypotheticalIndexErrorMaxLength = 300;
 
     /// <summary>
     /// The <c>fetch_active_queries</c> command handler (headless-plan live-snapshot wave): reads the LIVE
@@ -13611,15 +15263,7 @@ AND   j.hypertable_name = '{relation}'", connection))
     /// copy, so no SQL text ever rides on the command payload. Serves Top Queries, Query-Stats history, and the
     /// FinOps High Impact grid. The third column (isolation level) is NULL here (query_stats does not capture it).
     /// Public const so a test can pin its shape ($1 server_id, $2 query_hash, $3 database_name).</summary>
-    public const string ResolveStoredQueryForActualPlanSql = @"
-SELECT query_text, query_plan_xml, NULL::text AS transaction_isolation_level, query_plan_gz
-FROM v_query_stats
-WHERE server_id = $1
-AND   query_hash = $2
-AND   database_name = $3
-AND   query_text IS NOT NULL
-ORDER BY collection_time DESC
-LIMIT 1";
+    public const string ResolveStoredQueryForActualPlanSql = ActualPlanStoredQuery.QueryStatsResolveSql; /* #5639: the viewer reads its prompt text with this same constant */
 
     /// <summary>The <c>query_store_stats</c> resolver — the Query Store history surface's identifier (server_id +
     /// database_name + query_id) to its captured query text + stored plan. $1 server_id, $2 database_name, $3
@@ -13718,6 +15362,14 @@ LIMIT 1";
     private async Task<CommandOutcome> RunExecuteActualPlanAsync(
         List<ServerLoopState> servers, int serverId, ActualPlanRequest request, CancellationToken cancellationToken)
     {
+        /* #5639: a query_stats request is refused BEFORE any work unless it carries the digest of the text the
+           operator confirmed and a hash that names a particular query. */
+        var refusedBeforeResolve = RefuseActualPlanRequest(request);
+        if (refusedBeforeResolve is not null)
+        {
+            return new CommandOutcome(false, "request refused", JsonError(refusedBeforeResolve));
+        }
+
         /* Resolve the connection under the lock (the command loop reconciles the list concurrently). Capture the
            immutable connection string + Azure flag as locals — never hold the runtime across the execute. */
         bool serverExists;
@@ -13787,6 +15439,15 @@ LIMIT 1";
                 JsonError($"no stored query text was found for this {DescribeActualPlanIdentifier(request)} on '{displayName}' — the actual plan is captured by re-executing the stored query text, which is not available"));
         }
 
+        /* #5639: the store picks the latest text for a hash + database, which can differ from the text the
+           operator confirmed in the viewer prompt. Run it only when it is the confirmed text. */
+        var refusedChangedText = RefuseChangedActualPlanText(request, queryText);
+        if (refusedChangedText is not null)
+        {
+            _logger.LogInformation("[{Server}] execute_actual_plan: the stored query text no longer matches the confirmed text; nothing was run", displayName);
+            return new CommandOutcome(false, "stored query changed", JsonError(refusedChangedText));
+        }
+
         /* RE-EXECUTE via the SHARED executor (SET STATISTICS XML ON), as the server's stored credential. */
         try
         {
@@ -13846,6 +15507,52 @@ LIMIT 1";
         ActualPlanSource.QuerySnapshot => ResolveStoredSnapshotForActualPlanSql,
         _ => throw new InvalidOperationException($"no store resolver for actual-plan source {source}"),
     };
+
+    /// <summary>
+    /// #5639: the checks a <c>query_stats</c> actual-plan request must pass before the store is read. Returns the
+    /// refusal message, or null when the request may proceed. The request has to carry the digest of the text the
+    /// operator confirmed (a request from a viewer that predates the digest is refused rather than run unchecked)
+    /// and a hash that names a particular query (an empty or all-zero hash would let the lookup pick any statement
+    /// in the database). Query Store and snapshot requests name one stored row exactly and are not checked.
+    /// </summary>
+    internal static string? RefuseActualPlanRequest(ActualPlanRequest request)
+    {
+        if (request.Source != ActualPlanSource.QueryStats)
+        {
+            return null;
+        }
+
+        if (!QueryModificationDetector.IsUsableQueryHash(request.QueryHash))
+        {
+            return "This row has no usable query hash (it is empty or all zeros), so the stored text cannot be tied to "
+                + "the statement you confirmed. Nothing was run.";
+        }
+
+        if (string.IsNullOrWhiteSpace(request.ConfirmedSha256))
+        {
+            return "This request did not include the digest of the query text you confirmed, so nothing was run. "
+                + "Update the viewer to the same version as the service and try again.";
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// #5639: compares the digest of the text the operator confirmed with the digest of the text the store
+    /// resolved. Returns the refusal message on a mismatch, or null when the texts are the same (or the request is
+    /// not a <c>query_stats</c> one, which names one stored row exactly).
+    /// </summary>
+    internal static string? RefuseChangedActualPlanText(ActualPlanRequest request, string resolvedQueryText)
+    {
+        if (request.Source != ActualPlanSource.QueryStats)
+        {
+            return null;
+        }
+
+        return QueryTextDigest.Matches(request.ConfirmedSha256, resolvedQueryText)
+            ? null
+            : "The stored query text changed after you confirmed. Nothing was run. Reopen the plan and confirm again.";
+    }
 
     /// <summary>Binds the store-resolution parameters ($1 server_id, then the identifier's $2/$3) for the request's
     /// identifier kind (a snapshot also binds $4, the database name). The snapshot's collection_time binds as a
@@ -14583,6 +16290,45 @@ LIMIT 1";
 
 
     /// <summary>
+    /// #6186: the collection_log write every <see cref="RunOneAsync"/> outcome goes through, then the refusal backoff's record
+    /// of that outcome, so no arm can write its row and forget the backoff.
+    /// </summary>
+    private async Task LogRunAsync(
+        ServerLoopState server, ServerRuntime runtime, string collectorName, string status, int rowsCollected,
+        long sqlMs, long storageMs, string? errorMessage, FanoutCost? fanout, ServerPhaseCost? phases,
+        DrainForensics? drain, FetchPhaseCost? fetchPhases, int? sweepPeerMaxMs, ILogger? logger, CancellationToken cancellationToken,
+        string? readSource = null)
+    {
+        await DarlingObservability.LogCollectionAsync(
+            _postgres!, runtime, collectorName, status, rowsCollected, sqlMs, storageMs, errorMessage, fanout, phases, drain,
+            fetchPhases, sweepPeerMaxMs, logger, cancellationToken, readSource);
+        RecordRunForBackoff(server, runtime, collectorName, status, errorMessage);
+    }
+
+    /// <summary>
+    /// #6186: feeds one run's status to the server's refusal backoff. A PERMISSIONS run with the same answer as the last one
+    /// extends the streak; a success, an error or a different answer restarts from the normal interval. YIELDED, ABANDONED and
+    /// SKIPPED runs say nothing about whether the grant changed, so they leave the streak alone.
+    /// </summary>
+    private void RecordRunForBackoff(ServerLoopState server, ServerRuntime runtime, string collectorName, string status, string? message)
+    {
+        if (status is "YIELDED" or "SKIPPED" || status == EnumeratedCollectorDriver.AbandonedStatus)
+        {
+            return;
+        }
+
+        var effective = StoreConfigProvider.ResolveSchedule(collectorName, runtime.ServerId, _scheduleOverrides);
+        var interval = TimeSpan.FromMinutes(CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes(effective.FrequencyMinutes));
+        var streak = server.RefusedBackoff.Record(collectorName, status == "PERMISSIONS", message, DateTime.UtcNow, interval);
+        if (streak == RefusedCollectorBackoff.FreeRefusals + 1)
+        {
+            _logger.LogInformation(
+                "  [{Server}] {Collector} refused {Streak} times in a row with the same answer: it is tried less often (up to every {Max}) until the answer changes or it succeeds (#6186)",
+                server.Config.DisplayName, collectorName, streak, RefusedCollectorBackoff.MaxDelay);
+        }
+    }
+
+    /// <summary>
     /// Runs one collector for a server and logs its outcome to collection_log. Returns the rows written
     /// (0 on skip/permissions/error) so an on-demand snapshot can tally them; the scheduled/on-load callers
     /// simply discard the count.
@@ -14615,6 +16361,11 @@ LIMIT 1";
         if (runtime is null || !s_dispatch.TryGetValue(collectorName, out var run))
         {
             return 0;
+        }
+
+        if (DispatchOverrideForTests is { } dispatchOverride)
+        {
+            run = (_, overrideRuntime, overrideToken) => dispatchOverride(collectorName, overrideRuntime, overrideToken);
         }
 
         /* #2165: the tick's Query Store pass and the backfill slice both do heavy QS text extraction, and
@@ -14714,6 +16465,16 @@ LIMIT 1";
         if (RunOneBodyOverride is { } bodyOverride)
         {
             var overrideRows = await bodyOverride(server, runtime, collectorName, cancellationToken);
+            if (RunOneRefusalOverride?.Invoke(collectorName) is { } overrideRefusal)
+            {
+                /* Stands in for the PERMISSIONS arm: the same recorder the real run goes through (LogRunAsync). */
+                RecordRunForBackoff(server, runtime, collectorName, "PERMISSIONS", overrideRefusal);
+            }
+            else
+            {
+                RecordRunForBackoff(server, runtime, collectorName, overrideRows >= 0 ? "SUCCESS" : "ERROR", null);
+            }
+
             if (runOutcome is not null)
             {
                 runOutcome.Succeeded = overrideRows >= 0;
@@ -14764,6 +16525,16 @@ LIMIT 1";
                 }
 
                 throw new DarlingXeSessionMissingException(traceFault);
+            }
+
+            /* #5640 (H2): the client-timeout session's create was refused for permission. The read of a session that cannot exist
+               would throw "not running" and record SESSION_MISSING, and the Capture Down self-alert reads that: a permanent alert on
+               every server whose login lacks ALTER ANY EVENT SESSION (or whose engine refuses it). The same arm as the long-query
+               session's denial (#5378), so the row is PERMISSIONS. A session dropped by hand on a login that may create one is not
+               here: the ensure recreates it, and until then the read records SESSION_MISSING. */
+            if (AttentionPermissionFaultFor(collectorName, server) is { } attentionFault)
+            {
+                throw new DarlingXeSessionDeniedException(attentionFault);
             }
 
             var result = await run(runner, runtime, cancellationToken);
@@ -14907,9 +16678,10 @@ LIMIT 1";
                read. */
             var status = EnumeratedCollectorDriver.ClassifyReturnedRun(result.Abandoned);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, status, result.Rows, result.SqlMs, result.StorageMs, result.Note,
-                result.Fanout, result.ServerPhases, result.Drain, result.FetchPhases, peerMaxAtDispatchMs, _logger, cancellationToken);
+            await LogRunAsync(
+                server, runtime, collectorName, status, result.Rows, result.SqlMs, result.StorageMs, result.Note,
+                result.Fanout, result.ServerPhases, result.Drain, result.FetchPhases, peerMaxAtDispatchMs, _logger, cancellationToken,
+                readSource: result.ReadSource);
 
             /* #2864 item 3: fold THIS run into the body's peer high-water mark, AFTER its own row is
                written so a collector is never its own peer. The mark answers the question that took
@@ -14977,8 +16749,8 @@ LIMIT 1";
                 "  [{Server}] {Collector} => insufficient permissions: {Message}",
                 server.Config.DisplayName, collectorName, ex.Message);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
         catch (DarlingXeSessionMissingException ex)
@@ -15006,8 +16778,8 @@ LIMIT 1";
                 "  [{Server}] {Collector} => XE session missing (capture down): {Message}",
                 server.Config.DisplayName, collectorName, ex.Message);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "SESSION_MISSING", 0, runClock.ElapsedMilliseconds, 0, ex.Message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
+            await LogRunAsync(
+                server, runtime, collectorName, "SESSION_MISSING", 0, runClock.ElapsedMilliseconds, 0, ex.Message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
         catch (Exception ex) when (AwsRoleConfigurationFault(ex) is { } assume)
@@ -15022,8 +16794,8 @@ LIMIT 1";
                STS failure) carry no operator-fixable setting and fall through to the general ERROR arm with the same message. */
             var roleNote = AwsRoleFaultNote(_logger, server.Config.DisplayName, collectorName, assume);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds, roleNote,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds, roleNote,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15038,8 +16810,8 @@ LIMIT 1";
                     : "  [{Server}] {Collector} => PERMISSIONS: the host does not match the endpoint AWS reports",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds, ex.Message,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds, ex.Message,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15057,8 +16829,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: the RDS log API refused the call",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds,
                 $"{ex.Message} — the MONITORING HOST's IAM role lacks a grant this source needs, which is "
                 + "not a database grant: plan capture on managed PostgreSQL reads the server log through "
                 + "the RDS API, so the role needs rds:DescribeDBInstances, rds:DescribeDBClusters, "
@@ -15076,8 +16848,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: the RDS/PI API refused the call",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, 0, runClock.ElapsedMilliseconds,
                 $"{ex.Message} — the MONITORING HOST's IAM role lacks a grant this source needs, which is "
                 + "not a database grant: instance CPU on managed PostgreSQL reads AWS Performance Insights, "
                 + "so the role needs rds:DescribeDBInstances, rds:DescribeDBClusters and "
@@ -15120,8 +16892,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: the server log is stamped '{Zone}', not UTC",
                 server.Config.DisplayName, collectorName, ex.ObservedZone);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, 0, 0, ex.Message,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, 0, 0, ex.Message,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15146,8 +16918,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: logging_collector is off, so the target writes no server log files",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15187,8 +16959,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: log_destination carries no stderr-format file for this target",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15221,8 +16993,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: no csvlog file has appeared for this target yet",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15248,8 +17020,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => PERMISSIONS: no jsonlog file has appeared for this target yet",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, ex.Message,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15268,8 +17040,8 @@ LIMIT 1";
             _logger.LogInformation("  [{Server}] {Collector} => YIELDED - 1s lock-timeout guard fired (target lock contention)",
                 server.Config.DisplayName, collectorName);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "YIELDED", 0, runClock.ElapsedMilliseconds, 0,
+            await LogRunAsync(
+                server, runtime, collectorName, "YIELDED", 0, runClock.ElapsedMilliseconds, 0,
                 $"Lock-timeout yield (SQL error #{ex.Number}): the 1-second LOCK_TIMEOUT guard fired rather than waiting in a blocking chain. One snapshot sweep skipped; evidence of lock contention on the monitored server, not a monitoring failure.",
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
@@ -15293,8 +17065,8 @@ LIMIT 1";
             _logger.LogWarning("  [{Server}] {Collector} => insufficient permissions ({Number}): {Message}",
                 server.Config.DisplayName, collectorName, ex.Number, message);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
+            await LogRunAsync(
+                server, runtime, collectorName, "PERMISSIONS", 0, runClock.ElapsedMilliseconds, 0, message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
         /* #2997: the database is read off the EXCEPTION first, falling back to the runtime's own. #2638
@@ -15350,8 +17122,8 @@ LIMIT 1";
                     server.Config.DisplayName, collectorName, status, ex.SqlState, explanation);
             }
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, status, 0, runClock.ElapsedMilliseconds, 0, explanation, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
+            await LogRunAsync(
+                server, runtime, collectorName, status, 0, runClock.ElapsedMilliseconds, 0, explanation, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
         /* yieldsOnLockTimeout: false is deliberate, and matches the general catch below rather than the
@@ -15445,8 +17217,8 @@ LIMIT 1";
             _logger.LogError("  [{Server}] {Collector} => ERROR (timeout): {Message}",
                 server.Config.DisplayName, collectorName, explanation);
 
-            await DarlingObservability.LogCollectionAsync(
-                _postgres!, runtime, collectorName, "ERROR", 0, elapsedMs, 0, explanation,
+            await LogRunAsync(
+                server, runtime, collectorName, "ERROR", 0, elapsedMs, 0, explanation,
                 fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             return 0;
         }
@@ -15543,9 +17315,13 @@ LIMIT 1";
                    instantaneous — a 300-second timeout and a refused connection stored the identical
                    row, and the number that separates them is the only one an operator needs first.
                    Read from the stopwatch rather than from the exception, because most faults carry
-                   no duration at all. */
-                await DarlingObservability.LogCollectionAsync(
-                    _postgres!, runtime, collectorName, "ERROR", 0, runClock.ElapsedMilliseconds, 0, message, fanout: null, phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
+                   no duration at all.
+
+                   #5813: the fan-out comes off the exception, where the runner's all-failed rethrow put it, so a
+                   one-database server whose Query Store read timed out names that database in slowest_item with
+                   the budget as slowest_item_ms. Null for every fault that carries none, as before. */
+                await LogRunAsync(
+                    server, runtime, collectorName, "ERROR", 0, runClock.ElapsedMilliseconds, 0, message, fanout: CollectorFaultFanout.For(ex), phases: null, drain: null, fetchPhases: null, sweepPeerMaxMs: peerMaxAtDispatchMs, _logger, cancellationToken);
             }
             catch
             {
@@ -15596,8 +17372,8 @@ LIMIT 1";
     /// <summary>
     /// Collector-name dispatch — the Darling twin of Lite's RunCollectorAsync switch, one typed
     /// entry per shared definition, with Lite's forwarder tolerances mirrored: the XE readers
-    /// treat a missing/inaccessible session as zero rows, trace_flags treats denied DBCC as zero
-    /// rows with a warning.
+    /// treat a missing/inaccessible session as zero rows. trace_flags has no tolerance (#5633 item 19):
+    /// a failed DBCC TRACESTATUS is a PERMISSIONS or ERROR run, because a SUCCESS run with 0 rows reads as "no flag is enabled".
     /// </summary>
     private static readonly IReadOnlyDictionary<string, DispatchEntry> s_dispatch = new Dictionary<string, DispatchEntry>(StringComparer.OrdinalIgnoreCase)
     {
@@ -15617,7 +17393,7 @@ LIMIT 1";
         ["server_config"] = (r, s, ct) => r.RunAsync(ServerConfigCollector.Instance, s, ct),
         ["database_config"] = (r, s, ct) => r.RunAsync(DatabaseConfigCollector.Instance, s, ct),
         ["database_states"] = (r, s, ct) => r.RunAsync(DatabaseStateCollector.Instance, s, ct),
-        ["trace_flags"] = RunTraceFlagsTolerantAsync,
+        ["trace_flags"] = (r, s, ct) => r.RunAsync(TraceFlagsCollector.Instance, s, ct),
         ["database_scoped_config"] = (r, s, ct) => r.RunAsync(DatabaseScopedConfigCollector.Instance, s, ct),
         ["query_store_health"] = (r, s, ct) => r.RunAsync(QueryStoreHealthCollector.Instance, s, ct),
         ["session_stats"] = (r, s, ct) => r.RunAsync(SessionStatsCollector.Instance, s, ct),
@@ -15634,6 +17410,7 @@ LIMIT 1";
         ["query_store"] = (r, s, ct) => r.RunAsync(QueryStoreCollector.Instance, s, ct),
         ["deadlocks"] = (r, s, ct) => RunXeTolerantAsync(DeadlocksCollector.Instance, r, s, ct),
         ["blocked_process_report"] = (r, s, ct) => RunXeTolerantAsync(BlockedProcessReportCollector.Instance, r, s, ct),
+        ["attention"] = (r, s, ct) => RunXeTolerantAsync(AttentionCollector.Instance, r, s, ct),
         ["long_query_completions"] = (r, s, ct) => RunXeTolerantAsync(LongQueryCompletionsCollector.Instance, r, s, ct),
         ["system_health_events"] = (r, s, ct) => r.RunAsync(SystemHealthEventsCollector.Instance, s, ct),
         ["default_trace_events"] = (r, s, ct) => r.RunAsync(DefaultTraceEventsCollector.Instance, s, ct),
@@ -15642,6 +17419,7 @@ LIMIT 1";
         ["ag_replica_states"] = (r, s, ct) => r.RunAsync(AgReplicaStatesCollector.Instance, s, ct),
         ["ag_database_replica_states"] = (r, s, ct) => r.RunAsync(AgDatabaseReplicaStatesCollector.Instance, s, ct),
         ["plan_correction"] = (r, s, ct) => r.RunAsync(PlanCorrectionCollector.Instance, s, ct),
+        ["query_store_forced_plans"] = (r, s, ct) => r.RunAsync(QueryStoreForcedPlansCollector.Instance, s, ct),
         ["pvs_stats"] = (r, s, ct) => r.RunAsync(PvsStatsCollector.Instance, s, ct),
         /* PostgreSQL. Dispatch is by name and engine-agnostic; the engine gate upstream in
            RunDueCollectorsAsync means this lambda is only ever reached for a Postgres target. */
@@ -15752,20 +17530,6 @@ LIMIT 1";
                deadlock capture is non-functional. RunOneAsync catches this and continues the sweep, so
                collection is still tolerant — only the logged status differs from a real zero-row success. */
             throw new DarlingXeSessionMissingException(ex.Message, ex);
-        }
-    }
-
-    private static async Task<CollectorRunResult> RunTraceFlagsTolerantAsync(
-        DarlingCollectorRunner runner, ServerRuntime server, CancellationToken cancellationToken)
-    {
-        try
-        {
-            return await runner.RunAsync(TraceFlagsCollector.Instance, server, cancellationToken);
-        }
-        catch (SqlException)
-        {
-            /* DBCC may be denied — degrade to zero rows, mirrors Lite's warning path. */
-            return new CollectorRunResult(0, 0, 0, CollectorContext.NoMeasurements);
         }
     }
 }

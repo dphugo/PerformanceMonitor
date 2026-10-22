@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using DuckDB.NET.Data;
+using PerformanceMonitor.Common.Tags;
 using PerformanceMonitor.Ui;
 using PerformanceMonitorLite.Database;
 
@@ -81,7 +82,7 @@ public partial class LocalDataService
     /// </summary>
     public async Task<int> CreateServerTagAsync(string name, int? parentId)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
 
         await ThrowIfDuplicateNameAsync(connection, parentId, name, excludeTagId: null);
@@ -89,7 +90,12 @@ public partial class LocalDataService
         int id;
         using (var next = connection.CreateCommand())
         {
-            next.CommandText = "SELECT COALESCE(MAX(id), 0) + 1 FROM server_tags";
+            /* #5750: never hand out an id a notification route is still scoped to. A route whose tag was deleted stays
+               (orphaned, matching nothing); if the next id reused the deleted tag's id the route would silently attach to
+               an unrelated new tag. */
+            next.CommandText = @"
+SELECT GREATEST(COALESCE(MAX(id), 0), COALESCE((SELECT MAX(scope_tag_id) FROM notification_routes), 0)) + 1
+FROM server_tags";
             id = Convert.ToInt32(await next.ExecuteScalarAsync());
         }
 
@@ -111,7 +117,7 @@ SELECT $1, $2, $3, 0, $4, now()::TIMESTAMP";
     /// <summary>Renames a tag, rejecting a duplicate name under its parent (excluding itself).</summary>
     public async Task RenameServerTagAsync(int tagId, string name)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
 
         var parentId = await GetParentIdAsync(connection, tagId);
@@ -127,7 +133,7 @@ SELECT $1, $2, $3, 0, $4, now()::TIMESTAMP";
     /// <summary>Sets a tag's colour, or clears it to neutral when <paramref name="colour"/> is null.</summary>
     public async Task SetServerTagColorAsync(int tagId, string? colour)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
         using var command = connection.CreateCommand();
         command.CommandText = "UPDATE server_tags SET colour = $2 WHERE id = $1";
@@ -140,13 +146,59 @@ SELECT $1, $2, $3, 0, $4, now()::TIMESTAMP";
     /// caller's job against its in-memory tree, exactly as in the viewer.</summary>
     public async Task ReparentServerTagAsync(int tagId, int? newParentId)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
+        NotificationRouteCache.Invalidate();
         using var command = connection.CreateCommand();
         command.CommandText = "UPDATE server_tags SET parent_id = $2 WHERE id = $1";
         command.Parameters.Add(new DuckDBParameter { Value = tagId });
         command.Parameters.Add(new DuckDBParameter { Value = (object?)newParentId ?? DBNull.Value });
         await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Moves a tag one place up or down among its siblings (the tags under the same parent) and renumbers every
+    /// sibling 0 to n-1 with the shared <see cref="TagSiblingOrder"/> rule (#6094). The siblings are read on the
+    /// write connection, under the exclusive write lock, so a second writer is never renumbered from a stale
+    /// snapshot, and the new orders go in ONE statement. Returns false (and writes nothing) when the tag is
+    /// already first (up) or last (down), or no longer exists.
+    /// </summary>
+    public async Task<bool> MoveServerTagAsync(int tagId, TagMoveDirection direction)
+    {
+        using var connection = await OpenUserWriteConnectionAsync();
+        ThrowIfTagRestorePending();
+
+        var tags = new List<(int Id, string Name, int? ParentId, int SortOrder)>();
+        using (var read = connection.CreateCommand())
+        {
+            read.CommandText = "SELECT id, name, parent_id, sort_order FROM server_tags";
+            using var reader = await read.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                tags.Add((reader.GetInt32(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetInt32(2), reader.GetInt32(3)));
+            }
+        }
+
+        var tag = tags.FirstOrDefault(t => t.Id == tagId);
+        if (tag.Id != tagId)
+        {
+            return false;
+        }
+
+        var siblings = tags.Where(t => t.ParentId == tag.ParentId).Select(t => new TagSibling(t.Id, t.Name, t.SortOrder));
+        var moves = TagSiblingOrder.Move(siblings, tagId, direction);
+        if (moves.Count == 0)
+        {
+            return false;
+        }
+
+        /* ids and orders are ints, so inlining them is injection-safe and keeps the write one statement. */
+        var cases = string.Concat(moves.Select(m => string.Create(System.Globalization.CultureInfo.InvariantCulture, $" WHEN {m.TagId} THEN {m.SortOrder}")));
+        var inList = string.Join(",", moves.Select(m => m.TagId));
+        using var write = connection.CreateCommand();
+        write.CommandText = $"UPDATE server_tags SET sort_order = CASE id{cases} END WHERE id IN ({inList})";
+        await write.ExecuteNonQueryAsync();
+        return true;
     }
 
     /// <summary>
@@ -157,8 +209,9 @@ SELECT $1, $2, $3, 0, $4, now()::TIMESTAMP";
     /// </summary>
     public async Task DeleteServerTagAsync(int tagId)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
+        NotificationRouteCache.Invalidate();
 
         var subtree = new List<int> { tagId };
         using (var walk = connection.CreateCommand())
@@ -207,8 +260,9 @@ SELECT id FROM subtree WHERE id <> $1";
     /// <summary>Assigns a tag to servers. Already-assigned servers are no-ops (composite PK + ON CONFLICT).</summary>
     public async Task AssignServerTagAsync(IEnumerable<int> serverIds, int tagId)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
+        NotificationRouteCache.Invalidate();
         foreach (var serverId in serverIds)
         {
             using var command = connection.CreateCommand();
@@ -222,8 +276,9 @@ SELECT id FROM subtree WHERE id <> $1";
     /// <summary>Removes a tag from servers.</summary>
     public async Task UnassignServerTagAsync(IEnumerable<int> serverIds, int tagId)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
+        NotificationRouteCache.Invalidate();
         foreach (var serverId in serverIds)
         {
             using var command = connection.CreateCommand();
@@ -239,8 +294,9 @@ SELECT id FROM subtree WHERE id <> $1";
     /// resurrect its old tags. Same rationale as the Darling twin.</summary>
     public async Task ClearServerTagsForServerAsync(int serverId)
     {
-        using var connection = await OpenWriteConnectionAsync();
+        using var connection = await OpenUserWriteConnectionAsync();
         ThrowIfTagRestorePending();
+        NotificationRouteCache.Invalidate();
         using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM server_tag_map WHERE server_id = $1";
         command.Parameters.Add(new DuckDBParameter { Value = serverId });

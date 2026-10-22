@@ -21,7 +21,6 @@ namespace Darling.Tests;
 /// <c>Lite.Tests/McpToolGuideHeadsSqlCoreTests</c>. Follows the pattern in
 /// <see cref="McpToolGuideHeadsDataTests"/>.
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class McpToolGuideHeadsSqlCoreTests
 {
     private static readonly string[] ConvertedTools =
@@ -54,7 +53,7 @@ public sealed class McpToolGuideHeadsSqlCoreTests
         ("analyze_server", "empty: window observed, nothing fired (a true all-clear)"),
         ("analyze_server", "Unanchored runs persist findings to the store; as_of runs are exploratory, not saved"),
         ("analyze_server", "remediation_command is advisory, never auto-executed"),
-        ("compare_analysis", "must exceed hours_back, else refused"),
+        ("compare_analysis", ">= 2 x hours_back, else refused"),
         ("compare_analysis", "N=1 vs N=1: never proves causation"),
         ("compare_analysis", "unavailable = BOTH windows had zero facts"),
         ("compare_analysis", "coverage_caveat flags a partly-collected side"),
@@ -183,7 +182,6 @@ public sealed class McpToolGuideHeadsSqlCoreTests
 /// had, because Lite's daily-summary payload has no rollup tier to disclose (<c>Lite/Mcp/McpHealthTools.cs</c>'s
 /// <c>GetDailySummary</c>/<c>GetDailySummaryRange</c> bodies carry no <c>days_missing</c> key at all).
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class McpToolGuideHeadsSqlCoreDailySummaryTests
 {
     private static readonly string[] ConvertedTools =
@@ -242,7 +240,6 @@ public sealed class McpToolGuideHeadsSqlCoreDailySummaryTests
 /// generic cross-SKU pin in <see cref="McpToolGuideTests"/> also covers this); each product's own tail keeps its
 /// own original prose, including the one line that names that product's own blocked-process-report tool.
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class McpToolGuideHeadsSqlCoreActiveQueriesTests
 {
     private static readonly (string Tool, string Fact)[] HeadFacts =

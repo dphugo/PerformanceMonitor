@@ -126,7 +126,7 @@ try {
     'import { el } from "./util.js";\nexport const SERIES_COLORS = [];\nexport function normalizeColor(c) { return c; }\nexport function renderLineChart() { return el("div", {}); }\n' +
       'export function zoomableLineChart() { return el("div", {}); }\nexport function chartZoomScope() { return ""; }\n'
   );
-  const { renderJobHistory, JOB_HISTORY_COLUMNS } = await import(pathToFileURL(path.join(scratch, "pages", "job-history.js")).href);
+  const { renderJobHistory, JOB_HISTORY_COLUMNS, limitNote, noAgentLine } = await import(pathToFileURL(path.join(scratch, "pages", "job-history.js")).href);
 
   const run = {
     runs: [
@@ -239,6 +239,21 @@ try {
   await settle();
   out.notices = { text: noticed.textContent, noticeCount: all(noticed, "div").filter((d) => d.className === "strip notice").length };
 
+  // #5703: the limit note offers "pick a server" only while no server is picked, and the rendered page passes its pick to it.
+  byLabel(noticed, "Server").value = "srv-a";
+  byLabel(noticed, "Server").handlers.change();
+  await settle();
+  out.noticesOneServer = { text: noticed.textContent };
+  byLabel(noticed, "Server").value = "";
+  byLabel(noticed, "Server").handlers.change();
+  await settle();
+  const cut = { ...run, truncated: true };
+  out.limitNotes = {
+    fleet: limitNote(cut, ""),
+    oneServer: limitNote(cut, "srv-a"),
+    notCut: limitNote({ ...run, truncated: false }, "") === null,
+  };
+
   // An empty answer carries its window facts under hints.
   historyBody = JSON.stringify({ status: "empty", message: "No job runs matched in the requested time range.", hints: { effective_start: "2026-03-01T08:00:00Z", window_truncated: true } });
   const emptyPartial = new FakeNode("div");
@@ -314,6 +329,46 @@ try {
   all(rebuilt2, "button").find((b) => b.textContent === "Close").handlers.click();
   const closed = all(rebuilt2, "div").filter((d) => d.className === "jh-detail").map((d) => d.textContent).join("");
   out.detail = { longMessage, before, opened, preText, reopened, noMessagePre, closed };
+
+  // #6178: the sentence for a not_collected answer that names Azure SQL Database; every other answer keeps its own.
+  const azureMessage = "srv-az runs on Azure SQL Database (EngineEdition 5). The job_history collector does not run there.";
+  out.noAgentLines = {
+    azure: noAgentLine({ kind: "empty", status: "not_collected", message: azureMessage }),
+    otherEngine: noAgentLine({ kind: "empty", status: "not_collected", message: "srv-mi runs on Azure SQL Managed Instance (EngineEdition 8)." }),
+    plainEmpty: noAgentLine({ kind: "empty", status: "empty", message: "No job runs matched in the requested time range." }),
+    azureButEmpty: noAgentLine({ kind: "empty", status: "empty", message: azureMessage }),
+    none: noAgentLine(null),
+  };
+
+  // #6439: the Category choices are the selected server's own. A server whose answer has no runs (an Azure SQL Database) lists none,
+  // the fleet view keeps the union, and a category picked on one server is not carried to the next.
+  const cat = new FakeNode("div");
+  cat.isRoot = true;
+  historyBody = JSON.stringify(run);
+  renderJobHistory(cat);
+  await settle();
+  const catOptions = () => byLabel(cat, "Category").children.map((o) => o.attrs.value);
+  const pickServer = async (name, body) => {
+    historyBody = JSON.stringify(body);
+    byLabel(cat, "Server").value = name;
+    byLabel(cat, "Server").handlers.change();
+    await settle();
+  };
+  await pickServer("", run);
+  const fleetCats = catOptions();
+  // srv-b has never answered with a run: it lists no category, not the fleet's.
+  await pickServer("srv-b", { status: "not_collected", message: "srv-b runs on Azure SQL Database (EngineEdition 5). This is a permanent engine capability gap" });
+  const noRunsCats = catOptions();
+  // Then it answers with one category: only that one is offered, and picking it sends it.
+  await pickServer("srv-b", { ...run, runs: [run.runs[1]] });
+  const oneServerCats = catOptions();
+  byLabel(cat, "Category").value = "Backup";
+  byLabel(cat, "Category").handlers.change();
+  await settle();
+  const pickedSent = historyCalls().pop().q.category || null;
+  // Back to the fleet: the pick is not carried over, and the union is offered again.
+  await pickServer("", run);
+  out.categoryChoices = { fleet: fleetCats, noRuns: noRunsCats, oneServer: oneServerCats, pickedSent, backToFleet: catOptions(), fleetCategorySent: historyCalls().pop().q.category || null };
 
   out.columns = JOB_HISTORY_COLUMNS.map((c) => c.label);
   console.log(JSON.stringify(out));

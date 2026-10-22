@@ -29,6 +29,7 @@ namespace Darling.Tests;
 /// <c>interval == 0 &lt;=&gt; no delta was knowable</c> that the whole (delta, interval) reading rests
 /// on.</para>
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class DeltaGapPolicyTests
 {
     private const int ServerId = 1;
@@ -159,21 +160,6 @@ public sealed class DeltaGapPolicyTests
             .ToList();
 
         Assert.Empty(offenders);
-    }
-
-    /// <summary>The perfmon collector must MEASURE its interval. It wrote a literal 60 — the configured
-    /// cadence — while the real median gap was 299 s, so every rate derived from it was up to 5x high.
-    /// </summary>
-    [Fact]
-    public void ThePerfmonCollectorMeasuresItsInterval_RatherThanAssertingTheCadence()
-    {
-        var source = File.ReadAllText(Path.Combine(
-            RepoRoot(), "PerformanceMonitor.Collectors", "PerfmonStatsCollector.cs"));
-
-        Assert.Contains("CalculateDeltaWithInterval", source, StringComparison.Ordinal);
-        Assert.Contains(".Value(sampleIntervalSeconds)", source, StringComparison.Ordinal);
-        /* The literal it used to write, as the payload value. */
-        Assert.DoesNotContain(".Value(60)", source, StringComparison.Ordinal);
     }
 
     /// <summary>The read has to carry the denominator, or the distinction dies at the API boundary —

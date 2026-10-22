@@ -63,7 +63,7 @@ public enum StartupAction
 /// that validates from the CLI connects identically under the running service. Pure output formatting
 /// (<see cref="FormatProbeLine"/>) is split out so it is unit-testable without live SQL.
 /// </summary>
-public static class DarlingCliCommands
+public static partial class DarlingCliCommands
 {
     /// <summary>The verb that encrypts a SQL-auth password for darling.json (reads stdin).</summary>
     public static bool IsEncryptPasswordVerb(string arg) =>
@@ -123,6 +123,69 @@ public static class DarlingCliCommands
     public static bool IsHardenFilesVerb(string arg) =>
         string.Equals(arg, "--harden-files", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>The flag that makes <see cref="IsHardenFilesVerb"/>'s verb run only <see cref="HardenTlsKeyFilesOnly(string?, TextWriter, TextWriter)"/>
+    /// (#5700); the scripts pass it, and it is not in the help text.</summary>
+    public static bool IsTlsKeyFilesOnlyFlag(string arg) =>
+        string.Equals(arg, "--tls-key-files-only", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The arguments after <c>--harden-files</c>: <c>[--tls-key-files-only] [--config &lt;path to darling.json&gt;]</c>. The
+    /// config path may also be given as the one bare argument (the verb's long-standing form), but not both. Returns false
+    /// with a ready-to-print <paramref name="errorMessage"/> on anything else.
+    /// </summary>
+    public static bool TryParseHardenFilesArgs(string[] rest, out string? configPath, out bool tlsKeyFilesOnly, out string? errorMessage)
+    {
+        configPath = null;
+        tlsKeyFilesOnly = false;
+        errorMessage = null;
+        const string Usage = "Usage: --harden-files [--config <path to darling.json>]";
+        for (var i = 0; i < rest.Length; i++)
+        {
+            var arg = rest[i];
+            if (IsTlsKeyFilesOnlyFlag(arg))
+            {
+                tlsKeyFilesOnly = true;
+                continue;
+            }
+
+            if (string.Equals(arg, "--config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= rest.Length || rest[i + 1].StartsWith('-') || configPath is not null)
+                {
+                    errorMessage = (configPath is not null ? "--config was given twice, or with a path argument too." : "--config needs a path.") + Environment.NewLine + Usage;
+                    return false;
+                }
+
+                configPath = rest[++i];
+                continue;
+            }
+
+            if (arg.StartsWith('-') || configPath is not null)
+            {
+                errorMessage = $"Unknown or unexpected argument for --harden-files: {arg}" + Environment.NewLine + Usage;
+                return false;
+            }
+
+            configPath = arg;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The first lines <c>--harden-files</c> prints (#5700): the config file it checks, and, when no path was passed and
+    /// <c>DARLING_CONFIG</c> is set, that the path came from that variable. The service does not read the variable, so an
+    /// administrator whose session has it set can be checking a different file from the service's.
+    /// </summary>
+    internal static void WriteConfigSource(TextWriter output, string? passedPath, string resolvedConfig, Func<string, string?> environment)
+    {
+        output.WriteLine($"Config file: {resolvedConfig}");
+        if (string.IsNullOrWhiteSpace(passedPath) && !string.IsNullOrWhiteSpace(environment("DARLING_CONFIG")))
+        {
+            output.WriteLine("  (taken from the DARLING_CONFIG environment variable, because no --config was passed. Pass --config <path> to check another file.)");
+        }
+    }
+
     /// <summary>The verb <see cref="EnableMcpAsync"/> handles — enable the MCP endpoint in the store (+ firewall).</summary>
     public static bool IsEnableMcpVerb(string arg) =>
         string.Equals(arg, "--enable-mcp", StringComparison.OrdinalIgnoreCase);
@@ -161,6 +224,34 @@ public static class DarlingCliCommands
     public static bool IsAddServerVerb(string arg) =>
         string.Equals(arg, "--add-server", StringComparison.OrdinalIgnoreCase)
         || string.Equals(arg, "--add-servers", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The verb <see cref="AddAlertSourceAsync"/> handles: make a source for external alerts, a login of its own that can submit alerts and nothing else (#5654).</summary>
+    public static bool IsAddAlertSourceVerb(string arg) =>
+        string.Equals(arg, "--add-alert-source", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The verb <see cref="RotateAlertSourceAsync"/> handles: give a source a new password (#5654).</summary>
+    public static bool IsRotateAlertSourceVerb(string arg) =>
+        string.Equals(arg, "--rotate-alert-source", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The verb <see cref="RemoveAlertSourceAsync"/> handles: drop a source's login and its registry row (#5654).</summary>
+    public static bool IsRemoveAlertSourceVerb(string arg) =>
+        string.Equals(arg, "--remove-alert-source", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The verb <see cref="ListAlertSourcesAsync"/> handles: list the sources and how they are doing (#5654).</summary>
+    public static bool IsListAlertSourcesVerb(string arg) =>
+        string.Equals(arg, "--list-alert-sources", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The <c>mcp.dataDetail</c> level of the config at <paramref name="configPath"/>, for the verbs that serve collected text (#6236).
+    /// Here, not beside the verb, because the CLI's loads of darling.json live in this file (DarlingOwnedSecretsCensusTests).</summary>
+    private static McpDataDetail ReadConfiguredDataDetail(string? configPath)
+    {
+        McpDataDetailModes.TryParse(DarlingConfig.Load(configPath).Mcp.DataDetail, out var mode);
+        return mode;
+    }
+
+    /// <summary>The verb <see cref="ExportInvestigationsAsync"/> handles: write the investigation cases that have feedback as JSON lines (#6236).</summary>
+    public static bool IsExportInvestigationsVerb(string arg) =>
+        string.Equals(arg, "--export-investigations", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The verb <see cref="ToggleCollectorAsync"/> handles with <c>enable: true</c> — turn one collector ON in the
     /// store's schedule overrides, fleet-wide or for one server (#3752). Until this verb the only writer of that
@@ -250,6 +341,16 @@ public static class DarlingCliCommands
     public static bool IsSetCollectorRunAtVerb(string arg) =>
         string.Equals(arg, "--set-collector-run-at", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>The verb <see cref="SetCollectorColumnAsync"/> handles for the frequency (#6227): set or clear how often one collector
+    /// runs, in minutes, fleet-wide or for one server.</summary>
+    public static bool IsSetCollectorFrequencyVerb(string arg) =>
+        string.Equals(arg, "--set-collector-frequency", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The verb <see cref="SetCollectorColumnAsync"/> handles for the retention (#6227): set or clear how many days one
+    /// collector's data is kept, fleet-wide or for one server.</summary>
+    public static bool IsSetCollectorRetentionVerb(string arg) =>
+        string.Equals(arg, "--set-collector-retention", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>The verb <see cref="DropXeSessionsAsync(string[], TextWriter, TextWriter, CancellationToken)"/> handles — drop the
     /// Extended Events sessions Darling created on a server this service still monitors (run it just before the server is
     /// removed), or with <c>--print-sql</c> print the guarded DROP statements for a server that is no longer configured (#4732).
@@ -295,9 +396,16 @@ public static class DarlingCliCommands
         || IsCollapseLegacySlicesVerb(arg)
         || IsRecompressPlanDimVerb(arg)
         || IsAddServerVerb(arg)
+        || IsAddAlertSourceVerb(arg)
+        || IsRotateAlertSourceVerb(arg)
+        || IsRemoveAlertSourceVerb(arg)
+        || IsListAlertSourcesVerb(arg)
+        || IsExportInvestigationsVerb(arg)
         || IsEnableCollectorVerb(arg)
         || IsDisableCollectorVerb(arg)
         || IsSetCollectorRunAtVerb(arg)
+        || IsSetCollectorFrequencyVerb(arg)
+        || IsSetCollectorRetentionVerb(arg)
         || IsDropXeSessionsVerb(arg)
         || IsResetPasswordKeyVerb(arg)
         || IsSelfCheckPasswordKeyVerb(arg);
@@ -356,6 +464,8 @@ public static class DarlingCliCommands
     public static string UsageText() =>
         "PerformanceMonitor Darling service." + Environment.NewLine +
         Environment.NewLine +
+        "On Linux, and anywhere the service runs as a .NET app, type 'dotnet PerformanceMonitor.Darling.Service.dll' where this text says PerformanceMonitor.Darling.Service.exe." + Environment.NewLine +
+        Environment.NewLine +
         "Usage:" + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe                     Run the service (also how the Windows Service Control Manager starts it)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --version, -v       Print the product version and exit." + Environment.NewLine +
@@ -370,18 +480,25 @@ public static class DarlingCliCommands
         "  PerformanceMonitor.Darling.Service.exe --export-viewer-config [dir] [--config <path>]  Write a ready-to-copy viewer folder (darling.json + server.crt + README.txt)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --configure-network Interactive LAN-exposure wizard." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --configure-firewall  Create/remove the scoped firewall rules to match darling.json (run elevated)." + Environment.NewLine +
-        "  PerformanceMonitor.Darling.Service.exe --harden-files      Re-apply the ACLs on darling.json, the store credentials and the log-hash key (run elevated)." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --harden-files      Re-apply the ACLs on darling.json, the store credentials, the log-hash key and the TLS key files darling.json names (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --enable-mcp        Enable the MCP endpoint in the store and open its firewall (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --disable-mcp       Disable the MCP endpoint in the store and remove its firewall rule (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --enable-web        Enable the web dashboard in the store and open its firewall (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --disable-web       Disable the web dashboard in the store and remove its firewall rule (run elevated)." + Environment.NewLine +
-        "  PerformanceMonitor.Darling.Service.exe --backfill-rollups  Materialize the retention rollups back over existing history, after a disk preflight." + Environment.NewLine +
-        "  PerformanceMonitor.Darling.Service.exe --collapse-legacy-slices  Repair Query Store rows collected before the split-slice fix, then re-materialize the rollups they fed." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --backfill-rollups  Materialize the retention rollups back over existing history, after a disk preflight. Runs on Linux against a bring-your-own store; only a managed store needs Windows." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --collapse-legacy-slices  Repair Query Store rows collected before the split-slice fix, then re-materialize the rollups they fed. Same platform rule as --backfill-rollups." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --recompress-plan-dim  Convert the plan dimension's pre-V54 text rows to gzip in batches while the service runs, then VACUUM FULL to return the space to the volume (--no-vacuum-full to skip; --vacuum-full to compact an already-converted store)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --add-server, --add-servers   Register monitored server(s) from a JSON array on stdin (the add_servers shape); the running service picks them up without a restart." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --add-alert-source <name> [--config <path>]      Make a source for external alerts: a login that can send alerts and do nothing else. Prints its connection string ONCE; Darling keeps no copy. <name> is 2-31 characters: a letter, then lower-case letters, digits or underscores." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --rotate-alert-source <name> [--config <path>]   Give a source a new password and print its connection string once. The old password stops working." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --remove-alert-source <name> [--config <path>]   Drop a source's login and remove it, along with any alerts of its that are still queued. Alerts it already sent stay in the history." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --list-alert-sources [--config <path>]           List the sources: name, created, last alert sent and alerts not yet delivered. Never shows a password." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --export-investigations <file> [--since <date>] [--until <date>] [--server <name>] [--verdict right|partly|wrong] [--force] [--config <path>]   Write the investigation cases that have feedback, one JSON object per line: the alert, the brief and evidence the agent was given, its report and the recorded verdict and note. Collected text is masked at mcp.dataDetail, as get_investigation_reports masks it. Test your own agent on them." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --enable-collector <name> [--server <server>] [--config <path>]   Turn a collector ON in the store's schedule overrides (fleet-wide by default; --server scopes it to one server) and print the resulting schedule rows. The running service applies it within one sweep." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --disable-collector <name> [--server <server>] [--config <path>]  Turn a collector OFF the same way. Frequency/retention overrides on the row are kept; only enabled changes." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --set-collector-run-at <collector> <HH:MM|none|default> [--server <server>] [--config <path>]   Set the time of day (the monitored server's own clock) a collector that runs once a day or less often starts; none stops a fixed time, default clears the row's time so the next level applies. Fleet-wide by default; --server scopes it to one server. Only the run time changes. The running service applies it within one sweep." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --set-collector-frequency <collector> <minutes|default> [--server <server>] [--config <path>]   Set how often a collector runs, in minutes (0 = once when the server loads, at most " + CollectorScheduleDefaults.MaxFrequencyMinutes + "); default clears the row's value so the next level applies. Fleet-wide by default; --server scopes it to one server. Only the frequency is written: the enabled flag, retention and database scope on the row are kept, and a new row stores no enabled flag of its own." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --set-collector-retention <collector> <days|default> [--server <server>] [--config <path>]   Set how many days a collector's data is kept (1 to " + CollectorScheduleDefaults.MaxRetentionDays + "); default clears the row's value so the next level applies. Fleet-wide by default; --server scopes it to one server. Only the retention is written." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --drop-xe-sessions <server-name> [--dry-run] [--config <path>]   Drop the Extended Events sessions Darling created on a server this service still monitors (" + DarlingXeSessionCleanup.SessionNamesPhrase() + ", and this install's own, whichever exist). Removing a server drops only this install's own sessions, so run this just before you remove the server to drop the shared ones too. It also lists the sessions of other installs and never drops them. --dry-run lists them and drops nothing." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --drop-xe-sessions --print-sql   Print guarded DROP statements for the shared sessions, and a query that lists every install's sessions with their DROP statements, in both scopes. It connects to nothing, so use it for a server that is no longer configured or that a removal could not reach." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --backfill-rollups --dry-run   Show the plan, the disk estimate and the time budget, and change nothing.";
@@ -427,19 +544,49 @@ public static class DarlingCliCommands
             return 1;
         }
 
+        /* #6262: a warning, not a failure: operator remediation opens a DPAPI blob, so the file is valid, but agent server actions would refuse it. */
+        foreach (var warning in DarlingSecrets.RemediationSecretWarnings(config.Servers))
+        {
+            output.WriteLine("WARNING: " + warning);
+        }
+
         var targets = await ResolveValidationTargetsAsync(config, output, error, cancellationToken);
         if (targets is null)
         {
             return 1;
         }
 
+        await ReportAgentDispatchAsync(config, output, cancellationToken);
+
+        /* #6265: a warning, not an error, so a setup that started before still starts; the web refuses that token for sign-in. */
+        if (DarlingAgentDispatchChecks.WebTokenFinding(config) is { } webTokenFinding)
+        {
+            output.WriteLine("WARNING: " + webTokenFinding);
+        }
+
         output.WriteLine($"Validating connectivity to {targets.Count} server(s)...");
 
         var allReachable = true;
+        var nativeLoadFailureSaid = false;
         foreach (var server in targets)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var probe = await DarlingServerConnector.ProbeAsync(server, null, cancellationToken);
+            if (probe.SqlClientNativeLoadFailed)
+            {
+                /* #6183: SqlClient's native library did not load, so no SQL Server connection can work from this
+                   install. It is one cause for every SQL Server target, so say it once, plainly, and not once per
+                   server. A PostgreSQL target does not use that library and is still probed. */
+                if (!nativeLoadFailureSaid)
+                {
+                    nativeLoadFailureSaid = true;
+                    output.WriteLine("  [FAIL] " + probe.Error);
+                }
+
+                allReachable = false;
+                continue;
+            }
+
             output.WriteLine(FormatProbeLine(server.DisplayName, probe));
             if (!probe.Success)
             {
@@ -451,6 +598,43 @@ public static class DarlingCliCommands
             ? "All servers reachable."
             : "One or more servers failed the connection pre-flight (see above).");
         return allReachable ? 0 : 1;
+    }
+
+    /// <summary>
+    /// The agent dispatch checks for <c>--validate-config</c> (#6263): investigations on with MCP off, with no usable token,
+    /// with writes also on, or with no agent route. Nothing is read or printed when <c>mcp.allowInvestigations</c> is off.
+    /// Each finding is a <c>WARNING:</c> or a <c>NOTE:</c> line on <paramref name="output"/>, the same shape as the other
+    /// warnings in this verb. None of them changes the exit code: those configs ran before, so an upgrade must not start
+    /// failing a validation. The MCP switch and the route count come from the store when it answers, else from the file.
+    /// </summary>
+    internal static async Task ReportAgentDispatchAsync(
+        DarlingConfig config, TextWriter output, CancellationToken cancellationToken)
+    {
+        if (!config.Mcp.AllowInvestigations)
+        {
+            return;
+        }
+
+        var mcpEnabled = config.Mcp.Enabled;
+        int? agentRoutes = null;
+        if (TryBuildStoreConnectionString(config.Postgres, out var connectionString, out _)
+            && !string.IsNullOrWhiteSpace(connectionString))
+        {
+            var facts = await DarlingAgentDispatchChecks.TryReadStoreFactsAsync(
+                DarlingStoreConnection.WithApplicationName(connectionString, DarlingManagedPostgres.CliApplicationName),
+                cancellationToken);
+            /* The store did not answer: the file's switch stands and the route note is skipped. */
+            mcpEnabled = facts.McpEnabled ?? mcpEnabled;
+            agentRoutes = facts.AgentRoutes;
+        }
+
+        var (token, unreadable) = DarlingAgentDispatchChecks.ResolveToken(config.Mcp);
+        foreach (var finding in DarlingAgentDispatchChecks.Evaluate(config.Mcp, mcpEnabled, token, unreadable, agentRoutes))
+        {
+            output.WriteLine(
+                (finding.Severity == DarlingAgentDispatchChecks.AgentDispatchSeverity.Warning ? "WARNING: " : "NOTE: ")
+                + finding.Message);
+        }
     }
 
     /// <summary>
@@ -650,13 +834,32 @@ public static class DarlingCliCommands
             /* A managed store has no connection string setting to blame: what failed is its stored credential (#4744),
                and a DPAPI failure gets the store credential's own explanation instead of the raw
                CryptographicException text. The IsWindows call repeats what readingCredential already implies, for the
-               platform analyzer, which cannot follow a bool. */
+               platform analyzer, which cannot follow a bool.
+
+               Anything else is the connection string failing to parse, and Npgsql's message for that can quote part of
+               the string (a password with an unquoted ';' makes the text after it the "keyword"), so the text printed
+               is DarlingStoreConnection.DescribeParseFailure's and never the exception's own message. */
             unusable = readingCredential && OperatingSystem.IsWindows()
                 ? "The stored store credential could not be read: " + StoreCredentialFailureDetail(ex)
-                : "postgres.connectionString could not be used: " + ex.Message;
+                : "postgres.connectionString could not be used: " + DarlingStoreConnection.DescribeParseFailure(ex);
             return false;
         }
     }
+
+    /// <summary>
+    /// The platform decision for the store verbs that open the store with the owner credential
+    /// (<c>--backfill-rollups</c>, <c>--collapse-legacy-slices</c>, <c>--recompress-plan-dim</c>, #6071). Windows is
+    /// needed only for a MANAGED store, whose credential is DPAPI-protected and only Windows can read. A
+    /// bring-your-own store connects with <c>postgres.connectionString</c> on any platform. Returns null when the verb
+    /// may run, else the refusal text, which says why and what to do. Pure, because
+    /// <see cref="OperatingSystem.IsWindows"/> cannot be faked in a test.
+    /// </summary>
+    internal static string? ManagedStoreCredentialRefusal(string verb, bool isWindows, bool managedStore) =>
+        managedStore && !isWindows
+            ? $"{verb} cannot run on this host: a managed Postgres store keeps its credential in DPAPI, which only Windows can read. "
+                + "Run it on the Windows host the service runs on, or, for a store you run yourself, set postgres.connectionString "
+                + "(and managed to false). A bring-your-own store works on any platform."
+            : null;
 
     /// <summary>
     /// Why a managed store's stored credential could not be read, in the operator's terms (#4744): a Windows Data
@@ -763,29 +966,60 @@ public static class DarlingCliCommands
         NpgsqlDataSource? dataSource = null;
         Exception? storeError = null;
         string? storeReason = null;
+        IReadOnlyList<string> connectNotes = Array.Empty<string>();
         if (string.IsNullOrWhiteSpace(connectionString))
         {
             storeReason = DiagnosticsBundle.MissingConnectionReason(postgres);
         }
         else
         {
+            /* One try at one port. A managed store on Windows is also located from its own data directory when this
+               try is refused (#6217): see DiagnosticsBundleStoreLocator. */
+            async Task<NpgsqlDataSource> OpenStoreAsync(int port, CancellationToken token)
+            {
+                var attemptString = port == postgres.Port ? connectionString : DiagnosticsBundleStoreLocator.WithPort(connectionString, port);
+                NpgsqlDataSource? opened = null;
+                try
+                {
+                    opened = NpgsqlDataSource.Create(
+                        DarlingStoreConnection.PinSessionTimeZoneUtc(
+                            DarlingStoreConnection.WithApplicationName(attemptString, DarlingManagedPostgres.CliApplicationName)));
+                    using var probeBudget = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    probeBudget.CancelAfter(TimeSpan.FromSeconds(ServiceCommandDeadlines.CliStoreReadSeconds * 2));
+                    await using var probe = await opened.OpenConnectionAsync(probeBudget.Token);
+                    return opened;
+                }
+                catch
+                {
+                    if (opened is not null)
+                    {
+                        await opened.DisposeAsync();
+                    }
+
+                    throw;
+                }
+            }
+
             try
             {
-                dataSource = NpgsqlDataSource.Create(
-                    DarlingStoreConnection.PinSessionTimeZoneUtc(
-                        DarlingStoreConnection.WithApplicationName(connectionString, DarlingManagedPostgres.CliApplicationName)));
-                using var probeBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                probeBudget.CancelAfter(TimeSpan.FromSeconds(ServiceCommandDeadlines.CliStoreReadSeconds * 2));
-                await using var probe = await dataSource.OpenConnectionAsync(probeBudget.Token);
+                if (postgres.Managed && OperatingSystem.IsWindows())
+                {
+                    var connected = await DiagnosticsBundleStoreLocator.ConnectAsync(
+                        DarlingManagedPostgres.ResolveDataDirectory(postgres), postgres.Port, OpenStoreAsync,
+                        TimeSpan.FromSeconds(ServiceCommandDeadlines.CliStoreReadSeconds * 2), TimeSpan.FromSeconds(1), cancellationToken);
+                    dataSource = connected.DataSource;
+                    storeError = connected.Error;
+                    storeReason = connected.Reason;
+                    connectNotes = connected.Notes;
+                }
+                else
+                {
+                    dataSource = await OpenStoreAsync(postgres.Port, cancellationToken);
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
                 storeError = ex;
-                if (dataSource is not null)
-                {
-                    await dataSource.DisposeAsync();
-                    dataSource = null;
-                }
             }
         }
 
@@ -795,7 +1029,7 @@ public static class DarlingCliCommands
             /* #5366: sealed webhook values are opened with the key file read only, so the hosts they hold are aliased. */
             var keyRing = DarlingCliSealKey.TryOpenFileRing(config, DarlingConfig.ResolveConfigPath(options.ConfigPath), null);
             outcome = await DiagnosticsBundleRunner.BuildAsync(
-                options, config, connectionString, dataSource, storeError, storeReason, cancellationToken, keyRing: keyRing);
+                options, config, connectionString, dataSource, storeError, storeReason, cancellationToken, keyRing: keyRing, connectNotes: connectNotes);
         }
         finally
         {
@@ -836,7 +1070,7 @@ public static class DarlingCliCommands
                 var lines = new List<string> { DiagnosticsBundle.AliasMapWarning };
                 lines.AddRange(outcome.Aliaser.AliasMapLines());
                 /* The same writer as the bundle: a random temp name created with CreateNew, then moved, so a planted link is replaced and never written through. */
-                var mapProblem2 = DiagnosticsBundle.WriteAtomically(options.AliasMapPath, string.Join(Environment.NewLine, lines) + Environment.NewLine, options.Force);
+                var mapProblem2 = DiagnosticsBundle.WriteAtomically(options.AliasMapPath, string.Join(Environment.NewLine, lines) + Environment.NewLine, options.Force, restricted: true);
                 if (mapProblem2 is null)
                 {
                     output.WriteLine("Alias map written (DO NOT ATTACH it): " + options.AliasMapPath);
@@ -976,7 +1210,16 @@ public static class DarlingCliCommands
             return $"  [FAIL] {serverName}: {probe.Error}";
         }
 
-        return $"  [PASS] {serverName}: {DarlingServerConnector.DescribeProbeFacts(probe)}";
+        var passLine = $"  [PASS] {serverName}: {DarlingServerConnector.DescribeProbeFacts(probe)}";
+        /* #6254: a server with a Query Store replica is tested on both connections, and each is named. A replica that could not be
+           opened is a [WARN], not a [FAIL]: the primary answered, and collection reads Query Store from it. */
+        if (DarlingServerConnector.DescribeQueryStoreReplica(probe) is not { } replicaLine)
+        {
+            return passLine;
+        }
+
+        var replicaPrefix = string.IsNullOrEmpty(probe.QueryStoreReplicaError) ? "         " : "  [WARN] ";
+        return passLine + Environment.NewLine + $"{replicaPrefix}{serverName}: Primary: connected. {replicaLine}";
     }
 
     /// <summary>
@@ -1194,7 +1437,7 @@ public static class DarlingCliCommands
             "web",
             "web dashboard access",
             "--print-web-token",
-            "A remote browser presents it once via ?token=... and gets a session cookie back.",
+            "A remote browser pastes it into the sign-in form once and gets a session cookie back.",
             IsElevated(),
             network is not null && network.IsConfigured,
             () => network!.ResolveToken(out _),
@@ -1230,12 +1473,13 @@ public static class DarlingCliCommands
             error.WriteLine("It reprints a live credential, so it is a deliberate act rather than something a script or a");
             error.WriteLine("shared shell picks up in passing.");
             error.WriteLine();
-            error.WriteLine("Be clear about what this gate is NOT, though: darling.json grants INTERACTIVE read on purpose");
-            error.WriteLine("(the Viewer and these CLI verbs are run by the interactive operator), and the token is DPAPI-");
-            error.WriteLine("protected at LocalMachine scope with an entropy constant published in this project's source.");
-            error.WriteLine("Anyone who can log on to this box interactively can already decrypt it without this verb. The");
-            error.WriteLine("token's protection is the FILE'S ACL - keep darling.json restricted, and run --harden-files if");
-            error.WriteLine("you are not sure it still is.");
+            error.WriteLine("Be clear about what this gate is NOT, though: darling.json grants read to the local group");
+            error.WriteLine($"'{DarlingOperatorGroup.Name}' on purpose (the Viewer and these CLI verbs run as");
+            error.WriteLine("its members), and the token is DPAPI-protected at LocalMachine scope with an entropy constant");
+            error.WriteLine("published in this project's source. Any member of that group can already decrypt it without");
+            error.WriteLine("this verb. The token's protection is the FILE'S ACL and the group's membership - keep");
+            error.WriteLine("darling.json restricted, keep the group to the people who run the Viewer or the CLI, and run");
+            error.WriteLine("--harden-files if you are not sure it still is.");
             return 1;
         }
 
@@ -1357,13 +1601,27 @@ public static class DarlingCliCommands
            An explicitly-invalid value is a hard error: the store degrades to loopback for it, so no remote
            connection exists at all. */
         var network = postgres.Network;
-        var roles = DarlingNetwork.NormalizeNetworkRoles(network?.Role);
-        if (roles is null || roles.Count == 0)
+        var allRoles = DarlingNetwork.NormalizeNetworkRoles(network?.Role);
+        if (allRoles is null || allRoles.Count == 0)
         {
             error.WriteLine(
                 $"postgres.network.role '{network?.Role}' is invalid — it must be \"viewer\" (default, read-only), " +
-                $"\"admin\", or both (e.g. \"admin,viewer\"). The store degrades to loopback for an unknown role, so " +
-                $"there is no remote connection to {action}.");
+                $"\"admin\", \"sources\" (external alert source logins), or several (e.g. \"admin,viewer\"). The store " +
+                $"degrades to loopback for an unknown role, so there is no remote connection to {action}.");
+            return null;
+        }
+
+        /* #5654: "sources" admits the external alert source logins, which are not a viewer seat: each source's connection
+           string comes from --add-alert-source, and there is no credential file for it here. */
+        var roles = allRoles
+            .Where(r => !string.Equals(r, DarlingManagedPostgres.AlertSourcesNetworkToken, StringComparison.Ordinal))
+            .ToList();
+        if (roles.Count == 0)
+        {
+            error.WriteLine(
+                $"postgres.network.role admits only external alert source logins (\"sources\"), so there is no viewer seat " +
+                $"to {action}. Add \"viewer\" or \"admin\" to the field for a remote Viewer; a source's connection string " +
+                "comes from --add-alert-source.");
             return null;
         }
 
@@ -1383,9 +1641,7 @@ public static class DarlingCliCommands
            Every credential and the cert live in the same directory (ParentOf(dataDirectory)), so the cert
            path is role-independent. */
         var dataDirectory = DarlingManagedPostgres.ResolveDataDirectory(postgres);
-        var certificatePath = Path.Combine(
-            Path.GetDirectoryName(DarlingManagedPostgres.ViewerCredentialPathFor(dataDirectory))!,
-            DarlingManagedPostgres.ServerCertFileName);
+        var certificatePath = ManagedStoreCertificatePath(dataDirectory);
 
         var handoffs = new List<ViewerHandoff>(roles.Count);
         foreach (var role in roles)
@@ -1650,18 +1906,20 @@ public static class DarlingCliCommands
                     BuildViewerConnectionString(
                         handoff.Host, handoff.Port, handoff.Role, handoff.Password, ViewerClientCertificateFileName),
                     generatedUtc),
+                restrictToOperators: true,
                 cancellationToken);
 
-            /* Only this file gets an ACL: it is the only one carrying a secret. The certificate is public by
-               construction and the README has nothing in it — but all three go through the same
-               replace-safely path above, because the ownership and symlink problems are about the PATH, not
-               about what the file contains. */
-            secretProtected = TryHardenExportedSecret(configFile, error);
+            /* Only this file gets an ACL: it is the only one carrying a secret, and it is created with that ACL
+               already in place. The certificate is public by construction and the README has nothing in it — but
+               all three go through the same replace-safely path above, because the ownership and symlink
+               problems are about the PATH, not about what the file contains. */
+            secretProtected = ConfirmExportedSecretIsProtected(configFile, error);
 
-            await WriteExportFileAsync(certificateFile, certificate + Environment.NewLine, cancellationToken);
+            await WriteExportFileAsync(certificateFile, certificate + Environment.NewLine, restrictToOperators: false, cancellationToken);
             await WriteExportFileAsync(
                 readmeFile,
                 BuildViewerConfigReadme(handoff.Host, handoff.Port, handoff.Role, generatedUtc),
+                restrictToOperators: false,
                 cancellationToken);
         }
         catch (Exception ex)
@@ -2079,13 +2337,19 @@ public static class DarlingCliCommands
     /// keeps <c>WRITE_DAC</c> — so writing over a file someone else created would leave them able to undo the
     /// ACL applied afterwards. <c>CreateNew</c> also closes the gap between
     /// <see cref="TryCheckExportTarget"/> and this write: anything that reappears at the path in between
-    /// makes the create FAIL rather than be written through.
+    /// makes the create FAIL rather than be written through. With <paramref name="restrictToOperators"/> (the file
+    /// that carries the live password) the file is created with <see cref="DarlingFileSecurity.CreateHardenedFile"/>'s
+    /// ACL already applied, so no inherited entry from the target folder ever covers it.
     /// </summary>
-    private static async Task WriteExportFileAsync(string path, string content, CancellationToken cancellationToken)
+    [SupportedOSPlatform("windows")]
+    private static async Task WriteExportFileAsync(
+        string path, string content, bool restrictToOperators, CancellationToken cancellationToken)
     {
         File.Delete(path);
 
-        var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        var stream = restrictToOperators
+            ? DarlingFileSecurity.CreateHardenedFile(path, allowInteractiveRead: true)
+            : new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         await using (stream.ConfigureAwait(false))
         {
             var writer = new StreamWriter(stream);
@@ -2097,30 +2361,17 @@ public static class DarlingCliCommands
     }
 
     /// <summary>
-    /// ACLs the exported darling.json down to SYSTEM + Administrators + this account + INTERACTIVE (the
-    /// admin/viewer-credential posture — the Viewer reads it interactively), so it does not sit in a folder
-    /// that inherited BUILTIN\Users read, then CONFIRMS the result. Returns whether the file is protected —
+    /// Confirms the exported viewer config, which was created restricted to SYSTEM + Administrators + the service
+    /// account + the operator group (the admin/viewer-credential posture — the Viewer reads it as an operator), is
+    /// not readable by ordinary users. Returns whether the file is protected —
     /// "we tried" is not the same claim as "the secret is not readable", which is why the credential-writing
     /// harden sites pair the call with <see cref="DarlingFileSecurity.IsReadableByOrdinaryUsers"/> and why
     /// the caller's exit code depends on this answer. Never throws: the export's value is the file, so a
     /// failure is reported with the icacls that fixes it rather than throwing the folder away.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static bool TryHardenExportedSecret(string path, TextWriter error)
+    private static bool ConfirmExportedSecretIsProtected(string path, TextWriter error)
     {
-        try
-        {
-            DarlingFileSecurity.HardenFile(path, allowInteractiveRead: true);
-        }
-        catch (Exception ex)
-        {
-            error.WriteLine(
-                $"WARNING: could not restrict the ACL on {path} ({ex.Message}){DarlingFileSecurity.DescribeOwnerAndExposure(path)}. " +
-                "It holds a LIVE password in cleartext. Delete it, or restrict it by hand before leaving this machine: " +
-                $"icacls \"{path}\" /inheritance:r /grant \"{DarlingFileSecurity.ServiceAccountDisplayName}\":F");
-            return false;
-        }
-
         try
         {
             if (DarlingFileSecurity.IsReadableByOrdinaryUsers(path))
@@ -2178,6 +2429,15 @@ public static class DarlingCliCommands
         string host, int port, string role, string password, string rootCertificatePath) =>
         $"Host={host};Port={port};Username={role};Password={password};Database=darling;" +
         $"Search Path=collect,config,public;SSL Mode=VerifyFull;Root Certificate={rootCertificatePath}";
+
+    /// <summary>
+    /// The managed store's TLS certificate (the PEM a remote client names in <c>Root Certificate</c>), beside the role credentials
+    /// in the parent of the data directory. The viewer handoff and the alert source verbs (#5654) both name this file.
+    /// </summary>
+    internal static string ManagedStoreCertificatePath(string dataDirectory) =>
+        Path.Combine(
+            Path.GetDirectoryName(DarlingManagedPostgres.ViewerCredentialPathFor(dataDirectory))!,
+            DarlingManagedPostgres.ServerCertFileName);
 
     /* ================================================================================================
        --configure-network: the interactive opt-in exposure wizard (#1561).
@@ -2516,7 +2776,7 @@ public static class DarlingCliCommands
         {
             error.WriteLine();
             error.WriteLine("SAVE THIS NOW — your new web dashboard access token is shown ONCE (darling.json stores only its DPAPI blob).");
-            error.WriteLine("A remote browser presents it once via ?token=... and gets a session cookie back.");
+            error.WriteLine("A remote browser pastes it into the sign-in form once and gets a session cookie back.");
             output.WriteLine(web.Value.GeneratedPlain);
         }
 
@@ -2719,9 +2979,10 @@ public static class DarlingCliCommands
             }
 
             output.WriteLine("Remote pg_hba role(s): 'viewer' (read-only, the secure default), 'admin' (remote WRITES),");
-            output.WriteLine("or BOTH as 'admin,viewer' — that writes one hostssl rule per role inside the managed block, so");
-            output.WriteLine("an admin seat and read-only seats can reach the same store and a later CIDR narrowing tightens");
-            output.WriteLine("all of them together (#2665).");
+            output.WriteLine("'sources' (external alert source logins, made by --add-alert-source), or several, e.g.");
+            output.WriteLine("'admin,viewer' or 'viewer,sources' — that writes one hostssl rule per role inside the managed");
+            output.WriteLine("block, so the seats and sources can reach the same store and a later CIDR narrowing tightens");
+            output.WriteLine("all of them together (#2665, #5654).");
             var role = Prompt(input, output, "Role(s)", "viewer");
             if (role is null)
             {
@@ -3101,7 +3362,7 @@ public static class DarlingCliCommands
             output.WriteLine("   --configure-firewall ELEVATED instead and it resolves the effective port and moves the rule.)");
 
             /* The one login step a human does differently for Web: a remote browser presents the access token
-               once via ?token= and is 302'd back with a session cookie. BuildWebLoginHint decides the scheme
+               into the sign-in form and is 302'd back with a session cookie. BuildWebLoginHint decides the scheme
                and the host, so a test can pin them. */
             foreach (var line in BuildWebLoginHint(webListen, webPort, webTls))
             {
@@ -3166,8 +3427,8 @@ public static class DarlingCliCommands
         return
         [
             "  Remote browser login (after the service restarts):",
-            $"    {scheme}://{WebLoginHost(listen)}:{port}/?token=<your-access-token>",
-            "  (the token is exchanged for a session cookie and stripped from the URL; loopback presents the token too)",
+            $"    {scheme}://{WebLoginHost(listen)}:{port}/",
+            "  (open the address and paste the access token into the sign-in form; loopback presents the token too)",
         ];
     }
 
@@ -3216,16 +3477,20 @@ public static class DarlingCliCommands
         try
         {
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
-            var backupPath = resolvedPath + ".bak-" + stamp;
+            var backupPath = DarlingConfigBackup.BackupPath(resolvedPath, stamp);
             for (var suffix = 2; File.Exists(backupPath); suffix++)
             {
-                backupPath = $"{resolvedPath}.bak-{stamp}-{suffix}";
+                backupPath = DarlingConfigBackup.BackupPath(resolvedPath, stamp, suffix);
             }
 
-            File.Copy(resolvedPath, backupPath, overwrite: false);
             if (OperatingSystem.IsWindows())
             {
-                HardenConfigBackup(backupPath, error);
+                CopyToHardenedBackup(resolvedPath, backupPath);
+                VerifyConfigBackup(backupPath, error);
+            }
+            else
+            {
+                File.Copy(resolvedPath, backupPath, overwrite: false);
             }
 
             /* WriteAllText TRUNCATES an existing file rather than recreating it, so darling.json keeps
@@ -3255,33 +3520,29 @@ public static class DarlingCliCommands
     /// <b>LocalMachine</b> blobs with an entropy constant that ships in an open-source repo, so READ access
     /// IS the secret. The live config grants INTERACTIVE read because things genuinely read it as the
     /// interactive operator — the Viewer (<c>ViewerSettings.TryLoad</c>) and the CLI verbs. <b>Nothing reads
-    /// a backup.</b> The only references to the <c>.bak-</c> name in non-test code are the two lines above
-    /// that CONSTRUCT it, and restoring one is a hand operation that already requires elevation, because
+    /// a backup.</b> The service builds the name in <c>DarlingConfigBackup.BackupPath</c> and lists
+    /// it in <c>DarlingConfigBackup.ListBackups</c> (the start-up hardening and the CLI permission check); it only ever
+    /// hardens a backup, never reads one. Restoring one is a hand operation that already requires elevation, because
     /// writing <c>darling.json</c> does — INTERACTIVE only ever had Read here, never Write. So the grant
     /// bought nothing and cost a second copy of every secret, readable by any interactively-logged-on user.</para>
     ///
-    /// <para>Never fatal — the edit that produced the backup has already been decided on and refusing to
-    /// finish it over a permissions problem would leave the operator worse off. But it is reported LOUDLY
-    /// and names the file, because a silent best-effort ACL failure is exactly how #1721 persisted
-    /// unnoticed across months of service starts: the failure was logged once per start and read by nobody
-    /// until a deploy check happened to look. An operator who just ran a command is the one person
-    /// guaranteed to be watching, so tell them while they are there.</para>
+    /// <para>The backup is CREATED with that ACL, not copied and hardened after: the install folder grants Users
+    /// read, and a plain copy carried that for the moment between the copy and the harden. A failure here fails
+    /// the write the way a failed copy always did (the caller reports it and leaves darling.json untouched): an
+    /// unprotected copy of every secret is not an acceptable side effect of an edit.</para>
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static void HardenConfigBackup(string backupPath, TextWriter error)
+    private static void CopyToHardenedBackup(string sourcePath, string backupPath)
     {
-        try
-        {
-            DarlingFileSecurity.HardenFile(backupPath, allowInteractiveRead: false);
-        }
-        catch (Exception ex)
-        {
-            error.WriteLine($"WARNING: could not restrict permissions on the backup {backupPath} ({ex.Message}).");
-            error.WriteLine("         It is a full copy of your encrypted passwords and access tokens. Delete it, or");
-            error.WriteLine("         restrict it by hand, before leaving this machine.");
-            return;
-        }
+        using var source = File.OpenRead(sourcePath);
+        using var backup = DarlingFileSecurity.CreateHardenedFile(backupPath, allowInteractiveRead: false);
+        source.CopyTo(backup);
+    }
 
+    /// <summary>The check the backup's creation is verified by: it must not be readable by ordinary users.</summary>
+    [SupportedOSPlatform("windows")]
+    private static void VerifyConfigBackup(string backupPath, TextWriter error)
+    {
         if (DarlingFileSecurity.IsReadableByOrdinaryUsers(backupPath))
         {
             error.WriteLine($"WARNING: {backupPath} is still readable by ordinary local users after hardening.");
@@ -4067,74 +4328,447 @@ public static class DarlingCliCommands
     /// </summary>
     private readonly record struct HardenTarget(string Path, bool AllowInteractive, bool IsDirectory, string What);
 
+    /// <summary>One file <see cref="TlsKeyFilesNamed"/> lists: the path as written, the setting that names it, and what
+    /// its content has to be.</summary>
+    [SupportedOSPlatform("windows")]
+    internal readonly record struct TlsKeyFileEntry(string Path, string Setting, DarlingFileSecurity.KeyFileKind Kind)
+    {
+        /// <summary>What the report calls the file.</summary>
+        internal string What => Kind == DarlingFileSecurity.KeyFileKind.PasswordFile
+            ? $"the TLS key password file, {Setting}"
+            : $"the TLS key file, {Setting}";
+    }
+
     /// <summary>
-    /// Re-applies the secret-file ACLs, elevated (#2352).
-    ///
-    /// <para><b>Why this exists as a verb.</b> The service already computes the correct DACL
-    /// (<see cref="DarlingFileSecurity.HardenFile"/>) and already detects when the real one is wrong
-    /// (<see cref="DarlingFileSecurity.IsReadableByOrdinaryUsers"/>). What it lacks is authority: re-ACLing a
-    /// file it does not own needs WRITE_DAC, and taking ownership needs a privilege a virtual service account is
-    /// not granted, so it can only log the remedy and continue. Until now the only thing that ever APPLIED the
-    /// rule to an existing install was <c>install-darling.ps1</c>, which leaves anyone who registered the exe by
-    /// hand — the README's own <c>sc create</c> path — typing three <c>icacls</c> lines out of a log message.</para>
-    ///
-    /// <para><b>It verifies rather than claims.</b> Every target is re-read after the attempt and reported as
-    /// SECURED or STILL READABLE, and the exit code is 1 if anything is still exposed. "We tried" is not the
-    /// same statement as "the secret is not readable" — a distinction <see cref="TryHardenExportedSecret"/>'s own
-    /// contract already makes, and the reason a permissions call that silently did nothing was able to hide.</para>
-    ///
-    /// <para>Idempotent, so it is safe on a healthy box and can simply live in a runbook. Missing targets are
-    /// skipped quietly: a BYO-Postgres install has no managed credential files, and their absence is not a
-    /// fault.</para>
+    /// The TLS secret files darling.json names (#5700): the PKCS#12 bundle (<c>pfxPath</c>) and the PEM key
+    /// (<c>keyPath</c>) of <c>web.network.tls</c> and <c>mcp.network.tls</c>, and the file a <c>pfxPassword</c> points at
+    /// when it is a <c>file:</c> reference, trimmed as the loader trims them and listed once each. A <c>certPath</c> is a
+    /// public certificate and is not listed. Each entry is the path as written, the setting that names it, and the kind
+    /// of content the file has to hold.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    public static int HardenFiles(string? configPath, TextWriter output, TextWriter error)
+    internal static IReadOnlyList<TlsKeyFileEntry> TlsKeyFilesNamed(DarlingConfig config)
     {
-        var resolvedConfig = DarlingConfig.ResolveConfigPath(configPath);
+        var found = new List<TlsKeyFileEntry>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string? path, string setting, DarlingFileSecurity.KeyFileKind kind)
+        {
+            var trimmed = path?.Trim();
+            if (!string.IsNullOrEmpty(trimmed) && seen.Add(trimmed))
+            {
+                found.Add(new TlsKeyFileEntry(trimmed, setting, kind));
+            }
+        }
 
-        /* The managed store's directory is derived from config when it loads, but this verb has to work when
-           darling.json is exactly what is unreadable — that is the failure it exists to repair. So a config that
-           will not load is a warning, not a stop: the config file itself is still hardened, and the store
-           targets fall back to the documented default location. */
-        string? dataDirectory = null;
-        string? keyDirectory = null;
+        foreach (var (section, tls) in new[] { ("web", config.Web?.Network?.Tls), ("mcp", config.Mcp?.Network?.Tls) })
+        {
+            Add(tls?.PfxPath, $"{section}.network.tls.pfxPath", DarlingFileSecurity.KeyFileKind.Pfx);
+            Add(tls?.KeyPath, $"{section}.network.tls.keyPath", DarlingFileSecurity.KeyFileKind.PemKey);
+            if (tls?.PfxPassword is { } password && password.StartsWith("file:", StringComparison.Ordinal))
+            {
+                Add(password["file:".Length..], $"{section}.network.tls.pfxPassword", DarlingFileSecurity.KeyFileKind.PasswordFile);
+            }
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// The <c>icacls</c> line that leaves a TLS key file to SYSTEM and Administrators with full control and the
+    /// service account with read only, nothing inherited: the ACL <see cref="HardenTlsKeyFiles"/> applies to a key
+    /// inside the install folder, and the line an administrator runs for one outside it. The read grant is the same
+    /// shape the service logs when it finds such a file readable by ordinary users.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    internal static string TlsKeyFileIcaclsLine(string path) =>
+        $"icacls \"{path}\" /inheritance:r /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" \"{DarlingFileSecurity.ServiceAccountDisplayName}:(R)\"";
+
+    /// <summary>
+    /// Why a TLS key path from darling.json is not changed, or null when it is a fully qualified path on a drive
+    /// letter (#5700). A UNC path would rewrite a remote file's ACL (and the service reads it as the machine account,
+    /// not as itself); a path from the root of the current drive, a path relative to a drive's current directory
+    /// and a relative path all resolve against a directory this verb cannot know, so it never resolves them against
+    /// its own.
+    /// </summary>
+    internal static string? TlsKeyPathProblem(string keyFile)
+    {
+        var driveLetter = keyFile.Length >= 2 && char.IsAsciiLetter(keyFile[0]) && keyFile[1] == ':';
+        if (driveLetter && keyFile.Length >= 3 && keyFile[2] is '\\' or '/' && Path.IsPathFullyQualified(keyFile))
+        {
+            return null;
+        }
+
+        const string Advice = " Use a full path that starts with a drive letter in darling.json, then re-run.";
+        if (keyFile.StartsWith('\\') || keyFile.StartsWith('/'))
+        {
+            return "a network path or a path from the root of the current drive, which this verb does not change." + Advice;
+        }
+
+        if (driveLetter)
+        {
+            return "a path relative to a drive's current directory, which the service resolves from its own working directory, so this verb did not guess." + Advice;
+        }
+
+        return "a relative path, which the service resolves from its own working directory, so this verb did not guess." + Advice;
+    }
+
+    /// <summary>The tally <see cref="HardenTlsKeyFiles"/> hands <see cref="HardenFiles"/>: files that exist and were
+    /// examined; files readable by ordinary users, or whose ACL could not be applied or leaves the service locked out
+    /// (<c>Exposed</c>); files that accounts other than SYSTEM, Administrators and the service account are allowed to
+    /// (<c>OtherAccess</c>); files whose owner is not one of the three (<c>UntrustedOwner</c>); files refused; and files
+    /// named but not found. A file that ordinary users can read is counted only as readable, not also as open to other accounts; it can still be in the owner count. Each needs an administrator's action.</summary>
+    internal readonly record struct TlsKeyFileResult(int Examined, int Exposed, int Refused, int Missing, int OtherAccess = 0, int UntrustedOwner = 0);
+
+    /// <summary>The closing lines for the other-access and untrusted-owner counts of <paramref name="tls"/>, each in its
+    /// own words, shared by <see cref="HardenFiles"/> and <see cref="HardenTlsKeyFilesOnly(string?, TextWriter, TextWriter)"/>.</summary>
+    internal static IEnumerable<string> TlsKeyFileAccessCountLines(TlsKeyFileResult tls)
+    {
+        if (tls.OtherAccess > 0)
+        {
+            yield return $"{tls.OtherAccess} of {tls.Examined} TLS key file(s) are open to accounts other than SYSTEM, Administrators and the service account (see the lines above for who).";
+        }
+
+        if (tls.UntrustedOwner > 0)
+        {
+            yield return $"{tls.UntrustedOwner} of {tls.Examined} TLS key file(s) have an owner who is not SYSTEM, Administrators or the service account, so the owner can change who may read them.";
+        }
+    }
+
+    /// <summary>
+    /// The TLS key-file step of <see cref="HardenFiles"/> (#5700): each private-key file darling.json names, one
+    /// report line each. A key inside the install folder (<paramref name="installRoot"/>) is changed through a handle
+    /// to exactly the checked file (<see cref="DarlingFileSecurity.HardenKeyFileWithoutFollowingLinks"/>): SYSTEM and
+    /// Administrators full control, the service account read only, nothing inherited. A key outside it is never
+    /// changed (an ACL set by path follows every junction a user-writable folder can hold): it is reported with
+    /// whether ordinary users can read it and the <c>icacls</c> line for an administrator to run. A path that is
+    /// not fully qualified on a drive letter is skipped with the reason, and a named file that is not there is
+    /// reported, because the service fails to load a certificate it cannot find. A line that is not SECURED goes to
+    /// <paramref name="problems"/>.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    internal static TlsKeyFileResult HardenTlsKeyFiles(DarlingConfig config, string installRoot, TextWriter output, TextWriter problems, string? configFile = null)
+    {
+        var examined = 0;
+        var exposed = 0;
+        var otherAccess = 0;
+        var untrustedOwner = 0;
+        var refused = 0;
+        var missing = 0;
+        var notKeyFiles = configFile is null ? new List<NotKeyTarget>() : NotKeyTargets(config, configFile);
+        foreach (var entry in TlsKeyFilesNamed(config))
+        {
+            var (keyFile, _, kind) = entry;
+            var what = entry.What;
+            if (TlsKeyPathProblem(keyFile) is { } problem)
+            {
+                problems.WriteLine($"  SKIPPED  {keyFile} ({what}): {problem}");
+                continue;
+            }
+
+            /* A colon after the drive letter's names an alternate data stream: a handle to one answers for its host file,
+               so the ACL would land on a file the setting does not name. */
+            if (keyFile.IndexOf(':', 2) >= 0)
+            {
+                problems.WriteLine($"  REFUSED  {keyFile} ({what}): names an alternate data stream, not a file, so nothing was changed. Name the key file itself in darling.json and re-run.");
+                examined++;
+                refused++;
+                continue;
+            }
+
+            string full;
+            try
+            {
+                full = Path.GetFullPath(keyFile);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                problems.WriteLine($"  SKIPPED  {keyFile} ({what}): not a valid path ({OneLine(ex.Message)}).");
+                continue;
+            }
+
+            if (notKeyFiles.FirstOrDefault(target => target.Names(full)) is { Path: not null } notKey)
+            {
+                problems.WriteLine($"  REFUSED  {full} ({what}): it is {notKey.What}, which has its own access rule and is not a key file, so nothing was changed. Name the key file in darling.json and re-run.");
+                examined++;
+                refused++;
+                continue;
+            }
+
+            if (!File.Exists(full))
+            {
+                problems.WriteLine($"  MISSING  {full} ({what}): not found, so no ACL was applied. Once it is in place, run: {TlsKeyFileIcaclsLine(full)}");
+                missing++;
+                continue;
+            }
+
+            examined++;
+            if (!IsBelow(installRoot, full))
+            {
+                var readable = DarlingFileSecurity.IsReadableByOrdinaryUsers(full);
+                var others = DarlingFileSecurity.AccessBeyondTrusted(full);
+                var ownerTrusted = DarlingFileSecurity.IsTrustedOwner(full);
+                var note = readable ? "ordinary users can read it" : "ordinary users cannot read it";
+                if (others is not null)
+                {
+                    note += $"; other accounts are allowed access to it: {others}";
+                }
+
+                if (!ownerTrusted)
+                {
+                    note += $"; its owner is not SYSTEM, Administrators or the service account{DarlingFileSecurity.DescribeOwnerAndExposure(full)}";
+                }
+
+                problems.WriteLine(
+                    $"  NOT CHANGED (outside the install folder)  {full} ({what}): {note}" +
+                    $". To restrict it to SYSTEM, Administrators and the service account, run from an elevated prompt: {TlsKeyFileIcaclsLine(full)}" +
+                    (ownerTrusted ? string.Empty : $" and then make Administrators the owner: takeown /a /f \"{full}\""));
+                if (readable)
+                {
+                    exposed++;
+                }
+
+                if (others is not null && !readable)
+                {
+                    otherAccess++;
+                }
+
+                if (!ownerTrusted)
+                {
+                    untrustedOwner++;
+                }
+
+                continue;
+            }
+
+            try
+            {
+                /* The leaf and every folder on the path up to the install folder are checked for a junction or symbolic
+                   link, and the change itself checks the handle again (final path, reparse bit, one name). */
+                var refusal = ReparsePointOnPath(installRoot, full)
+                    ?? DarlingFileSecurity.HardenKeyFileWithoutFollowingLinks(full, installRoot, kind);
+                if (refusal is not null)
+                {
+                    /* A file that is not what its setting says is refused by what it holds, not by a link on its path. */
+                    var byContent = refusal.Contains(DarlingFileSecurity.NotAKeyFileReason, StringComparison.Ordinal)
+                        || refusal.Contains(DarlingFileSecurity.NotAPasswordFileReason, StringComparison.Ordinal);
+                    var hardLink = refusal.Contains(" is a hard link: ", StringComparison.Ordinal);
+                    problems.WriteLine(byContent
+                        ? $"  REFUSED  {full} ({what}): {OneLine(refusal)}, so nothing was changed. Name the right file in darling.json and re-run."
+                        : hardLink
+                            ? $"  REFUSED  {full} ({what}): {OneLine(refusal)}. Nothing was changed. Remove the other name(s) and re-run."
+                            : $"  REFUSED  {full} ({what}): {OneLine(refusal)}, so nothing was changed through it. Remove it and re-run.");
+                    refused++;
+                    continue;
+                }
+            }
+            catch (Exception ex)
+            {
+                problems.WriteLine($"  FAILED   {full} ({what}): {OneLine(ex.Message)}");
+                exposed++;
+                continue;
+            }
+
+            /* The claim is the re-read, not the call that returned without throwing. */
+            if (TlsKeyFileUnsecured(full, what) is { } unsecured)
+            {
+                problems.WriteLine(unsecured);
+                if (unsecured.StartsWith("  OTHER ACCESS", StringComparison.Ordinal))
+                {
+                    otherAccess++;
+                }
+                else if (unsecured.StartsWith("  UNTRUSTED OWNER", StringComparison.Ordinal))
+                {
+                    untrustedOwner++;
+                }
+                else
+                {
+                    exposed++;
+                }
+            }
+            else
+            {
+                output.WriteLine($"  SECURED  {full} ({what})");
+            }
+        }
+
+        return new TlsKeyFileResult(examined, exposed, refused, missing, otherAccess, untrustedOwner);
+    }
+
+    /// <summary>A file or folder <see cref="HardenFiles"/> hardens under a rule of its own, which a TLS key setting must not
+    /// be pointed at: <see cref="Names"/> is true for the path itself and, for a folder, for anything below it.</summary>
+    internal readonly record struct NotKeyTarget(string Path, bool IsFolder, string What)
+    {
+        internal bool Names(string full) =>
+            string.Equals(System.IO.Path.TrimEndingDirectorySeparator(Path), System.IO.Path.TrimEndingDirectorySeparator(full), StringComparison.OrdinalIgnoreCase)
+            || (IsFolder && IsBelow(Path, full));
+    }
+
+    /// <summary>
+    /// What a TLS key setting may not name (#5700): the config file the verb loaded, its backups, the store's files
+    /// (its credentials and TLS key), the log-hash key and the folder it lives in. The store's own folder is not listed:
+    /// only files, and the log-hash key folder, are kept from the targets <see cref="HardenFiles"/> hardens under their
+    /// own rules, so a setting that named one would give it the key ACL instead.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    internal static List<NotKeyTarget> NotKeyTargets(DarlingConfig config, string configFile)
+    {
+        string dataDirectory;
+        string? keyDirectory;
         try
         {
-            var config = DarlingConfig.Load(configPath);
             dataDirectory = DarlingManagedPostgres.ResolveDataDirectory(config.Postgres);
-            keyDirectory = DarlingLogHashKeyFile.DirectoryFor(config, resolvedConfig);
+            keyDirectory = DarlingLogHashKeyFile.DirectoryFor(config, configFile);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or NotSupportedException or IOException)
+        {
+            dataDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "PerformanceMonitorDarling", "pg");
+            keyDirectory = null;
+        }
+
+        return HardenTargets(configFile, dataDirectory, keyDirectory)
+            .Where(target => !target.IsDirectory || target.What == "the log-hash key directory")
+            .Select(target => new NotKeyTarget(Path.GetFullPath(target.Path), target.IsDirectory, target.What))
+            .ToList();
+    }
+
+    /// <summary>
+    /// The report line for a TLS key file that is not in the state <see cref="HardenTlsKeyFiles"/> leaves, or null when it
+    /// is (SECURED): not readable by ordinary users, the service account can read it, every Allow entry is SYSTEM,
+    /// Administrators or the service account (an allowlist, so a named user or a domain group does not pass), and the
+    /// owner is one of the three (an owner can always change who may read the file).
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    internal static string? TlsKeyFileUnsecured(string full, string what)
+    {
+        if (DarlingFileSecurity.IsReadableByOrdinaryUsers(full))
+        {
+            return $"  STILL READABLE  {full} ({what})";
+        }
+
+        if (!DarlingFileSecurity.GrantsHardenedAccount(full))
+        {
+            return $"  LOCKED OUT  {full} ({what}): secured, but {DarlingFileSecurity.ServiceAccountDisplayName} cannot read it, so the service would fail on its next start. Grant that account read and re-run.";
+        }
+
+        if (DarlingFileSecurity.AccessBeyondTrusted(full) is { } others)
+        {
+            return $"  OTHER ACCESS  {full} ({what}): other accounts are allowed access to it: {others}. Run from an elevated prompt: {TlsKeyFileIcaclsLine(full)}";
+        }
+
+        if (!DarlingFileSecurity.IsTrustedOwner(full))
+        {
+            return $"  UNTRUSTED OWNER  {full} ({what}): its owner is not SYSTEM, Administrators or the service account{DarlingFileSecurity.DescribeOwnerAndExposure(full)}, so the owner can change who may read it. Run from an elevated prompt: takeown /a /f \"{full}\"";
+        }
+
+        return null;
+    }
+
+    private static string OneLine(string text) => text.ReplaceLineEndings(" ");
+
+    /// <summary>
+    /// Only the TLS key-file step of <see cref="HardenFiles"/>, for the install and upgrade scripts
+    /// (<c>--harden-files --tls-key-files-only</c>; not in the help text). One line per file on standard output; the
+    /// exit code is 0 whenever the step ran, whatever it reported for each file, and 2 only when it could not run:
+    /// not elevated, no darling.json that loads, or no registered service account to grant the read to.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public static int HardenTlsKeyFilesOnly(string? configPath, TextWriter output, TextWriter error) =>
+        HardenTlsKeyFilesOnly(configPath, output, error, IsElevated(), DarlingFileSecurity.RegisteredServiceAccount(ServiceName));
+
+    [SupportedOSPlatform("windows")]
+    internal static int HardenTlsKeyFilesOnly(
+        string? configPath, TextWriter output, TextWriter error, bool elevated, SecurityIdentifier? serviceAccount, Func<string, string?>? environment = null)
+    {
+        if (!elevated)
+        {
+            error.WriteLine("The TLS key file step needs an elevated prompt (Run as administrator).");
+            return 2;
+        }
+
+        environment ??= Environment.GetEnvironmentVariable;
+        var resolvedConfig = DarlingConfig.ResolveConfigPath(configPath, environment);
+        WriteConfigSource(output, configPath, resolvedConfig, environment);
+        DarlingConfig config;
+        try
+        {
+            config = DarlingConfig.Load(resolvedConfig);
         }
         catch (Exception ex)
         {
-            output.WriteLine($"NOTE: could not load {resolvedConfig} ({ex.Message}).");
-            output.WriteLine("      Continuing with the documented default store location — hardening darling.json");
-            output.WriteLine("      is very often what makes it loadable again.");
-            dataDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                "PerformanceMonitorDarling", "pg");
+            error.WriteLine($"The TLS key file step could not load {resolvedConfig}: {OneLine(ex.Message)}");
+            return 2;
         }
 
+        if (serviceAccount is null)
+        {
+            error.WriteLine($"The TLS key file step needs the '{ServiceName}' service to be registered, so it knows which account reads the key. Install the service first.");
+            return 2;
+        }
+
+        DarlingFileSecurity.HardenForAccount(serviceAccount);
+        if (TlsKeyFilesNamed(config).Count == 0)
+        {
+            output.WriteLine("No TLS key files are named in darling.json.");
+            return 0;
+        }
+
+        var installRoot = Path.GetDirectoryName(Path.GetFullPath(resolvedConfig)) ?? AppContext.BaseDirectory;
+        var tls = HardenTlsKeyFiles(config, installRoot, output, output, resolvedConfig);
+
+        /* The exit code is 0 whenever the step ran (the scripts read a nonzero code as "could not run"); the counts that
+           need an administrator are in the closing lines. */
+        if (tls.Exposed > 0)
+        {
+            output.WriteLine($"{tls.Exposed} of {tls.Examined} TLS key file(s) are STILL readable by ordinary users or could not be secured.");
+        }
+
+        foreach (var line in TlsKeyFileAccessCountLines(tls))
+        {
+            output.WriteLine(line);
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// The files and folders <see cref="HardenFiles"/> hardens that are not TLS key files (#5700 keeps them apart from the
+    /// key files darling.json names): the live config, its backups, the store's folder and credentials, the store's own TLS
+    /// key and the log-hash key. Built from the loaded config's data and key folders, or the documented default store
+    /// location when the config did not load.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static List<HardenTarget> HardenTargets(string resolvedConfig, string dataDirectory, string? keyDirectory)
+    {
         var storeRoot = Path.GetDirectoryName(Path.GetFullPath(dataDirectory));
         var targets = new List<HardenTarget>
         {
-            /* INTERACTIVE read, the only file in this list that keeps it: the Viewer (ViewerSettings.ResolveConfigPath)
-               and the CLI verbs run as the operator and must still read the live config. Nothing reads a backup (#1769). */
+            /* Operator-group read (the local group DarlingFileSecurity.OperatorGroupName, when it exists): the Viewer
+               (ViewerSettings.ResolveConfigPath) and the CLI verbs run as the operator and must still read the live
+               config. Nothing reads a backup (#1769). */
             new(resolvedConfig, AllowInteractive: true, IsDirectory: false, "the live config"),
         };
 
-        foreach (var backup in SafeEnumerate(Path.GetDirectoryName(resolvedConfig), "darling.json.bak-*"))
+        foreach (var backup in ConfigBackupFiles(Path.GetDirectoryName(resolvedConfig), Path.GetFileName(resolvedConfig)))
         {
             targets.Add(new(backup, AllowInteractive: false, IsDirectory: false, "a config backup"));
         }
 
         if (!string.IsNullOrEmpty(storeRoot))
         {
-            /* INTERACTIVE traverse, never read: the operator walks through it to the config, never to the credential
-               blobs in it. Mirrors DarlingManagedPostgres' own call. */
+            /* Operator-group traverse, never list: the operator walks through it to the admin and viewer credentials,
+               never to the rest. Mirrors DarlingManagedPostgres' own call. */
             targets.Add(new(storeRoot, AllowInteractive: true, IsDirectory: true, "the store directory"));
             targets.Add(new(Path.Combine(storeRoot, "pg-credential.dpapi"), false, false, "the store credential"));
-            targets.Add(new(Path.Combine(storeRoot, "pg-admin-credential.dpapi"), false, false, "the admin credential"));
+            /* The same posture the service applies on every start (DarlingManagedRoles.EnsureProvisionedAsync): the
+               admin and viewer credentials are read by the operator's Viewer, the mcp credential only by the service. */
+            targets.Add(new(Path.Combine(storeRoot, "pg-admin-credential.dpapi"), AllowInteractive: true, IsDirectory: false, "the admin credential"));
+            targets.Add(new(Path.Combine(storeRoot, "pg-viewer-credential.dpapi"), AllowInteractive: true, IsDirectory: false, "the viewer credential"));
+            targets.Add(new(Path.Combine(storeRoot, "pg-mcp-credential.dpapi"), AllowInteractive: false, IsDirectory: false, "the mcp credential"));
             targets.Add(new(Path.Combine(storeRoot, DarlingLogHashKeyFile.WindowsFileName), AllowInteractive: false, IsDirectory: false, "the log-hash key"));
+            /* #5700: the store's own TLS key, read only by the service like the mcp credential. Absent until the store
+               has TLS on, and then skipped like every other store file that is not there. */
+            targets.Add(new(Path.Combine(storeRoot, DarlingManagedPostgres.ServerKeyFileName), AllowInteractive: false, IsDirectory: false, "the store's TLS key"));
             /* #4253/#4280 Low 2: the last major upgrade's pre-upgrade postgresql.auto.conf, which File.Copy does
                not ACL on its own. Kept until the NEXT major upgrade replaces it (DarlingStoreUpgrade.CarryAutoConfAsync). */
             targets.Add(new(Path.Combine(storeRoot, DarlingStoreUpgrade.PreUpgradeAutoConfFileName), false, false, "the pre-upgrade postgresql.auto.conf"));
@@ -4156,6 +4790,63 @@ public static class DarlingCliCommands
             targets.Add(new(keyDirectory, AllowInteractive: false, IsDirectory: true, "the log-hash key directory"));
             targets.Add(new(Path.Combine(keyDirectory, DarlingLogHashKeyFile.WindowsFileName), AllowInteractive: false, IsDirectory: false, "the log-hash key"));
         }
+
+        return targets;
+    }
+
+    /// <summary>
+    /// Re-applies the secret-file ACLs, elevated (#2352).
+    ///
+    /// <para><b>Why this exists as a verb.</b> The service already computes the correct DACL
+    /// (<see cref="DarlingFileSecurity.HardenFile"/>) and already detects when the real one is wrong
+    /// (<see cref="DarlingFileSecurity.IsReadableByOrdinaryUsers"/>). What it lacks is authority: re-ACLing a
+    /// file it does not own needs WRITE_DAC, and taking ownership needs a privilege a virtual service account is
+    /// not granted, so it can only log the remedy and continue. Until now the only thing that ever APPLIED the
+    /// rule to an existing install was <c>install-darling.ps1</c>, which leaves anyone who registered the exe by
+    /// hand — the README's own <c>sc create</c> path — typing three <c>icacls</c> lines out of a log message.</para>
+    ///
+    /// <para><b>It verifies rather than claims.</b> Every target is re-read after the attempt and reported as
+    /// SECURED or STILL READABLE, and the exit code is 1 if anything is still exposed. "We tried" is not the
+    /// same statement as "the secret is not readable" — a distinction <see cref="ConfirmExportedSecretIsProtected"/>'s own
+    /// contract already makes, and the reason a permissions call that silently did nothing was able to hide.</para>
+    ///
+    /// <para>Idempotent, so it is safe on a healthy box and can simply live in a runbook. Missing targets are
+    /// skipped quietly: a BYO-Postgres install has no managed credential files, and their absence is not a
+    /// fault.</para>
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public static int HardenFiles(string? configPath, TextWriter output, TextWriter error, Func<string, string?>? environment = null)
+    {
+        environment ??= Environment.GetEnvironmentVariable;
+        var resolvedConfig = DarlingConfig.ResolveConfigPath(configPath, environment);
+        WriteConfigSource(output, configPath, resolvedConfig, environment);
+
+        /* The managed store's directory is derived from config when it loads, but this verb has to work when
+           darling.json is exactly what is unreadable — that is the failure it exists to repair. So a config that
+           will not load is a warning, not a stop: the config file itself is still hardened, and the store
+           targets fall back to the documented default location. */
+        string? dataDirectory = null;
+        string? keyDirectory = null;
+        DarlingConfig? loadedConfig = null;
+        try
+        {
+            var config = DarlingConfig.Load(resolvedConfig);
+            loadedConfig = config;
+            dataDirectory = DarlingManagedPostgres.ResolveDataDirectory(config.Postgres);
+            keyDirectory = DarlingLogHashKeyFile.DirectoryFor(config, resolvedConfig);
+        }
+        catch (Exception ex)
+        {
+            output.WriteLine($"NOTE: could not load {resolvedConfig} ({ex.Message}).");
+            output.WriteLine("      Continuing with the documented default store location — hardening darling.json");
+            output.WriteLine("      is very often what makes it loadable again.");
+            dataDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "PerformanceMonitorDarling", "pg");
+        }
+
+        var targets = HardenTargets(resolvedConfig, dataDirectory, keyDirectory);
+        var configDirectory = Path.GetDirectoryName(Path.GetFullPath(resolvedConfig)) ?? AppContext.BaseDirectory;
 
         /* #2371: harden for the account the SERVICE runs as, not for whoever is running THIS. The verb is
            documented to be run elevated and exists because the service cannot re-ACL a file it does not own,
@@ -4258,6 +4949,27 @@ public static class DarlingCliCommands
             }
         }
 
+        /* #5700: the TLS private-key files darling.json names. */
+        var tlsExamined = 0;
+        var tlsResult = default(TlsKeyFileResult);
+        if (loadedConfig is null)
+        {
+            error.WriteLine("The TLS key files named in darling.json were not checked, because darling.json did not load. Fix it and re-run --harden-files.");
+        }
+        else
+        {
+            var tls = HardenTlsKeyFiles(loadedConfig, configDirectory, output, error, resolvedConfig);
+            tlsExamined = tls.Examined;
+            touched += tls.Examined;
+            exposed += tls.Exposed;
+            tlsResult = tls;
+            refused += tls.Refused;
+            if (tls.Missing > 0)
+            {
+                error.WriteLine($"{tls.Missing} TLS key file(s) named in darling.json were not found.");
+            }
+        }
+
         output.WriteLine();
 
         if (touched == 0)
@@ -4277,15 +4989,26 @@ public static class DarlingCliCommands
             error.WriteLine($"{exposed} of {touched} item(s) are STILL readable by ordinary users.");
             error.WriteLine("Run this from an ELEVATED prompt. If it was already elevated, the owner is the");
             error.WriteLine("problem: ownership carries WRITE_DAC, so take ownership first, then re-run.");
-            return 1;
         }
 
-        if (refused > 0)
+        /* Each count needs an administrator's action, so each ends the run with exit 1. */
+        foreach (var line in TlsKeyFileAccessCountLines(tlsResult))
+        {
+            error.WriteLine(line);
+        }
+
+        if (exposed > 0 || tlsResult.OtherAccess > 0 || tlsResult.UntrustedOwner > 0 || refused > 0)
         {
             return 1;
         }
 
-        output.WriteLine($"All {touched} item(s) secured. The service re-asserts these ACLs at every start.");
+        /* The service re-asserts the store and config ACLs at every start; it only warns about a TLS key file, and a
+           renewed certificate arrives with the folder's ACL. */
+        output.WriteLine(tlsExamined == 0
+            ? $"All {touched} item(s) secured. The service re-asserts these ACLs at every start."
+            : touched == tlsExamined
+                ? $"All {touched} item(s) secured. Re-run --harden-files after replacing a TLS key file."
+                : $"All {touched} item(s) secured. The service re-asserts the ACLs of the {touched - tlsExamined} item(s) that are not TLS key files at every start. Re-run --harden-files after replacing a TLS key file.");
         return 0;
     }
 
@@ -4335,6 +5058,14 @@ public static class DarlingCliCommands
     /// <summary>Whether <paramref name="path"/> is strictly below <paramref name="directory"/>, a volume root included
     /// (<see cref="DarlingPathContainment.IsStrictlyBelow"/>, #4004 review, round 3).</summary>
     internal static bool IsBelow(string directory, string path) => DarlingPathContainment.IsStrictlyBelow(directory, path);
+
+    /// <summary>The backups of the config file named <paramref name="configFileName"/> in <paramref name="directory"/>
+    /// (#5649): the files that start with that file's own name plus <c>.bak-</c> (<c>prod.json.bak-x</c> for
+    /// <c>prod.json</c>), which is what the config verbs write and what the service's start-up hardening takes, not the
+    /// default config's backups. The directory listing's pattern only narrows the list; the ordinal name test decides.</summary>
+    internal static IEnumerable<string> ConfigBackupFiles(string? directory, string configFileName) =>
+        SafeEnumerate(directory, configFileName + DarlingConfigBackup.GlobSuffix)
+            .Where(file => DarlingConfigBackup.IsBackupName(configFileName, Path.GetFileName(file)));
 
     /// <summary>Directory enumeration that treats an unreadable or missing folder as empty — this verb runs
     /// precisely when permissions are broken, so a throw here would defeat its purpose.</summary>
@@ -4868,7 +5599,6 @@ public static class DarlingCliCommands
     ///
     /// <para>Returns 0 when the repair completed or had nothing to do, 1 on a load/mode/credential error.</para>
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public static async Task<int> CollapseLegacySlicesAsync(
         string? configPath, bool dryRun, TextWriter output, TextWriter error, CancellationToken cancellationToken)
     {
@@ -4893,6 +5623,13 @@ public static class DarlingCliCommands
             return 1;
         }
 
+        /* Windows is needed only for a MANAGED store's DPAPI credential (#6071). A bring-your-own store runs here. */
+        if (ManagedStoreCredentialRefusal("--collapse-legacy-slices", OperatingSystem.IsWindows(), postgres.Managed) is { } platformRefusal)
+        {
+            error.WriteLine(platformRefusal);
+            return 1;
+        }
+
         if (!TryBuildStoreConnectionString(postgres, out var connectionString, out var unusable))
         {
             error.WriteLine(unusable);
@@ -4901,7 +5638,7 @@ public static class DarlingCliCommands
 
         if (string.IsNullOrWhiteSpace(connectionString))
         {
-            error.WriteLine(postgres.Managed
+            error.WriteLine(postgres.Managed && OperatingSystem.IsWindows()
                 ? DarlingStoreBootstrapEvidence.MissingStoreCredentialMessage(postgres)
                 : "postgres.connectionString is empty, so there is no store to repair.");
             return 1;
@@ -5256,7 +5993,6 @@ public static class DarlingCliCommands
     /// error or when any row failed round-trip verification (those rows keep their text; re-run after
     /// investigating).</para>
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public static async Task<int> RecompressPlanDimAsync(
         string? configPath, bool dryRun, RecompressVacuumMode vacuumMode, TextWriter output, TextWriter error,
         CancellationToken cancellationToken)
@@ -5282,6 +6018,13 @@ public static class DarlingCliCommands
             return 1;
         }
 
+        /* Windows is needed only for a MANAGED store's DPAPI credential (#6071). A bring-your-own store runs here. */
+        if (ManagedStoreCredentialRefusal("--recompress-plan-dim", OperatingSystem.IsWindows(), postgres.Managed) is { } platformRefusal)
+        {
+            error.WriteLine(platformRefusal);
+            return 1;
+        }
+
         if (!TryBuildStoreConnectionString(postgres, out var connectionString, out var unusable))
         {
             error.WriteLine(unusable);
@@ -5290,7 +6033,7 @@ public static class DarlingCliCommands
 
         if (string.IsNullOrWhiteSpace(connectionString))
         {
-            error.WriteLine(postgres.Managed
+            error.WriteLine(postgres.Managed && OperatingSystem.IsWindows()
                 ? DarlingStoreBootstrapEvidence.MissingStoreCredentialMessage(postgres)
                 : "postgres.connectionString is empty, so there is no store to convert.");
             return 1;
@@ -5788,6 +6531,478 @@ public static class DarlingCliCommands
         return exitCode;
     }
 
+    /* ───────────────────── --add / --rotate / --remove / --list -alert-source (#5654) ───────────────────── */
+
+    /// <summary>
+    /// Parses the alert source verbs' arguments STRICTLY (the posture <see cref="TryParseCollectorToggleArgs"/> takes): one
+    /// bare argument, the source name, for the three verbs that need one, none for <c>--list-alert-sources</c>; <c>--config
+    /// &lt;path&gt;</c> takes a value; anything else starting with '-' is refused rather than taken as a name. Pure so the
+    /// grammar pins. Returns false with a ready-to-print <paramref name="errorMessage"/>.
+    /// </summary>
+    /// <param name="verb">The verb as typed (for the messages).</param>
+    /// <param name="rest">The arguments AFTER the verb itself.</param>
+    /// <param name="takesName">Whether the verb takes a source name.</param>
+    public static bool TryParseAlertSourceArgs(
+        string verb, string[] rest, bool takesName, out string? sourceName, out string? configPath, out string? errorMessage)
+    {
+        sourceName = null;
+        configPath = null;
+        errorMessage = null;
+
+        for (var i = 0; i < rest.Length; i++)
+        {
+            var arg = rest[i];
+            if (string.Equals(arg, "--config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= rest.Length || rest[i + 1].StartsWith('-'))
+                {
+                    errorMessage = $"--config needs a path: {verb}{(takesName ? " <name>" : string.Empty)} --config <path to darling.json>";
+                    return false;
+                }
+
+                configPath = rest[++i];
+                continue;
+            }
+
+            if (arg.StartsWith('-'))
+            {
+                errorMessage = $"Unknown option for {verb}: {arg}";
+                return false;
+            }
+
+            if (!takesName)
+            {
+                errorMessage = $"{verb} takes no name; got '{arg}'.";
+                return false;
+            }
+
+            if (sourceName is not null)
+            {
+                errorMessage = $"{verb} takes ONE source name; got '{sourceName}' and '{arg}'.";
+                return false;
+            }
+
+            sourceName = arg;
+        }
+
+        if (takesName && string.IsNullOrWhiteSpace(sourceName))
+        {
+            errorMessage = $"{verb} needs a source name.";
+            return false;
+        }
+
+        if (takesName && !ExternalAlertSourceAdmin.IsValidName(sourceName))
+        {
+            errorMessage = $"'{sourceName}' is not a valid source name: use 2 to 31 characters, a lower-case letter first, then lower-case letters, digits or underscores.";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary><c>--add-alert-source &lt;name&gt;</c>: see <see cref="ExternalAlertSourceAdmin.AddAsync"/>. Prints the connection string once.</summary>
+    public static Task<int> AddAlertSourceAsync(string[] rest, TextWriter output, TextWriter error, CancellationToken cancellationToken) =>
+        RunAlertSourceVerbAsync("--add-alert-source", rest, takesName: true, output, error, cancellationToken);
+
+    /// <summary><c>--rotate-alert-source &lt;name&gt;</c>: see <see cref="ExternalAlertSourceAdmin.RotateAsync"/>. Prints the new connection string once.</summary>
+    public static Task<int> RotateAlertSourceAsync(string[] rest, TextWriter output, TextWriter error, CancellationToken cancellationToken) =>
+        RunAlertSourceVerbAsync("--rotate-alert-source", rest, takesName: true, output, error, cancellationToken);
+
+    /// <summary><c>--remove-alert-source &lt;name&gt;</c>: see <see cref="ExternalAlertSourceAdmin.RemoveAsync"/>.</summary>
+    public static Task<int> RemoveAlertSourceAsync(string[] rest, TextWriter output, TextWriter error, CancellationToken cancellationToken) =>
+        RunAlertSourceVerbAsync("--remove-alert-source", rest, takesName: true, output, error, cancellationToken);
+
+    /// <summary><c>--list-alert-sources</c>: see <see cref="ExternalAlertSourceAdmin.ListAsync"/>.</summary>
+    public static Task<int> ListAlertSourcesAsync(string[] rest, TextWriter output, TextWriter error, CancellationToken cancellationToken) =>
+        RunAlertSourceVerbAsync("--list-alert-sources", rest, takesName: false, output, error, cancellationToken);
+
+    /// <summary>
+    /// The one body behind the four alert source verbs: parse, open the store as its owner (the connection
+    /// <see cref="ToggleCollectorAsync"/> opens, so a refusal reads the same), run the verb on one connection and print the outcome.
+    /// Exit codes are <see cref="CollectorToggleExitCode"/>'s: 1 for a usage, configuration or name problem, 2 when the store
+    /// cannot be reached or refuses the change.
+    /// </summary>
+    private static async Task<int> RunAlertSourceVerbAsync(
+        string verb, string[] rest, bool takesName, TextWriter output, TextWriter error, CancellationToken cancellationToken)
+    {
+        if (!TryParseAlertSourceArgs(verb, rest, takesName, out var sourceName, out var configPath, out var parseError))
+        {
+            error.WriteLine(parseError);
+            output.WriteLine($"Usage: {verb}{(takesName ? " <name>" : string.Empty)} [--config <path to darling.json>]");
+            return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        var created = TryCreateCollectorStoreDataSource(verb, configPath, error);
+        if (created is null)
+        {
+            return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        /* The config already loaded once inside TryCreateCollectorStoreDataSource; read again here for the network block,
+           which the add and rotate text describe (whether a source on another machine is admitted). */
+        PostgresConfig? postgres = null;
+        try
+        {
+            postgres = DarlingConfig.Load(configPath).Postgres;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            postgres = null;
+        }
+
+        await using var dataSource = created;
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+            return await RunAlertSourceVerbAsync(verb, connection, sourceName, dataSource.ConnectionString, output, error, cancellationToken, postgres);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Could not change the alert sources in the store: {ex.Message}");
+            return CollectorToggleExitCode.StoreUnavailable;
+        }
+    }
+
+    /// <summary>The verb on an open owner connection, so a live test drives exactly what the command line does.</summary>
+    internal static async Task<int> RunAlertSourceVerbAsync(
+        string verb, NpgsqlConnection connection, string? sourceName, string storeConnectionString,
+        TextWriter output, TextWriter error, CancellationToken cancellationToken, PostgresConfig? postgres = null,
+        Func<NpgsqlConnection, CancellationToken, Task<IReadOnlyList<string>>>? readGroupExtras = null)
+    {
+        if (IsListAlertSourcesVerb(verb))
+        {
+            return PrintAlertSourceList(await ExternalAlertSourceAdmin.ListAsync(connection, cancellationToken), output, error);
+        }
+
+        var result = IsAddAlertSourceVerb(verb) ? await ExternalAlertSourceAdmin.AddAsync(connection, sourceName!, cancellationToken)
+            : IsRotateAlertSourceVerb(verb) ? await ExternalAlertSourceAdmin.RotateAsync(connection, sourceName!, cancellationToken)
+            : await ExternalAlertSourceAdmin.RemoveAsync(connection, sourceName!, cancellationToken);
+
+        /* The roles besides the source logins that a +darling_alert_sources pg_hba line would admit (#5654): what the
+           provisioning step could not revoke, read after it ran. The add and rotate text name each one. The verb has
+           committed by now, so a failure here is reported after the result (and its one-time password), never in its place. */
+        IReadOnlyList<string>? groupExtras = null;
+        if (!IsRemoveAlertSourceVerb(verb)
+            && result.Outcome is ExternalAlertSourceAdmin.Outcome.Done or ExternalAlertSourceAdmin.Outcome.NeedsDbaSql)
+        {
+            try
+            {
+                groupExtras = await (readGroupExtras ?? DarlingManagedRoles.ReadAlertSourceGroupExtrasAsync)(connection, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                var group = DarlingManagedRoles.AlertSourceGroupRoleName;
+                var failure = $"The change above is committed, but the read of which other roles are members of {group} failed ({ex.Message}), "
+                    + $"so none is named above. Before a +{group} pg_hba line admits the group, list them as the store owner with:"
+                    + Environment.NewLine + DarlingManagedRoles.AlertSourceGroupExtrasSql(PgSchemaGenerator.ConfigSchema, registryExists: true).Trim();
+                result = result with { FollowUpFailure = result.FollowUpFailure is null ? failure : result.FollowUpFailure + Environment.NewLine + failure };
+            }
+        }
+
+        /* On the managed store the alert sources line written at the last service start is taken out of pg_hba.conf now,
+           and the server reloads it, rather than staying live until the next start. */
+        string? lineDropFailure = null;
+        if (postgres is { Managed: true } && groupExtras is { Count: > 0 })
+        {
+            lineDropFailure = await DarlingManagedPostgres.DropAlertSourcePgHbaLineAsync(
+                DarlingManagedPostgres.ResolveDataDirectory(postgres), connection, cancellationToken);
+        }
+
+        return PrintAlertSourceResult(verb, result, sourceName!, storeConnectionString, output, error, postgres, groupExtras, lineDropFailure);
+    }
+
+    /// <summary>Prints what an add, rotate or remove did, and returns the exit code. The only place a password is written, and only inside the connection string.</summary>
+    internal static int PrintAlertSourceResult(
+        string verb, ExternalAlertSourceAdmin.Result result, string sourceName, string storeConnectionString, TextWriter output, TextWriter error,
+        PostgresConfig? postgres = null, IReadOnlyList<string>? groupExtras = null, string? lineDropFailure = null)
+    {
+        switch (result.Outcome)
+        {
+            case ExternalAlertSourceAdmin.Outcome.InvalidName:
+                error.WriteLine($"'{sourceName}' is not a valid source name: use 2 to 31 characters, a lower-case letter first, then lower-case letters, digits or underscores.");
+                return CollectorToggleExitCode.UsageOrConfig;
+            case ExternalAlertSourceAdmin.Outcome.NoTables:
+                error.WriteLine("This store has no external alert tables yet. Start the Darling service once so it upgrades the store, then run this again.");
+                return CollectorToggleExitCode.UsageOrConfig;
+            case ExternalAlertSourceAdmin.Outcome.AlreadyRegistered:
+                error.WriteLine($"A source named '{sourceName}' already exists. Use --rotate-alert-source {sourceName} for a new password, or --remove-alert-source {sourceName} first.");
+                return CollectorToggleExitCode.UsageOrConfig;
+            case ExternalAlertSourceAdmin.Outcome.LoginExists:
+                error.WriteLine($"A database login named '{result.RoleName}' already exists and is not a registered source, so it was left alone. Pick another name, or drop that login first.");
+                return CollectorToggleExitCode.UsageOrConfig;
+            case ExternalAlertSourceAdmin.Outcome.NotRegistered:
+                error.WriteLine($"No source named '{sourceName}'. --list-alert-sources shows the sources there are.");
+                return CollectorToggleExitCode.UsageOrConfig;
+            case ExternalAlertSourceAdmin.Outcome.LoginNotManaged:
+                error.WriteLine($"The login '{result.RoleName}' is missing or was not made by --add-alert-source, so its password was not changed.");
+                return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        output.WriteLine();
+        if (IsRemoveAlertSourceVerb(verb))
+        {
+            output.WriteLine($"Source '{sourceName}' removed. It can no longer send alerts.");
+            output.WriteLine(result.LoginDropped
+                ? $"  Login '{result.RoleName}' dropped."
+                : $"  Login '{result.RoleName}' was not dropped: it is missing, or it was not made by --add-alert-source, or the statements below drop it.");
+            output.WriteLine($"  Removed with it: {result.RemovedRows} queued alert row(s), {result.RemovedUndelivered} of them not yet delivered. Alerts it already sent stay in the alert history.");
+            WriteEndedSessions(result, output);
+        }
+        else
+        {
+            var pending = result.Outcome == ExternalAlertSourceAdmin.Outcome.NeedsDbaSql;
+            output.WriteLine(IsRotateAlertSourceVerb(verb)
+                ? pending
+                    ? $"Source '{sourceName}': a new password was generated, and nothing is changed yet. It takes effect, and the old password stops working, only after a database administrator runs the statements below."
+                    : $"Source '{sourceName}': new password set. The old password no longer works for a new connection."
+                : pending
+                    ? $"Source '{sourceName}' is registered, and its login '{result.RoleName}' does not exist yet. A database administrator creates it with the statements below; until then the connection string does not work."
+                    : $"Source '{sourceName}' created (login '{result.RoleName}').");
+            WriteEndedSessions(result, output);
+            output.WriteLine();
+            output.WriteLine("Connection string (shown ONCE; Darling keeps no copy, so save it now. If it is lost, --rotate-alert-source makes a new one):");
+            output.WriteLine();
+            output.WriteLine("  " + ExternalAlertSourceAdmin.BuildSourceConnectionString(storeConnectionString, result.RoleName, result.Password!));
+            output.WriteLine();
+
+            /* #5654: a source on another machine always gets a string that verifies the server (SSL Mode=VerifyFull with a root
+               certificate), never the local string with only the host changed. */
+            var remote = BuildRemoteAlertSourceConnectionString(postgres, result.RoleName, result.Password!);
+            output.WriteLine("The string above is for a source on this machine. A source on another machine uses this one (also shown ONCE):");
+            output.WriteLine();
+            if (remote is null)
+            {
+                output.WriteLine("  " + ExternalAlertSourceAdmin.BuildRemoteSourceConnectionString(storeConnectionString, result.RoleName, result.Password!));
+                output.WriteLine();
+                output.WriteLine("It verifies the store's certificate (SSL Mode=VerifyFull). Replace the Root Certificate placeholder with the path, on the source");
+                output.WriteLine("machine, of the CA certificate that signed the store server's certificate. Host must be a name or address the store is reached at");
+                output.WriteLine("and that the server certificate carries.");
+            }
+            else
+            {
+                output.WriteLine("  " + remote.ConnectionString);
+                output.WriteLine();
+                output.WriteLine($"It verifies the store's certificate (SSL Mode=VerifyFull). Copy {remote.CertificatePath} to the source machine and point");
+                output.WriteLine("\"Root Certificate\" at the copy. Host must be a name or address the certificate carries.");
+                if (!remote.SourcesListed)
+                {
+                    output.WriteLine("It works once \"sources\" is listed in the store's network roles (postgres.network.role); until then the store admits no alert source from the network.");
+                }
+            }
+
+            foreach (var line in BuildAlertSourceNetworkNote(postgres, groupExtras, lineDropFailure))
+            {
+                output.WriteLine(line);
+            }
+
+            output.WriteLine("The source sends an alert with:  SELECT config.submit_external_alert('fire', 'key', 'warning', 'title', 'detail', 'server name', 1);");
+        }
+
+        if (result.Outcome == ExternalAlertSourceAdmin.Outcome.NeedsDbaSql)
+        {
+            output.WriteLine();
+            output.WriteLine(result.DbaReason is null
+                ? "This store's owner cannot make, change or drop logins (it lacks CREATEROLE)."
+                : $"The login step was not completed as this store's owner: {result.DbaReason}");
+            output.WriteLine(IsRotateAlertSourceVerb(verb)
+                ? "Nothing is applied yet. Have a database administrator run:"
+                : "The registry is updated and nothing of the login is applied yet. Have a database administrator run:");
+            output.WriteLine();
+            output.WriteLine(result.DbaSql);
+        }
+
+        if (result.ServerLogSettingsOn is not null)
+        {
+            /* #5654: the same warning step 0 of tools/provision-roles.sql gives when it may not turn the server log off. */
+            output.WriteLine();
+            output.WriteLine($"The server log records this store owner's statements ({result.ServerLogSettingsOn}), and this owner may not turn that off for its");
+            output.WriteLine("transaction, so the statement that set the login's password verifier was written to the server log.");
+        }
+
+        output.WriteLine();
+
+        /* #5654: a step after the commit that did not complete. The change and the password above stand; this says which step
+           and what to run, and the exit code stays success because the change itself is in effect. */
+        if (result.FollowUpFailure is not null)
+        {
+            error.WriteLine(result.FollowUpFailure);
+        }
+
+        return CollectorToggleExitCode.Success;
+    }
+
+    /// <summary>The sessions line of rotate and remove (#5654): how many open sessions of the login were ended, or the statement a database administrator runs when the owner may not end them.</summary>
+    private static void WriteEndedSessions(ExternalAlertSourceAdmin.Result result, TextWriter output)
+    {
+        if (result.SessionsEnded is { } ended)
+        {
+            output.WriteLine($"  Ended {ended} open session(s) of login '{result.RoleName}'.");
+        }
+        else if (result.EndSessionsSqlForDba is { } sql)
+        {
+            output.WriteLine($"  This store's owner may not end the open sessions of login '{result.RoleName}', so any it holds stay connected. Have a database administrator run:");
+            output.WriteLine("  " + sql);
+        }
+    }
+
+    /// <summary>A source's connection string for another machine, the certificate file it names, and whether the store's network roles list <c>sources</c> now.</summary>
+    internal sealed record RemoteAlertSourceString(string ConnectionString, string CertificatePath, bool SourcesListed);
+
+    /// <summary>
+    /// The connection string for a source on another machine (#5654), built exactly as the remote viewer's is
+    /// (<see cref="BuildViewerConnectionString"/>: the host <see cref="ResolveViewerHost"/> picks, SSL Mode=VerifyFull and the store's
+    /// own certificate as the root), with the source's login and password. For a managed store, whether or not
+    /// <c>postgres.network.role</c> lists <c>sources</c> yet (<see cref="RemoteAlertSourceString.SourcesListed"/>); null for a store
+    /// Darling does not manage, which gets <see cref="ExternalAlertSourceAdmin.BuildRemoteSourceConnectionString"/>. Pure: nothing is written or kept.
+    /// </summary>
+    internal static RemoteAlertSourceString? BuildRemoteAlertSourceConnectionString(PostgresConfig? postgres, string roleName, string password)
+    {
+        if (postgres is null || !postgres.Managed)
+        {
+            return null;
+        }
+
+        var roles = DarlingNetwork.NormalizeNetworkRoles(postgres.Network?.Role);
+        var sourcesListed = roles is not null && roles.Contains(DarlingManagedPostgres.AlertSourcesNetworkToken, StringComparer.Ordinal);
+        var certificatePath = ManagedStoreCertificatePath(DarlingManagedPostgres.ResolveDataDirectory(postgres));
+        return new RemoteAlertSourceString(
+            BuildViewerConnectionString(ResolveViewerHost(postgres.Network?.Listen), postgres.Port, roleName, password, certificatePath),
+            certificatePath,
+            sourcesListed);
+    }
+
+    /// <summary>
+    /// The add and rotate text's note on a source that runs on another machine (#5654): whether the store admits alert source
+    /// logins from the network now, and if not, the one change that does. On the managed store that is the <c>sources</c> token
+    /// in <c>postgres.network.role</c>, which writes <c>hostssl darling +darling_alert_sources &lt;allowFrom&gt; scram-sha-256</c>
+    /// into the managed pg_hba block; the suggested value keeps every role the field admits today. A bring-your-own store's own
+    /// pg_hba.conf decides, so the note names the line to add there. Pure.
+    /// <para><paramref name="groupExtras"/> are the roles besides the source logins that are members of the group at any depth
+    /// (<see cref="DarlingManagedRoles.ReadAlertSourceGroupExtrasAsync"/>), which a <c>+</c> line admits too. Each is named:
+    /// on the managed store the verb has just taken the alert source line out of pg_hba.conf and reloaded the server
+    /// (<see cref="DarlingManagedPostgres.DropAlertSourcePgHbaLineAsync"/>), or, when <paramref name="lineDropFailure"/> says
+    /// it could not, the note says the line written at the last start stays live until the service restarts. A
+    /// bring-your-own store gets a <c>reject</c> line for each, to go above the group line.</para>
+    /// </summary>
+    internal static IReadOnlyList<string> BuildAlertSourceNetworkNote(PostgresConfig? postgres, IReadOnlyList<string>? groupExtras = null, string? lineDropFailure = null)
+    {
+        var lines = BuildAlertSourceNetworkNoteCore(postgres);
+        if (groupExtras is not { Count: > 0 })
+        {
+            return lines;
+        }
+
+        var group = DarlingManagedRoles.AlertSourceGroupRoleName;
+        var named = string.Join(", ", groupExtras.Select(role => $"'{role}'"));
+        var all = new List<string>(lines)
+        {
+            $"These roles are members of {group} too, directly or through a source login, and could not be removed (PostgreSQL 16 makes a role that is not a superuser a member of each role it creates): {named}.",
+        };
+        if (postgres is { Managed: true })
+        {
+            all.Add(lineDropFailure is null
+                ? $"The managed pg_hba block now holds no +{group} line (the verb took it out and reloaded pg_hba.conf if it was there), so no source connects from another machine. A superuser revokes the membership; each service start checks again and writes the line back only when no such role remains."
+                : $"The +{group} line could not be taken out of the live pg_hba rules here ({lineDropFailure}). The line written at the last service start stays live, and admits these roles from the allowed range, until the service restarts: restart it now, or have a superuser revoke the membership.");
+        }
+        else
+        {
+            all.Add($"A +{group} line admits them too. Put these lines ABOVE it, so they cannot connect from that range:");
+            all.AddRange(groupExtras.Select(role => $"  hostssl <database> {QuotePgHbaRole(role)} <range> reject"));
+        }
+
+        return all;
+    }
+
+    private static string QuotePgHbaRole(string role) => DarlingManagedPostgres.QuotePgHbaName(role);
+
+    private static IReadOnlyList<string> BuildAlertSourceNetworkNoteCore(PostgresConfig? postgres)
+    {
+        const string token = "sources";
+        if (postgres is null)
+        {
+            return new[] { $"A source on another machine is admitted only when postgres.network.role lists \"{token}\" (see the README's \"Alert sources on another machine\")." };
+        }
+
+        if (!postgres.Managed)
+        {
+            return new[]
+            {
+                $"This store is your own PostgreSQL, so its pg_hba.conf decides who connects from another machine. This line admits, from one range over TLS, each role that is a member of {DarlingManagedRoles.AlertSourceGroupRoleName} directly or through another role; Darling keeps those members to the registered alert source logins and names any other it cannot remove:",
+                $"  hostssl <database> +{DarlingManagedRoles.AlertSourceGroupRoleName} <range> scram-sha-256",
+            };
+        }
+
+        var network = postgres.Network;
+        var roles = DarlingNetwork.NormalizeNetworkRoles(network?.Role);
+        var exposed = DarlingNetwork.IsExposedListenAddress(network?.Listen);
+
+        if (roles is not null && roles.Contains(token, StringComparer.Ordinal) && exposed)
+        {
+            return new[]
+            {
+                $"postgres.network.role lists \"{token}\", so a source on another machine connects with TLS from {network!.AllowFrom} (postgres.network.allowFrom), to {network.Listen}.",
+            };
+        }
+
+        var lines = new List<string>();
+        if (roles is null)
+        {
+            lines.Add($"postgres.network.role '{network?.Role}' is not valid, so the store admits no connection from the network.");
+            lines.Add($"To admit alert sources from another machine, set \"role\": \"viewer,{token}\" in postgres.network.");
+        }
+        else if (!roles.Contains(token, StringComparer.Ordinal))
+        {
+            var suggested = string.Join(",", roles.Append(token));
+            lines.Add($"postgres.network.role does not list \"{token}\", so the store admits no alert source login from another machine.");
+            lines.Add($"To admit them, set \"role\": \"{suggested}\" in postgres.network (it keeps the roles admitted now).");
+        }
+        else
+        {
+            lines.Add($"postgres.network.role lists \"{token}\", but postgres.network.listen is not a network address, so the store is reachable only from this machine.");
+        }
+
+        if (!exposed)
+        {
+            lines.Add("postgres.network.listen and allowFrom must also be set: the store listens on that address and admits only that range.");
+        }
+
+        lines.Add("A service restart applies the change. The source then connects with TLS from the postgres.network.allowFrom range.");
+        return lines;
+    }
+
+    /// <summary>Prints the source table. No secret is in it.</summary>
+    internal static int PrintAlertSourceList(IReadOnlyList<ExternalAlertSourceAdmin.SourceRow>? rows, TextWriter output, TextWriter error)
+    {
+        if (rows is null)
+        {
+            error.WriteLine("This store has no external alert tables yet. Start the Darling service once so it upgrades the store, then run this again.");
+            return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        output.WriteLine();
+        if (rows.Count == 0)
+        {
+            output.WriteLine("No alert sources. --add-alert-source <name> makes one.");
+            output.WriteLine();
+            return CollectorToggleExitCode.Success;
+        }
+
+        var nameWidth = Math.Max("SOURCE".Length, rows.Max(r => r.Name.Length));
+        output.WriteLine($"{"SOURCE".PadRight(nameWidth)}  {"STATE",-8}  {"CREATED (UTC)",-16}  {"LAST ALERT SENT (UTC)",-21}  UNDELIVERED");
+        foreach (var row in rows)
+        {
+            output.WriteLine(
+                $"{row.Name.PadRight(nameWidth)}  {(row.Enabled ? "enabled" : "disabled"),-8}  "
+                + $"{row.CreatedAt.UtcDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture),-16}  "
+                + $"{(row.LastSubmit is { } last ? last.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "never"),-21}  {row.Undelivered}");
+        }
+
+        output.WriteLine();
+        output.WriteLine("The last alert sent and the undelivered count come from the queue rows the store still keeps.");
+        output.WriteLine();
+        return CollectorToggleExitCode.Success;
+    }
+
     /* ───────────────────── --enable-collector / --disable-collector (#3752) ───────────────────── */
 
     /// <summary>
@@ -5980,20 +7195,21 @@ public static class DarlingCliCommands
     /// </summary>
     internal const string CollectorScheduleReadbackSql = @"
 SELECT cs.server_id, cs.collector_name, cs.frequency_minutes, cs.retention_days, cs.enabled, cs.databases,
-       COALESCE(s.display_name, s.server_name) AS server_label
+       COALESCE(s.display_name, s.server_name) AS server_label, s.server_name
 FROM config.config_collector_schedules cs
 LEFT JOIN collect.servers s ON s.server_id = cs.server_id
-WHERE lower(cs.collector_name) = lower($1)
+WHERE ($1::text IS NULL OR lower(cs.collector_name) = lower($1))
 ORDER BY cs.server_id NULLS FIRST, server_label, cs.server_id";
 
     /// <summary>One <c>config_collector_schedules</c> row as the verb reads it back: the service's
-    /// <see cref="ScheduleOverride"/> columns plus the registry label the operator knows the server by.</summary>
+    /// <see cref="ScheduleOverride"/> columns plus the registry label the operator knows the server by, and the storage name
+    /// (<c>ServerName</c>) the server resolver accepts, which the label ("Display (Storage)") is not.</summary>
     internal sealed record CollectorScheduleReadbackRow(
-        int? ServerId, string CollectorName, int? FrequencyMinutes, int? RetentionDays, bool Enabled,
-        IReadOnlyList<string>? Databases, string? ServerLabel);
+        int? ServerId, string CollectorName, int? FrequencyMinutes, int? RetentionDays, bool? Enabled,
+        IReadOnlyList<string>? Databases, string? ServerLabel, string? ServerName = null);
 
     internal static async Task<List<CollectorScheduleReadbackRow>> ReadCollectorScheduleRowsAsync(
-        NpgsqlDataSource postgres, string collectorName, CancellationToken cancellationToken)
+        NpgsqlDataSource postgres, string? collectorName, CancellationToken cancellationToken)
     {
         var rows = new List<CollectorScheduleReadbackRow>();
         /* The deadline is written ON the construction, as every CLI store command in this file writes it: the
@@ -6001,7 +7217,7 @@ ORDER BY cs.server_id NULLS FIRST, server_label, cs.server_id";
            so a deadline assigned a statement later would be a site it cannot certify. */
         await using var connection = await postgres.OpenConnectionAsync(cancellationToken);
         await using var command = new NpgsqlCommand(CollectorScheduleReadbackSql, connection) { CommandTimeout = ServiceCommandDeadlines.CliStoreReadSeconds };
-        command.Parameters.Add(new NpgsqlParameter<string> { TypedValue = collectorName });
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text, Value = (object?)collectorName ?? DBNull.Value });
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
@@ -6010,11 +7226,12 @@ ORDER BY cs.server_id NULLS FIRST, server_label, cs.server_id";
                 reader.GetString(1),
                 reader.IsDBNull(2) ? null : reader.GetInt32(2),
                 reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                reader.GetBoolean(4),
+                reader.IsDBNull(4) ? null : reader.GetBoolean(4),
                 /* V125 (#3477): NULL and an empty array are different readings — keep both, as the service's
                    ReadScheduleOverridesAsync does, so the printout says which one the row carries. */
                 reader.IsDBNull(5) ? null : reader.GetFieldValue<string[]>(5),
-                reader.IsDBNull(6) ? null : reader.GetString(6)));
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7)));
         }
 
         return rows;
@@ -6031,7 +7248,7 @@ ORDER BY cs.server_id NULLS FIRST, server_label, cs.server_id";
 SELECT rt.server_id, rt.collector_name, rt.run_at_minute, COALESCE(s.display_name, s.server_name) AS server_label
 FROM config.config_collector_run_times rt
 LEFT JOIN collect.servers s ON s.server_id = rt.server_id
-WHERE lower(rt.collector_name) = lower($1)
+WHERE ($1::text IS NULL OR lower(rt.collector_name) = lower($1))
 ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
 
     /// <summary>One <c>config_collector_run_times</c> row as the verb reads it back, with the registry label the operator knows
@@ -6046,14 +7263,14 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
     /// is what is matched: lc_messages is not always English. Any other failure propagates.
     /// </summary>
     internal static async Task<List<CollectorRunTimeReadbackRow>> ReadCollectorRunTimeRowsAsync(
-        NpgsqlDataSource postgres, string collectorName, CancellationToken cancellationToken)
+        NpgsqlDataSource postgres, string? collectorName, CancellationToken cancellationToken)
     {
         var rows = new List<CollectorRunTimeReadbackRow>();
         try
         {
             await using var connection = await postgres.OpenConnectionAsync(cancellationToken);
             await using var command = new NpgsqlCommand(CollectorRunTimeReadbackSql, connection) { CommandTimeout = ServiceCommandDeadlines.CliStoreReadSeconds };
-            command.Parameters.Add(new NpgsqlParameter<string> { TypedValue = collectorName });
+            command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text, Value = (object?)collectorName ?? DBNull.Value });
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
@@ -6108,7 +7325,7 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
             var line = string.Format(
                 CultureInfo.InvariantCulture,
                 "  {0}: enabled={1}  frequency={2}  retention={3}",
-                scope, row.Enabled ? "true" : "false", frequency, retention);
+                scope, row.Enabled is bool en ? (en ? "true" : "false") : "(inherited)", frequency, retention);
             if (row.Databases is not null)
             {
                 line += row.Databases.Count == 0
@@ -6359,7 +7576,7 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
     }
 
     /// <summary>What <see cref="ResolveCollectorScopeAsync"/> decided: the schedule row a verb writes, or the exit code it stops with.</summary>
-    private readonly record struct CollectorScope(int? ServerId, string Label, int? FailureExitCode)
+    internal readonly record struct CollectorScope(int? ServerId, string Label, int? FailureExitCode, string? ServerName = null)
     {
         /// <summary>No <c>--server</c>: the fleet-wide row (<c>server_id</c> NULL).</summary>
         public static CollectorScope Fleet { get; } = new(null, "fleet-wide", null);
@@ -6375,7 +7592,7 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
     /// with the candidates named and "Nothing was changed." The one place either verb resolves a server, so the two cannot learn
     /// different rules.
     /// </summary>
-    private static async Task<CollectorScope> ResolveCollectorScopeAsync(NpgsqlDataSource dataSource, string? serverName, TextWriter error)
+    internal static async Task<CollectorScope> ResolveCollectorScopeAsync(NpgsqlDataSource dataSource, string? serverName, TextWriter error)
     {
         if (serverName is null)
         {
@@ -6393,7 +7610,7 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
             return CollectorScope.Failed(CollectorToggleExitCode.StoreUnavailable);
         }
 
-        var target = DarlingMcpServerAdminTools.ResolveForRemoval(servers, serverName);
+        var target = DarlingMcpServerAdminTools.ResolveForRemoval(servers, serverName, nameClash: NameClash.Refuse);
         if (target.Candidates.Count == 0)
         {
             /* The read resolver's miss message: the local listing (a typo is the commonest miss) plus the
@@ -6425,7 +7642,7 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
         var scopeLabel = string.IsNullOrEmpty(resolved.DisplayName) || resolved.DisplayName == resolved.ServerName
             ? resolved.ServerName
             : $"{resolved.DisplayName} ({resolved.ServerName})";
-        return new CollectorScope(resolved.ServerId, scopeLabel, null);
+        return new CollectorScope(resolved.ServerId, scopeLabel, null, resolved.ServerName);
     }
 
     /// <summary>
@@ -6609,6 +7826,17 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
     }
 
     /// <summary>
+    /// The refusal for a time of day on a collector whose interval, for the row being written, is not a whole number of days
+    /// (<see cref="CollectorRunTime.AllowsRunAt"/> over <see cref="ResolveRunAtInterval"/>), or null when the time is fine. One rule for
+    /// <c>--set-collector-run-at</c> and the MCP <c>set_collector_run_at</c> tool (#6227). Pure over the rows already read.
+    /// </summary>
+    internal static string? RunAtIntervalRefusal(string collectorName, int? serverId, IReadOnlyList<CollectorScheduleReadbackRow> rows)
+    {
+        var interval = ResolveRunAtInterval(collectorName, serverId, rows);
+        return CollectorRunTime.AllowsRunAt(interval) ? null : CollectorRunTime.IntervalRefusalMessage(collectorName, interval);
+    }
+
+    /// <summary>
     /// <c>--set-collector-run-at</c> (#4938): sets, stops or clears the time of day a once-a-day collector runs, in
     /// <c>config.config_collector_run_times</c>, fleet-wide or for one server with <c>--server</c>, and prints the rows
     /// read back from the store.
@@ -6691,10 +7919,9 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
                 return CollectorToggleExitCode.StoreUnavailable;
             }
 
-            var interval = ResolveRunAtInterval(collectorName, scope.ServerId, existing);
-            if (!CollectorRunTime.AllowsRunAt(interval))
+            if (RunAtIntervalRefusal(collectorName, scope.ServerId, existing) is string intervalRefusal)
             {
-                error.WriteLine(CollectorRunTime.IntervalRefusalMessage(collectorName, interval));
+                error.WriteLine(intervalRefusal);
                 error.WriteLine("Nothing was changed.");
                 return CollectorToggleExitCode.UsageOrConfig;
             }
@@ -6730,6 +7957,213 @@ ORDER BY rt.server_id NULLS FIRST, server_label, rt.server_id";
                 ? $"run at {CollectorRunTime.Format(minuteOfDay)} server time"
                 : "no fixed run time on this server";
         output.WriteLine($"  [{(cleared ? "CLEARED" : "SET")}] {collectorName} — {scope.Label} ({detail}).");
+        output.WriteLine();
+
+        return await PrintCollectorScheduleReadbackAsync(dataSource, collectorName, output, error, cancellationToken);
+    }
+
+    /* ───────────────────── --set-collector-frequency / --set-collector-retention (#6227) ───────────────────── */
+
+    private static string ColumnVerb(CollectorScheduleColumn column) =>
+        column == CollectorScheduleColumn.FrequencyMinutes ? "--set-collector-frequency" : "--set-collector-retention";
+
+    private static string ColumnValueLabel(CollectorScheduleColumn column) =>
+        column == CollectorScheduleColumn.FrequencyMinutes ? "<minutes|default>" : "<days|default>";
+
+    /// <summary>
+    /// What <c>--set-collector-frequency</c> / <c>--set-collector-retention</c> print when their arguments do not parse or the executor
+    /// refuses them: to STDOUT, as <see cref="CollectorRunAtUsageText"/> does, with the one-line refusal itself on STDERR.
+    /// </summary>
+    public static string CollectorColumnUsageText(CollectorScheduleColumn column)
+    {
+        var frequency = column == CollectorScheduleColumn.FrequencyMinutes;
+        return "Usage:" + Environment.NewLine +
+            $"  PerformanceMonitor.Darling.Service.exe {ColumnVerb(column)} <collector> {ColumnValueLabel(column)} [--server <server>] [--config <path to darling.json>]" + Environment.NewLine +
+            Environment.NewLine +
+            "<collector> is a collector name as collection health reports it." + Environment.NewLine +
+            (frequency
+                ? $"<minutes> is how often the collector runs: a whole number from 0 to {CollectorScheduleDefaults.MaxFrequencyMinutes} (one year), where 0 means once when the server loads."
+                : $"<days> is how many days the collector's data is kept: a whole number from 1 to {CollectorScheduleDefaults.MaxRetentionDays} (ten years).") + Environment.NewLine +
+            "default clears the row's value, so the next level applies again (a server's row falls back to the fleet-wide value, the fleet-wide row to the code default)." + Environment.NewLine +
+            "Without --server the change is FLEET-WIDE (the schedule row with no server); --server <server> writes that server's own row" + Environment.NewLine +
+            "instead (its display name or storage name, as the Viewer and the MCP tools show it)." + Environment.NewLine +
+            "Only this one value is written: the other columns on the row are kept, and a row the verb creates stores no enabled flag of its" + Environment.NewLine +
+            "own, so it follows the fleet-wide row and the code default." + Environment.NewLine +
+            Environment.NewLine +
+            "Collectors:" + Environment.NewLine +
+            KnownCollectorsText(_ => true);
+    }
+
+    /// <summary>
+    /// Parses <c>--set-collector-frequency</c> / <c>--set-collector-retention</c>'s trailing arguments STRICTLY, as
+    /// <see cref="TryParseCollectorRunAtArgs"/> does: exactly two bare arguments, the collector name and then the value (a number or
+    /// <c>default</c>, which the executor's plan checks, not this grammar), plus <c>--server &lt;name&gt;</c> and
+    /// <c>--config &lt;path&gt;</c> in any order. Pure.
+    /// </summary>
+    public static bool TryParseCollectorColumnArgs(
+        string verb, CollectorScheduleColumn column, string[] rest, out string? collectorName, out string? value, out string? serverName, out string? configPath, out string? errorMessage)
+    {
+        collectorName = null;
+        value = null;
+        serverName = null;
+        configPath = null;
+        errorMessage = null;
+        var label = ColumnValueLabel(column);
+
+        for (var i = 0; i < rest.Length; i++)
+        {
+            var arg = rest[i];
+            if (string.Equals(arg, "--server", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= rest.Length || rest[i + 1].StartsWith('-'))
+                {
+                    errorMessage = $"--server needs a server name: {verb} <collector> {label} --server <display name or storage name>";
+                    return false;
+                }
+
+                serverName = rest[++i];
+                continue;
+            }
+
+            if (string.Equals(arg, "--config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= rest.Length || rest[i + 1].StartsWith('-'))
+                {
+                    errorMessage = $"--config needs a path: {verb} <collector> {label} --config <path to darling.json>";
+                    return false;
+                }
+
+                configPath = rest[++i];
+                continue;
+            }
+
+            /* A negative number starts with '-' but is a value, not an option: the executor's bounds refuse it in their own words. */
+            if (arg.StartsWith('-') && !int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+            {
+                errorMessage = $"Unknown option for {verb}: {arg}";
+                return false;
+            }
+
+            if (collectorName is null)
+            {
+                collectorName = arg;
+                continue;
+            }
+
+            if (value is null)
+            {
+                value = arg;
+                continue;
+            }
+
+            errorMessage = $"{verb} takes ONE collector name and ONE value; got '{collectorName}', '{value}' and '{arg}'.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(collectorName))
+        {
+            errorMessage = $"{verb} needs a collector name and a value.";
+            return false;
+        }
+
+        if (value is null)
+        {
+            errorMessage = $"{verb} needs a value: {(column == CollectorScheduleColumn.FrequencyMinutes ? "a number of minutes" : "a number of days")} or default.";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The store command these verbs stand in for: the <c>set_collector_frequency</c> / <c>set_collector_retention</c> row the command
+    /// plane carries for the same request, minus the queue. A value that reads as a whole number goes as a JSON number; anything else
+    /// goes as the text typed (<c>default</c> clears), which the plan checks.
+    /// </summary>
+    internal static ClaimedCommand BuildCollectorColumnCommand(CollectorScheduleColumn column, string collectorName, string value, int? serverId)
+    {
+        var frequency = column == CollectorScheduleColumn.FrequencyMinutes;
+        var args = new Dictionary<string, object?> { ["collector_name"] = collectorName };
+        args[frequency ? "frequency_minutes" : "retention_days"] =
+            int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number) ? number : value;
+        return new ClaimedCommand(
+            CommandId: 0,
+            CommandType: frequency ? "set_collector_frequency" : "set_collector_retention",
+            TargetServerId: serverId,
+            ArgsJson: JsonSerializer.Serialize(args),
+            RequestedBy: "cli");
+    }
+
+    /// <summary>The plan the verbs execute: <see cref="DarlingCommandExecutor.ResolvePlan"/> over <see cref="BuildCollectorColumnCommand"/>,
+    /// nothing else, so the verbs own no SQL and the refusals (unknown collector, a value out of bounds) are the executor's. Pure.</summary>
+    internal static CommandPlan PlanCollectorColumn(CollectorScheduleColumn column, string collectorName, string value, int? serverId) =>
+        DarlingCommandExecutor.ResolvePlan(BuildCollectorColumnCommand(column, collectorName, value, serverId));
+
+    /// <summary>
+    /// <c>--set-collector-frequency</c> and <c>--set-collector-retention</c> (#6227): set or clear one column of the collector's row in
+    /// <c>config.config_collector_schedules</c>, fleet-wide or for one server with <c>--server</c>, and print the rows read back. The
+    /// same shape as <see cref="SetCollectorRunAtAsync"/>: strict parse, the executor's own plan checked before config or the store is
+    /// touched, the one shared store opener and server resolver, the plan executed through
+    /// <see cref="DarlingCommandExecutor.ExecuteStoreWriteAsync(NpgsqlDataSource, CommandPlan, CancellationToken)"/>, the shared read-back.
+    /// The verbs own no SQL and no bounds. Exit codes are <see cref="CollectorToggleExitCode"/>'s.
+    /// </summary>
+    /// <param name="column">Which value the verb sets.</param>
+    /// <param name="rest">The arguments AFTER the verb itself.</param>
+    public static async Task<int> SetCollectorColumnAsync(
+        CollectorScheduleColumn column, string[] rest, TextWriter output, TextWriter error, CancellationToken cancellationToken)
+    {
+        var verb = ColumnVerb(column);
+        var frequency = column == CollectorScheduleColumn.FrequencyMinutes;
+
+        if (!TryParseCollectorColumnArgs(verb, column, rest, out var typedName, out var valueText, out var serverName, out var configPath, out var argError))
+        {
+            error.WriteLine(argError);
+            output.WriteLine(CollectorColumnUsageText(column));
+            return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        var collectorName = CanonicalCollectorName(typedName) ?? typedName!;
+        var preflight = PlanCollectorColumn(column, collectorName, valueText!, serverId: null);
+        if (preflight.Kind != CommandKind.StoreWrite)
+        {
+            error.WriteLine(preflight.FailReason ?? $"{verb}: the executor refused the request.");
+            output.WriteLine(CollectorColumnUsageText(column));
+            return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        var created = TryCreateCollectorStoreDataSource(verb, configPath, error);
+        if (created is null)
+        {
+            return CollectorToggleExitCode.UsageOrConfig;
+        }
+
+        await using var dataSource = created;
+
+        output.WriteLine();
+        output.WriteLine($"PerformanceMonitor Darling — set a collector's {(frequency ? "frequency" : "retention")} ({verb})");
+        output.WriteLine();
+
+        var scope = await ResolveCollectorScopeAsync(dataSource, serverName, error);
+        if (scope.FailureExitCode is int scopeFailure)
+        {
+            return scopeFailure;
+        }
+
+        var plan = PlanCollectorColumn(column, collectorName, valueText!, scope.ServerId);
+        try
+        {
+            await DarlingCommandExecutor.ExecuteStoreWriteAsync(dataSource, plan, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Could not update the control-plane store: {ex.Message}");
+            return CollectorToggleExitCode.StoreUnavailable;
+        }
+
+        var cleared = plan.SuccessStatus.Contains("cleared", StringComparison.Ordinal);
+        output.WriteLine(cleared
+            ? $"  [CLEARED] {collectorName} — {scope.Label} ({(frequency ? "frequency" : "retention")} cleared)."
+            : $"  [SET] {collectorName} — {scope.Label} ({(frequency ? "frequency" : "retention")} {valueText}{(frequency ? " minutes" : " days")}).");
         output.WriteLine();
 
         return await PrintCollectorScheduleReadbackAsync(dataSource, collectorName, output, error, cancellationToken);
@@ -7087,7 +8521,7 @@ WHERE cs.collector_name = 'long_query_completions'", connection) { CommandTimeou
                 reader.GetString(1),
                 reader.IsDBNull(2) ? null : reader.GetInt32(2),
                 reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                reader.GetBoolean(4),
+                reader.IsDBNull(4) ? null : reader.GetBoolean(4),
                 reader.IsDBNull(5) ? null : reader.GetFieldValue<string[]>(5)));
         }
 
@@ -7153,7 +8587,6 @@ AND   cst.collector_name = ANY($2)", connection) { CommandTimeout = ServiceComma
     /// <para>Returns 0 when every rollup reached coverage (or already had it), 1 on a load/mode/credential
     /// error, on a preflight refusal, or when any rollup finished short of raw.</para>
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public static async Task<int> BackfillRollupsAsync(
         string? configPath, bool dryRun, TextWriter output, TextWriter error, CancellationToken cancellationToken)
     {
@@ -7175,6 +8608,13 @@ AND   cst.collector_name = ANY($2)", connection) { CommandTimeout = ServiceComma
             return 1;
         }
 
+        /* Windows is needed only for a MANAGED store's DPAPI credential (#6071). A bring-your-own store runs here. */
+        if (ManagedStoreCredentialRefusal("--backfill-rollups", OperatingSystem.IsWindows(), postgres.Managed) is { } platformRefusal)
+        {
+            error.WriteLine(platformRefusal);
+            return 1;
+        }
+
         /* Managed reads the service's own DPAPI-protected owner credential; bring-your-own uses the operator's
            configured string. Both are supported — this is a STORE operation, not a Windows one. */
         if (!TryBuildStoreConnectionString(postgres, out var connectionString, out var unusable))
@@ -7185,7 +8625,7 @@ AND   cst.collector_name = ANY($2)", connection) { CommandTimeout = ServiceComma
 
         if (string.IsNullOrWhiteSpace(connectionString))
         {
-            error.WriteLine(postgres.Managed
+            error.WriteLine(postgres.Managed && OperatingSystem.IsWindows()
                 ? DarlingStoreBootstrapEvidence.MissingStoreCredentialMessage(postgres)
                 : "postgres.connectionString is empty, so there is no store to back fill.");
             return 1;

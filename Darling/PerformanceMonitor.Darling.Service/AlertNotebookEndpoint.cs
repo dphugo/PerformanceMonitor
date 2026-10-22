@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -78,9 +79,26 @@ internal static partial class AlertNotebookEndpoint
     /// <summary>Maps <c>GET /api/alert-notebook</c>. Called once from <see cref="DarlingWebEndpoints.MapAll"/>,
     /// after the auth middleware like every sibling route.</summary>
     public static void Map(WebApplication app, NpgsqlDataSource postgres, DarlingAnalysisService analysis, ILogger logger)
+        => Map(app, postgres, analysis, logger, null, null);
+
+    /// <summary>The name the notebook is admitted and recorded under (#5506 part 3, round 1 M3): it has no MCP twin, so it
+    /// takes its own, as <c>/api/triage</c> takes <c>triage</c>.</summary>
+    internal const string NotebookRoute = "alert_notebook";
+
+    internal static void Map(WebApplication app, NpgsqlDataSource postgres, DarlingAnalysisService analysis, ILogger logger,
+        ReadAdmission? readAdmission, ReadLatencyRecorder? readLatencyRecorder)
     {
         app.MapGet("/api/alert-notebook", async (HttpContext context) =>
         {
+            /* #5506 part 3 (round 1, M3): admitted, and recorded, under its own name (it has no MCP twin) and its window band, like /api/fleet (D8). */
+            using var readScope = ReadScope.Open(logger);
+            using var ticket = await DarlingWebEndpoints.AdmitWebRouteAsync(readAdmission, NotebookRoute, ReadWindowBand.OneDay, context, readLatencyRecorder, readScope.Scope);
+            if (ticket.Refusal is { } refusal)
+            {
+                return DarlingWebEndpoints.BusyResult(refusal);
+            }
+
+            using var run = new DarlingWebEndpoints.WebRouteRun(readLatencyRecorder, NotebookRoute, ReadWindowBand.OneDay, context, readScope.Scope);
             var serverQuery = Query(context, "server");
             var metric = Query(context, "metric");
             var dedup = Query(context, "dedup");
@@ -99,7 +117,7 @@ internal static partial class AlertNotebookEndpoint
                 var resolveStopwatch = Stopwatch.StartNew();
                 try
                 {
-                    var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, serverQuery);
+                    var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, serverQuery, context.RequestAborted);
                     if (error is null)
                     {
                         serverId = resolved.ServerId;
@@ -107,7 +125,7 @@ internal static partial class AlertNotebookEndpoint
                     }
                     else if (error.StartsWith(DarlingServerResolver.RegistryReadFaultPrefix, StringComparison.Ordinal))
                     {
-                        DarlingWebFailureLog.Report(logger, "/api/alert-notebook:resolve-server", resolveStopwatch.ElapsedMilliseconds, error);
+                        DarlingWebFailureLog.Report(logger, "/api/alert-notebook:resolve-server", resolveStopwatch.ElapsedMilliseconds, error, context.RequestAborted);
                         notes.Add((JsonNode)(DarlingWebFailureLog.IsStatementTimeoutSentence(error)
                             ? DarlingWebFailureLog.TimeoutMessage
                             : DarlingWebFailureLog.GenericMessage));
@@ -119,7 +137,7 @@ internal static partial class AlertNotebookEndpoint
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    DarlingWebFailureLog.Report(logger, "/api/alert-notebook:resolve-server", resolveStopwatch.ElapsedMilliseconds, ex);
+                    DarlingWebFailureLog.Report(logger, "/api/alert-notebook:resolve-server", resolveStopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
                     notes.Add((JsonNode)"Server resolution failed. The service log names what failed.");
                 }
             }
@@ -161,7 +179,7 @@ internal static partial class AlertNotebookEndpoint
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:alert-history", alertHistoryStopwatch.ElapsedMilliseconds, ex);
+                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:alert-history", alertHistoryStopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
                 notes.Add((JsonNode)"Alert-history lookup failed. The service log names what failed.");
             }
 
@@ -186,7 +204,7 @@ internal static partial class AlertNotebookEndpoint
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:status-history", statusHistoryStopwatch.ElapsedMilliseconds, ex);
+                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:status-history", statusHistoryStopwatch.ElapsedMilliseconds, ex, context.RequestAborted);
                 notes.Add((JsonNode)"Status lookup failed. The service log names what failed.");
             }
 
@@ -246,7 +264,8 @@ internal static partial class AlertNotebookEndpoint
             }
 
             /* #4348: the notebook's own body carries the alert row's text, so it is swept whole. */
-            return DarlingWebStatementSweep.JsonText(body, "/api/alert-notebook", logger, 0);
+            run.Complete(ReadOutcome.Ok);
+            return DarlingWebStatementSweep.JsonText(body, "/api/alert-notebook", logger, 0, context.RequestAborted);
         });
     }
 
@@ -299,7 +318,7 @@ internal static partial class AlertNotebookEndpoint
         var (servers, fault) = await DarlingServerResolver.LoadEnabledOrFaultAsync(postgres, cancellationToken);
         if (fault is not null)
         {
-            DarlingWebFailureLog.Report(logger, "/api/alert-notebook:scope-server", stopwatch.ElapsedMilliseconds, fault);
+            DarlingWebFailureLog.Report(logger, "/api/alert-notebook:scope-server", stopwatch.ElapsedMilliseconds, fault, cancellationToken);
             var note = DarlingWebFailureLog.IsStatementTimeoutSentence(fault)
                 ? DarlingWebFailureLog.TimeoutMessage
                 : DarlingWebFailureLog.GenericMessage;
@@ -563,6 +582,8 @@ internal static partial class AlertNotebookEndpoint
             new AuthoredTemplateEntry("authored/pg-xmin-horizon", PgXminHorizonTemplateVersion, BuildPgXminHorizonCells)),
         (new[] { "PostgreSQL Wraparound Risk" },
             new AuthoredTemplateEntry("authored/pg-wraparound", PgWraparoundTemplateVersion, BuildPgWraparoundCells)),
+        (new[] { "Runnable Queue" },
+            new AuthoredTemplateEntry("authored/runnable-queue", RunnableQueueTemplateVersion, BuildRunnableQueueCells)),
         (new[] { "Server Unreachable", "Server Restored" },
             new AuthoredTemplateEntry("authored/server-connect", ServerConnectTemplateVersion, BuildServerConnectCells)),
     };
@@ -725,7 +746,7 @@ internal static partial class AlertNotebookEndpoint
         {
             if (logger is not null)
             {
-                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:prefetch", stopwatch.ElapsedMilliseconds, ex);
+                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:prefetch", stopwatch.ElapsedMilliseconds, ex, ct);
             }
 
             notes?.Add((JsonNode)"The rule could not be read.");
@@ -767,7 +788,7 @@ internal static partial class AlertNotebookEndpoint
         {
             if (logger is not null)
             {
-                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:prefetch", stopwatch.ElapsedMilliseconds, ex);
+                DarlingWebFailureLog.Report(logger, "/api/alert-notebook:prefetch", stopwatch.ElapsedMilliseconds, ex, ct);
             }
 
             notes?.Add((JsonNode)"The finding could not be read.");
@@ -1043,7 +1064,7 @@ internal static partial class AlertNotebookEndpoint
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            DarlingWebFailureLog.Report(logger, "/api/alert-notebook:collector-freshness", freshnessStopwatch.ElapsedMilliseconds, ex);
+            DarlingWebFailureLog.Report(logger, "/api/alert-notebook:collector-freshness", freshnessStopwatch.ElapsedMilliseconds, ex, cancellationToken);
         }
 
         return "Unknown (not collected since " + anchorStamp + ")";
@@ -1295,7 +1316,7 @@ internal static partial class AlertNotebookEndpoint
     /// <summary>One alert-history row plus its dedup-matched incident's facts, in the SAME wire shape
     /// <see cref="DarlingTriageEndpoint"/>'s own row node uses, extended with the incident facts the spec
     /// requires (Incident Since, Involved Objects, Database, Total Occurrences).</summary>
-    private static JsonObject AlertRowNode(DarlingAlertReader.AlertHistoryReadRow row, AlertIncident? incident)
+    internal static JsonObject AlertRowNode(DarlingAlertReader.AlertHistoryReadRow row, AlertIncident? incident)
     {
         var node = new JsonObject
         {
@@ -1306,6 +1327,10 @@ internal static partial class AlertNotebookEndpoint
             ["current_value"] = row.CurrentValue,
             ["threshold_value"] = row.ThresholdValue,
             ["detail_text"] = row.DetailText,
+            /* #5642: the fire-time age of the newest sample, read from the persisted context. */
+            ["newest_sample"] = NewestSampleNode(row.ContextJson),
+            /* #5654: the source an external alert came from, read from the persisted context; null for every built-in alert. */
+            ["external_source"] = AlertContextSerializer.TryReadExternalSource(row.ContextJson),
         };
 
         if (incident is not null)
@@ -1318,6 +1343,13 @@ internal static partial class AlertNotebookEndpoint
 
         return node;
     }
+
+    /// <summary>The <c>newest_sample</c> node of an alert row (#5642), shared by the notebook and the triage
+    /// page so both publish the shape <c>get_alert_history</c> does: null when the row carries no sample age.</summary>
+    internal static JsonNode? NewestSampleNode(string? contextJson) =>
+        AlertNewestSampleWire.FromContextJson(contextJson) is AlertNewestSampleWire wire
+            ? JsonSerializer.SerializeToNode(wire)
+            : null;
 
     /// <summary>The first non-empty value for a query key, or null — the read surface's binding rule, which this
     /// calls rather than restates (#5245: a repeated key is its first value, not the values joined by a comma).</summary>

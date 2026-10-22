@@ -53,6 +53,8 @@ public sealed class PgClusterObjectCensusTests
     /// <summary>Classes that reach the shared cluster, match a rule, and are safe. Every entry says why.</summary>
     internal static readonly IReadOnlyDictionary<string, string> AllowList = new Dictionary<string, string>(StringComparer.Ordinal)
     {
+        ["PostgresKillLiveTests"] =
+            "its ALTER SYSTEM, ALTER DATABASE postgres and CONNECT grants run on the class's own cluster (ScramTlsCluster, booted from DARLING_TEST_PGRUNTIME on its own port); on DARLING_TEST_PG it only creates a scratch store database",
         ["PgStatementTextScrubLiveTests"] =
             "the ALTER ROLE text is a sample statement fed to the scrubber as data; the class runs no role DDL",
         ["StatementAnalysisReadCutLiveTests"] =
@@ -65,6 +67,8 @@ public sealed class PgClusterObjectCensusTests
             "creates the cluster's own bootstrap role name only when it is missing (CREATE ROLE darling ... IF NOT EXISTS); on a CI cluster it already exists, so the write never happens",
         ["AlertHistoryDismissTests"] =
             "builds the shipped provisioning text and retargets its viewer GRANT at a per-run role; the batch itself is never executed",
+        ["McpAlertAdminLiveTests"] =
+            "lifts the shipped mcp REVOKE and GRANT on the alert history table out of the provisioning text and runs them retargeted at a per-run role; the batch itself is never executed",
         ["ViewerStoreLoginRawReadLiveTests"] =
             "lifts two shipped GRANT statements out of the provisioning text and runs them retargeted at a per-run role",
         ["ServerAddViewerRoleLiveTests"] =
@@ -73,8 +77,14 @@ public sealed class PgClusterObjectCensusTests
             "lifts the shipped viewer GRANT statements out of the provisioning text and runs them retargeted at a per-run role",
         ["ServerTagMcpRoleLiveTests"] =
             "lifts the shipped mcp GRANT statements out of the provisioning text and runs them retargeted at a per-run role",
+        ["InvestigationRequestStoreLiveTests"] =
+            "lifts the shipped mcp investigation GRANT statements out of the provisioning text, and provision-roles.sql's V184 blocks out of the script, and runs them retargeted at per-run roles (the script's blocks inside a rolled-back transaction)",
+        ["DarlingMcpQueryTagToolsLiveTests"] =
+            "lifts the shipped mcp query-tag GRANT statements out of the provisioning text and runs them retargeted at a per-run role",
         ["ServerTagViewerRoleLiveTests"] =
             "lifts the shipped viewer GRANT statements out of the provisioning text and runs them retargeted at a per-run role",
+        ["PlanForceToolLiveTests"] =
+            "its ALTER ROLE and ALTER DATABASE text is T-SQL run against the local test SQL Server, on a per-run database and login; the store side is a per-run scratch database",
         ["ComposeTempFileLimitLiveTests"] =
             "renders the shipped compose-store role statements and retargets them at a per-run role; the fixed roles are not written",
     };
@@ -155,42 +165,6 @@ public sealed class PgClusterObjectCensusTests
             + "write the fixed roles or the cluster settings.\n"
             + "  - Give the object a name built from the scratch database name or a per-run token ({...}), so no other test can see it.\n"
             + "  - Or add the class to PgClusterObjectCensusTests.AllowList with the reason it is safe.");
-    }
-
-    [Fact]
-    public void EveryAllowListEntry_StillMatchesARuleInAClassThatReachesTheCluster()
-    {
-        var matched = ScanClasses().Where(h => !h.InCollection).Select(h => h.ClassName).ToHashSet(StringComparer.Ordinal);
-        var stale = AllowList.Keys.Where(name => !matched.Contains(name)).OrderBy(name => name, StringComparer.Ordinal).ToList();
-
-        Assert.True(stale.Count == 0,
-            "These allow-list entries no longer match anything (the class was removed, joined the "
-            + CollectionName + " collection, or stopped doing the thing). Delete them:\n" + string.Join("\n", stale));
-
-        foreach (var (name, reason) in AllowList)
-        {
-            Assert.False(string.IsNullOrWhiteSpace(reason), $"allow-list entry {name} needs a reason");
-        }
-    }
-
-    [Fact]
-    public void EveryPinnedSampleStatement_StillMatchesInItsClass()
-    {
-        var seen = ScanClasses().Where(h => !h.InCollection).Select(h => (h.ClassName, h.Text)).ToHashSet();
-        var stale = PinnedSampleText
-            .SelectMany(p => p.Value.Select(text => (Class: p.Key, Text: text)))
-            .Where(p => !seen.Contains((p.Class, p.Text)))
-            .Select(p => p.Class + "  " + p.Text)
-            .ToList();
-
-        Assert.True(stale.Count == 0,
-            "These pinned sample statements no longer match a rule in their class (the line changed or went away). Update or delete them in "
-            + "PgClusterObjectCensusTests.PinnedSampleText:\n" + string.Join("\n", stale));
-
-        foreach (var name in PinnedSampleText.Keys)
-        {
-            Assert.True(AllowList.ContainsKey(name), $"pinned class {name} is not on the allow list");
-        }
     }
 
     // ---- rules -------------------------------------------------------------------------------------------

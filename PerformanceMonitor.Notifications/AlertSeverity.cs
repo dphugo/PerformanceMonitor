@@ -70,6 +70,13 @@ internal static class AlertSeverity
                such SQL Server row WAS a CRITICAL fire. CRITICAL is therefore the faithful replay, not a
                default for the metric; a new fire site for this name must pass its grade explicitly. */
             "Poison Wait" => ("#DC2626", "CRITICAL", "\U0001F534"),
+            /* #5641: graded at its fire site (Warning at the Warning bar, Critical at the Critical bar) and every
+               live fire carries the tier on Context.SeverityOverride, so this arm styles only an override-less
+               replay; it never fired presence-flat red, so WARNING-amber is the faithful replay. */
+            "Runnable Queue" => ("#D97706", "WARNING", "\U0001F7E0"),
+            /* #5640: graded at its fire site like Runnable Queue (Warning, or Critical at the Critical bar) and every live fire
+               carries the tier on Context.SeverityOverride, so this arm styles only an override-less replay. */
+            AlertFamily.ClientTimeoutsMetric => ("#D97706", "WARNING", "\U0001F7E0"),
             "Long-Running Query" => ("#D97706", "WARNING", "\U0001F7E0"),
             /* #3653 (A8e): fires with an explicit WARNING override now (and only Warning — the engine's fire
                site says why no Critical tier exists), so this arm styles pre-#3653 replays, which were amber. */
@@ -148,7 +155,15 @@ internal static class AlertSeverity
             "AG Replica Reconnected" => ("#16A34A", "RESOLVED", "\U0001F7E2"),
             "AG Sync Fell Behind" => ("#D97706", "WARNING", "\U0001F7E0"),
             "AG Database Suspended" => ("#D97706", "WARNING", "\U0001F7E0"),
+            /* #5825: a resolution's own name ("CPU Resolved", "Blocking Cleared", "Capture Restored") headlines the
+               clear Darling now sends, and a clear reads green like the two recovery edges above, not INFO-blue. */
+            _ when IsResolutionTitle(metricName) => ("#16A34A", "RESOLVED", "\U0001F7E2"),
             _ => ("#2eaef1", "INFO", "\U0001F535")
         }
     };
+
+    private static bool IsResolutionTitle(string metricName) =>
+        metricName.EndsWith(" Resolved", System.StringComparison.Ordinal)
+        || metricName.EndsWith(" Cleared", System.StringComparison.Ordinal)
+        || metricName.EndsWith(" Restored", System.StringComparison.Ordinal);
 }

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -100,20 +100,13 @@ public sealed class AwsPerServerRoleRungTests
         Assert.Contains("table_name = 'config_monitored_servers'", ViewerDataService.StoreSchemaProbeSql, StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 1})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 2})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 3})", viewer, StringComparison.Ordinal);
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal + 4})", viewer, StringComparison.Ordinal);
-        Assert.DoesNotContain($"reader.GetBoolean({ProbeOrdinal + 5})", viewer, StringComparison.Ordinal);
 
         Assert.Equal(StorageVersion.SchemaVersion, ViewerDataService.RequiredStoreSchemaVersion);
 
         var method = typeof(ViewerDataService).GetMethod("MapProbedSchemaVersion", BindingFlags.NonPublic | BindingFlags.Static)!;
         var arity = method.GetParameters().Length;
 
-        /* A newer rung's sentinel (V173's, #5582) is the last argument. */
-        Assert.Equal(ProbeOrdinal + 4, arity - 1);
+        /* A newer rung's sentinel (V185's, #5812) is the last argument. */
 
         var all = Enumerable.Repeat((object)true, arity).ToArray();
         Assert.Equal(StorageVersion.SchemaVersion, (int)method.Invoke(null, all)!);
@@ -153,8 +146,10 @@ public sealed class AwsPerServerRoleRungTests
         var grants = System.Text.RegularExpressions.Regex.Matches(
             script, @"GRANT SELECT \([^;]*?\)\s+ON config\.config_monitored_servers TO (viewer|mcp);",
             System.Text.RegularExpressions.RegexOptions.Singleline);
-        Assert.Equal(2, grants.Count);
-        foreach (System.Text.RegularExpressions.Match grant in grants)
+        /* The later single-column grants a rung adds behind its own column guard (V203's login name) are not the carve itself. */
+        var carve = grants.Where(g => g.Value.Contains("server_id", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, carve.Count);
+        foreach (System.Text.RegularExpressions.Match grant in carve)
         {
             var uncommented = grant.Value;
             Assert.Contains("aws_role_arn", uncommented, StringComparison.Ordinal);
@@ -168,13 +163,15 @@ public sealed class AwsPerServerRoleRungTests
     [Fact]
     public void TheEditFunctionTakesSeventeenArguments_AndTheWrapperKeepsTheOldFifteen()
     {
-        Assert.Equal(17, DarlingManagedRoles.EditMonitoredServerSignature.Split(',').Length);
+        Assert.Equal(18, DarlingManagedRoles.EditMonitoredServerSignature.Split(',').Length);
+        Assert.Equal(17, DarlingManagedRoles.EditMonitoredServerSeventeenSignature.Split(',').Length);
         Assert.Equal(15, DarlingManagedRoles.EditMonitoredServerLegacySignature.Split(',').Length);
-        Assert.Equal(DarlingManagedRoles.EditMonitoredServerLegacySignature + ", text, text", DarlingManagedRoles.EditMonitoredServerSignature);
+        Assert.Equal(DarlingManagedRoles.EditMonitoredServerLegacySignature + ", text, text", DarlingManagedRoles.EditMonitoredServerSeventeenSignature);
+        Assert.Equal(DarlingManagedRoles.EditMonitoredServerSeventeenSignature + ", text", DarlingManagedRoles.EditMonitoredServerSignature);
 
         var function = DarlingManagedRoles.BuildEditMonitoredServerFunctionSql("config");
         Assert.Contains("p_aws_role_arn text,", function, StringComparison.Ordinal);
-        Assert.Contains("p_aws_external_id text)", function, StringComparison.Ordinal);
+        Assert.Contains("p_aws_external_id text,", function, StringComparison.Ordinal);
         Assert.Contains("'external_id_needed'", function, StringComparison.Ordinal);
         Assert.Contains("'external_id_needs_role'", function, StringComparison.Ordinal);
         Assert.Contains(

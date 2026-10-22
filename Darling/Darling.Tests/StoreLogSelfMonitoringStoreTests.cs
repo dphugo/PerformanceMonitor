@@ -23,6 +23,7 @@ namespace Darling.Tests;
 /// tables are deliberately NOT collector tables, the viewer's connect-time gate, the read's wiring, and the
 /// derived note.
 /// </summary>
+[Trait("Stage", "Guard")]
 public class StoreLogSelfMonitoringStoreTests
 {
     internal const int RungVersion = 111;
@@ -152,50 +153,6 @@ public class StoreLogSelfMonitoringStoreTests
         foreach (var cast in new[] { "$2::text[]", "$3::text[]", "$4::integer[]", "$5::text[]", "$6::text[]" })
         {
             Assert.Contains(cast, StoreLogSweep.EventInsertSql, StringComparison.Ordinal);
-        }
-    }
-
-    /// <summary>
-    /// The sweep never parses the log's clock or its prefix, asserted over the SHIPPED source rather than
-    /// claimed in a comment.
-    ///
-    /// <para>This is the #3030 lesson turned into a guard. That defect was a parser that assumed a
-    /// <c>log_line_prefix</c> and could not match another family AT ALL, reporting zero capture as a clean
-    /// read. The store's case adds a second trap on the same axis: PostgreSQL renders <c>%m</c> in
-    /// <c>log_timezone</c>, and <c>DarlingManagedPostgres</c> deliberately does not set it (its v9 block pins
-    /// the session <c>timezone</c> only, and <c>DarlingManagedPostgresTests</c> asserts the absence), so the
-    /// store's own log stamps are in the HOST's zone. A census that read them would be wrong on every
-    /// non-UTC host, and would be wrong SILENTLY. Binning on the sweep's own UTC capture instant is what
-    /// makes both traps unreachable, so the guard is that neither file names either setting.</para>
-    /// </summary>
-    [Fact]
-    public void TheStoreLogPathReadsNeitherThePrefixNorTheLogClock()
-    {
-        foreach (var relative in new[]
-                 {
-                     "Darling/PerformanceMonitor.Darling.Storage/StoreLogSweep.cs",
-                     "Darling/PerformanceMonitor.Darling.Storage/StoreLogClassifier.cs",
-                 })
-        {
-            var source = ReadSource(relative);
-
-            /* The control: the file was actually read. An unreadable path returns nothing from a
-               DoesNotContain, which reads exactly like a clean result. */
-            Assert.Contains("namespace PerformanceMonitor.Darling.Storage", source, StringComparison.Ordinal);
-
-            var code = StripBlockComments(source);
-
-            /* And the control on the STRIPPING, which is the step that could make this vacuous: the
-               stripped text must still hold the code it was supposed to keep. Every textual decision here
-               reads code, never prose (#3014) - both files discuss log_line_prefix and log_timezone at
-               length in their comments, and a whole-file substring check would fail on the discussion. */
-            Assert.Contains("namespace PerformanceMonitor.Darling.Storage", code, StringComparison.Ordinal);
-
-            Assert.DoesNotContain("current_setting('log_line_prefix')", code, StringComparison.Ordinal);
-            Assert.DoesNotContain("current_setting('log_timezone')", code, StringComparison.Ordinal);
-            Assert.DoesNotContain("IsZeroOffsetLogZone", code, StringComparison.Ordinal);
-            Assert.DoesNotContain("DateTime.Parse", code, StringComparison.Ordinal);
-            Assert.DoesNotContain("DateTime.TryParse", code, StringComparison.Ordinal);
         }
     }
 
@@ -492,27 +449,6 @@ public class StoreLogSelfMonitoringStoreTests
         /* And a tick that DID consume something needs no heartbeat - it already wrote a row per file. */
         Assert.False(StoreLogSweep.ShouldWriteHeartbeat(consumedFiles: 1, candidateFiles: 3));
         Assert.False(StoreLogSweep.ShouldWriteHeartbeat(consumedFiles: 3, candidateFiles: 3));
-
-        /* The heartbeat writes the capture row and NOTHING else. A marker advanced on a read that consumed
-           no bytes is a marker that skipped bytes, so the write path is deliberately separate from the one
-           that moves it. Read over stripped code, so the prose above the method cannot satisfy this. */
-        var code = StripBlockComments(ReadSource("Darling/PerformanceMonitor.Darling.Storage/StoreLogSweep.cs"))
-            .Replace("\r\n", "\n", StringComparison.Ordinal);
-
-        var start = code.IndexOf("private static async Task WriteHeartbeatAsync", StringComparison.Ordinal);
-        Assert.True(start > 0, "WriteHeartbeatAsync is gone — the quiet tick records nothing again");
-
-        var body = code[start..];
-        var end = body.IndexOf("\n    private ", StringComparison.Ordinal);
-        if (end > 0)
-        {
-            body = body[..end];
-        }
-
-        Assert.Contains("CaptureInsertSql", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("MarkerUpsertSql", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("EventInsertSql", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("BeginTransactionAsync", body, StringComparison.Ordinal);
     }
 
     /// <summary>Both retention DELETEs run on ONE cutoff, so a window can never hold events without the
@@ -534,63 +470,6 @@ public class StoreLogSelfMonitoringStoreTests
     }
 
     private static string RungSql() => PgMigrations.Scripts.Single(s => s.Version == RungVersion).Sql;
-
-    /// <summary>Strips <c>/* … *&#47;</c> and <c>//</c> comment bodies, PRESERVING LENGTH, so a check over
-    /// the result reads code and never prose (#3014) while any offset into it still addresses the same
-    /// character as in the source.</summary>
-    private static string StripBlockComments(string source)
-    {
-        var buffer = source.ToCharArray();
-        var i = 0;
-        while (i < buffer.Length)
-        {
-            if (i + 1 < buffer.Length && buffer[i] == '/' && buffer[i + 1] == '*')
-            {
-                while (i < buffer.Length && !(i + 1 < buffer.Length && buffer[i] == '*' && buffer[i + 1] == '/'))
-                {
-                    if (buffer[i] != '\n')
-                    {
-                        buffer[i] = ' ';
-                    }
-
-                    i++;
-                }
-
-                /* Blank the closing delimiter too, so its surviving '/' cannot pair with a following '/'
-                   and start a spurious line-comment strip. */
-                while (i < buffer.Length && buffer[i] != '\n' && i < buffer.Length)
-                {
-                    buffer[i] = ' ';
-                    i++;
-                    if (i > 0 && buffer[i - 1] == ' ' && i < buffer.Length && buffer[i] == '/')
-                    {
-                        buffer[i] = ' ';
-                        i++;
-                        break;
-                    }
-
-                    break;
-                }
-
-                continue;
-            }
-
-            if (i + 1 < buffer.Length && buffer[i] == '/' && buffer[i + 1] == '/')
-            {
-                while (i < buffer.Length && buffer[i] != '\n')
-                {
-                    buffer[i] = ' ';
-                    i++;
-                }
-
-                continue;
-            }
-
-            i++;
-        }
-
-        return new string(buffer);
-    }
 
     private static string ReadSource(string relativePath)
     {

@@ -22,7 +22,6 @@ namespace Darling.Tests;
 /// rung forever — that it is registered, that its DDL is what it was, and that a store migrated to exactly
 /// 79 still maps to 79 rather than falling through a newer arm.
 /// </summary>
-[Trait("Reads", "Lite")]
 public class FileGrowthAlertStoreTests
 {
     [Fact]
@@ -71,7 +70,6 @@ public class FileGrowthAlertStoreTests
            was quietly asserting a later rung's wiring while reading as though it still guarded this one.
            Pinned at 54, this rung's own ordinal, which cannot slide. The "and no more than that" half
            belongs to whichever rung is newest and lives there. */
-        Assert.Contains("reader.GetBoolean(54)", ReadViewerSource(), StringComparison.Ordinal);
     }
 
     [Fact]

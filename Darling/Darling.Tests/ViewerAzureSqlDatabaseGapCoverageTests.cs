@@ -13,6 +13,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using PerformanceMonitor.Collectors;
 using PerformanceMonitor.Common;
+using PerformanceMonitor.Darling.Service.Mcp;
 using PerformanceMonitor.Darling.Viewer;
 using Xunit;
 using Visibility = System.Windows.Visibility;
@@ -29,6 +30,7 @@ namespace Darling.Tests;
 /// Configuration, Trace Flags, the two config-change grids, Memory Pressure Events and the database-state editor showed an
 /// empty grid, chart or "0 databases" with no message.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class ViewerAzureSqlDatabaseGapCoverageTests
 {
     private const string ServerName = "EngineGapServer";
@@ -629,11 +631,9 @@ public sealed class ViewerAzureSqlDatabaseGapCoverageTests
     [Fact]
     public void CollectorLastRunSql_IsTheDarlingServicesOwnRead()
     {
-        var service = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Mcp/DarlingRuntimePrecondition.cs");
-        var match = Regex.Match(service, @"CollectorLastRunSql\s*=\s*@""(?<sql>[^""]*)"";", RegexOptions.CultureInvariant);
-
-        Assert.True(match.Success, "DarlingRuntimePrecondition.cs no longer declares CollectorLastRunSql as a verbatim string.");
-        Assert.Equal(Squash(match.Groups["sql"].Value), Squash(ViewerDataService.CollectorLastRunSql));
+        /* #5735: both texts interpolate the cycle-row exclusion constant, so the declared source is no longer a plain
+           verbatim string; the compared texts are the compiled constants. */
+        Assert.Equal(Squash(DarlingRuntimePrecondition.CollectorLastRunSql), Squash(ViewerDataService.CollectorLastRunSql));
     }
 
     /// <summary>

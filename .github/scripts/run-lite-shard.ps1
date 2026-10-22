@@ -57,12 +57,15 @@ if ($classes.Count -eq 0) { throw 'the class listing returned no classes - the s
 if ($ScopeMode -eq 'reads') {
     # A diff that reaches only the Darling trees Lite.Tests reads: run the classes that carry the
     # trait, all of them, in this one leg. The trait set is read off the built assembly, so it is
-    # whatever exists on THIS commit; DarlingReadsTraitGuardTests fails a class that reads a
-    # Darling path without the trait. An empty set is not "nothing to run": it would mean the trait
-    # went missing, so this leg runs the WHOLE suite rather than none of it.
-    $mine = @(Get-LiteClasses @('-trait', 'Reads=Darling'))
+    # whatever exists on THIS commit. #5961: the set is the classes ci-select.py's source scan says
+    # read a Darling path, matched by full name against the listing above (no Reads trait). An empty
+    # set is not "nothing to run": it would mean the scan went blind, so this leg runs the WHOLE
+    # suite rather than none of it.
+    $readsNames = @(python .github/scripts/ci-select.py reads-classes --suite lite | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0) { throw "ci-select.py reads-classes failed with exit code $LASTEXITCODE" }
+    $mine = @($classes | Where-Object { $readsNames -contains $_ })
     if ($mine.Count -eq 0) {
-        Write-Host '::warning title=Lite Darling-reads selection is empty::No Lite.Tests class carries [Trait("Reads", "Darling")], so this leg runs the whole Lite suite instead.'
+        Write-Host '::warning title=Lite Darling-reads selection is empty::The source scan found no Lite.Tests class that reads a Darling path, so this leg runs the whole Lite suite instead.'
         $mine = $classes
     }
     Write-Host "Darling-reads run: $($mine.Count) of $($classes.Count) classes"
@@ -87,14 +90,14 @@ else {
 
         $PSNativeCommandUseErrorActionPreference = $false
         $downloaded = $false
-        foreach ($attempt in 1..3) {
+        foreach ($attempt in 1..5) {
             # Start every try from an empty folder: gh will not overwrite a file that a partial try left.
             Remove-Item -Recurse -Force -Path $timingDir -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Force -Path $timingDir | Out-Null
             gh run download $TimingRun --pattern 'lite-tests-timing-*' --dir $timingDir
             if ($LASTEXITCODE -eq 0) { $downloaded = $true; break }
-            Write-Host "timing download attempt $attempt of 3 failed with exit code $LASTEXITCODE"
-            if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+            Write-Host "timing download attempt $attempt of 5 failed with exit code $LASTEXITCODE"
+            if ($attempt -lt 5) { Start-Sleep -Seconds (15 * $attempt) }
         }
         if (-not $downloaded) { throw "could not download the Lite timings of run $TimingRun that the gate pinned - failing this shard rather than cutting alone, because the other shards may have cut by duration" }
         # The gate pinned the exact artifact set. A leg that got fewer (one expired or was deleted since,
@@ -103,7 +106,8 @@ else {
         $got = @(Get-ChildItem -Path $timingDir -Directory | ForEach-Object { $_.Name } | Sort-Object)
         if ($expected.Count -eq 0 -or ($expected -join ',') -ne ($got -join ',')) { throw "downloaded timing artifacts [$($got -join ', ')] are not the [$($expected -join ', ')] the gate pinned from run $TimingRun - failing this shard rather than cutting from different inputs than the other shards" }
 
-        $packOutput = @(python .github/scripts/lite-shard-pack.py pack --classes $classesFile --shards $shards --out $planDir --timings $timingDir)
+        # #6117: --classes-source names the listing the class file holds, so a reconcile mismatch says where each side came from.
+        $packOutput = @(python .github/scripts/lite-shard-pack.py pack --classes $classesFile --shards $shards --out $planDir --timings $timingDir --classes-source 'the class listing of this leg')
         $packExit = $LASTEXITCODE
         $packOutput | ForEach-Object { Write-Host $_ }
         if ($packExit -ne 0) { throw 'the shard packer failed or could not prove its cut total - failing this shard rather than guessing' }
@@ -112,7 +116,7 @@ else {
         # the notice below.
         $method = if (($packOutput -join ' ') -match 'shards by (\w+);') { $Matches[1] } else { 'an unreported method' }
         # The guard again, on the very files this shard reads.
-        python .github/scripts/lite-shard-pack.py reconcile --classes $classesFile --shards $shards --out $planDir
+        python .github/scripts/lite-shard-pack.py reconcile --classes $classesFile --shards $shards --out $planDir --classes-source 'the class listing of this leg'
         if ($LASTEXITCODE -ne 0) { throw 'the shard files are not exactly the discovered classes - failing this shard' }
 
         $mine = @(Get-Content -Path (Join-Path $planDir "shard-$Shard.txt") | Where-Object { $_.Trim() })
@@ -178,6 +182,20 @@ elseif ($EventName -eq 'pull_request') {
     if ($mine.Count -eq 0) { Write-Host "shard ${Shard}: every class of this shard is a skipped Cost=Slow class, so nothing runs"; exit 0 }
 }
 
+# #5942 the CI quarantine: a test that dev's own latest push broke is left out of an unrelated pull request. The
+# test-map-select job decided it once and put quarantine.json beside the selection (ci-select.py quarantine); the
+# honored tests of this suite become `-method- <test>` arguments on every chunk below. A missing or unreadable decision
+# leaves nothing out, so every doubt runs the test.
+$quarantineArgs = @()
+if ($EventName -eq 'pull_request' -and $SelectionFile) {
+    $quarantineFile = Join-Path (Split-Path -Parent $SelectionFile) 'quarantine.json'
+    if (Test-Path -LiteralPath $quarantineFile) {
+        $quarantineArgs = @(python .github/scripts/ci-select.py quarantine-args --quarantine $quarantineFile --suite lite | Where-Object { $_ })
+        if ($LASTEXITCODE -ne 0) { $quarantineArgs = @() }
+        if ($quarantineArgs.Count -gt 0) { Write-Host "shard ${Shard}: the CI quarantine leaves out $($quarantineArgs.Count / 2) test(s): $(($quarantineArgs | Where-Object { $_ -ne '-method-' }) -join ', ')" }
+    }
+}
+
 # One runner invocation per chunk, never one for the whole shard: Windows CreateProcess caps the
 # complete command line at 32,767 characters, and a Darling PG shard's -class list alone reached ~32,660
 # (#5100). The budget counts only the -class arguments; the other ~170 characters (the dotnet
@@ -211,7 +229,7 @@ foreach ($chunk in $chunks) {
     $chunkLength = ($chunk | ForEach-Object { '-class'.Length + 1 + $_.Length + 1 } | Measure-Object -Sum).Sum
     Write-Host "shard ${Shard} chunk $chunkNumber of $($chunks.Count): $($chunk.Count) classes, $chunkLength characters"
     # -xml: per-test durations for the lite-tests-timing artifact (#5208).
-    dotnet run --project Lite.Tests/Lite.Tests.csproj -c Release --no-build -- @chunkArgs -xml TestResults/lite-timing-${Shard}-$chunkNumber-a${RunAttempt}.xml -longRunning 300 | Tee-Object -FilePath TestResults/lite-runner-${Shard}.log -Append
+    dotnet run --project Lite.Tests/Lite.Tests.csproj -c Release --no-build -- @chunkArgs @quarantineArgs -xml TestResults/lite-timing-${Shard}-$chunkNumber-a${RunAttempt}.xml -longRunning 300 | Tee-Object -FilePath TestResults/lite-runner-${Shard}.log -Append
     if ($LASTEXITCODE -ne 0) {
         $failedChunks++
         Write-Host "shard ${Shard} chunk $chunkNumber of $($chunks.Count) failed with exit code $LASTEXITCODE"

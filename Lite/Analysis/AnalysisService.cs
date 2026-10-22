@@ -144,7 +144,10 @@ public class AnalysisService
         _duckDb = duckDb;
         SharedBaselineCache = baselineCache;
         _findingStore = new FindingStore(duckDb);
-        _collector = new DuckDbFactCollector(duckDb, collectorFrequencyMinutes);
+        _collector = new DuckDbFactCollector(
+            duckDb, collectorFrequencyMinutes,
+            /* #5630: the same fetcher serves the plan-regression inputs check; a caller with none passes no source. */
+            planFetcher as IQueryStorePlanSource);
         _scorer = new FactScorer();
         _graph = new RelationshipGraph();
         _engine = new InferenceEngine(_graph);
@@ -324,21 +327,7 @@ public class AnalysisService
                    read (wait_stats on a SQL Server target, pg_database_stats on a PostgreSQL one, #3665), so
                    "unstamped" is not a third state here — Coverage is null only when collection threw, and
                    that unwinds through the catch below, never through this test. */
-                /* True when the WINDOW went unobserved but point-in-time facts (config, trace flags,
-                   hardware) still read — the case that used to slip past the facts.Count == 0 check. */
-                var hasPointInTimeFactsOnly = facts.Count > 0;
-                WindowEmptyMessage = hasPointInTimeFactsOnly
-                    ? $"The collector observed none of the analysis window " +
-                      $"({context.TimeRangeStart:yyyy-MM-dd HH:mm} to {context.TimeRangeEnd:yyyy-MM-dd HH:mm} UTC): " +
-                      $"no collection interval landed inside it, even though this server has {dataSpanHours:F1} hours " +
-                      $"of total collected history. The {facts.Count} fact(s) that could still be read are point-in-time " +
-                      "configuration and state, not measurements of this window. Collection appears to have stopped or " +
-                      "broken for this window, so nothing was measured — this is NOT an all-clear."
-                    : $"No facts were collected in the analysis window " +
-                      $"({context.TimeRangeStart:yyyy-MM-dd HH:mm} to {context.TimeRangeEnd:yyyy-MM-dd HH:mm} UTC) " +
-                      $"even though this server has {dataSpanHours:F1} hours of total collected history. " +
-                      "Collection appears to have stopped or broken for this window, so nothing was measured " +
-                      "— this is NOT an all-clear.";
+                WindowEmptyMessage = WindowEmptyText.Compose(context, dataSpanHours, facts.Count);
 
                 AppLogger.Warn("AnalysisService",
                     $"No observed collection in the analysis window for {context.ServerName} " +
@@ -790,6 +779,14 @@ public class AnalysisService
     }
 
     /// <summary>
+    /// Removes the mute registered for a story pattern in one scope and returns how many registry rows it removed;
+    /// the write behind the MCP unmute verb. <paramref name="serverId"/> null or 0 is the all-servers scope. A
+    /// pass-through to <see cref="FindingStore.UnmuteStoryAsync"/>, which says why it holds the write lock.
+    /// </summary>
+    public Task<int> UnmuteFindingAsync(int? serverId, string storyPathHash, CancellationToken cancellationToken = default) =>
+        _findingStore.UnmuteStoryAsync(serverId ?? 0, storyPathHash, cancellationToken);
+
+    /// <summary>
     /// How many stored findings carry <paramref name="storyPathHash"/> for one server (or every server when
     /// <paramref name="serverId"/> is null / the all-servers sentinel 0) — the MCP mute verb's <c>matched_now</c>
     /// disclosure (#3541 A14). A pass-through to <see cref="FindingStore.CountStoredFindingsAsync"/>; see its
@@ -986,6 +983,7 @@ ORDER BY event_time";
 
             var databaseSnapshots = await ReadDatabaseConfigSnapshotsAsync(context);
             var traceFlagSnapshots = await ReadTraceFlagSnapshotsAsync(context);
+            var emptyTraceFlagRuns = await ReadEmptyTraceFlagRunsAsync(context);
 
             var serverEvents = ConfigChangeAttribution.GroupIntoEvents(
                 ConfigChangeDiff.DiffServerConfigChanges(snapshots, context.TimeRangeStart, context.TimeRangeEnd)
@@ -998,9 +996,9 @@ ORDER BY event_time";
                     .Select(c => (c.ChangeTime, ConfigChangeAttribution.SettingChange.ForDatabase(c.DatabaseName, c.SettingName, c.OldValue, c.NewValue))),
                 databaseSnapshots.Select(s => s.CaptureTime));
             var traceFlagEvents = ConfigChangeAttribution.GroupIntoEvents(
-                ConfigChangeDiff.DiffTraceFlagChanges(traceFlagSnapshots, context.TimeRangeStart, context.TimeRangeEnd)
+                ConfigChangeDiff.DiffTraceFlagChanges(traceFlagSnapshots, emptyTraceFlagRuns, context.TimeRangeStart, context.TimeRangeEnd)
                     .Select(c => (c.ChangeTime, ConfigChangeAttribution.SettingChange.ForTraceFlag(c.TraceFlag, c.ChangeType, c.Scope, c.PreviousStatus, c.NewStatus))),
-                traceFlagSnapshots.Select(s => s.CaptureTime));
+                traceFlagSnapshots.Select(s => s.CaptureTime).Concat(emptyTraceFlagRuns));
             var events = ConfigChangeAttribution.MergeSameConnectEvents(serverEvents.Concat(databaseEvents).Concat(traceFlagEvents));
             if (events.Count == 0)
                 return;
@@ -1086,6 +1084,19 @@ ORDER BY event_time";
         }
 
         return rows;
+    }
+
+    /// <summary>The times of the successful trace_flags runs that stored no row (#5633 item 19), through
+    /// <see cref="LocalDataService.EmptyTraceFlagRunsSql"/>. No catch of its own, for the reason
+    /// <see cref="ReadDatabaseConfigSnapshotsAsync"/> states.</summary>
+    private async Task<List<DateTime>> ReadEmptyTraceFlagRunsAsync(AnalysisContext context)
+    {
+        using var readLock = _duckDb.AcquireReadLock(context.CancellationToken);
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync(context.CancellationToken);
+        using var command = connection.CreateCommand();
+        return await LocalDataService.ReadEmptyTraceFlagRunsAsync(
+            command, context.ServerId, context.TimeRangeStart, context.TimeRangeEnd, context.CancellationToken);
     }
 
     /// <summary>

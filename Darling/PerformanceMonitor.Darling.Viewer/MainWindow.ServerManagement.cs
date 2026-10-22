@@ -14,6 +14,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using PerformanceMonitor.Ui;
 
 namespace PerformanceMonitor.Darling.Viewer;
 
@@ -79,7 +80,7 @@ public partial class MainWindow
            ItemsSource behind the model's back (which is how the bound list and the fleet drifted apart). */
         var selected = (ServerList.SelectedItem as FleetServerRow)?.Server.ServerId;
         _fleet.SetAll(SortWithFavorites(_fleet.All.ToList()));
-        ServerList.ItemsSource = _fleet.Visible;
+        ServerListKeyboard.Rebind(ServerList, _fleet.Visible);
 
         /* A re-sort is not the user choosing a server, so the restore leaves the Recommendations and FinOps
            pickers where they are. */
@@ -434,7 +435,9 @@ public partial class MainWindow
         try
         {
             var bytes = await _dataService.GetStoreSizeBytesAsync();
-            DatabaseSizeText.Text = bytes.HasValue ? $"Database: {FormatBytes(bytes.Value)}" : "Database: --";
+            DatabaseSizeText.Text = bytes.HasValue
+                ? $"Database: {(_dataService.StoreSizeIsEstimate ? "~" : "")}{FormatBytes(bytes.Value)}{(_dataService.StoreSizeIsEstimate ? " (estimate)" : "")}"
+                : "Database: --";
         }
         catch (Exception ex)
         {
@@ -602,7 +605,7 @@ public partial class MainWindow
         try
         {
             var rules = await _dataService.GetMuteRulesAsync();
-            if (rules.Any(r => ViewerDataService.IsWholeServerSilence(r, server.ServerId, server.DisplayName) && r.Enabled && !r.IsExpired))
+            if (rules.Any(r => ViewerDataService.IsWholeServerSilence(r, server.ServerId, server.DisplayName) && r.Enabled && !r.IsExpired && !r.IsUpcomingAt(DateTime.UtcNow)))
             {
                 StatusText.Text = $"'{server.DisplayName}' is already silenced.";
                 return;
@@ -735,7 +738,7 @@ public partial class MainWindow
         {
             var readStartedUtc = DateTime.UtcNow;
             var rules = await _dataService.GetMuteRulesAsync();
-            var active = rules.Where(r => r.Enabled && !r.IsExpired).ToList();
+            var active = rules.Where(r => r.Enabled && !r.IsExpired && !r.IsUpcomingAt(DateTime.UtcNow)).ToList();
 
             /* Replace, not merge: the store is the authority. A rule this viewer added locally before this read
                began is in the store too (persist-then-cache), so it comes back in `rules`; a rule deleted from
@@ -973,9 +976,12 @@ public partial class MainWindow
                travels; a SQL server's secret does not cross machines, so it lands locally only). */
             var pushedToStore = 0;
             var collidedInStore = 0;
+            var refusedHostsInStore = 0;
             if (_dataService is not null && !_dataService.IsReadOnly && OperatingSystem.IsWindows())
             {
-                (pushedToStore, collidedInStore) = await ViewerServerMigration.ImportFromStoreAsync(_serverStore, ProfileStore, _dataService);
+                var storeImport = await ViewerServerMigration.ImportFromStoreAsync(_serverStore, ProfileStore, _dataService);
+                (pushedToStore, collidedInStore) = storeImport;
+                refusedHostsInStore = storeImport.Refused;
             }
 
             /* #2434: "Imported N" is a claim about a file, and the registry write behind it can refuse —
@@ -1000,6 +1006,10 @@ public partial class MainWindow
             if (collidedInStore > 0)
             {
                 message += $"\n{collidedInStore} not added to the monitored store: the id matches a different server already there (see the viewer log).";
+            }
+            if (refusedHostsInStore > 0)
+            {
+                message += $"\n{refusedHostsInStore} not added to the monitored store: the host is a named pipe, admin or path-style one, which is not accepted (see the viewer log).";
             }
             if (copied > 0)
             {

@@ -7,6 +7,8 @@
  */
 
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -50,7 +52,19 @@ public sealed class ServerRuntime
     /// </summary>
     public string? ConnectedDatabase { get; init; }
 
+    /// <summary>#6285: the machine and instance the SQL Server calls itself (<c>SERVERPROPERTY('ServerName')</c>), read by the
+    /// same detection query; null on an Azure SQL Database, which names no machine of its own. #6339: on PostgreSQL, the cluster's
+    /// <c>system_identifier</c>, a colon and the server port, or null when the role may not read it.</summary>
+    public string? MachineIdentity { get; init; }
+
     public bool HasMsdbAccess { get; init; }
+
+    /// <summary>
+    /// True once the ensure of the server-scoped client-timeout session has dropped and recreated a session of that name that had
+    /// another definition (#5640). Per connection, so it happens at most once per connect: if the recreated session still read
+    /// as another definition, the next ensure leaves it alone and does not drop it again.
+    /// </summary>
+    public bool AttentionXeDefinitionReplaced { get; set; }
 
     public bool IsAwsRds { get; init; }
 
@@ -98,7 +112,7 @@ public static class DarlingServerConnector
        depend on it (#1535). sqlserver_start_time - the one column that needs the DMV - is not read
        here (the service never surfaces a start time), so unlike Lite/Dashboard no best-effort
        start-time read is needed. Columns: 0 sql_version, 1 major_version, 2 utc_offset,
-       3 engine_edition, 4 is_aws_rds, 5 has_msdb_access, 6 connected_database (#2228).
+       3 engine_edition, 4 is_aws_rds, 5 has_msdb_access, 6 connected_database (#2228), 7 server_name (#6285).
 
        #2228 — connected_database is DB_NAME(): the database this connection ACTUALLY reached, which is not
        necessarily the one the registration names. An Initial Catalog that is absent, misspelled or overridden
@@ -118,7 +132,9 @@ SELECT /* PerformanceMonitorLite */
     CASE WHEN DB_ID('rdsadmin') IS NOT NULL THEN 1 ELSE 0 END AS is_aws_rds,
     HAS_DBACCESS(N'msdb') AS has_msdb_access,
     /* #2228: which database this connection actually landed in. Appended; see the comment above. */
-    DB_NAME() AS connected_database";
+    DB_NAME() AS connected_database,
+    /* #6285: the machine and instance the server calls itself, appended like the column above. */
+    CONVERT(nvarchar(128), SERVERPROPERTY('ServerName')) AS server_name";
 
     /// <summary>
     /// The tripwire's verdict: the message to raise when a registration is connected to a database it does not
@@ -161,6 +177,15 @@ SELECT /* PerformanceMonitorLite */
                "Manage Servers, or the 'database' field for it in darling.json.";
     }
 
+    /// <summary>
+    /// #6254: the connection string for the server's Query Store replica, null when none is set. The same secret resolution as
+    /// <see cref="ResolveConnectionString"/>; the builder is <see cref="MonitoredServerConnection.BuildQueryStoreReplicaConnectionString"/>.
+    /// </summary>
+    public static string? ResolveQueryStoreReplicaConnectionString(MonitoredServer config, bool isAzureSqlDatabase, ILogger? logger = null) =>
+        /* The builder takes the replica from the identity the password seal opens with and resolves the password itself (a stored
+           reference only when darling.json declares it), and returns null for an Azure SQL Database. */
+        MonitoredServerConnection.BuildQueryStoreReplicaConnectionString(config, isAzureSqlDatabase);
+
     public static string ResolveConnectionString(MonitoredServer config, ILogger? logger = null)
     {
         string? password = null;
@@ -187,21 +212,18 @@ SELECT /* PerformanceMonitorLite */
     }
 
     /// <summary>
-    /// Says out loud that an armed remediation credential does nothing in this build (#2138 phase 1).
+    /// Says at connect what a remediation login is for, and when only half of one is set (#2138, #6263).
     ///
-    /// <para><b>Why this exists.</b> V113 accepts a per-server remediation credential and nothing in this
-    /// build consumes it — the write path is its own change. An operator who has entered one believes the
-    /// server is armed, and the failure mode of a knob that silently does nothing is at its worst when what
-    /// it claims to gate is a write to a production server. So the same discipline #2745 applied to its
-    /// all-gates-open force (journal it as WITHHELD rather than quietly downgrading it) applies here: the
-    /// credential is accepted, stored, resolvable, and announced as inert.</para>
+    /// <para>Level 3 server actions (#5632) use the login: force and unforce a Query Store plan, evict a cached plan and
+    /// kill a session on SQL Server, and kill a session on PostgreSQL. A server action also needs the server's action
+    /// switch, which is off until the store owner turns it on, so an armed login alone does nothing. The line says so,
+    /// because an operator who entered a login should learn what else must be on. A one-sided credential is reported
+    /// separately: "you configured half of one" is a mistake to fix now.</para>
     ///
     /// <para>Once per connect rather than once per sweep: connects are rare, so this cannot become the
-    /// every-60-seconds log line #2255 was about. A one-sided credential is reported separately, because
-    /// "you configured half of one" and "this build cannot use it yet" send an operator to different
-    /// places — the first is a mistake to fix now, the second is a wait.</para>
+    /// every-60-seconds log line #2255 was about.</para>
     /// </summary>
-    private static void WarnIfRemediationCredentialIsInert(MonitoredServer config, ILogger? logger)
+    internal static void WarnIfRemediationCredentialIsInert(MonitoredServer config, ILogger? logger)
     {
         var username = !string.IsNullOrWhiteSpace(config.RemediationUsername);
         var secret = !string.IsNullOrWhiteSpace(config.RemediationEncryptedPassword);
@@ -217,20 +239,18 @@ SELECT /* PerformanceMonitorLite */
 
         if (username && secret)
         {
-            /* "yet" is only true where the capability is coming. BuildRemediationConnectionString
-               throws for a PostgreSQL target, and plan-force remediation is a Query Store concept,
-               so on Postgres this credential is inert PERMANENTLY rather than pending. One message
-               for both would promise an operator a future that engine does not have. */
+            /* Plan force, unforce and eviction are SQL Server only (Query Store and the plan cache), so a PostgreSQL
+               target's login serves kill_session alone (#6263). */
             if (config.IsPostgres)
             {
-                logger?.LogWarning(
-                    "Server '{Server}' has a remediation credential, but plan-force remediation is SQL Server-only (it forces a Query Store plan), so nothing on a PostgreSQL target will ever use it. Remove it, or move it to the SQL Server registration it was meant for.",
+                logger?.LogInformation(
+                    "Server '{Server}' has a remediation login. On a PostgreSQL server Darling uses it only to end a session (kill_session), and only when that server's kill_session switch is on. The monitoring login stays read-only.",
                     config.DisplayName);
                 return;
             }
 
             logger?.LogInformation(
-                "Server '{Server}' has a remediation credential, but this build ships no remediation write path (#2138 phase 1 is the credential seam, the journal's actor and the decision logic). Nothing will use it yet, and the monitoring credential remains read-only.",
+                "Server '{Server}' has a remediation login. Darling uses it only for the server actions an agent asks for at Level 3 (force or unforce a plan, evict a cached plan, kill a session), and only for an action whose switch is on for this server. The monitoring login stays read-only.",
                 config.DisplayName);
         }
     }
@@ -250,12 +270,12 @@ SELECT /* PerformanceMonitorLite */
        here are read as-is and the store's convention is naive UTC either way. */
     public const string PostgresDetectionQueryText = @"
 SELECT
-    version() AS server_version_text,
-    current_setting('server_version_num')::int / 10000 AS major_version,
-    pg_is_in_recovery() AS is_in_recovery,
-    current_setting('server_version_num')::int AS server_version_num,
+    pg_catalog.version() AS server_version_text,
+    pg_catalog.current_setting('server_version_num')::int OPERATOR(pg_catalog./) 10000 AS major_version,
+    pg_catalog.pg_is_in_recovery() AS is_in_recovery,
+    pg_catalog.current_setting('server_version_num')::int AS server_version_num,
     -- #2228: which database this connection actually landed in. Appended; see the comment above.
-    current_database() AS connected_database,
+    pg_catalog.current_database() AS connected_database,
     -- #3830: the pg_stat_statements catalog version in THIS database, or NULL when pg_extension has no
     -- row for it. A column on the read that was already being made rather than a probe of its own: one
     -- scalar on one statement, and pg_extension is world-readable, so it adds no round trip and no grant.
@@ -263,7 +283,84 @@ SELECT
     -- the collector's own RequiredPgExtensions declaration, so the two cannot drift apart unnoticed.
     (SELECT e.extversion
      FROM pg_catalog.pg_extension AS e
-     WHERE e.extname = 'pg_stat_statements') AS pg_stat_statements_extversion";
+     WHERE e.extname OPERATOR(pg_catalog.=) 'pg_stat_statements') AS pg_stat_statements_extversion,
+    -- #6143: the search_path this session actually has. The service sends search_path=pg_catalog,pg_temp at
+    -- sign-in; a connection pooler can drop that startup option without an error, and then this differs.
+    pg_catalog.current_setting('search_path') AS search_path";
+
+    /// <summary>
+    /// #6143: refuses a PostgreSQL target whose monitoring session does not have the search_path the service sent at
+    /// sign-in (<see cref="MonitoredServerConnection.PinnedSearchPathOption"/>). The collectors' SQL relies on it, so a
+    /// session without it is not collected from at all. Only the whitespace PostgreSQL itself skips between schema
+    /// names (space, tab, line feed, carriage return, form feed) is ignored; anything else must match. Other Unicode
+    /// spaces, such as U+00A0, are part of a schema name to PostgreSQL, so a search_path that holds one is refused.
+    /// </summary>
+    internal static void EnsureSearchPathPinned(string? observedSearchPath, string serverName)
+    {
+        /* The rule is shared with the kill connection (PostgresSearchPathPin.IsPinned). */
+        if (PostgresSearchPathPin.IsPinned(observedSearchPath))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"precondition: the monitoring session on PostgreSQL target '{serverName}' has search_path "
+            + $"'{CleanServerText(observedSearchPath, MaxSearchPathLength)}', not the 'pg_catalog, pg_temp' this service sends when it signs in, so nothing "
+            + "is collected from it. The usual cause is a connection pooler that drops the startup 'options' "
+            + "parameter, as PgBouncer does when 'options' is listed in ignore_startup_parameters. Monitoring needs a "
+            + "direct connection to the PostgreSQL server: point the target at the server's own host and port.");
+    }
+
+    /// <summary>#6143: the characters PostgreSQL's identifier-list parser skips (scanner_isspace).</summary>
+    internal static bool IsPgListSpace(char c) => PostgresSearchPathPin.IsPgListSpace(c);
+
+    /// <summary>
+    /// #6143: an unpooled data source over <paramref name="connectionString"/> that loads no types, so a session opened
+    /// from it runs no statement but the caller's own. Npgsql otherwise reads pg_type on the first open, naming its
+    /// relations and operators without a schema.
+    /// </summary>
+    internal static NpgsqlDataSource OpenWithoutTypeLoading(string connectionString)
+    {
+        var builder = new NpgsqlDataSourceBuilder(connectionString);
+        builder.ConnectionStringBuilder.Pooling = false;
+        builder.ConfigureTypeLoading(typeLoading => typeLoading.EnableTypeLoading(false));
+        return builder.Build();
+    }
+
+    /// <summary>The most of the observed search_path a message quotes (#6143).</summary>
+    internal const int MaxSearchPathLength = 200;
+
+    /// <summary>The most of a pooler's sign-in error a message quotes (#6143).</summary>
+    internal const int MaxPoolerTextLength = 300;
+
+    /// <summary>
+    /// #6143: text the monitored server or a pooler sent, made fit for a log line and a precondition message: control
+    /// and line-break characters become a space, characters that hide or reorder text are dropped, and the result is
+    /// capped at <paramref name="maxLength"/>.
+    /// </summary>
+    internal static string CleanServerText(string? value, int maxLength) =>
+        CustomAlertEvaluator.SanitizeDisplayText(value, maxLength);
+
+    /// <summary>
+    /// #6143: PgBouncer refuses a startup parameter it does not know with SQLSTATE 08P01 and "unsupported startup
+    /// parameter: options" (PgBouncer's own text, never translated). PostgreSQL itself accepts 'options', so this
+    /// error at sign-in means a pooler is in the way.
+    /// </summary>
+    internal static bool IsStartupParameterRejection(PostgresException ex)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        return string.Equals(ex.SqlState, PostgresErrorCodes.ProtocolViolation, StringComparison.Ordinal)
+            && ex.MessageText.Contains("startup parameter", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>#6143: the message for a PostgreSQL target reached through a connection pooler.</summary>
+    internal static InvalidOperationException PoolerPrecondition(string serverName, string detail, Exception? inner = null) =>
+        new(
+            $"precondition: PostgreSQL target '{serverName}' is reached through a connection pooler ({detail}). "
+            + "Monitoring needs a direct connection to the PostgreSQL server, because a pooler cannot carry the "
+            + "search_path setting this service sends when it signs in. Point the target at the server's own host "
+            + "and port; on AWS, use the instance or cluster endpoint, not the RDS Proxy endpoint.",
+            inner);
 
     /// <summary>
     /// The Aurora probe (#2340), a SEPARATE statement because it decides by CALLING the marker function
@@ -283,7 +380,10 @@ SELECT
     /// <c>42883 undefined_function</c> be caught and read as "not Aurora" instead of failing the whole
     /// probe — the wrapping the old column comment claimed but a catalog subquery never actually needed.</para>
     /// </summary>
-    public const string PostgresAuroraProbeQueryText = @"SELECT aurora_version()";
+    /// <para>#6143: <c>{0}</c> is the schema, quoted, from <see cref="ResolveAuroraFunctionSchemaAsync"/>. For
+    /// <c>aurora_version</c> that is always pg_catalog: the pg_stat_statements extension does not ship it, so a function
+    /// of that name in any other schema is never called. Whether the target is Aurora is still decided by the call.</para>
+    public const string PostgresAuroraProbeQueryText = @"SELECT {0}.aurora_version()";
 
     /// <summary>
     /// Whether this target is Aurora, decided by CALLING <c>aurora_version()</c> (#2340). True when the call
@@ -300,12 +400,14 @@ SELECT
     /// reading as stock PostgreSQL" is answerable from the service log instead of requiring a live psql
     /// session against the target, which is what diagnosing #2340 actually took.</para>
     /// </summary>
-    private static async Task<bool> ProbeAuroraAsync(
+    internal static async Task<bool> ProbeAuroraAsync(
         NpgsqlConnection connection, CancellationToken cancellationToken, ILogger? logger = null)
     {
         try
         {
-            using var command = new NpgsqlCommand(PostgresAuroraProbeQueryText, connection) { CommandTimeout = 15 };
+            var schema = await ResolveAuroraFunctionSchemaAsync(connection, "aurora_version", cancellationToken);
+            using var command = new NpgsqlCommand(
+                PostgresAuroraProbeQueryText.Replace("{0}", schema, StringComparison.Ordinal), connection) { CommandTimeout = 15 };
             var version = await command.ExecuteScalarAsync(cancellationToken);
             return version is not null and not DBNull;
         }
@@ -314,6 +416,41 @@ SELECT
             logger?.LogDebug(ex, "aurora_version() probe did not succeed; treating the target as stock PostgreSQL");
             return false;
         }
+    }
+
+    /// <summary>
+    /// #6143: the quoted schema to call an Aurora built-in by, from <see cref="DarlingCollectorRunner.PgExtensionSchemasSql"/>
+    /// and <see cref="CollectorContext.ChoosePgFunctionSchemas"/>: pg_catalog, or, only for the function the
+    /// pg_stat_statements extension ships and only as a member of it, the schema the extension was created in; never
+    /// any other. pg_catalog when the catalog shows neither.
+    /// </summary>
+    internal static async Task<string> ResolveAuroraFunctionSchemaAsync(
+        NpgsqlConnection connection, string functionName, CancellationToken cancellationToken)
+    {
+        string? statementsSchema = null;
+        var functions = new List<(string Function, string Schema)>();
+        using (var command = new NpgsqlCommand(DarlingCollectorRunner.PgExtensionSchemasSql, connection)
+               { CommandTimeout = DarlingCollectorRunner.PgExtensionSchemasTimeoutSeconds })
+        {
+            command.Parameters.AddWithValue("functions", new[] { functionName });
+            using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (reader.GetString(0) == "function")
+                {
+                    functions.Add((reader.GetString(1), reader.GetString(2)));
+                }
+                else if (reader.GetString(1) == "pg_stat_statements")
+                {
+                    statementsSchema = reader.GetString(2);
+                }
+            }
+        }
+
+        /* #6143: when pg_proc shows nothing (measured on Aurora for a pg_monitor login, #2340), the call goes to
+           pg_catalog: aurora_version is not shipped by pg_stat_statements, so no other schema is looked in. */
+        var chosen = CollectorContext.ChoosePgFunctionSchemas(functions, statementsSchema);
+        return CollectorContext.QuotePgFunctionSchema(chosen, functionName);
     }
 
     /// <summary>
@@ -369,7 +506,7 @@ SELECT
 
         int majorVersion = 0, engineEdition = 0;
         bool isAwsRds = false, hasMsdbAccess = true;
-        string? connectedDatabase = null;
+        string? connectedDatabase = null, machineIdentity = null;
         if (await reader.ReadAsync(cancellationToken))
         {
             // Column indices per DetectionQueryText: 1 major_version, 3 engine_edition,
@@ -379,6 +516,9 @@ SELECT
             isAwsRds = !reader.IsDBNull(4) && reader.GetInt32(4) == 1;
             hasMsdbAccess = reader.IsDBNull(5) || reader.GetInt32(5) == 1;
             connectedDatabase = reader.IsDBNull(6) ? null : reader.GetString(6);   /* #2228 */
+            /* #6285: the server's own name, for the add and edit tools' same-machine check. An Azure SQL Database has no
+               machine of its own to name, so it reports none. */
+            machineIdentity = reader.IsDBNull(7) || engineEdition == 5 ? null : reader.GetString(7);
         }
 
         return new ServerRuntime
@@ -406,6 +546,7 @@ SELECT
             IsAwsRds = isAwsRds,
             EngineEdition = engineEdition,
             ConnectedDatabase = connectedDatabase,
+            MachineIdentity = machineIdentity,
         };
     }
 
@@ -418,14 +559,41 @@ SELECT
     /// <see cref="CollectorCatalog.AppliesTo(ICollectorSchemaInfo, CollectorTargetInfo)"/> keeps every
     /// T-SQL definition away from this target regardless of their values.</para>
     /// </summary>
-    private static async Task<ServerRuntime> ConnectPostgresAsync(
-        MonitoredServer config, ILogger? logger, CancellationToken cancellationToken)
+    private static Task<ServerRuntime> ConnectPostgresAsync(
+        MonitoredServer config, ILogger? logger, CancellationToken cancellationToken) =>
+        ConnectPostgresAsync(config, ResolveConnectionString(config, logger), logger, cancellationToken);
+
+    /// <summary><see cref="ConnectPostgresAsync(MonitoredServer, ILogger?, CancellationToken)"/> over a connection
+    /// string already resolved from <paramref name="config"/>; a test passes one without the pin, as a pooler that
+    /// drops the startup options would leave it (#6143).</summary>
+    internal static async Task<ServerRuntime> ConnectPostgresAsync(
+        MonitoredServer config, string connectionString, ILogger? logger, CancellationToken cancellationToken)
     {
-        var connectionString = ResolveConnectionString(config, logger);
         var storageName = config.StorageName;
 
-        using var connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
+        /* #6143: an RDS Proxy endpoint accepts only the startup parameters AWS lists, and 'options' is not one. */
+        var host = new NpgsqlConnectionStringBuilder(connectionString).Host;
+        if (RdsEndpoint.IsProxyHost(host))
+        {
+            throw PoolerPrecondition(config.DisplayName, $"'{host}' is an RDS Proxy endpoint");
+        }
+
+        /* #6143: no type loading and no pool, so the only statement this session runs before EnsureSearchPathPinned
+           is the detection query itself. Npgsql's type-loading query names pg_type and its operators without a schema,
+           and on a session whose pin a pooler dropped it would resolve them through the database's own search_path.
+           Unpooled, so this session is never handed to a collector either. The detection and probe reads that follow
+           use only built-in types. */
+        await using var detectionSource = OpenWithoutTypeLoading(connectionString);
+        using var connection = detectionSource.CreateConnection();
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+        }
+        catch (PostgresException ex) when (IsStartupParameterRejection(ex))
+        {
+            throw PoolerPrecondition(
+                config.DisplayName, $"it refused the sign-in: {CleanServerText(ex.MessageText, MaxPoolerTextLength)}", ex);
+        }
 
         using var command = new NpgsqlCommand(PostgresDetectionQueryText, connection) { CommandTimeout = 30 };
         using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -435,6 +603,7 @@ SELECT
         string versionText = "";
         string? connectedDatabase = null;
         var statementsExtension = PgExtensionRowObservation.NotObserved;
+        string? observedSearchPath = null;
         if (await reader.ReadAsync(cancellationToken))
         {
             versionText = reader.IsDBNull(0) ? "" : reader.GetString(0);
@@ -448,12 +617,20 @@ SELECT
                present in the result, never inferred from the value being null. */
             statementsExtension = PgExtensionRowObservation.From(
                 reader.IsDBNull(5) ? null : reader.GetString(5), connectedDatabase);
+            observedSearchPath = reader.IsDBNull(6) ? null : reader.GetString(6);   /* #6143 */
         }
 
         /* The reader must be closed before another command runs on this connection. */
         await reader.CloseAsync();
 
+        /* #6143: before any other read, and before the runtime exists, so no collector runs on this session. */
+        EnsureSearchPathPinned(observedSearchPath, config.DisplayName);
+
         var isAurora = await ProbeAuroraAsync(connection, cancellationToken, logger);
+
+        /* #6339: which cluster this is, for the add and edit tools' same-machine check. After the facts the collectors depend on,
+           and on its own statement, so a role that may not read it costs nothing but the identity. */
+        var machineIdentity = await ProbePostgresIdentityAsync(connection, logger, cancellationToken, isAurora);
 
         /* #3604: the wait-tier decision's second fact. Probed AFTER Aurora-ness and independently of it —
            an Aurora cluster cannot load the module, so the answer there is false by construction, but the
@@ -498,11 +675,57 @@ SELECT
             StorageName = storageName,
             ServerId = config.ServerId,
             ConnectedDatabase = connectedDatabase,
+            MachineIdentity = machineIdentity,
             /* #3830: on the runtime rather than on Target, because nothing dispatches on it - it feeds one
                fault sentence - and CollectorTargetInfo is the type whose facts the engine-capability sweep
                has to vary or fix. */
             PgStatStatementsExtension = statementsExtension,
         };
+    }
+
+    /// <summary>
+    /// #6339: what identifies the PostgreSQL cluster this session reached, as <c>system_identifier</c>, a colon and the port the
+    /// server listens on (<c>pg_control_system()</c> and the <c>port</c> setting), so one cluster reached under two host names reads
+    /// as one machine while two clusters on a host (a different identifier, or a different port) do not. Null when the role may not
+    /// call <c>pg_control_system()</c> (a managed service can refuse it): the caller then matches by host text alone. Never throws
+    /// except for cancellation, and never fails the connect. Standalone statement outside any transaction, so a refusal leaves the
+    /// session usable. Streaming replicas of one primary share its identifier and usually its port, so they read as one cluster.
+    /// </summary>
+    internal const string PostgresIdentityQueryText = @"
+SELECT s.system_identifier::text AS system_identifier,
+       pg_catalog.current_setting('port') AS port
+FROM pg_catalog.pg_control_system() AS s";
+
+    internal static async Task<string?> ProbePostgresIdentityAsync(NpgsqlConnection connection, ILogger? logger, CancellationToken cancellationToken, bool isAurora = false)
+    {
+        /* #6340 round 2 (N4): none on Aurora. No AWS documentation shows system_identifier to be unique per Aurora cluster (the control
+           file is virtual there, and one report has RDS instances sharing one), so a value that two clusters could share would only
+           make the add and edit tools refuse unrelated clusters. The host-text match decides there. */
+        if (isAurora)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var command = new NpgsqlCommand(PostgresIdentityQueryText, connection) { CommandTimeout = 30 };
+            using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken) && !reader.IsDBNull(0) && !reader.IsDBNull(1))
+            {
+                return reader.GetString(0) + ":" + reader.GetString(1);
+            }
+
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger?.LogDebug("pg_control_system() is not readable on this target ({Message}); it is matched by host text alone", ex.Message);
+            return null;
+        }
     }
 
     /// <summary>
@@ -524,6 +747,9 @@ SELECT
         {
             var runtime = await ConnectAsync(config, logger, cancellationToken);
             var isPostgres = runtime.Target.Engine == CollectorTargetEngine.PostgreSql;
+            /* #6254: a server with a Query Store replica is tested on both connections, so a replica that cannot be reached shows now
+               and not as a collection that quietly reads the primary. Its failure is a warning: the primary answered. */
+            var (replicaHost, replicaError) = await ProbeQueryStoreReplicaAsync(config, runtime.Target.IsAzureSqlDb, logger, cancellationToken);
             return new ConnectionProbeResult(
                 Success: true,
                 MajorVersion: runtime.Target.SqlMajorVersion,
@@ -538,12 +764,15 @@ SELECT
                 HasMsdbAccess: runtime.HasMsdbAccess,
                 Error: null,
                 ConnectedDatabase: runtime.ConnectedDatabase,
+                MachineIdentity: runtime.MachineIdentity,
                 Engine: runtime.Target.Engine,
                 PostgresMajorVersion: runtime.Target.PostgresMajorVersion,
                 PostgresVersionNum: runtime.Target.PostgresVersionNum,
                 IsAurora: runtime.Target.IsAurora,
                 IsInRecovery: runtime.Target.IsInRecovery,
-                HasPgWaitSamplingExtension: runtime.Target.HasPgWaitSamplingExtension);
+                HasPgWaitSamplingExtension: runtime.Target.HasPgWaitSamplingExtension,
+                QueryStoreReplica: replicaHost,
+                QueryStoreReplicaError: replicaError);
         }
         catch (OperationCanceledException)
         {
@@ -560,8 +789,75 @@ SELECT
                 IsAzureManagedInstance: false,
                 IsAwsRds: false,
                 HasMsdbAccess: false,
-                Error: ex.Message);
+                /* #6183: SqlClient's native library failing to load reads "The type initializer for ... TdsParser
+                   threw an exception" and says nothing about why. One shared explanation, for every caller. */
+                Error: SqlClientNativeLoadFailure.Describe(ex, AppContext.BaseDirectory) ?? ex.Message,
+                SqlClientNativeLoadFailed: SqlClientNativeLoadFailure.IsMatch(ex));
         }
+    }
+
+    /// <summary>
+    /// #6254: opens the server's Query Store replica connection the way collection opens it: the string comes from
+    /// <see cref="ResolveQueryStoreReplicaConnectionString"/> (the same builder: the replica host, <c>ApplicationIntent=ReadOnly</c>,
+    /// the server's login and authentication) and the connection is the SQL Server target provider's own <see cref="SqlConnection"/>.
+    /// Returns <c>(null, null)</c> for a server with no replica, a PostgreSQL target or an Azure SQL Database, <c>(host, null)</c> when the
+    /// replica opened, and <c>(host, error)</c> when it did not (a refused login, an unreachable host, a password the builder would not
+    /// release). Never throws except for cancellation. <paramref name="createConnection"/> is a test seam; null opens a SqlConnection.
+    /// </summary>
+    internal static async Task<(string? Host, string? Error)> ProbeQueryStoreReplicaAsync(
+        MonitoredServer config, bool isAzureSqlDatabase, ILogger? logger, CancellationToken cancellationToken,
+        Func<string, System.Data.Common.DbConnection>? createConnection = null)
+    {
+        if (config.IsPostgres || isAzureSqlDatabase
+            || PerformanceMonitor.Darling.Storage.QueryStoreReplicaSetting.Normalize(config.ConnectionIdentity.QueryStoreReplica) is not { } host)
+        {
+            return (null, null);
+        }
+
+        try
+        {
+            var connectionString = ResolveQueryStoreReplicaConnectionString(config, isAzureSqlDatabase, logger);
+            if (connectionString is null)
+            {
+                return (null, null);
+            }
+
+            await using var connection = createConnection is null ? new SqlConnection(connectionString) : createConnection(connectionString);
+            await connection.OpenAsync(cancellationToken);
+            return (host, null);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return (host, SqlClientNativeLoadFailure.Describe(ex, AppContext.BaseDirectory) ?? ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// #6254: the one line a connection test says about the Query Store replica, or null when the probed server has none.
+    /// <paramref name="revealError"/> says whether the driver's text may be shown (the CLI and the Viewer, the operator's own
+    /// surfaces, as for the primary); a caller that must not echo it (MCP and web replies) gets a fixed sentence and logs the text.
+    /// A failing replica is a warning: collection reads the primary, and the line says so.
+    /// </summary>
+    public static string? DescribeQueryStoreReplica(ConnectionProbeResult probe, bool revealError = true)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+        if (string.IsNullOrEmpty(probe.QueryStoreReplica))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(probe.QueryStoreReplicaError))
+        {
+            return $"Query Store replica {probe.QueryStoreReplica}: connected.";
+        }
+
+        return revealError
+            ? $"Query Store replica {probe.QueryStoreReplica}: could not connect ({probe.QueryStoreReplicaError}). Collection reads Query Store from the primary until it can."
+            : $"Query Store replica {probe.QueryStoreReplica}: could not connect. Collection reads Query Store from the primary until it can. The service log has the details.";
     }
 
     /// <summary>
@@ -656,7 +952,20 @@ public sealed record ConnectionProbeResult(
     string? ConnectedDatabase = null,
     /* #3604: the wait-tier fact, so --test-connection's "which collectors would run" count is computed
        against the same shape the gate reads. Trailing and defaulted for the #2280 reason. */
-    bool HasPgWaitSamplingExtension = false)
+    bool HasPgWaitSamplingExtension = false,
+    /* #6183: the failure was SqlClient's native library not loading. No SQL Server connection can work from this
+       install, so a caller that probes several servers says so once instead of once per server. Trailing and
+       defaulted, like the fields above. */
+    bool SqlClientNativeLoadFailed = false,
+    /* #6285: the machine and instance name the SQL Server reached calls itself (SERVERPROPERTY('ServerName')), read on this
+       same connection, so add_servers and edit_server can tell one machine reached under two names. Null when the probe
+       read none: a failed connection, an Azure SQL Database, or a PostgreSQL role that may not read the cluster identity (#6339). Trailing and defaulted, like the fields above. */
+    string? MachineIdentity = null,
+    /* #6254: the Query Store replica host the test also opened, and the error when it would not open. Null host: the server has no
+       replica (or is a PostgreSQL target or an Azure SQL Database). A set error leaves Success alone, because collection reads
+       the primary when the replica cannot be reached. Trailing and defaulted, like the fields above. */
+    string? QueryStoreReplica = null,
+    string? QueryStoreReplicaError = null)
 {
     /// <summary>
     /// Rebuilds the gate's-eye view of this target, so a caller can ask which collectors would actually

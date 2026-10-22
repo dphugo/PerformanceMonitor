@@ -9,6 +9,7 @@
 using System;
 using System.Linq;
 using System.Text.Json;
+using PerformanceMonitor.Darling.Viewer;
 using Xunit;
 
 namespace Darling.Tests;
@@ -29,14 +30,15 @@ public sealed class AdminPageBehaviourTests
 
     [Theory]
     [InlineData("servers", "Alpha", "GET /api/admin/servers")]
-    [InlineData("routes", "Blocking Detected", "GET /api/read/get_notification_routes")]
+    // The routes tab also reads the webhook signing status (#5998), second, after its routes.
+    [InlineData("routes", "Blocking Detected", "GET /api/read/get_notification_routes", "GET /api/webhook-signing")]
     [InlineData("settings", "CPU: threshold (%)", "GET /api/read/get_alert_settings")]
-    public void EachTab_ReadsItsTool_AndDrawsTheRow(string tab, string expectedText, string read)
+    public void EachTab_ReadsItsTool_AndDrawsTheRow(string tab, string expectedText, params string[] reads)
     {
         var page = Tab("tab:" + tab);
 
         Assert.Contains(Texts(page), t => t == expectedText);
-        Assert.Equal(read, Assert.Single(Reads(page)));
+        Assert.Equal(reads, Reads(page));
     }
 
     [Fact]
@@ -64,6 +66,15 @@ public sealed class AdminPageBehaviourTests
         Assert.Equal(1, classes.Count(c => c == "band-Offline"));
         Assert.Contains("2 servers.", string.Join(" ", texts));
         Assert.Equal("GET /api/admin/servers", Assert.Single(Reads(page)));
+    }
+
+    [Fact]
+    public void TheServersTab_DrawsTheSameMachineColumn_WithTheNamesTheServiceSent_AndABlankCellWhenThereIsNone()
+    {
+        var texts = Texts(Tab("tab:servers"));
+
+        Assert.Contains("Same machine as", texts);
+        Assert.Contains("Peer-One, Peer-Two", texts);
     }
 
     [Theory]
@@ -126,5 +137,49 @@ public sealed class AdminPageBehaviourTests
 
         Assert.Contains("slack, pagerduty", texts);
         Assert.Contains("ops@example.test", texts);
+    }
+
+    /// <summary>#5825: the route's send-resolutions override reads in the route dialog's words (null follows the channel), and
+    /// the settings tab draws the per-channel flags as yes/no, never "—" and never a value that is not a boolean.</summary>
+    [Fact]
+    public void TheSendResolutionsSettingAndRouteOverride_AreDrawnInTheViewersWords()
+    {
+        var routes = Texts(Tab("tab:routes"));
+        Assert.Contains("Send resolutions", routes);
+        Assert.Contains("Always", routes);
+        Assert.Contains("Never", routes);
+        // Route 9 sends null and routes 10 to 13 carry no field: all five follow the channel.
+        Assert.Equal(5, routes.Count(t => t == "Use channel setting"));
+
+        var settings = Texts(Tab("tab:settings"));
+        Assert.Contains("Delivery: send resolutions", settings);
+        Assert.Contains("Slack: yes, Teams: no, Generic webhook: no, Email: yes", settings);
+        Assert.DoesNotContain(settings, t => t.Contains("UNLISTED-RES", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void TheRoutesTab_ShowsWhereEachRouteApplies_AndAnOrphanOrUnreadableScopeNeverReadsAsOk()
+    {
+        var texts = Texts(Tab("tab:routes"));
+
+        // The fleet-wide route and the scoped ones: "All servers", the server's name, the tag's name, or the id a gone scope still names.
+        Assert.Contains(ViewerNotificationRouteScope.AllServersLabel, texts);
+        Assert.Contains("Alpha", texts);
+        Assert.Contains("East", texts);
+        Assert.Contains("(server id 99)", texts);
+        Assert.Contains("(tag id 6)", texts);
+        // An untrusted name is drawn as text, never parsed as markup: the grid shows the literal characters.
+        Assert.Contains("<img src=x onerror=alert(1)>", texts);
+
+        // The status words are the desktop viewer's, and the orphan and unreadable routes (which match nothing) are never OK.
+        Assert.Contains(ViewerNotificationRouteScope.OrphanedServerStatus, texts);
+        Assert.Contains(ViewerNotificationRouteScope.OrphanedTagStatus, texts);
+        Assert.Contains(ViewerNotificationRouteScope.TagDataUnreadableStatus, texts);
+        // A server-scoped route whose inputs could not be read says "scope data unreadable", as the desktop viewer does; the tag route above keeps "tag data unreadable".
+        Assert.Contains(ViewerNotificationRouteScope.ScopeDataUnreadableStatus, texts);
+        Assert.Contains(ViewerNotificationRouteScope.OkStatus, texts);
+        Assert.Equal(3, texts.Count(t => t == ViewerNotificationRouteScope.OkStatus));
+        // The wildcard route reports no family.
+        Assert.Contains("wildcard", texts);
     }
 }

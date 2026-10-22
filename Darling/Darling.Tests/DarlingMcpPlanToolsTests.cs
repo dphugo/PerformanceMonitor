@@ -41,6 +41,7 @@ namespace Darling.Tests;
 /// the wire) and assert each fetch + analysis round-trips, the optional keys refine, and an absent
 /// key returns the #1224 "unavailable" envelope.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpPlanToolsSurfaceAndSqlTests
 {
     /* ---------------- ungated: tool-surface pin ---------------- */
@@ -174,7 +175,7 @@ public sealed class DarlingMcpPlanToolsSurfaceAndSqlTests
     /// risk for other plans; test it). #3696 had them say "no CREATE INDEX text — the suggestion is a hint, not a
     /// design" on a rule that was never made — suppression; the maintainer's reframing is honesty, "corroboration,
     /// with caveats", and the suppression sentence must not come back. Lite's three are pinned in <c>Lite.Tests</c>
-    /// (<c>McpDescriptionTruthPinTests</c>) with the same fragments, so the two SKUs describe one field in one voice.
+    /// with the same fragments, so the two SKUs describe one field in one voice.
     /// #3898 D3, as on Lite: the fragments must be in the SERVED head, because a caller needs these caveats from
     /// tools/list before acting on a missing-index row, so they may not move into get_tool_guide's tail. The
     /// suppression sentence is checked against the whole description, head and tail, so it cannot come back in
@@ -654,9 +655,10 @@ public sealed class DarlingMcpPlanToolsLivePostgresTests
             var qsPlan7 = await DarlingMcpPlanTools.AnalyzeQueryStorePlan(postgres, Db1, 42, ServerName, 7);
             AssertAnalysisEnvelope(qsPlan7, "query_store");
 
-            /* plan_id 9 exists but its plan text is NULL -> unavailable; an absent plan_id likewise. */
+            /* plan_id 9 has runtime statistics but its plan text is NULL: since #6211 that is a plan the top-N fetch did not
+               take, so the tool says not_collected and why. An absent plan_id (no statistics either) is still unavailable. */
             var qsPlan9 = await DarlingMcpPlanTools.AnalyzeQueryStorePlan(postgres, Db1, 42, ServerName, 9);
-            Assert.Equal("unavailable", StatusOf(qsPlan9));
+            Assert.Equal("not_collected", StatusOf(qsPlan9));
             var qsPlan999 = await DarlingMcpPlanTools.AnalyzeQueryStorePlan(postgres, Db1, 42, ServerName, 999);
             Assert.Equal("unavailable", StatusOf(qsPlan999));
 

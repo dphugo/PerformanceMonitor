@@ -7,13 +7,14 @@ using PerformanceMonitorLite.Services;
 namespace PerformanceMonitorLite.Mcp;
 
 /// <summary>
-/// The MCP endpoint's two settings, read out of the same settings.json every other Lite setting lives in.
+/// The MCP endpoint's three settings (on/off, port, and whether the write tools are served), read out of the same
+/// settings.json every other Lite setting lives in.
 ///
 /// <para><b>What a broken settings.json does to this endpoint, and why (#2431).</b> The endpoint stays
 /// OFF, Lite still starts, and every reader of this type is told which capability that cost. All three
 /// halves of that were decided rather than inherited from <c>new McpSettings()</c>.</para>
 ///
-/// <para><i>Off rather than on.</i> These two keys are consent and address for a TCP listener. A file we
+/// <para><i>Off rather than on.</i> These keys are consent, address and permissions for a TCP listener. A file we
 /// cannot read supplies neither, so starting anyway means opening a port nobody in this session asked
 /// for, at an address that is a guess — and Lite's firewall rule follows the configured port (#2414), so
 /// the guess is not even the port a client would be aimed at. Failing closed is the only defensible
@@ -47,10 +48,38 @@ internal sealed class McpSettings
     public int Port { get; set; } = DefaultPort;
 
     /// <summary>
+    /// Whether the MCP write tools (<see cref="McpWritePolicy.WriteTools"/>) are served. Default OFF: the
+    /// endpoint answers reads only, and a call to a write tool fails as an unknown tool. Read from the
+    /// <c>mcp_allow_writes</c> key (<see cref="McpWritePolicy.WritesSetting"/>), at start, so a change needs a
+    /// restart, like <c>mcp_enabled</c>. There is no Settings window control for it: it is a file setting on
+    /// purpose, so it is turned on by someone who edited the file rather than by a click.
+    /// </summary>
+    public bool AllowWrites { get; set; } = false;
+
+    /// <summary>
+    /// Whether the four investigation tools (<see cref="McpInvestigationPolicy.InvestigationTools"/>, #5820) are
+    /// offered. Default OFF. Read from <c>mcp_allow_investigations</c> (<see cref="McpInvestigationPolicy.InvestigationsSetting"/>)
+    /// at start, like <c>mcp_allow_writes</c>. They are served only when this is on AND <see cref="AllowWrites"/> is
+    /// off (<see cref="McpInvestigationPolicy.Served"/>): Lite has no token, so the agent tools reach local processes only
+    /// when the mute and route-disable tools are not also reachable. A file setting only, no Settings window control.
+    /// </summary>
+    public bool AllowInvestigations { get; set; } = false;
+
+    /// <summary>
+    /// How much collected data the MCP answers hand out (#5632 on Darling, #5820 here): full (the default),
+    /// maskLiterals or metadataOnly. Read from <c>mcp_data_detail</c> (<see cref="DataDetailSetting"/>) at start;
+    /// a word that is not one of the three leaves the endpoint off with the accepted words named, as for the other keys.
+    /// </summary>
+    public McpDataDetail DataDetail { get; set; } = McpDataDetail.Full;
+
+    /// <summary>The settings.json key for <see cref="DataDetail"/>.</summary>
+    public const string DataDetailSetting = "mcp_data_detail";
+
+    /// <summary>
     /// Why the MCP configuration could not be read, or null when it could.
     ///
     /// <para>Non-null covers two shapes that produce the identical user-visible outcome: settings.json is
-    /// present and unparseable, or it parses and one of these two keys holds a value of the wrong type.
+    /// present and unparseable, or it parses and one of these keys holds a value of the wrong type.
     /// Both end with the endpoint off through no decision of the operator's, which is the thing that has
     /// to be said out loud. An ABSENT file is deliberately not one of them — a first run has no
     /// settings.json, off is the correct answer, and there is no endpoint to have lost.</para>
@@ -127,6 +156,48 @@ internal sealed class McpSettings
                 }
 
                 settings.Port = portNumber;
+            }
+
+            if (root.TryGetProperty("mcp_allow_writes", out var allowWrites))
+            {
+                /* Same kind check as mcp_enabled: a quoted "true" from a hand edit is loud, not a silent OFF. The
+                   endpoint stays off with the problem named, exactly as for the other keys. */
+                if (allowWrites.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    return Lost(WrongKind("mcp_allow_writes", allowWrites, "true or false"));
+                }
+
+                settings.AllowWrites = allowWrites.GetBoolean();
+            }
+
+            if (root.TryGetProperty("mcp_allow_investigations", out var allowInvestigations))
+            {
+                if (allowInvestigations.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    return Lost(WrongKind(McpInvestigationPolicy.InvestigationsSetting, allowInvestigations, "true or false"));
+                }
+
+                settings.AllowInvestigations = allowInvestigations.GetBoolean();
+            }
+
+            if (root.TryGetProperty("mcp_data_detail", out var dataDetail))
+            {
+                if (dataDetail.ValueKind != JsonValueKind.String)
+                {
+                    return Lost(WrongKind(DataDetailSetting, dataDetail, "full, maskLiterals or metadataOnly"));
+                }
+
+                /* TryParse treats a blank word as full and any other unknown word as metadataOnly with a false return.
+                   Darling runs an unknown word as metadataOnly with a warning; Lite follows its other keys and refuses to
+                   start with the accepted words named, so a typo is seen at once and never hands out more than asked for. */
+                if (!McpDataDetailModes.TryParse(dataDetail.GetString(), out var mode))
+                {
+                    return Lost(string.Format(CultureInfo.InvariantCulture,
+                        "'{0}' is '{1}', which is not one of full, maskLiterals or metadataOnly",
+                        DataDetailSetting, dataDetail.GetString()));
+                }
+
+                settings.DataDetail = mode;
             }
 
             return settings;

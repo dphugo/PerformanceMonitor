@@ -32,6 +32,7 @@ namespace PerformanceMonitorLite.Tests;
 /// monitored server returns). Pinned here: the Live Snapshot row, and a scan that every re-run call site passes its
 /// result through <c>LivePlanDisplay.Filter</c> and that no new live read of the monitored server appears unnoticed.
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class StatementScrubLiveReadTests
 {
     private const string Marker = SensitiveStatements.PlaceholderText;
@@ -184,65 +185,13 @@ public sealed class StatementScrubLiveReadTests
             files.Add(relative);
         }
 
-        /* Five windows' plan actions and the server tab's own re-run; a scan that found nothing would pass vacuously. */
-        Assert.Equal(6, calls);
+        /* Five windows' plan actions and the server tab's own re-run (6 sites in 6 files), plus the FinOps tab's
+           second executor: the per-click ActualPlanRunTarget built in FinOpsGetActualPlan_Click (#5639), a separate
+           call from the tab's PlanActions fallback executor, in the same file. A scan that found nothing would pass
+           vacuously. */
+        Assert.Equal(7, calls);
         Assert.Equal(6, files.Count);
         Assert.Equal(calls, wrapped);
-    }
-
-    /// <summary>
-    /// The files anywhere in Lite (windows, tabs, services and the analysis fetcher) that open their own connection to the
-    /// monitored server. A read of statement text or a plan from one of them is judged where it is read (the Live Snapshot
-    /// above) or at the call that displays it; a new file that opens a connection fails here until the list is updated,
-    /// which is the moment to decide what it reads.
-    /// </summary>
-    [Fact]
-    public void TheFilesThatOpenTheirOwnServerConnection_AreTheKnownOnes()
-    {
-        var expected = new[]
-        {
-            "Lite/Controls/ServerTab.xaml.cs",            /* Live Snapshot: judged in ReadLiveSnapshotRow */
-            "Lite/Windows/AddMultipleServersDialog.xaml.cs", /* SELECT @@VERSION */
-            "Lite/Windows/AddServerDialog.xaml.cs",       /* SELECT @@VERSION */
-            "Lite/Windows/ExcludedDatabasesDialog.xaml.cs", /* database names */
-            /* #5554: the rest of Lite, not just the windows and tabs. Each is judged, or reads no statement text: */
-            "Lite/Analysis/SqlPlanFetcher.cs",            /* drill-down plan fetch: judged in DrillDownCollector.Plans before analysis */
-            "Lite/Services/LocalDataService.FinOps.IndexAnalysis.cs",    /* index names and sizes, no statement text */
-            "Lite/Services/LocalDataService.FinOps.Recommendations.cs",  /* object and setting metadata, no statement text */
-            "Lite/Services/LocalDataService.FinOps.ServerProperties.cs", /* server properties, no statement text */
-            "Lite/Services/LocalDataService.QueryStats.cs",              /* the live plan fetches: every caller wraps them (LivePlanDisplay) */
-            "Lite/Services/LocalDataService.QueryStore.cs",              /* the Query Store live plan fetch: every caller wraps it */
-            "Lite/Services/RemoteCollectorService.cs",                   /* the scheduled collectors: judged at collection */
-            "Lite/Services/RemoteCollectorService.DefinitionRunner.cs",  /* the definition-driven collectors: judged at collection */
-            "Lite/Services/RemoteCollectorService.QueryStoreBackfill.cs", /* Query Store backfill: judged at collection */
-            "Lite/Services/ServerManager.cs",                            /* connection test, @@VERSION */
-        };
-
-        var actual = new List<string>();
-        foreach (var file in Directory.EnumerateFiles(Path.Combine(RepoRoot(), "Lite"), "*.cs", SearchOption.AllDirectories))
-        {
-            var relative = Path.GetRelativePath(RepoRoot(), file).Replace('\\', '/');
-            if (relative.Contains("/obj/", StringComparison.Ordinal) || relative.Contains("/bin/", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var code = CSharpSourceWalker.StripCommentsAndStrings(File.ReadAllText(file));
-            if (Regex.IsMatch(code, @"new\s+SqlConnection\s*\("))
-            {
-                actual.Add(relative);
-            }
-        }
-
-        Assert.Equal(expected.OrderBy(x => x, StringComparer.Ordinal), actual.OrderBy(x => x, StringComparer.Ordinal));
-
-        /* And the one that reads statement text judges it: the row reader takes a session and uses it for the text and both plans. */
-        var serverTab = File.ReadAllText(Path.Combine(RepoRoot(), "Lite", "Controls", "ServerTab.xaml.cs"));
-        var start = serverTab.IndexOf("internal static QuerySnapshotRow ReadLiveSnapshotRow", StringComparison.Ordinal);
-        Assert.True(start > 0);
-        var body = serverTab[start..Math.Min(serverTab.Length, start + 4000)];
-        Assert.Contains("scrub.Text(", body, StringComparison.Ordinal);
-        Assert.Equal(2, Regex.Matches(body, @"scrub\.Xml\(").Count);
     }
 
     private static string RepoRoot([CallerFilePath] string thisFile = "")

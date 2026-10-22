@@ -78,7 +78,7 @@ public sealed class SystemHealthEventsCollector : CollectorDefinitionBase<System
        behind. evt.query('.') stores each matching <event> node verbatim as text — no shredding here
        (Stage 2 owns that). Timestamp watermark (> @cutoff_time) stops the rolling ring buffer being
        re-collected. Azure SQL DB is gated out by AppliesTo, so only server-scoped reaches here. */
-    private const string QueryText = @"
+    private const string QueryText = $@"
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 DECLARE
@@ -87,19 +87,30 @@ DECLARE
     ring_buffer xml NOT NULL
 );
 
-INSERT
-    @system_health
-(
-    ring_buffer
-)
+{RingBufferXml.DeclareSql}
+
 SELECT /* PerformanceMonitorLite */
-    ring_xml = TRY_CAST(xet.target_data AS xml)
+    @ring_text = CONVERT(nvarchar(max), xet.target_data),
+    @ring_session = xes.name
 FROM sys.dm_xe_session_targets AS xet
 JOIN sys.dm_xe_sessions AS xes
   ON xes.address = xet.event_session_address
 WHERE xes.name = N'system_health'
 AND   xet.target_name = N'ring_buffer'
 OPTION(RECOMPILE);
+
+{RingBufferXml.ParseSql}
+
+{RingBufferXml.TruncationSql}
+
+INSERT
+    @system_health
+(
+    ring_buffer
+)
+SELECT
+    ring_xml = @ring_xml
+WHERE @ring_xml IS NOT NULL;
 
 SELECT
     event_time = evt.value('(@timestamp)[1]', 'datetime2'),
@@ -122,7 +133,10 @@ AND   evt.value('(@name)[1]', 'sysname') IN
           N'scheduler_monitor_system_health_ring_buffer_recorded',
           N'wait_info'
       )
-OPTION(RECOMPILE);";
+OPTION(RECOMPILE);
+
+/* #6441: whether SQL Server truncated the buffer's XML, read by ReadAsync after the event rows. */
+{RingBufferXml.TruncationSelectSql}";
 
     public override string Name => "system_health_events";
 
@@ -188,6 +202,10 @@ OPTION(RECOMPILE);";
                 EventXml = reader.IsDBNull(2) ? null : scrub.Xml(reader.GetString(2)),
             });
         }
+
+        /* #6441: SQL Server cuts the ring buffer's XML at about 4 MB and keeps the OLDEST events, so on a busy server
+           this read can store 0 rows while new events exist. The counts are what bands the collector WARNING. */
+        await RingBufferXml.MeasureTrailingTruncationAsync(reader, context, cancellationToken);
 
         return rows;
     }

@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
+using PerformanceMonitor.Common;
 using PerformanceMonitor.Darling.Storage;
 
 namespace PerformanceMonitor.Darling.Viewer;
@@ -22,7 +23,7 @@ namespace PerformanceMonitor.Darling.Viewer;
 /// Mirrors Lite's <c>LongQueryCompletionRow</c>; event_time is stored naive-UTC, so
 /// <see cref="EventTimeLocal"/> converts to viewer-local via <see cref="ViewerTimeHelper.ForDisplay"/>.
 /// </summary>
-public sealed class ViewerLongQueryRow
+public sealed class ViewerLongQueryRow : QueryTagRowBase
 {
     public DateTime CollectionTime { get; set; }
     public DateTime? EventTime { get; set; }
@@ -33,7 +34,11 @@ public sealed class ViewerLongQueryRow
     public int? ClientPid { get; set; }
     public string NtUserName { get; set; } = "";
     public string ServerPrincipalName { get; set; } = "";
+    /// <summary>The stored <c>query_hash</c>, "" when the engine gave none (#5711: the trace's batch-level events carry 0).</summary>
     public string QueryHash { get; set; } = "";
+    /// <summary>#5711: the key to group, filter or label by: the real hash, else a fingerprint of the scrubbed statement
+    /// text, else "" (such a row joins no group).</summary>
+    public string QueryIdentity => QueryHashIdentity.Identity(QueryHash, StatementText) ?? "";
     public long? EventSequence { get; set; }
     public long? DurationMicroseconds { get; set; }
     public long? CpuTimeMicroseconds { get; set; }
@@ -96,6 +101,7 @@ public sealed partial class ViewerDataService
         AND   collection_time >= $2
         AND   collection_time <= $3
         AND   ($4::text[] IS NULL OR database_name = ANY($4))
+        /*TAG:hash:query_hash*/
         ORDER BY event_time DESC
         LIMIT 200
         """;
@@ -118,11 +124,11 @@ public sealed partial class ViewerDataService
             ViewerCommandDeadlines.CurrentInteractiveReadSeconds, cancellationToken);
 
     public async Task<List<ViewerLongQueryRow>> GetRecentLongQueryCompletionsAsync(
-        int serverId, DateTime startUtc, DateTime endUtc, IReadOnlyList<string>? databaseNames = null, CancellationToken cancellationToken = default)
+        int serverId, DateTime startUtc, DateTime endUtc, IReadOnlyList<string>? databaseNames = null, QueryTagFilter? tags = null, CancellationToken cancellationToken = default)
     {
         var rows = new List<ViewerLongQueryRow>();
 
-        await using var command = _dataSource.CreateCommand(LongQueryCompletionsSql);
+        await using var command = _dataSource.CreateCommand(QueryTagReadJoin.Apply(LongQueryCompletionsSql, serverId, tags));
         command.CommandTimeout = ViewerCommandDeadlines.CurrentInteractiveReadSeconds;
         AddWindowParameters(command, serverId, startUtc, endUtc);
         command.Parameters.Add(DatabaseFilterParameter(databaseNames));
@@ -140,7 +146,7 @@ public sealed partial class ViewerDataService
                 ClientPid = reader.IsDBNull(6) ? null : reader.GetInt32(6),
                 NtUserName = reader.IsDBNull(7) ? "" : reader.GetString(7),
                 ServerPrincipalName = reader.IsDBNull(8) ? "" : reader.GetString(8),
-                QueryHash = reader.IsDBNull(9) ? "" : reader.GetString(9),
+                QueryHash = reader.IsDBNull(9) ? "" : QueryHashIdentity.KnownHash(reader.GetString(9)) ?? "",
                 EventSequence = reader.IsDBNull(10) ? null : reader.GetInt64(10),
                 DurationMicroseconds = reader.IsDBNull(11) ? null : reader.GetInt64(11),
                 CpuTimeMicroseconds = reader.IsDBNull(12) ? null : reader.GetInt64(12),
@@ -154,6 +160,7 @@ public sealed partial class ViewerDataService
             });
         }
 
+        await LabelTagsAsync(serverId, QueryTagReadJoin.HashKind, rows, r => r.QueryHash, cancellationToken);
         return rows;
     }
 

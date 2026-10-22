@@ -54,10 +54,10 @@ public sealed class DarlingMcpPgKernelStatsTools
         ILogger? logger = null,
         CancellationToken cancellationToken = default)
     {
-        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
+        var (resolved, error) = await DarlingServerResolver.ResolveOrErrorForAnswerAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         validation = McpHelpers.ValidateTop(limit);
         if (validation != null) return validation;
@@ -76,9 +76,9 @@ public sealed class DarlingMcpPgKernelStatsTools
                    likely answer and the precondition vocabulary names the fix. Ordered after the
                    capability check so a wrong-engine target is never told to install an extension. */
                 var bare = await DarlingEngineCapability.NotCollectedStatusAsync(
-                    postgres, resolved.ServerId, resolved.ServerName, "pg_kernel_stats", cancellationToken)
+                    postgres, resolved.ServerId, resolved.DisplayName, "pg_kernel_stats", cancellationToken)
                     ?? await DarlingRuntimePrecondition.StatusAsync(
-                        postgres, resolved.ServerId, resolved.ServerName, "pg_kernel_stats", cancellationToken);
+                        postgres, resolved.ServerId, resolved.DisplayName, "pg_kernel_stats", cancellationToken);
                 if (bare is not null)
                 {
                     return bare;
@@ -91,12 +91,12 @@ public sealed class DarlingMcpPgKernelStatsTools
                 var emptyNotice = await DarlingMcpWindowNotice.ReadForToolAsync(
                     postgres, "get_pg_kernel_stats", resolved.ServerName, emptyStart, windowEnd, emptyAnswer: true, logger, cancellationToken);
 
-                return McpHelpers.Status(
+                return await DarlingServerOfflineNote.EmptyAsync(postgres, resolved.ServerId, resolved.DisplayName, windowEnd, McpHelpers.Status(
                         "empty",
-                        $"No per-query OS resource usage for {resolved.ServerName} in the last "
+                        $"No per-query OS resource usage for {resolved.DisplayName} in the last "
                         + $"{hours_back} hour(s). These are per-interval deltas, so a single collection "
                         + "has nothing to difference against and the window fills on the second one.",
-                        emptyNotice.AsHints());
+                        emptyNotice.AsHints()), cancellationToken);
             }
 
             /* #4966: where the store's coverage of the window starts, probed on the web's own source for this read (WebDataStartNote).
@@ -105,7 +105,7 @@ public sealed class DarlingMcpPgKernelStatsTools
             var windowStart = windowEnd.AddHours(-hours_back);
             var notice = await DarlingMcpWindowNotice.ReadForToolAsync(
                 postgres, "get_pg_kernel_stats", resolved.ServerName, windowStart, windowEnd, emptyAnswer: false, logger, cancellationToken);
-            return BuildKernelStatsJson(resolved.ServerName, hours_back, page, limit, notice);
+            return BuildKernelStatsJson(resolved.DisplayName, hours_back, page, limit, notice);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

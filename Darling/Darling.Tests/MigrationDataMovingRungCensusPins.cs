@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.RegularExpressions;
 using PerformanceMonitor.Darling.Storage;
 using Xunit;
@@ -210,8 +211,8 @@ public sealed class MigrationDataMovingRungCensusPins
             "CREATE INDEX over the populated collect.query_store_interval_wide table (created V145) (#4608, "
             + "split into its own rung #4615) - V153's twin, same shape and same measurement basis, on the "
             + "table this rung purges/reads instead: the index built in 3.52 s at 9M rows with "
-            + "max_parallel_maintenance_workers = 2. query_store_interval_wide is kept to 9 days, and the "
-            + "field store measured 9.3M rows at that horizon on 2026-09-28 - a full-horizon store (roughly "
+            + "max_parallel_maintenance_workers = 2. query_store_interval_wide was kept to 9 days then (10 "
+            + "since #5809), and the field store measured 9.3M rows at that horizon on 2026-09-28 - a full-horizon store (roughly "
             + "6-7x today's rows, ~65M) projects to roughly 25-30 s with parallel workers, nowhere near the "
             + "280 s MigrationCommandTimeoutSeconds window this rung's own SET LOCAL lock_timeout leaves. "
             + "V145 is new in 3.9.0 (v3.8.0 was schema 125), so every store upgrading from a released version "
@@ -226,6 +227,108 @@ public sealed class MigrationDataMovingRungCensusPins
             + "monitored-server registry, one row per configured server (about a hundred rows on the largest known "
             + "store, and every aws_* value NULL at this rung), so each is instant and neither touches data an earlier "
             + "rung created beyond that table. It does not move the lock-wait floor."),
+        new(
+            181,
+            SetsTheFloor: false,
+            "ADD CONSTRAINT ... CHECK on config.config_notification_routes (#5750, created V131): the one-scope CHECK is "
+            + "validated against every stored route, and the metric-match CHECK is NOT VALID so it scans nothing. The "
+            + "routes table holds a handful of operator-written rows (zero is the ordinary state), so the scan is "
+            + "instant and touches no data an earlier rung created beyond that table. It does not move the lock-wait floor."),
+        new(
+            182,
+            SetsTheFloor: false,
+            "ADD CONSTRAINT ... PRIMARY KEY on collect.read_latency (#5506, created V148) builds the new five-column key "
+            + "over the stored rows. The table holds one row per hour per surface, route and outcome that was read, kept "
+            + "90 days: at most a few hundred thousand narrow rows, so the build takes about a second. The three ADD "
+            + "COLUMNs carry constant defaults and rewrite nothing. It does not move the lock-wait floor."),
+        new(
+            184,
+            SetsTheFloor: false,
+            "ADD CONSTRAINT ... CHECK on config.config_notification_routes (#5632, created V131): the agent CHECK is "
+            + "validated against every stored route, whose five new columns are NULL or their constant defaults at this "
+            + "rung. The routes table holds a handful of operator-written rows, so the scan is instant and touches no data "
+            + "an earlier rung created beyond that table. The six investigation tables are created empty. It does not move "
+            + "the lock-wait floor."),
+        new(
+            191,
+            SetsTheFloor: false,
+            "ADD CONSTRAINT ... CHECK on config.config_notification_routes (#5909, created V131) and on "
+            + "config.investigation_requests (created V184): each level CHECK is replaced by a wider one and validated against "
+            + "every stored row. The routes table holds a handful of operator-written rows, and the requests table holds at "
+            + "most a year of investigation requests (one per server, alert family and 30-minute window, retention "
+            + "InvestigationRetentionDays), narrow rows with no payload read, so each scan is milliseconds. Each replacement "
+            + "runs only when the stored definition does not already name level 2. The ADD COLUMNs carry a constant default "
+            + "or none and rewrite nothing; the two new tables are created empty. It does not move the lock-wait floor."),
+        new(
+            193,
+            SetsTheFloor: false,
+            "ADD COLUMN event_id uuid NOT NULL DEFAULT gen_random_uuid() on config.investigation_journal (#5997, created V184) "
+            + "is a volatile default, so it rewrites the table once and fills every stored row, and the unique index on it "
+            + "builds over the same rows. The journal is a plain table of narrow rows kept InvestigationRetentionDays (a year): "
+            + "a few events per investigation request, so the rewrite and the build are milliseconds. The ADD CONSTRAINT ... "
+            + "CHECK on config.investigation_reports (created V184) validates the stored reports, whose new queries_run is NULL "
+            + "at this rung, one row per answered request; the family_of foreign key scans the same rows. The routes "
+            + "CHECK validates a handful of operator-written rows. The other ADD COLUMNs are nullable with no default or "
+            + "a constant default and rewrite nothing; the three new tables are created empty. It does not move the lock-wait floor."),
+        new(
+            194,
+            SetsTheFloor: false,
+            "CREATE UNIQUE INDEX on collect.query_tag_sightings (#5985, created V192): the same key plus the database, built over the "
+            + "stored sightings, then the V192 index is dropped. The table holds one row per distinct key and caller a collector has "
+            + "sighted since V192 shipped, which is far smaller than a collector table and is pruned by retention, and nothing wrote "
+            + "to it before this build, so at this rung it is empty on nearly every store and a build over it is milliseconds. It does "
+            + "not move the lock-wait floor."),
+        new(
+            196,
+            SetsTheFloor: false,
+            "ADD CONSTRAINT ... CHECK on config.config_notification_routes (#5632, created V131) and on "
+            + "config.investigation_requests (created V184): each level CHECK is replaced by one that also allows level 3 and "
+            + "validated against every stored row, as V191 did. The routes table holds a handful of operator-written rows, and the "
+            + "requests table holds at most a year of investigation requests, narrow rows with no payload read, so each scan is "
+            + "milliseconds. Each replacement runs only when the stored definition does not already name level 3. The new "
+            + "config.config_server_actions table is created empty, and the migration inserts no row. It does not move the "
+            + "lock-wait floor."),
+        new(
+            197,
+            SetsTheFloor: false,
+            "CREATE UNIQUE INDEX on config.investigation_requests (#5632, created V184): a partial index over the two columns this rung "
+            + "adds (force_check_of, force_check_no), which are null on every stored row, so the index holds no entry and the build reads "
+            + "the requests table once, a narrow table of at most a year of investigation requests with no payload read. Both ADD COLUMNs "
+            + "are nullable with no default and rewrite nothing, and the CHECK is validated against rows that are all null in both "
+            + "columns. It does not move the lock-wait floor."),
+        new(
+            175,
+            SetsTheFloor: false,
+            "an UPDATE of late_seq on every row of collect.plan_regression_daily_built (created V168), in the same "
+            + "guarded block as the ADD COLUMN rowcount_sum on collect.plan_regression_daily (#5631). The built table "
+            + "holds one row per server per closed day and the hourly cleanup keeps about 17 days of them, so a fleet of "
+            + "a hundred servers is a few thousand rows and the UPDATE is milliseconds. The ADD COLUMN is nullable "
+            + "with no DEFAULT, so it is catalog-only and rewrites no row. It does not move the lock-wait floor."),
+        new(
+            204,
+            SetsTheFloor: false,
+            "two partial unique indexes and two CHECK constraints on config.custom_views (created V31), whose new constraints are validated "
+            + "over the rows already there. custom_views is the user-authored view list, one row per saved dashboard or notebook: dozens "
+            + "on a busy store, hundreds at the very most, so each build and each validation is milliseconds and spends none of the "
+            + "budget. The rung's DO block also drops V31's UNIQUE (name) under the name it carries, found by its column; a DROP "
+            + "CONSTRAINT is catalog-only"),
+        new(
+            206,
+            SetsTheFloor: false,
+            "a DELETE, three UPDATEs and three ADD CONSTRAINT ... NOT VALID on config.config_collector_schedules (created V17), which tidy "
+            + "the stored rows before the new name and value limits bind (#6227). The table is sparse: a row exists only where somebody "
+            + "overrode one collector for one server or the fleet, so a store holds dozens of rows and a very large one a few thousand. Each "
+            + "statement reads the table once, and NOT VALID adds a constraint without scanning it. The rung's trigger function on "
+            + "config.config_monitored_servers only runs for later INSERTs. It does not move the lock-wait floor."),
+        new(
+            207,
+            SetsTheFloor: false,
+            "one partial unique index on config.investigation_requests (created V184), WHERE trigger_kind = 'change_watch'. The column "
+            + "is added by the same rung with DEFAULT 'alert', so no existing row matches the predicate and the build indexes nothing: "
+            + "it reads the table once (a request is one row per incident, about a hundred a day at the route limits, kept for a few "
+            + "weeks) and is milliseconds. The rung also builds one partial index on collect.query_store_forced_plans, WHERE plan_id IS NULL "
+            + "(the marker rows, one per captured database per pass): a read of that plain table once, a few seconds on a store that keeps "
+            + "30 days of captures. It does not move the lock-wait floor."),
     ];
 
     /// <summary>
@@ -275,37 +378,36 @@ public sealed class MigrationDataMovingRungCensusPins
     }
 
     /// <summary>
-    /// The multiple and the census cannot drift apart. Deliberately reads the constant out of the
-    /// SOURCE rather than widening its visibility: the value is private, and the thing worth pinning is
-    /// the derived FORM the constant's own doc comment argues for ("a multiple rather than a literal so
-    /// the two budgets cannot drift apart"), which a compiled <c>int</c> no longer carries.
+    /// The multiple and the census cannot drift apart. Reads the two private constants out of the compiled product by
+    /// reflection, so the test follows the values the migrator runs with and not the way the source spells them (#5950): the
+    /// lock-wait budget has to be one command timeout per floor-setting rung, plus one of margin.
     /// </summary>
     [Fact]
     public void TheLockWaitMultiple_IsOneMoreThanTheFloorContributingRungCount()
     {
-        var source = ReadRepoFile("Darling/PerformanceMonitor.Darling.Storage/PgMigrations.cs");
+        const BindingFlags constantFlags = BindingFlags.NonPublic | BindingFlags.Static;
+        var lockWaitField = typeof(PgMigrations).GetField("MigrationLockWaitTimeoutSeconds", constantFlags);
+        var commandField = typeof(PgMigrations).GetField("MigrationCommandTimeoutSeconds", constantFlags);
 
-        var declaration = Regex.Match(
-            source,
-            @"MigrationLockWaitTimeoutSeconds\s*=\s*(?<multiple>\d+)\s*\*\s*MigrationCommandTimeoutSeconds",
-            RegexOptions.CultureInvariant);
-
-        /* Positive control for the read itself: a rename or a switch to a literal makes the regex
-           miss, and a miss must not read as agreement. */
+        /* Positive control for the read itself: a rename makes the lookup miss, and a miss must not read as agreement. */
         Assert.True(
-            declaration.Success,
-            "MigrationLockWaitTimeoutSeconds is no longer declared as <n> * MigrationCommandTimeoutSeconds "
-            + "in PgMigrations.cs. The multiple IS the link between the lock-wait budget and the rung "
-            + "census (#2894); a literal breaks it and leaves this pin unable to check anything. Restore "
-            + "the multiple form, or move this assertion to whatever expresses the derivation now.");
+            lockWaitField is not null && commandField is not null,
+            "PgMigrations no longer declares MigrationLockWaitTimeoutSeconds and MigrationCommandTimeoutSeconds as private "
+            + "constants. They are the link between the lock-wait budget and the rung census (#2894); point this pin at "
+            + "whatever expresses the budget now.");
 
-        var multiple = int.Parse(
-            declaration.Groups["multiple"].Value, CultureInfo.InvariantCulture);
+        var lockWait = (int)lockWaitField!.GetRawConstantValue()!;
+        var commandTimeout = (int)commandField!.GetRawConstantValue()!;
+        Assert.True(
+            commandTimeout > 0 && lockWait % commandTimeout == 0,
+            $"MigrationLockWaitTimeoutSeconds ({lockWait}) is not a whole multiple of MigrationCommandTimeoutSeconds "
+            + $"({commandTimeout}): the budget must stay a multiple of one rung bound so the census can count it.");
+        var multiple = lockWait / commandTimeout;
         var floor = s_declared.Count(d => d.SetsTheFloor);
 
         Assert.True(
             multiple == floor + 1,
-            $"MigrationLockWaitTimeoutSeconds is {multiple} * MigrationCommandTimeoutSeconds, but the "
+            $"MigrationLockWaitTimeoutSeconds is {multiple} * MigrationCommandTimeoutSeconds ({lockWait} s), but the "
             + $"census declares {floor} floor-setting rung(s) "
             + $"({string.Join(", ", s_declared.Where(d => d.SetsTheFloor).Select(d => "V" + d.Version.ToString(CultureInfo.InvariantCulture)))})"
             + $", which derives {floor + 1} — {floor} multiples of floor plus one of margin, sized at one "
@@ -512,12 +614,12 @@ public sealed class MigrationDataMovingRungCensusPins
     /// <see cref="s_declared"/> entry at all: there is no data-moving cost to declare, only a scan blind
     /// spot to name.
     /// </summary>
-    private static readonly int[] s_dynamicSqlExemptedRungs = [152];
+    private static readonly int[] s_dynamicSqlExemptedRungs = [152, 204];
 
     /// <summary>
     /// The scan is textual, so dynamic SQL would hide a data-moving statement from it completely. The
-    /// ladder has one exempted rung today (V152, named in <see cref="s_dynamicSqlExemptedRungs"/> because
-    /// its <c>DO $$ ... EXECUTE format(...)</c> drops a catalog index rather than moving data) and
+    /// ladder has two exempted rungs today (V152 and V204, named in <see cref="s_dynamicSqlExemptedRungs"/> because
+    /// each <c>DO $$ ... EXECUTE format(...)</c> drops a catalog index or constraint rather than moving data) and
     /// otherwise none — the only other <c>EXECUTE</c> is <c>EXECUTE FUNCTION</c> in V17's trigger
     /// definitions. Pinned so the blind spot stays theoretical for every other rung: one that builds DDL
     /// with <c>format()</c> needs to be costed by hand, added either to this exemption list (if it moves

@@ -63,6 +63,69 @@ internal static class McpHelpers
     public static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
 
     /// <summary>
+    /// #6254: adds <c>read_source</c> to the runs of a <c>get_collection_log</c> page that have one, in page order. A run with none (every
+    /// run of a server with the Query Store replica setting off, and every run from before the setting existed) gets no key at all, so a
+    /// page with no <c>read_source</c> is returned as it is, byte for byte. Shared by Lite and Darling so the two tools carry the same field.
+    /// </summary>
+    public static string WithRunsReadSource(string json, IEnumerable<string?> readSources)
+    {
+        var sources = readSources.ToList();
+        if (sources.All(s => s is null))
+        {
+            return json;
+        }
+
+        var root = System.Text.Json.Nodes.JsonNode.Parse(json)!;
+        if (root["runs"] is not System.Text.Json.Nodes.JsonArray runs)
+        {
+            return json;
+        }
+
+        for (var i = 0; i < runs.Count && i < sources.Count; i++)
+        {
+            if (sources[i] is { } source && runs[i] is System.Text.Json.Nodes.JsonObject run)
+            {
+                run["read_source"] = source;
+            }
+        }
+
+        return root.ToJsonString(JsonOptions);
+    }
+
+    /// <summary>
+    /// #6254: adds <c>read_source</c> to the <c>collectors</c> rows of a <c>get_collection_health</c> reply whose collector has one
+    /// (<paramref name="readSources"/> maps collector name to where its newest run read from). A collector with none, which is every
+    /// collector of a server with the Query Store replica setting off, gets no key, so a reply with no read source is returned as it is,
+    /// byte for byte. Shared by Lite and Darling so the two tools carry the same field.
+    /// </summary>
+    public static string WithCollectorReadSource(string json, IReadOnlyDictionary<string, string> readSources)
+    {
+        if (readSources.Count == 0)
+        {
+            return json;
+        }
+
+        var root = System.Text.Json.Nodes.JsonNode.Parse(json)!;
+        if (root["collectors"] is not System.Text.Json.Nodes.JsonArray collectors)
+        {
+            return json;
+        }
+
+        foreach (var node in collectors)
+        {
+            if (node is System.Text.Json.Nodes.JsonObject row
+                && row["collector"] is System.Text.Json.Nodes.JsonValue name
+                && name.TryGetValue<string>(out var collector)
+                && readSources.TryGetValue(collector, out var source))
+            {
+                row["read_source"] = source;
+            }
+        }
+
+        return root.ToJsonString(JsonOptions);
+    }
+
+    /// <summary>
     /// Truncates a string to the specified maximum length, adding a truncation suffix. The cut lands on a whole
     /// text element at or before <paramref name="maxLength"/> (<see cref="TextElementCutLength"/>), so it never
     /// splits an emoji's surrogate pair or a letter from its accent. A split pair would reach the caller as U+FFFD,
@@ -163,6 +226,37 @@ internal static class McpHelpers
         char.IsAscii(text[index - 1])
         && char.IsAscii(text[index])
         && !(text[index - 1] == '\r' && text[index] == '\n');
+
+    /// <summary>
+    /// compare_analysis's baseline window (#5633 item 12). The comparison window is the last <paramref name="hoursBack"/>
+    /// hours; the baseline window is the same length and ends <c>baselineHoursBack - hoursBack</c> hours before the
+    /// comparison's end, so the two are disjoint only when <c>baselineHoursBack &gt;= 2 x hoursBack</c>. An omitted
+    /// <paramref name="baselineHoursBack"/> defaults to <c>hoursBack + 24</c> (28 for the default 4; yesterday same time),
+    /// raised to 2 x hoursBack when that is larger (hours_back past 24). Returns null when valid, with the resolved value in
+    /// <paramref name="resolved"/>; otherwise the <see cref="Refusal"/> envelope, naming both windows.
+    /// </summary>
+    public static string? ValidateBaselineWindow(int hoursBack, int? baselineHoursBack, out int resolved)
+    {
+        resolved = baselineHoursBack ?? Math.Max(hoursBack + 24, 2 * hoursBack);
+
+        if (baselineHoursBack is null && resolved > MaxHoursBack)
+        {
+            return Refusal("baseline_hours_back", $"hours_back {hoursBack} leaves no room for a baseline window that does not overlap the comparison window inside the {MaxHoursBack}-hour limit (it needs {resolved} hours back). Use an hours_back of {MaxHoursBack / 2} or less.");
+        }
+
+        var validation = ValidateHoursBack(resolved);
+        if (validation != null)
+        {
+            return validation;
+        }
+
+        if (resolved < 2 * hoursBack)
+        {
+            return Refusal("baseline_hours_back", $"The comparison window (the last {hoursBack} hours) and the baseline window (hours {resolved} to {resolved - hoursBack} back) would overlap: baseline_hours_back {resolved} is below 2 x hours_back ({2 * hoursBack}). Pass a baseline_hours_back of at least {2 * hoursBack}, or a smaller hours_back.");
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Validates hours_back parameter. Returns null if valid, the <see cref="Refusal"/> envelope if invalid.
@@ -497,6 +591,36 @@ internal static class McpHelpers
     /// </summary>
     public static string? FormatEffectiveStart(DateTime? effectiveStart) =>
         effectiveStart is DateTime instant ? FormatEffectiveStart(instant) : null;
+
+    /// <summary>
+    /// #6127: the whole hours back from <paramref name="windowEnd"/> that reach <paramref name="newestMeasuredDeltaAt"/>,
+    /// rounded up, so a window of that many hours ending at the same anchor contains the snapshot.
+    /// </summary>
+    public static int SuggestedHoursBack(DateTime newestMeasuredDeltaAt, DateTime windowEnd) =>
+        Math.Max(1, (int)Math.Ceiling((windowEnd - newestMeasuredDeltaAt).TotalHours));
+
+    /// <summary>
+    /// #6127, one sentence for both products: the window stored query_stats snapshots, but none carries a measured delta, so
+    /// no CPU figure can be attributed. A CPU figure is the change in a plan's counters between two snapshots of it; a plan
+    /// sighted once (first sighting, a restart, a gap) or sighted again with unmoved counters stores zero deltas, which the
+    /// ranking leaves out. Says which window would answer, when the store holds one.
+    /// </summary>
+    public static string SnapshotsWithoutDeltaMessage(string serverName, int hoursBack, long snapshots, DateTime? newestMeasuredDeltaAt, DateTime windowEnd)
+    {
+        var message = $"{serverName} stored {snapshots} query_stats snapshot(s) in the last {hoursBack} hour(s), but none carries a measured delta, so no CPU can be attributed to a query in this window. "
+            + "A CPU figure is the change in a plan's counters between two snapshots of the same plan; a plan sighted once, or sighted again with unmoved counters, stores zero deltas and is left out of the ranking. "
+            + "This is not a collection gap, and collection health showing stored rows is consistent with it.";
+        if (newestMeasuredDeltaAt is { } newest)
+        {
+            message += $" The newest snapshot with a measured delta is at {FormatEffectiveStart(newest)}; a window that reaches it (hours_back {SuggestedHoursBack(newest, windowEnd)} or more with the same as_of) answers.";
+        }
+        else
+        {
+            message += " No snapshot in the raw tier up to the window's end carries a measured delta, so a wider raw window does not answer; a window the hourly rollup holds (a longer hours_back) may.";
+        }
+
+        return message;
+    }
 
     /// <summary>
     /// How far past <c>now</c> an <c>as_of</c> anchor may sit and still be accepted.
@@ -934,6 +1058,53 @@ internal static class McpHelpers
             : JsonSerializer.Serialize(new { status, message, hints }, JsonOptions);
     }
 
+    /// <summary>True when <paramref name="answerJson"/> is a status envelope whose <c>status</c> is <c>empty</c> or <c>unavailable</c> (#6074).</summary>
+    public static bool IsEmptyOrUnavailableStatus(string answerJson)
+    {
+        try
+        {
+            return System.Text.Json.Nodes.JsonNode.Parse(answerJson) is System.Text.Json.Nodes.JsonObject node
+                && node["status"] is System.Text.Json.Nodes.JsonValue status
+                && status.TryGetValue<string>(out var word)
+                && (word == "empty" || word == "unavailable");
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="statusJson"/> (an envelope another helper built) with <paramref name="suffix"/> appended to its
+    /// <c>message</c> (#6074), so one extra sentence can ride on whichever empty answer a read produced without each
+    /// builder growing a parameter. A null or blank suffix, an answer with no string <c>message</c> and anything that is not a JSON object
+    /// come back unchanged.
+    /// </summary>
+    public static string AppendToMessage(string statusJson, string? suffix)
+    {
+        if (string.IsNullOrWhiteSpace(suffix))
+        {
+            return statusJson;
+        }
+
+        try
+        {
+            if (System.Text.Json.Nodes.JsonNode.Parse(statusJson) is System.Text.Json.Nodes.JsonObject node
+                && node["message"] is System.Text.Json.Nodes.JsonValue value
+                && value.TryGetValue<string>(out var message))
+            {
+                node["message"] = message + suffix;
+                return node.ToJsonString(JsonOptions);
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            /* Not an envelope: nothing to append to. */
+        }
+
+        return statusJson;
+    }
+
     /// <summary>
     /// <see cref="Status"/> for a read that takes <c>database_name</c> (#5244 review L2): the same <c>status</c>,
     /// <c>message</c> and optional <c>hints</c>, with the database echo beside them, so an empty answer says which
@@ -971,6 +1142,31 @@ internal static class McpHelpers
         }
 
         node["database_name"] = databaseName;
+        return node.ToJsonString(JsonOptions);
+    }
+
+    /// <summary>
+    /// #5633 review (finding D): <paramref name="statusJson"/> (an envelope another helper built) with the databases the read
+    /// left out beside it: <see cref="DatabasesLeftOut.NamesKey"/> (the names, capped) and
+    /// <see cref="DatabasesLeftOut.NoteKey"/>. Null in, null out; an envelope returned unchanged
+    /// when nothing was left out or when it already carries the key.
+    /// </summary>
+    public static string? WithDatabasesLeftOut(string? statusJson, IReadOnlyList<string>? leftOut)
+    {
+        if (statusJson is null || leftOut is null || leftOut.Count == 0)
+        {
+            return statusJson;
+        }
+
+        var node = System.Text.Json.Nodes.JsonNode.Parse(statusJson) as System.Text.Json.Nodes.JsonObject;
+        if (node is null || node.ContainsKey(DatabasesLeftOut.NamesKey))
+        {
+            return statusJson;
+        }
+
+        node[DatabasesLeftOut.NamesKey] =
+            JsonSerializer.SerializeToNode(DatabasesLeftOut.Named(leftOut), JsonOptions);
+        node[DatabasesLeftOut.NoteKey] = DatabasesLeftOut.Note(leftOut);
         return node.ToJsonString(JsonOptions);
     }
 

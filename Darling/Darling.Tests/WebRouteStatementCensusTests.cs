@@ -41,6 +41,7 @@ public sealed class WebRouteStatementCensusTests
     {
         "AlertNotebookEndpoint.cs",
         "DarlingFleetSweepEndpoints.cs",
+        "DarlingKnownPatternRoutes.cs",
         "DarlingServerDatabasesEndpoint.cs",
         "DarlingTriageEndpoint.cs",
         "DarlingWebEndpoints.cs",
@@ -51,8 +52,11 @@ public sealed class WebRouteStatementCensusTests
     private static readonly Dictionary<string, string> Named = new(StringComparer.Ordinal)
     {
         ["\"/api/ping\""] = "liveness, no data",
+        ["\"/api/webhook-signing\""] = "signing key presence and dates from the worker's in-process snapshot, no store read (#5998)",
         ["\"/api/session\""] = "the seat's capabilities",
-        ["\"/api/catalog\""] = "the compose vocabulary (labels; no statement or plan column, pinned by the L8 catalog census)",
+        ["\"/api/agent-setup/access\""] = "two booleans from the store login's privilege checks, no text (#6264)",
+        ["\"/api/investigation-export\""] = "streams the file the shared export wrote, whose every line the credential-statement check already judged (InvestigationFeedbackExport.Line); a refused line refuses the whole download through the sweep's refusal (#6236)",
+        ["\"/api/catalog\""] ="the compose vocabulary (labels; no statement or plan column, pinned by the L8 catalog census)",
         ["\"/api/fleet\""] = "fleet counts and server names",
         ["\"/api/ag\""] = "availability group health",
         ["\"/api/ag/count\""] = "availability group counts",
@@ -64,9 +68,14 @@ public sealed class WebRouteStatementCensusTests
         ["\"/api/alerts/validate\""] = "rule validation messages",
         ["\"/api/servers\""] = "server registry",
         ["\"/api/servers/{id:int}\""] = "server registry",
+        ["\"/api/servers/{id:int}/actions/{action}\""] = "writes one action switch; the answer is a status, server name and on or off (#6269)",
         ["\"/api/admin/servers/{id:int}\""] = "server registry",
+        ["\"/api/collectors/run\""] = "queues one command through a store function; no statement read (#5941)",
+        ["\"/api/collectors/run/{commandId:long}\""] = "one command row by id (#5941)",
         ["DarlingAdminServersReader.Route"] = "server registry",
         ["\"/api/alert-history/dismiss\""] = "a dismissal receipt",
+        ["\"/api/known-patterns\""] = "writes one known-pattern entry; the answer is a status word and the id, or the refusal reason, never collected text (#6334)",
+        ["\"/api/known-patterns/{id:long}\""] = "writes one known-pattern entry; the answer is a status word and the id, or the refusal reason, never collected text (#6334)",
         ["\"/api/server-tags\""] = "server tags",
         ["\"/api/server-tags/{id:int}\""] = "server tags",
         ["\"/api/server-tags/{id:int}/servers\""] = "server tags",
@@ -82,10 +91,21 @@ public sealed class WebRouteStatementCensusTests
     {
         (new Regex(@"^UnsupportedMediaTypeResult\s*\(\s*\)$", RegexOptions.Compiled), "a fixed 415 sentence"),
         (new Regex(@"^ErrorResult\s*\(", RegexOptions.Compiled), "the route's own request-validation message"),
+        (new Regex(@"^AgentChangeRefusedResult\s*\(\s*managedStore\s*\)$", RegexOptions.Compiled), "#5917: a fixed 403 sentence (the store refused an undo or the switch for privilege)"),
+        (new Regex(@"^NoteDecisionRefusedResult\s*\(\s*managedStore\s*\)$", RegexOptions.Compiled), "#5903: a fixed 403 sentence (the store refused a note decision for privilege)"),
+        (new Regex(@"^SignInRequiredResult\s*\(\s*\)$", RegexOptions.Compiled), "#6265: a fixed 403 sentence (a person-made investigation change needs a signed-in admin)"),
+        (new Regex(@"^PersonActorRefusedResult\s*\(\s*\)$", RegexOptions.Compiled), "#6265: a fixed 400 sentence (the signed-in name cannot be recorded; it never carries the name)"),
         (new Regex(@"^(?:Alert)?NotFoundResult\s*\(\s*\)$", RegexOptions.Compiled), "a fixed 404 sentence"),
+        (new Regex(@"^IdReceiptResult\s*\(", RegexOptions.Compiled), "#6334: a status word and the entry id, never collected text"),
         (new Regex(@"^Results\s*\.\s*NoContent\s*\(\s*\)$", RegexOptions.Compiled), "no body"),
         (new Regex(@"^Results\s*\.\s*Json\s*\(\s*DarlingWebFailureLog\s*\.\s*Body\s*\(", RegexOptions.Compiled),
             "DarlingWebFailureLog.Body is one fixed sentence per failure class, never the exception text"),
+        (new Regex(@"^(?:RunWebReadAsync\s*\(\s*context\s*\)$|new\s+WebReadAnswer\s*\(\s*(?:ToHttpResult\s*\(|BusyResult\s*\(\s*refusal\s*\)|Results\s*\.\s*Json\s*\(\s*DarlingWebFailureLog\s*\.\s*Body\s*\())", RegexOptions.Compiled),
+            "#5506 part 3: the read loop's RunWebReadAsync, whose every answer is a WebReadAnswer around ToHttpResult, BusyResult or DarlingWebFailureLog.Body"),
+        (new Regex(@"^(?:\(\s*await\s+(?:RunWebReadAsync\s*\(\s*context\s*\)|flight\s*\.\s*WaitAsync\s*\(\s*callerAborted\s*\))\s*\)|shared)\s*\.\s*Answer$", RegexOptions.Compiled),
+            "#5506 part 3: a WebReadAnswer.Answer, which the read loop's RunWebReadAsync builds only from ToHttpResult, BusyResult or DarlingWebFailureLog.Body; the read cache hands one read's answer to the callers that joined it"),
+        (new Regex(@"^(?:DarlingWebEndpoints\s*\.\s*)?BusyResult\s*\(\s*(?:refusal|busy)\s*\)$", RegexOptions.Compiled),
+            "#5506 part 3: the fixed admission refusal (a limit, a count and a retry-after), never a tool string"),
         (new Regex(@"^ServerErrorResult\s*\(", RegexOptions.Compiled),
             "answers DarlingWebFailureLog.Body(sentence): a fixed sentence, the argument only reaches the log"),
     };
@@ -106,7 +126,7 @@ public sealed class WebRouteStatementCensusTests
     };
 
     private static readonly Regex SweptWriter = new(
-        @"^(?:DarlingWebEndpoints\s*\.\s*)?(?:ToHttpResult|MuteRuleToolResult)\s*\(|^DarlingWebStatementSweep\s*\.\s*(?:Apply|JsonText|Refusal)\s*\(",
+        @"^(?:DarlingWebEndpoints\s*\.\s*)?(?:ToHttpResult|MuteRuleToolResult|QueryTagToolResult)\s*\(|^DarlingWebStatementSweep\s*\.\s*(?:Apply|JsonText|Refusal)\s*\(",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>Any <c>x.Map*(</c> or <c>).Map*(</c> call: <c>MapGet</c>, <c>MapPost</c>, <c>MapPut</c>, <c>MapPatch</c>,
@@ -553,7 +573,7 @@ public sealed class WebRouteStatementCensusTests
     public void TheSharedWriters_CallTheSweepBeforeAnythingElse()
     {
         string endpoints = File.ReadAllText(Path.Combine(ServiceDir(), "DarlingWebEndpoints.cs"));
-        foreach (string method in new[] { "ToHttpResult", "MuteRuleToolResult" })
+        foreach (string method in new[] { "ToHttpResult", "MuteRuleToolResult", "QueryTagToolResult" })
         {
             var bodies = StatementColumnCensusTests.BodiesOf(endpoints, "DarlingWebEndpoints", method);
             Assert.True(bodies.Count > 0, method + " was not found");

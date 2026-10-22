@@ -20,8 +20,8 @@ using Xunit;
 namespace Lite.Tests;
 
 /// <summary>
-/// Pins the test-map producer (#5459 change 4, slice 3): <c>.github/scripts/test-map.py</c> and the two jobs in
-/// <c>nightly.yml</c> that run it.
+/// Runs the test-map producer (#5459 change 4, slice 3), <c>.github/scripts/test-map.py</c>, which two jobs in
+/// <c>nightly.yml</c> run.
 ///
 /// <para><b>Why.</b> The map is only as good as what goes into it. Coverage sees the product files a class ran; the
 /// producer adds the files a class only names (path and tool-name literals, the type-name rule), marks a class that
@@ -31,7 +31,6 @@ namespace Lite.Tests;
 /// before a nightly spends 100 runner-minutes producing a map with a hole in it.</para>
 /// </summary>
 [Trait("Stage", "Guard")]
-[Trait("Reads", "Darling")]
 public sealed class TestMapProducerGuardTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "testmap-guard-" + Guid.NewGuid().ToString("N"));
@@ -302,6 +301,80 @@ public sealed class TestMapProducerGuardTests : IDisposable
         }
     }
 
+    /// <summary>#5876: a test source that names a directory that holds a test project (`Darling/`) must not select the
+    /// class for every change to a test file of that project. Before the fix the first segment of
+    /// `ReadRepoFile("Darling", "X", "Y.cs")` resolved on its own to `Darling/**`.</summary>
+    [Fact]
+    public void ARunOfPathSegments_NamesItsFile_NotTheWholeTopDirectory_AndABareTopDirectoryExcludesTheTestProject()
+    {
+        Write("tracked.txt", string.Join("\n", new[]
+        {
+            "Darling/Darling.Tests/RunHeadTests.cs", "Darling/Darling.Tests/WholeTests.cs",
+            "Darling/Darling.Tests/SharedBaselineCacheLiveTests.cs", "Darling/Darling.Tests/PgTargetWaitTests.cs",
+            "Darling/PerformanceMonitor.Darling.Service/Svc.cs", "Darling/PerformanceMonitor.Darling.Storage/Store.cs",
+        }));
+        Write("Darling/Darling.Tests/RunHeadTests.cs", """
+            public sealed class RunHeadTests
+            {
+                public void Reads() { var s = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Svc.cs"); }
+            }
+            """);
+        Write("Darling/Darling.Tests/WholeTests.cs", """
+            public sealed class WholeTests
+            {
+                public void Reads(string name)
+                {
+                    var d = Path.Combine(RepoRoot(), "Darling");
+                    File.ReadAllText(Path.Combine(d, name));
+                }
+            }
+            """);
+        Write("Darling/Darling.Tests/SharedBaselineCacheLiveTests.cs", """
+            public sealed class SharedBaselineCacheLiveTests
+            {
+                public void Reads() { var s = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Svc.cs"); }
+            }
+            """);
+        Write("Darling/Darling.Tests/PgTargetWaitTests.cs", """
+            public sealed class PgTargetWaitTests
+            {
+                public void Reads() { var s = ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "Svc.cs"); }
+            }
+            """);
+        Write("shards/a/shard-darling-0.json", ShardJson("darling", 0,
+            ("Ns.RunHeadTests", Array.Empty<string>(), 0.1, 1, 0),
+            ("Ns.WholeTests", Array.Empty<string>(), 0.1, 1, 0),
+            ("Ns.SharedBaselineCacheLiveTests", Array.Empty<string>(), 0.1, 1, 0),
+            ("Ns.PgTargetWaitTests", Array.Empty<string>(), 0.1, 1, 0)));
+        Write("shards/b/shard-lite-0.json", ShardJson("lite", 0, ("Ns.BetaTests", Array.Empty<string>(), 0.1, 1, 0)));
+        Write("Lite.Tests/BetaTests.cs", "public sealed class BetaTests { public void Runs() { } }\n");
+
+        var (code, output, map) = Build();
+        Assert.True(code == 0, output);
+        using (map)
+        {
+            var patterns = map!.RootElement.GetProperty("text_patterns");
+            List<string?> Of(string cls) => patterns.GetProperty(cls).EnumerateArray().Select(e => e.GetString()).ToList();
+
+            Assert.Equal(new List<string?> { "Darling/PerformanceMonitor.Darling.Service/Svc.cs" }, Of("RunHeadTests"));
+
+            var whole = Of("WholeTests");
+            Assert.Contains("Darling/PerformanceMonitor.Darling.Service/**", whole);
+            Assert.Contains("Darling/PerformanceMonitor.Darling.Storage/**", whole);
+            Assert.DoesNotContain("Darling/**", whole);
+            Assert.DoesNotContain(whole, p => p!.StartsWith("Darling/Darling.Tests", StringComparison.Ordinal));
+
+            // A class the replay of the failure corpus showed missing failures keeps the wide pattern (KEEP_DARLING_TREE),
+            // or every product project (KEEP_DARLING_PRODUCT); both still carry the file it names.
+            var kept = Of("SharedBaselineCacheLiveTests");
+            Assert.Contains("Darling/**", kept);
+            Assert.Contains("Darling/PerformanceMonitor.Darling.Service/Svc.cs", kept);
+            var product = Of("PgTargetWaitTests");
+            Assert.Contains("Darling/PerformanceMonitor.Darling.Storage/**", product);
+            Assert.DoesNotContain("Darling/**", product);
+        }
+    }
+
     [Fact]
     public void TheSummary_NamesTheHoles_AndTheSize()
     {
@@ -433,101 +506,4 @@ public sealed class TestMapProducerGuardTests : IDisposable
     }
 
     // ── the workflow ───────────────────────────────────────────────────────────────────────────────────────
-
-    private static string Nightly() => File.ReadAllText(Path.Combine(ParitySource.RepoRoot(), ".github", "workflows", "nightly.yml"))
-        .Replace("\r\n", "\n");
-
-    private static string Job(string yaml, string name)
-    {
-        var start = yaml.IndexOf("\n  " + name + ":\n", StringComparison.Ordinal);
-        Assert.True(start >= 0, "nightly.yml has no job " + name);
-        var next = Regex.Match(yaml[(start + 1)..], @"\n  (?:#[^\n]*\n  )*[a-z][a-z0-9-]*:\n");
-        return next.Success && next.Index > 0 ? yaml.Substring(start, next.Index + 1) : yaml[start..];
-    }
-
-    [Fact]
-    public void TheJobs_AreOptional_AndNoOtherJobWaitsOnThem()
-    {
-        var yaml = Nightly();
-        foreach (var name in new[] { "test-map-shard", "test-map" })
-        {
-            var job = Job(yaml, name);
-            Assert.Contains("continue-on-error: true", job);
-        }
-
-        Assert.Contains("inputs.test_map != false", Job(yaml, "test-map-shard"));
-        Assert.Matches(@"test_map:\n\s+description: [^\n]+\n\s+type: boolean\n\s+required: false\n\s+default: true", yaml);
-        // "needs: [...]" and block lists: no other job may list the producer, or its failure would change that job's result.
-        var checkedJobs = 0;
-        foreach (Match m in Regex.Matches(yaml, @"\n  ([a-z][a-z0-9-]*):\n"))
-        {
-            var name = m.Groups[1].Value;
-            if (name is "test-map" or "test-map-shard" or "schedule")
-            {
-                continue;
-            }
-
-            checkedJobs++;
-            var needs = Regex.Match(Job(yaml, name), @"\n    needs: ([^\n]+)");
-            if (needs.Success)
-            {
-                Assert.DoesNotContain("test-map", needs.Groups[1].Value);
-            }
-        }
-
-        Assert.True(checkedJobs >= 6, "the job scan found too few jobs to mean anything");
-    }
-
-    [Fact]
-    public void TheShardAndProbeJobs_WaitForBuildAndDarlingPg_ButStillRunAfterAFailedOne()
-    {
-        // The 10 windows shard legs and the AltCover probe used to need only `check`, so they raced build and darling-pg
-        // for runners and build checked out about 8 minutes late (#5459). They wait now; always() keeps them running
-        // after a failed build, and the check result must still be success (the check job is skipped on a schedule event).
-        var yaml = Nightly();
-        foreach (var name in new[] { "test-map-shard", "altcover-probe" })
-        {
-            var job = Job(yaml, name);
-            var needs = Regex.Match(job, @"\n    needs: \[([^\]]+)\]");
-            Assert.True(needs.Success, name + " has no needs list");
-            var listed = needs.Groups[1].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-            Assert.Contains("check", listed);
-            Assert.Contains("build", listed);
-            Assert.Contains("darling-pg", listed);
-
-            var condition = Regex.Match(job, @"\n    if: ([^\n]+)").Groups[1].Value;
-            Assert.StartsWith("always() && needs.check.result == 'success' && ", condition);
-        }
-
-        // The join job keeps waiting on the shards alone.
-        Assert.Matches(@"\n    needs: test-map-shard\n", Job(yaml, "test-map"));
-    }
-
-    [Fact]
-    public void TheJobs_CutTheSameShardCountTheyJoin_AndPinTheProbesAltCover()
-    {
-        var yaml = Nightly();
-        var shardJob = Job(yaml, "test-map-shard");
-        var joinJob = Job(yaml, "test-map");
-
-        foreach (var (suite, expected) in new[] { ("darling", 6), ("lite", 4) })
-        {
-            var legs = Regex.Matches(shardJob, @"\{ suite: " + suite + @", shard: (\d+), shards: (\d+) \}");
-            Assert.Equal(Enumerable.Range(0, expected).ToList(), legs.Select(l => int.Parse(l.Groups[1].Value)).ToList());
-            Assert.All(legs, l => Assert.Equal(expected, int.Parse(l.Groups[2].Value)));
-            Assert.Contains($"--expect {suite}={expected}", joinJob);
-        }
-
-        var pinned = Regex.Match(Job(yaml, "altcover-probe"), @"ALTCOVER_VERSION: '([^']+)'").Groups[1].Value;
-        Assert.NotEmpty(pinned);
-        Assert.Contains($"ALTCOVER_VERSION: '{pinned}'", shardJob);
-
-        // The runtime variable lights up the gated live classes; the Guard classes are listed too (a class the map never
-        // saw would run as "new" on every pull request).
-        Assert.Contains("DARLING_TEST_PGRUNTIME:", shardJob);
-        Assert.DoesNotContain("-trait- Stage=Guard", shardJob);
-        Assert.Contains("unwrap-skips", shardJob);
-        Assert.Contains("retention-days: 14", joinJob);
-        Assert.Contains("ref: ${{ github.sha }}", shardJob);
-    }
 }

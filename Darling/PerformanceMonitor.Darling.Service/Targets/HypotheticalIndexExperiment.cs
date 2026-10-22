@@ -14,6 +14,7 @@ using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
+using PerformanceMonitor.Collectors;
 
 namespace PerformanceMonitor.Darling.Service.Targets;
 
@@ -25,8 +26,10 @@ namespace PerformanceMonitor.Darling.Service.Targets;
 /// This is the one place the product ACTS on a monitored PostgreSQL server rather than reading it, so the
 /// blast radius is worth stating precisely rather than reassuringly. A hypothetical index costs no disk,
 /// is visible only inside the session that created it, and is never written anywhere.
-/// <c>EXPLAIN</c> without <c>ANALYZE</c> does not execute the statement. The whole experiment runs inside a
-/// transaction that is ROLLED BACK, so even the session-local catalog entry does not outlive the call.
+/// <c>EXPLAIN</c> without <c>ANALYZE</c> does not run the statement, but it does plan it, and planning can evaluate an
+/// IMMUTABLE function whose arguments are all constants, and a STABLE one while it estimates selectivity (#6170). So the connection is the hypothetical-index login
+/// (<see cref="HypotheticalIndexLogin"/>), never the monitoring login, and the experiment takes SELECT statements only. The
+/// whole experiment runs inside a transaction that is ROLLED BACK, so even the session-local catalog entry does not outlive the call.
 /// </para>
 ///
 /// <para>
@@ -194,19 +197,44 @@ public static class HypotheticalIndexExperiment
                 + "terminator, so this is text that did not come from one.");
         }
 
+        if (!IsSelectStatement(normalizedStatementText))
+        {
+            return new Result(
+                false, 0, 0, null, null, null,
+                "Only SELECT statements are tested. Planning an INSERT, UPDATE or DELETE needs write grants on its table, and the "
+                + "hypothetical-index login holds none, so this statement is not planned. No command reached the monitored server.");
+        }
+
         /* ROLLED BACK unconditionally: the hypothetical index is session-local, but the session is pooled
            and would carry it into the next caller's work. */
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
+        /* pg_catalog until the read below names the extension's schema: a reset there fails like a missing hypopg. */
+        var hypopgSchema = "pg_catalog";
+
         try
         {
+            /* #6170: nothing in the experiment writes. A function that planning evaluates (an IMMUTABLE one, and a STABLE one when
+               selectivity is estimated, each with constant arguments) runs under this read-only transaction, so it cannot write.
+               hypopg keeps its indexes in the backend's memory, not in a catalog, and works under it. First in the transaction,
+               before any other statement. */
+            await ExecuteAsync(connection, transaction, "SET TRANSACTION READ ONLY", cancellationToken);
+
             await ExecuteAsync(connection, transaction,
                 $"SET LOCAL statement_timeout = '{StatementTimeoutSeconds}s'", cancellationToken);
 
+            /* #6143: the connection's search_path is pinned to pg_catalog like every monitoring connection, so hypopg is
+               named by the schema it was created in, and the application statement is planned under the search_path
+               the database itself gives this login (set inside the DO block, around the EXPLAIN only). */
+            (hypopgSchema, var applicationSearchPath) = await ReadExperimentNamesAsync(connection, transaction, cancellationToken);
+            await ScalarTextAsync(connection, transaction,
+                "SELECT pg_catalog.set_config('pm.search_path', $1, true)", applicationSearchPath, cancellationToken);
+
             var before = await ExplainAsync(connection, transaction, normalizedStatementText, cancellationToken);
 
+            /* The CREATE INDEX names its table by schema (HypotheticalIndexRequest), so it runs under the pin. */
             var indexName = await ScalarTextAsync(connection, transaction,
-                "SELECT indexname FROM hypopg_create_index($1)", createIndexStatement, cancellationToken);
+                $"SELECT indexname FROM {hypopgSchema}.hypopg_create_index($1)", createIndexStatement, cancellationToken);
 
             var after = await ExplainAsync(connection, transaction, normalizedStatementText, cancellationToken);
 
@@ -233,7 +261,7 @@ public static class HypotheticalIndexExperiment
                     ? $"The planner WOULD use this index: estimated cost falls from {beforeText} to "
                       + $"{afterText}, a {savedText}% reduction. That is an ESTIMATE from the planner's own "
                       + "cost model on this server's current statistics, not a measured runtime — no "
-                      + "statement was executed and no index was built."
+                      + "statement was run and no index was built."
                     : $"The planner would NOT use this index. The plan is unchanged at an estimated cost of "
                       + $"{beforeText}. This is a real answer rather than an inconclusive run: on this "
                       + "server's current statistics, building it would cost write throughput and disk and "
@@ -273,7 +301,7 @@ public static class HypotheticalIndexExperiment
                broken to run it is a connection the pool will discard. */
             try
             {
-                await using var reset = new NpgsqlCommand("SELECT hypopg_reset()", connection)
+                await using var reset = new NpgsqlCommand($"SELECT {hypopgSchema}.hypopg_reset()", connection)
                 {
                     CommandTimeout = ResetCommandTimeoutSeconds,
                 };
@@ -297,6 +325,58 @@ public static class HypotheticalIndexExperiment
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    /// <summary>The search_path PostgreSQL gives a session that sets none, when no database or role setting names one.</summary>
+    internal const string DefaultSearchPath = "\"$user\", public";
+
+    /// <summary>
+    /// #6143: the schema hypopg was created in (NULL when it is not created here), and the search_path the database
+    /// gives this login at sign-in when nothing is sent with it: the <c>pg_db_role_setting</c> row for this role in this
+    /// database, then this role, then this database, then every role (<c>ALTER ROLE ALL</c>), the order PostgreSQL
+    /// applies them in. NULL when none names one; the caller then uses <see cref="DefaultSearchPath"/>. Run under the
+    /// pinned search_path, and every name in it is qualified all the same.
+    /// </summary>
+    internal const string ExperimentNamesSql = """
+        SELECT
+            (SELECT n.nspname::text
+             FROM pg_catalog.pg_extension AS e
+             JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) e.extnamespace
+             WHERE e.extname OPERATOR(pg_catalog.=) 'hypopg') AS hypopg_schema,
+            (SELECT pg_catalog.substr(c.setting, 13)
+             FROM pg_catalog.pg_db_role_setting AS s
+             CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS c(setting)
+             WHERE pg_catalog.starts_with(c.setting, 'search_path=')
+             AND s.setdatabase OPERATOR(pg_catalog.=) ANY (ARRAY[0::pg_catalog.oid,
+                 (SELECT d.oid FROM pg_catalog.pg_database AS d
+                  WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())])
+             AND s.setrole OPERATOR(pg_catalog.=) ANY (ARRAY[0::pg_catalog.oid,
+                 (SELECT r.oid FROM pg_catalog.pg_roles AS r WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER)])
+             ORDER BY CASE
+                 WHEN s.setrole OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                      AND s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid THEN 1
+                 WHEN s.setrole OPERATOR(pg_catalog.<>) 0::pg_catalog.oid THEN 2
+                 WHEN s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid THEN 3
+                 ELSE 4 END
+             LIMIT 1) AS database_search_path
+        """;
+
+    private static async Task<(string HypopgSchema, string ApplicationSearchPath)> ReadExperimentNamesAsync(
+        NpgsqlConnection connection, DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(ExperimentNamesSql, connection, (NpgsqlTransaction)transaction)
+        {
+            CommandTimeout = ForwardCommandTimeoutSeconds,
+        };
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        /* hypopg not created here: pg_catalog, where only a superuser can create a function, and the call fails with
+           the "does not exist" error it always did. */
+        var schema = reader.IsDBNull(0) ? "pg_catalog" : PgIdentifier.Quote(reader.GetString(0));
+        var searchPath = reader.IsDBNull(1) ? DefaultSearchPath : reader.GetString(1);
+        return (schema, searchPath);
+    }
+
     private static async Task<string?> ScalarTextAsync(
         NpgsqlConnection connection, DbTransaction transaction, string sql, string argument, CancellationToken cancellationToken)
     {
@@ -309,6 +389,71 @@ public static class HypotheticalIndexExperiment
 
         var value = await command.ExecuteScalarAsync(cancellationToken);
         return value as string;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="statementText"/> starts with <c>SELECT</c> or <c>WITH</c>, after white space and comments (#6170).
+    /// The hypothetical-index login holds SELECT and no write grant, so planning an INSERT, UPDATE or DELETE would fail on its
+    /// table's privileges. The check refuses those with a plain sentence instead. This is a courtesy and not the barrier: a
+    /// <c>WITH</c> statement that writes in a CTE is stopped by the login's missing grants, whatever this returns.
+    /// </summary>
+    public static bool IsSelectStatement(string? statementText)
+    {
+        if (string.IsNullOrWhiteSpace(statementText))
+        {
+            return false;
+        }
+
+        var text = statementText;
+        var index = 0;
+        while (index < text.Length)
+        {
+            if (char.IsWhiteSpace(text[index]))
+            {
+                index++;
+            }
+            else if (text[index] == '-' && index + 1 < text.Length && text[index + 1] == '-')
+            {
+                var next = EndOfLineComment(text, index);
+                if (next < 0)
+                {
+                    return false;
+                }
+
+                index = next;
+            }
+            else if (text[index] == '/' && index + 1 < text.Length && text[index + 1] == '*')
+            {
+                var next = EndOfBlockComment(text, index);
+                if (next < 0)
+                {
+                    return false;
+                }
+
+                index = next;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        var rest = text.AsSpan(index);
+        if (rest.Length > 0 && rest[0] == '(')
+        {
+            /* A parenthesised SELECT. A write cannot start with a parenthesis, and the login stops anything else. */
+            return true;
+        }
+
+        var end = 0;
+        while (end < rest.Length && char.IsLetter(rest[end]))
+        {
+            end++;
+        }
+
+        var word = rest[..end];
+        return word.Equals("select", StringComparison.OrdinalIgnoreCase)
+               || word.Equals("with", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -588,9 +733,12 @@ public static class HypotheticalIndexExperiment
     /// placeholder problem above; it does NOT sanitize the value at the point it is concatenated. And the text
     /// is untrusted: it originates in the monitored server's <c>pg_stat_statements</c> (resolved from this
     /// product's <c>pg_statement_text</c> store by queryid), so anyone who can run queries on a monitored
-    /// server can influence it, and this EXPLAIN runs as the monitoring credential ON that server. Safety
-    /// rests, in order, on: (1) <c>EXPLAIN</c> WITHOUT <c>ANALYZE</c> only PLANS — a hostile statement is never
-    /// executed; (2) the text is a single NORMALIZED <c>pg_stat_statements</c> entry, not a script;
+    /// server can influence it, and this EXPLAIN runs as the hypothetical-index login ON that server. Safety
+    /// rests, in order, on: (1) <c>EXPLAIN</c> WITHOUT <c>ANALYZE</c> only PLANS — the statement itself is not
+    /// run, but planning is not free of side effects: the planner can evaluate an IMMUTABLE function (and a STABLE one, while it estimates selectivity) with
+    /// constant arguments while it folds constants, so a function the text names can run during the EXPLAIN, under the
+    /// roles of the login that plans. That login is the hypothetical-index login (#6170), which holds CONNECT, USAGE and
+    /// SELECT and nothing else, and never the monitoring login; (2) the text is a single NORMALIZED <c>pg_stat_statements</c> entry, not a script;
     /// (3) <c>FOR line IN EXECUTE</c> rejects a multi-statement string outright; (4) the whole call runs in a
     /// ROLLED-BACK transaction as a least-privilege role. Barrier (1) is the strong one and stays first:
     /// <see cref="IsSingleStatement"/> is defence in depth beneath it, never a replacement for it. That
@@ -602,15 +750,23 @@ public static class HypotheticalIndexExperiment
     /// <c>GENERIC_PLAN</c>/no-<c>ANALYZE</c> shape, on the belief that the binding protects the concatenation:
     /// it does not.
     /// </para>
+    /// <para>
+    /// #6143: the connection's search_path is pinned to pg_catalog, so the block sets the database's own search_path
+    /// (staged in <c>pm.search_path</c>) just before the <c>EXECUTE</c>, for the application statement's unqualified
+    /// table names, and puts the pin back after the loop. Every function and operator the block itself calls is
+    /// named in pg_catalog, so that search_path never decides which of them runs.
+    /// </para>
     /// </summary>
     private const string ExplainThroughGucSql = """
         DO $pm$
-        DECLARE line text; acc text := '';
+        DECLARE line text; acc text := ''; pinned text := pg_catalog.current_setting('search_path');
         BEGIN
-          FOR line IN EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) ' || current_setting('pm.stmt') LOOP
-            acc := acc || line;
+          PERFORM pg_catalog.set_config('search_path', pg_catalog.current_setting('pm.search_path'), true);
+          FOR line IN EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) ' OPERATOR(pg_catalog.||) pg_catalog.current_setting('pm.stmt') LOOP
+            acc := acc OPERATOR(pg_catalog.||) line;
           END LOOP;
-          PERFORM set_config('pm.plan', acc, true);
+          PERFORM pg_catalog.set_config('search_path', pinned, true);
+          PERFORM pg_catalog.set_config('pm.plan', acc, true);
         END
         $pm$;
         """;
@@ -630,7 +786,7 @@ public static class HypotheticalIndexExperiment
 
         /* is_local = true on both: the settings die with the transaction that is rolled back below, so
            nothing survives into the next caller of this pooled session. */
-        await using (var stage = new NpgsqlCommand("SELECT set_config('pm.stmt', $1, true)", connection, (NpgsqlTransaction)transaction)
+        await using (var stage = new NpgsqlCommand("SELECT pg_catalog.set_config('pm.stmt', $1, true)", connection, (NpgsqlTransaction)transaction)
                { CommandTimeout = ForwardCommandTimeoutSeconds })
         {
             stage.Parameters.AddWithValue(statementText);
@@ -643,7 +799,7 @@ public static class HypotheticalIndexExperiment
             await explain.ExecuteNonQueryAsync(cancellationToken);
         }
 
-        await using var read = new NpgsqlCommand("SELECT current_setting('pm.plan', true)", connection, (NpgsqlTransaction)transaction)
+        await using var read = new NpgsqlCommand("SELECT pg_catalog.current_setting('pm.plan', true)", connection, (NpgsqlTransaction)transaction)
         {
             CommandTimeout = ForwardCommandTimeoutSeconds,
         };

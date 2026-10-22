@@ -42,7 +42,6 @@ namespace Darling.Tests;
 /// <c>deadlock_coverage</c> established one level up: numbers, a denominator, a named cause, and a sentence
 /// that names both windows and disclaims the one it did not measure.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class CollectionOutputBesideCostTests
 {
     /* The measured pg_deadlocks counts, so every row below is the shape this issue was filed on rather
@@ -195,7 +194,7 @@ public sealed class CollectionOutputBesideCostTests
 
     /// <summary>
     /// The finding's signature read off the TYPE rather than asserted over a hand-written list, so a
-    /// SEVENTH parameter reports itself here instead of passing unnoticed — the discipline
+    /// NINTH parameter reports itself here instead of passing unnoticed — the discipline
     /// <see cref="TheBandingSignature_TakesNoOutputAndNoDenialCurrency"/> applies to the band, one method
     /// over. Six since #3754: the faulted-run count (a RUN-CLASS count, like the note count beside it) and
     /// the event-collector bool, which is computed by the caller from the name on
@@ -220,10 +219,13 @@ public sealed class CollectionOutputBesideCostTests
 
         /* The precondition, named so a signature change reports itself rather than turning the assertions
            below into a vacuous pass over a list that no longer means what this test thinks. */
-        Assert.Equal(6, parameters.Length);
+        /* #5644: the zero-is-normal bool joined the event bool, computed from a name list the same way. */
+        /* #6177: the NO_PERMISSIONS-band bool joined them. The caller reduces the band word to a bool, so it is
+           a run-class fact like the others: no string, no note text, nothing that changes from run to run. */
+        Assert.Equal(8, parameters.Length);
 
         Assert.Equal(
-            new[] { "rowsStored", "totalRuns", "deniedSinceLastSuccess", "noteCount", "faultedRuns", "isEventCollector" },
+            new[] { "rowsStored", "totalRuns", "deniedSinceLastSuccess", "noteCount", "faultedRuns", "isEventCollector", "isZeroNormal", "bandedNoPermissions" },
             parameters.Select(p => p.Name!).ToArray());
 
         Assert.DoesNotContain(parameters, p => p.ParameterType == typeof(string));
@@ -283,14 +285,15 @@ public sealed class CollectionOutputBesideCostTests
            an on-load collector is no longer a distinct input to the ladder, only a distinct CADENCE the
            caller resolves (to CollectorScheduleDefaults.EffectiveRecurringIntervalMinutes) before calling
            in, so the ladder itself needs one fewer parameter to describe it. #4748 then appended latestRunNote - the newest run's own partial-failure
-           note, a text input that is neither an output count nor denial currency - netting 10. */
-        Assert.Equal(10, parameters.Length);
+           note, a text input that is neither an output count nor denial currency - netting 10; #5646 then appended trailingSuccessRuns - how many of the newest runs in a row
+           succeeded, a run outcome like the counts beside it - netting 11. */
+        Assert.Equal(11, parameters.Length);
 
         Assert.Equal(
             new[]
             {
                 "totalRuns", "successCount", "errorCount", "permissionDeniedCount", "extensionMissingCount",
-                "abandonedCount", "hoursSinceLastSuccess", "hoursSinceLastRun", "frequencyMinutes", "latestRunNote",
+                "abandonedCount", "hoursSinceLastSuccess", "hoursSinceLastRun", "frequencyMinutes", "latestRunNote", "trailingSuccessRuns",
             },
             parameters);
 
@@ -437,7 +440,7 @@ public sealed class CollectionOutputBesideCostTests
                cancellation and phase-timing wrapper) into ReadCollectionHealthAsync, which maps the row. */
             "private async Task<List<CollectorHealthRow>> ReadCollectionHealthAsync");
 
-        /* The precondition. 31 columns since #4748's one (latest_run_note, the newest run's note the band
+        /* The precondition. 32 columns since #5646 appended trailing_success_runs, 31 since #4748's one (latest_run_note, the newest run's note the band
            reads) - 30 at #3885's, 16 at #2460, plus #2472's four fan-out
            columns, #2804's abandoned_count, #3010's last_denied_time, #3017's two, #3240's
            extension_missing_count, #3754's session_missing_count, #3819's current_status,
@@ -448,13 +451,13 @@ public sealed class CollectionOutputBesideCostTests
            #3885 is the case this pin is FOR: the produced-then-stopped arm is not a Darling-only class -
            both SKUs dedup on watermarks - so the column had to land on both readers at the same ordinal,
            and this count is what would have failed had only one been widened. */
-        Assert.Equal(31, darling.Count);
-        Assert.Equal(31, lite.Count);
+        Assert.Equal(32, darling.Count);
+        Assert.Equal(32, lite.Count);
 
-        /* No gaps and no duplicates: ordinals 0..30 exactly once each. A duplicate would let two fields
+        /* No gaps and no duplicates: ordinals 0..31 exactly once each. A duplicate would let two fields
            read one column while a third read nothing, which compiles and is silently wrong. */
-        Assert.Equal(Enumerable.Range(0, 31), darling.Values.OrderBy(o => o));
-        Assert.Equal(Enumerable.Range(0, 31), lite.Values.OrderBy(o => o));
+        Assert.Equal(Enumerable.Range(0, 32), darling.Values.OrderBy(o => o));
+        Assert.Equal(Enumerable.Range(0, 32), lite.Values.OrderBy(o => o));
 
         /* And the same field at the same ordinal on both sides. */
         Assert.Equal(

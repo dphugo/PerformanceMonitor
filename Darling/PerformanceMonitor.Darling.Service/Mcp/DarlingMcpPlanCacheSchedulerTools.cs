@@ -50,6 +50,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
     internal const string CpuSchedulerPressureDescription =
         "Gets CPU scheduler pressure from the latest snapshot: runnable task queue depth, worker thread utilization, queued/blocked requests, the collector's pressure warning flags, and the banded pressure_level verdict with its recommendation. Shows whether the server has enough worker threads and if tasks are queuing for CPU time. LATEST IS A TIME: this is the newest scheduler snapshot found within hours_back of as_of, not an aggregate over those hours - captured_at is the instant it was collected and age_seconds its distance from the window's end; the verdict is that instant's, so read age_seconds before reading pressure_level as current.";
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.SearchBound)]
     [McpServerTool(Name = "get_plan_cache_bloat"), Description("Gets plan cache composition showing single-use vs multi-use plans, with a bloat-level classification. High single-use plan counts indicate ad-hoc query bloat consuming buffer pool memory. Consider enabling 'optimize for ad hoc workloads'. LATEST IS A TIME: this is the newest plan-cache snapshot found within hours_back of as_of, not an aggregate over those hours - captured_at is the instant the snapshot was collected and age_seconds its distance from the window's end.")]
     public static async Task<string> GetPlanCacheBloat(
         NpgsqlDataSource postgres,
@@ -61,7 +62,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -70,7 +71,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
             var rows = await DarlingPlanCacheSchedulerReader.GetPlanCacheBloatAsync(
                 postgres, resolved.ServerId, now.AddHours(-hours_back), now, cancellationToken);
             if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "plan_cache_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "plan_cache_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No plan cache statistics available in the requested time range.");
 
             var totalPlans = rows.Sum(r => (long)r.TotalPlans);
@@ -81,7 +82,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = rows[0].CollectionTime.ToString("o"),
                 age_seconds = LatestSnapshotStamp.AgeSeconds(rows[0].CollectionTime, now),
                 summary = new
@@ -115,6 +116,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
         }
     }
 
+    [ReadsLatestSnapshot(LatestSnapshotShape.SearchBound)]
     [McpServerTool(Name = "get_cpu_scheduler_pressure"), Description(CpuSchedulerPressureDescription)]
     public static async Task<string> GetCpuSchedulerPressure(
         NpgsqlDataSource postgres,
@@ -126,7 +128,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
 
         try
@@ -135,7 +137,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
             var item = await DarlingPlanCacheSchedulerReader.GetCpuSchedulerPressureAsync(
                 postgres, resolved.ServerId, now.AddHours(-hours_back), now, cancellationToken);
             if (item == null)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "cpu_scheduler_stats", cancellationToken)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "cpu_scheduler_stats", cancellationToken)
                     ?? McpHelpers.Status("unavailable", "No CPU scheduler snapshot in the requested time range. The scheduler collector may not have run yet, or its newest snapshot is older than hours_back.");
 
             var workerUtilizationPercent = item.MaxWorkersCount > 0
@@ -148,7 +150,7 @@ public sealed class DarlingMcpPlanCacheSchedulerTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 captured_at = item.CollectionTime.ToString("o"),
                 age_seconds = LatestSnapshotStamp.AgeSeconds(item.CollectionTime, now),
                 schedulers = item.SchedulerCount,

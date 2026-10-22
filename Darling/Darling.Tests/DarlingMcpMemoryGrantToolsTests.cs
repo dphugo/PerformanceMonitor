@@ -31,7 +31,7 @@ namespace Darling.Tests;
 /// the latest-snapshot read SQL pins (v_memory_grant_stats, the ceiling columns, per-pool SUM), and the
 /// Gemini-clean advertised schema.
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpMemoryGrantToolsSurfaceAndSqlTests
 {
     private static readonly string[] MemoryGrantToolSurface =
@@ -76,7 +76,11 @@ public sealed class DarlingMcpMemoryGrantToolsSurfaceAndSqlTests
     public void ParamContract_ServerHours_AllOptional(string toolName)
     {
         var p = McpParams(toolName);
-        Assert.Equal(new[] { "server_name", "hours_back", "as_of" }, p.Select(x => x.Name).ToArray());
+        /* #6299: get_memory_grants also takes chart + bucket_minutes, the whole-window series the web's two grant charts draw. */
+        var expected = toolName == "get_memory_grants"
+            ? new[] { "server_name", "hours_back", "as_of", "chart", "bucket_minutes" }
+            : new[] { "server_name", "hours_back", "as_of" };
+        Assert.Equal(expected, p.Select(x => x.Name).ToArray());
         Assert.All(p, x => Assert.True(x.Optional, $"{toolName}.{x.Name} must be optional"));
     }
 
@@ -246,7 +250,6 @@ public sealed class DarlingMcpMemoryGrantToolsSurfaceAndSqlTests
 /// the per-pool detail; an empty store returns the miss.
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class DarlingMcpMemoryGrantToolsLivePostgresTests
 {
     private const string ServerName = "darling-mcp-grants-e2e";
@@ -325,6 +328,80 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
 
             await DeleteRowsAsync(connection, ct, keepServer: true);
             Assert.Equal("unavailable", DarlingMcpTestData.StatusOf(await DarlingMcpMemoryGrantTools.GetResourceSemaphore(postgres, ServerName)));
+
+            bodySucceeded = true;
+        }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteRowsAsync(cleanup, cleanupCt));
+        }
+    }
+
+    /// <summary>
+    /// #6129: window[] shaped like a real instance. Pool 1's workspace shrank until almost nothing was available
+    /// while every snapshot sampled zero granted and zero waiters (grants too short to land on a snapshot); pool 2
+    /// caught a grant and waiters at an older snapshot. A zero peak has no moment (null *_at), a real peak keeps its
+    /// own snapshot's time, and both tools say the peaks are sampled.
+    /// </summary>
+    [Fact]
+    public async Task WindowPeaks_ZeroHasNoTime_RealPeakKeepsItsOwn_AndTheAnswerSaysItIsSampled()
+    {
+        var cs = ConnectionString;
+        Assert.SkipWhen(string.IsNullOrEmpty(cs), "Set DARLING_TEST_PG to a Postgres connection string to run the live memory-grant-tools test.");
+
+        var ct = TestContext.Current.CancellationToken;
+        using var connection = new NpgsqlConnection(cs);
+        await connection.OpenAsync(ct);
+        await PgMigrations.MigrateAsync(connection, ct);
+        await DeleteRowsAsync(connection, ct);
+        await using var postgres = NpgsqlDataSource.Create(cs!);
+
+        var bodySucceeded = false;
+        try
+        {
+            await DarlingMcpTestData.RegisterServerAsync(connection, ServerId, ServerName, ct);
+            var t0 = DarlingMcpTestData.TruncateToSeconds(DateTime.UtcNow).AddMinutes(-30);
+            var t1 = t0.AddMinutes(10);
+            var t2 = t0.AddMinutes(20);
+
+            foreach (var (t, pool, available, granted, waiters) in new[]
+            {
+                (t0, 1, 157m, 0m, 0), (t1, 1, 40m, 0m, 0), (t2, 1, 6.45m, 0m, 0),
+                (t0, 2, 500m, 0m, 0), (t1, 2, 200m, 300m, 4), (t2, 2, 500m, 0m, 0),
+            })
+            {
+                await DarlingMcpTestData.ExecAsync(connection, ct,
+                    @"INSERT INTO memory_grant_stats (collection_id, collection_time, server_id, server_name, resource_semaphore_id, pool_id, available_memory_mb, granted_memory_mb, waiter_count)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                    CollectionIdGenerator.Next(), t, ServerId, ServerName, (short)0, pool, available, granted, waiters);
+            }
+
+            foreach (var json in new[]
+            {
+                await DarlingMcpMemoryGrantTools.GetMemoryGrants(postgres, ServerName),
+                await DarlingMcpMemoryGrantTools.GetResourceSemaphore(postgres, ServerName, hours_back: 1),
+            })
+            {
+                using var doc = JsonDocument.Parse(json);
+                var window = doc.RootElement.GetProperty("window").EnumerateArray().ToDictionary(w => w.GetProperty("pool_id").GetInt32());
+
+                var quiet = window[1];
+                Assert.Equal(0, quiet.GetProperty("peak_waiter_count").GetInt64());
+                Assert.Equal(JsonValueKind.Null, quiet.GetProperty("peak_waiters_at").ValueKind);
+                Assert.Equal(0.0, quiet.GetProperty("peak_granted_memory_mb").GetDouble());
+                Assert.Equal(JsonValueKind.Null, quiet.GetProperty("peak_granted_at").ValueKind);
+                Assert.Equal(6.45, quiet.GetProperty("min_available_memory_mb").GetDouble(), 2);
+
+                var busy = window[2];
+                Assert.Equal(4, busy.GetProperty("peak_waiter_count").GetInt64());
+                Assert.Equal(300.0, busy.GetProperty("peak_granted_memory_mb").GetDouble());
+                var peakAt = DateTime.Parse(busy.GetProperty("peak_granted_at").GetString()!, null, System.Globalization.DateTimeStyles.RoundtripKind);
+                Assert.True(Math.Abs((peakAt - t1).TotalSeconds) < 2, "the peak keeps its own snapshot's time, not the newest snapshot's");
+                Assert.NotEqual(JsonValueKind.Null, busy.GetProperty("peak_waiters_at").ValueKind);
+
+                Assert.Contains("sampled", doc.RootElement.GetProperty("window_note").GetString(), StringComparison.Ordinal);
+            }
 
             bodySucceeded = true;
         }

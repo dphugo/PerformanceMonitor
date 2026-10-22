@@ -47,7 +47,6 @@ namespace Darling.Tests;
 /// have to be written into the table in its raw <c>&amp;#x0394;</c> form; no pinned header has one today.
 /// </summary>
 [Trait("Stage", "Guard")]
-[Trait("Reads", "Lite")]
 public sealed class ViewerGridPayloadColumnOrderPinTests
 {
     /// <summary>A grid whose payload columns are pinned: where the anchor sits, and what must follow it.</summary>
@@ -81,17 +80,17 @@ public sealed class ViewerGridPayloadColumnOrderPinTests
     [
         new(ViewerServerTab, "QuerySnapshotsGrid", "Collected", 1, ["Query Text", "Query Plan"]),
         new(ViewerServerTab, "CurrentActiveQueriesGrid", "Collected", 1, ["Query Text", "Query Plan"]),
-        new(ViewerServerTab, "QueryStatsGrid", "Creation Time", 3, ["Query Text", "Query Plan"]),
+        new(ViewerServerTab, "QueryStatsGrid", "Creation Time", 4, ["Query Text", "Query Plan"]),
         new(ViewerServerTab, "QueryStatsComparisonGrid", "Database", 1, ["Query Text"]),
-        new(ViewerServerTab, "ProcedureStatsGrid", "Cached Time", 4, ["Query Plan"]),
-        new(ViewerServerTab, "QueryStoreGrid", "First Execution", 5, ["Query Text", "Query Plan"]),
+        new(ViewerServerTab, "ProcedureStatsGrid", "Cached Time", 5, ["Query Plan"]),
+        new(ViewerServerTab, "QueryStoreGrid", "First Execution", 6, ["Query Text", "Query Plan"]),
         new(ViewerServerTab, "QueryStoreComparisonGrid", "Database", 1, ["Query Text"]),
         new(ViewerServerTab, "QueryStoreRegressionsGrid", "Last Execution", 0, ["Query Text"]),
         new(ViewerServerTab, "PlanCorrectionGrid", "Collected", 0, ["Query Text"]),
         new(ViewerServerTab, "BlockedProcessReportGrid", "Event Time", 0, ["Blocked SQL", "Blocking SQL", "XML"]),
         new(ViewerServerTab, "DeadlockGrid", "Time", 0, ["SQL Text", "XML"]),
         new(ViewerServerTab, "SignificantWaitsGrid", "Event Time", 0, ["Query Text"]),
-        new(ViewerServerTab, "LongQueryCompletionsGrid", "Event Time", 0, ["Statement"]),
+        new(ViewerServerTab, "LongQueryCompletionsGrid", "Event Time", 1, ["Statement"]),
         new(ViewerWaitDrillDown, "ResultsDataGrid", "Collected", 1, ["Query Text"]),
         new(ViewerProcedureHistory, "HistoryDataGrid", "Cached Time", 2, ["Plan"]),
         new(ViewerQueryStatsHistory, "HistoryDataGrid", "Creation Time", 2, ["Plan"]),
@@ -182,16 +181,17 @@ public sealed class ViewerGridPayloadColumnOrderPinTests
     [InlineData("TOP_QUERY_COLUMNS", "database_name", "query_text", 10)]
     [InlineData("QUERY_STORE_COLUMNS", "database_name", "query_text", 8)]
     [InlineData("LONG_QUERY_COLUMNS", "event_time", "statement", 8)]
-    [InlineData("PLAN_CORRECTION_COLUMNS", "collection_time", "query_text", 8)]
+    [InlineData("PLAN_CORRECTION_COLUMNS", "capture_count", "query_text", 8, 2)]
     [InlineData("BLOCKING_COLUMNS", "event_time", "blocked_sql_text", 9)]
     [InlineData("DEADLOCK_COLUMNS", "deadlock_time", "victim_sql_text", 5)]
-    public void EveryWebGridWithQueryText_PutsItRightOfTheAnchor(string array, string anchor, string text, int minKeys)
+    public void EveryWebGridWithQueryText_PutsItRightOfTheAnchor(string array, string anchor, string text, int minKeys, int anchorAt = 0)
     {
         // Array order IS the rendered column order — the page hands the array straight to the table renderer.
         var keys = JsColumnKeys(ReadRepoFile(ServerPageJs), array);
         Assert.True(keys.Count >= minKeys, $"only {keys.Count} {array} keys parsed — the scan is broken.");
-        Assert.Equal(anchor, keys[0]);
-        Assert.Equal(text, keys[1]);
+        // anchorAt is 0 except Plan Corrections, whose First seen and Last seen stamps lead (#5644 W21) and Captures is the anchor.
+        Assert.Equal(anchor, keys[anchorAt]);
+        Assert.Equal(text, keys[anchorAt + 1]);
 
         // Without this, re-adding a second text column at the BACK would leave the pin green — the same hole
         // EveryPinnedPayloadColumnIsUniqueInItsGrid closes on the XAML side.

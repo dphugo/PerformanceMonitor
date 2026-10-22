@@ -25,7 +25,7 @@ export const FILTERED = new Set([
   "get_blocked_process_xml",
   // Duration trends, Query Store clutter, long queries and plan corrections (#5244 PR4).
   "get_query_duration_trend", "get_procedure_duration_trend", "get_query_store_duration_trend",
-  "get_query_store_clutter", "get_long_query_completions", "get_plan_corrections",
+  "get_query_store_clutter", "get_long_query_completions", "get_plan_corrections", "get_forced_plans",
   // Configuration, Query Store health, configuration changes, severe errors and the default trace (#5244 PR6).
   "get_database_config", "get_database_scoped_config", "get_query_store_health", "get_database_config_changes",
   "get_health_parser_severe_errors", "get_default_trace_events",
@@ -35,7 +35,7 @@ export const FILTERED = new Set([
 ]);
 
 /** Database-scoped reads that cannot take the filter yet, so they show every database and say so (the "All databases"
- *  chip). 34 database-scoped reads in all: this list shrank as FILTERED grew, and what is left is the three
+ *  chip). 35 database-scoped reads in all: this list shrank as FILTERED grew, and what is left is the three
  *  deadlock reads, which stay unfiltered on purpose (as on the desktop): a deadlock spans several databases, and they are
  *  inside each deadlock graph. The groups follow the page that moves each read into FILTERED. */
 export const UNFILTERED = new Set([
@@ -50,23 +50,23 @@ export const UNFILTERED = new Set([
  *  injected into them and they show no chip. */
 export const IDENTITY = new Set([
   "get_query_trend", "get_plan_xml", "get_query_store_plan_xml", "get_active_query_plan_xml", "get_procedure_plan_xml",
-  "get_query_store_query_history", "get_blocking_plan_xml", "get_deadlock_plan_xml", "get_query_repro_script",
+  "get_query_store_query_history", "get_plan_force_precheck", "get_blocking_plan_xml", "get_deadlock_plan_xml", "get_query_repro_script",
 ]);
 
 /** Every other SQL Server read a module of the server page names: the data has no database, so the filter does not apply.
  *  That includes the fleet, FinOps, alert and self-monitoring reads the page's shared modules name. */
 export const SERVER_WIDE = new Set([
-  "audit_config", "get_alert_history", "get_analysis_findings", "get_collection_health", "get_collection_log",
-  "get_cpu_scheduler_pressure", "get_cpu_utilization", "get_daily_summary_range", "get_finops", "get_fleet_overview",
+  "audit_config", "get_alert_history", "get_analysis_findings", "get_block_chain", "get_collection_health", "get_collection_log",
+  "get_cpu_scheduler_pressure", "get_cpu_utilization", "get_daily_summary", "get_daily_summary_range", "get_finops", "get_fleet_overview", "get_investigation_reports",
   "get_health_parser_cpu_tasks", "get_health_parser_io_issues", "get_health_parser_memory_broker",
   "get_health_parser_memory_conditions", "get_health_parser_memory_node_oom", "get_health_parser_scheduler_issues",
   "get_health_parser_significant_waits", "get_health_parser_system_health", "get_job_history", "get_latch_stats",
   "get_lock_wait_trend", "get_memory_clerks", "get_memory_grants", "get_memory_pressure_events", "get_memory_stats",
-  "get_memory_trend", "get_mute_rules", "get_perfmon_stats", "get_perfmon_trend", "get_plan_cache_bloat",
+  "get_memory_trend", "get_mute_rules", "get_overview_baselines", "get_perfmon_stats", "get_perfmon_trend", "get_plan_cache_bloat",
   "get_read_latency", "get_resource_semaphore", "get_running_jobs", "get_server_config", "get_server_config_changes",
   "get_server_properties", "get_server_summary", "get_server_trend", "get_session_stats", "get_slow_reads",
   "get_spinlock_stats", "get_store_query_history", "get_tempdb_trend", "get_trace_flag_changes", "get_trace_flags",
-  "get_wait_stats", "get_wait_trend",
+  "get_wait_stats", "get_wait_trend", "list_query_tags",
 ]);
 
 /** The class a read is in: "filtered", "unfiltered", "identity" or "server" (server-wide); null for a read no class names

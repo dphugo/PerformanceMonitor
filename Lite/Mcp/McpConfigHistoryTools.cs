@@ -57,7 +57,7 @@ public sealed class McpConfigHistoryTools
 
             var rows = await dataService.GetServerConfigChangesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
             if (rows.Count == 0)
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "server_config")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "server_config")
                     ?? McpHelpers.Status("empty",
                         $"No server configuration changes detected in the last {hours_back}h. Config is captured on connect, so at least two snapshots are needed to detect a change.",
                         (await WindowNoticeAsync(dataService, QueryWindowRelation.ServerConfig, resolved.ServerId, hours_back, windowEnd, "server_config", emptyAnswer: true)).AsHints());
@@ -66,7 +66,7 @@ public sealed class McpConfigHistoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where this server's config snapshots start for the window, always present (false and null when
                    the store covered it). No effective_hours_back, as on the other window-floor payloads. */
@@ -118,7 +118,7 @@ public sealed class McpConfigHistoryTools
             var rows = await dataService.GetDatabaseConfigChangesAsync(
                 resolved.ServerId, hours_back, databaseNames: database is null ? null : new[] { database }, asOfUtc: windowEnd);
             if (rows.Count == 0)
-                return McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "database_config"), database)
+                return McpHelpers.WithDatabase(await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "database_config"), database)
                     ?? McpHelpers.StatusForDatabase("empty",
                         $"No database configuration changes detected in the last {hours_back}h{McpDatabaseSelection.ForChosen(database is null ? null : new[] { database })}. Config is captured on connect, so at least two snapshots are needed to detect a change.",
                         database,
@@ -128,7 +128,7 @@ public sealed class McpConfigHistoryTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where this server's config snapshots start for the window, always present (false and null when
                    the store covered it). No effective_hours_back, as on the other window-floor payloads. */
@@ -154,6 +154,17 @@ public sealed class McpConfigHistoryTools
         }
     }
 
+    /// <summary>#5633 item 19: the empty message of get_trace_flag_changes. When the trace_flags collector's newest successful run stored zero rows,
+    /// no flag is on, and that is what it says; otherwise the old "at least two snapshots" text, which is then the true one. Darling's twin is
+    /// <c>DarlingMcpConfigHistoryTools.NoTraceFlagChanges</c>; the words for "no flag is on" are shared in <see cref="CollectorRunFacts"/>.</summary>
+    internal static string NoTraceFlagChangesMessage(CollectorRunFacts runFacts, int hoursBack)
+    {
+        var none = runFacts.NoTraceFlagsEnabled();
+        return none is null
+            ? $"No trace flag changes detected in the last {hoursBack}h. Config is captured on connect, so at least two snapshots are needed to detect a change."
+            : none + " A successful run that finds no flag stores no rows and counts as an empty capture, so a flag turned off shows as a change at that run's time; none falls in this window.";
+    }
+
     [McpServerTool(Name = "get_trace_flag_changes"), Description("Gets trace flag change history by diffing DBCC TRACESTATUS snapshots. Shows which trace flags were enabled or disabled, with scope (global/session) and the change time. NOTE: config is captured on server connect (not on a fixed schedule), so changes are detected between connect snapshots and need at least two.")]
     public static async Task<string> GetTraceFlagChanges(
         LocalDataService dataService,
@@ -172,16 +183,16 @@ public sealed class McpConfigHistoryTools
 
             var rows = await dataService.GetTraceFlagChangesAsync(resolved.ServerId, hours_back, asOfUtc: windowEnd);
             if (rows.Count == 0)
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "trace_flags")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "trace_flags")
                     ?? McpHelpers.Status("empty",
-                        $"No trace flag changes detected in the last {hours_back}h. Config is captured on connect, so at least two snapshots are needed to detect a change.",
+                        NoTraceFlagChangesMessage(await dataService.GetCollectorRunFactsAsync(resolved.ServerId, "trace_flags", asOfUtc: windowEnd), hours_back),
                         (await WindowNoticeAsync(dataService, QueryWindowRelation.TraceFlags, resolved.ServerId, hours_back, windowEnd, "trace_flags", emptyAnswer: true)).AsHints());
 
             var notice = await WindowNoticeAsync(dataService, QueryWindowRelation.TraceFlags, resolved.ServerId, hours_back, windowEnd, "trace_flags");
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 hours_back,
                 /* #4966: where this server's config snapshots start for the window, always present (false and null when
                    the store covered it). No effective_hours_back, as on the other window-floor payloads. */

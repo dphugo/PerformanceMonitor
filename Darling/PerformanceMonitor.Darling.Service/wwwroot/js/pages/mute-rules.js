@@ -29,17 +29,29 @@ import * as api from "../alerts-api.js";
 export const TEXT_FIELDS = [
   { key: "server_name", label: "Server name (exact)" },
   { key: "metric_name", label: "Metric" },
+  /* #5654: limits the rule to alerts one external source raised; empty (the default) leaves it unlimited. */
+  { key: "external_source", label: "External source (lower case, e.g. nagios)" },
   { key: "database_pattern", label: "Database (substring)" },
   { key: "wait_type_pattern", label: "Wait type (substring)" },
   { key: "query_text_pattern", label: "Query text (substring)" },
   { key: "job_name_pattern", label: "Job name (substring)" },
+  { key: "client_app_pattern", label: "Client application (substring)" },
   { key: "reason", label: "Reason" },
 ];
 const EXPIRY = "expires_at_utc";
+/* #6231: the optional start; until it passes the rule is stored and listed but mutes nothing (a quiet window set ahead of planned work). */
+const STARTS = "starts_at_utc";
 /* server_id is not a form field: it arrives from an Alert History pre-fill and rides along in the create body, so
    the rule is keyed on the server's store id (the name is only its label). */
 const SERVER_ID = "server_id";
-const EDITABLE_KEYS = TEXT_FIELDS.map((f) => f.key).concat([EXPIRY, SERVER_ID]);
+const EDITABLE_KEYS = TEXT_FIELDS.map((f) => f.key).concat([STARTS, EXPIRY, SERVER_ID]);
+/* The only fields a link may fill in: the ones the app's own "Mute this alert" and "Mute similar" links send
+   (mute-context.js's mutePrefillParams, alerts.js's muteCell). The reason, the external source, the start and the
+   expiry are never taken from a link: they are typed in the form (#6286). */
+const PREFILL_KEYS = [
+  SERVER_ID, "server_name", "metric_name", "database_pattern", "wait_type_pattern",
+  "query_text_pattern", "job_name_pattern", "client_app_pattern",
+];
 
 /** A datetime-local value ("2026-08-01T10:30", local clock) to an ISO UTC string, or "" when blank/unparseable. */
 export function localInputToIso(v) {
@@ -61,7 +73,7 @@ export function isoToLocalInput(iso) {
  *  datetime-local value). */
 function fieldValue(values, key) {
   const raw = values[key] == null ? "" : String(values[key]).trim();
-  if (key === EXPIRY) return localInputToIso(raw) || null;
+  if (key === EXPIRY || key === STARTS) return localInputToIso(raw) || null;
   if (key === SERVER_ID) return /^-?\d+$/.test(raw) && Number(raw) !== 0 ? Number(raw) : null;
   return raw === "" ? null : raw;
 }
@@ -78,7 +90,7 @@ export function formToCreateBody(values) {
 
 /** True for a create body that names no scope at all: such a rule mutes EVERY alert, so the page confirms first. */
 export function isEmptyCreate(body) {
-  return !body || Object.keys(body).filter((k) => k !== "reason" && k !== EXPIRY).length === 0;
+  return !body || Object.keys(body).filter((k) => k !== "reason" && k !== EXPIRY && k !== STARTS).length === 0;
 }
 
 export const EMPTY_CREATE_WARNING =
@@ -94,7 +106,7 @@ export function buildPatch(original, values) {
     if (key === SERVER_ID) continue; /* never edited on the form, so an edit must not clear it */
     const next = fieldValue(values, key);
     const old = original[key] == null || original[key] === "" ? null : original[key];
-    const same = key === EXPIRY && next !== null && old !== null
+    const same = (key === EXPIRY || key === STARTS) && next !== null && old !== null
       ? new Date(next).getTime() === new Date(old).getTime()
       : next === old;
     if (!same) patch[key] = next;
@@ -117,6 +129,11 @@ export function interpretWrite(status, body) {
   }
   if (status >= 200 && status < 300) return { kind: "ok", rule: b.mute_rule || null, status: b.status || null };
   return { kind: "error", message };
+}
+
+/** Whether a rule's start is still ahead (#6231): the rule exists but does not apply yet. */
+export function isUpcoming(rule, now) {
+  return !!rule.starts_at_utc && new Date(rule.starts_at_utc).getTime() > (now || Date.now());
 }
 
 /** Whether a rule's expiry has passed. */
@@ -163,11 +180,13 @@ export const deleteRule = (id) => send("DELETE", "/api/mute-rules/" + encodeURIC
 let live = null;
 let form = null;
 let lastPrefillQuery = null;
+/* Shown on a create form that was filled in from a link, so the person reads every field before saving. */
+export const LINK_FILLED_NOTICE = "This form was filled in from a link. Check every field before saving.";
 
 function parsePrefill(query) {
   const p = new URLSearchParams(query || "");
   const v = {};
-  for (const k of EDITABLE_KEYS) if (p.get(k)) v[k] = p.get(k);
+  for (const k of PREFILL_KEYS) if (p.get(k)) v[k] = p.get(k);
   return v;
 }
 
@@ -196,7 +215,7 @@ export async function renderMuteRules(main, query) {
     lastPrefillQuery = query;
     form = null;
     const values = parsePrefill(query);
-    openForm({ mode: "create", values, idName: values[SERVER_ID] ? values.server_name || "" : null });
+    openForm({ mode: "create", values, fromLink: true, idName: values[SERVER_ID] ? values.server_name || "" : null });
   } else if (form) {
     drawForm();
   }
@@ -217,7 +236,7 @@ async function refreshList(state) {
 
 function drawList(state) {
   if (!state.rules.length) return mount(state.listBox, emptyStrip("No mute rules are configured."));
-  const head = ["Status", "Scope", "Reason", "Expires", "Created", state.canEdit ? "" : null]
+  const head = ["Status", "Scope", "External source", "Reason", "Starts", "Expires", "Created", state.canEdit ? "" : null]
     .filter((h) => h !== null)
     .map((h) => el("th", { text: h }));
   const rows = state.rules.map((r) => ruleRow(r, state.canEdit));
@@ -229,16 +248,19 @@ function drawList(state) {
 
 function statusOf(r) {
   if (isExpired(r)) return "Expired";
-  return r.enabled ? "Enabled" : "Paused";
+  if (!r.enabled) return "Paused";
+  return isUpcoming(r) ? "Upcoming" : "Enabled";
 }
 
 function ruleRow(r, canEdit) {
   const st = statusOf(r);
-  const scope = r.summary || "Every alert";
+  const scope = r.match_summary || "Every alert";
   const cells = [
     el("td", {}, [el("span", { class: st === "Enabled" ? "status-cell sev-Healthy" : "paused-badge", text: st })]),
     el("td", { text: scope, title: r.server_id != null ? "server_id " + r.server_id : null }),
+    el("td", { text: r.external_source || "—" }),
     el("td", { text: r.reason || "—" }),
+    el("td", { text: r.starts_at_utc ? localTime(r.starts_at_utc) + (isUpcoming(r) ? " (not started)" : "") : "At once" }),
     el("td", { text: r.expires_at_utc ? localTime(r.expires_at_utc) + (isExpired(r) ? " (expired)" : "") : "Never" }),
     el("td", { text: r.created_at_utc ? localTime(r.created_at_utc) : "—" }),
   ];
@@ -255,6 +277,7 @@ function ruleRow(r, canEdit) {
 function valuesOf(r) {
   const v = {};
   for (const f of TEXT_FIELDS) v[f.key] = r[f.key] || "";
+  v[STARTS] = isoToLocalInput(r.starts_at_utc);
   v[EXPIRY] = isoToLocalInput(r.expires_at_utc);
   return v;
 }
@@ -270,7 +293,7 @@ async function toggle(r) {
 }
 
 async function remove(r) {
-  if (!window.confirm("Delete this mute rule permanently?\n\n" + (r.summary || "Every alert") + "\n\nPausing keeps the rule; deleting cannot be undone.")) return;
+  if (!window.confirm("Delete this mute rule permanently?\n\n" + (r.match_summary || "Every alert") + "\n\nPausing keeps the rule; deleting cannot be undone.")) return;
   const res = await deleteRule(r.id);
   if (res.kind !== "ok" && res.kind !== "notfound") return notify(res.message, true);
   await refreshList(live);
@@ -301,11 +324,13 @@ function closeForm() {
 
 function formNode() {
   const fields = TEXT_FIELDS.map((f) => fieldRow(f.key, f.label, "text"));
+  fields.push(fieldRow(STARTS, "Starts (local time; blank = at once)", "datetime-local"));
   fields.push(fieldRow(EXPIRY, "Expires (local time; blank = never)", "datetime-local"));
   const empty = form.mode === "create" && isEmptyCreate(formToCreateBody(form.values));
   return el("div", { class: "card mute-form" }, [
     el("h3", { text: form.mode === "create" ? "New mute rule" : "Edit mute rule" }),
     el("div", { class: "meta", text: "Alerts matching ALL filled fields are suppressed. Blank fields match anything." }),
+    form.fromLink ? el("div", { class: "strip notice", role: "note", text: LINK_FILLED_NOTICE }) : null,
     form.banner ? el("div", { class: "strip error", text: form.banner }) : null,
     form.exists ? existsNode() : null,
     ...fields,

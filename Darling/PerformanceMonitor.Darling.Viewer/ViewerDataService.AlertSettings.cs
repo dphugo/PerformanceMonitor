@@ -82,7 +82,18 @@ public sealed partial class ViewerDataService
         "long_running_query_excluded_program_name_prefixes, long_running_query_excluded_logins, " +
         /* #3712 (V137): the uncorroborated-finding route knob's STORE half — nullable text under a CHECK, the one
            tri-state on the row (NULL = the file governs), APPENDED for the same reason. */
-        "analysis_uncorroborated_route";
+        "analysis_uncorroborated_route, " +
+        /* #5641 (V177): the Runnable Queue alert's switch and two bars, APPENDED for the same reason. */
+        "runnable_queue_enabled, runnable_queue_warning_per_scheduler, runnable_queue_critical_per_scheduler, " +
+        /* #5640 (V179): the Client Timeouts alert's switch and two bars, APPENDED for the same reason. The viewer refuses a
+           store below StorageVersion.SchemaVersion (RequiredStoreSchemaVersion, checked at connect in MainWindow), so
+           the columns always exist where this runs and the SELECT and upsert need no per-version gate (#5641 had none either). */
+        "client_timeouts_enabled, client_timeouts_warning_per_minute, client_timeouts_critical_per_minute, " +
+        /* #6098 (V200): the Volume Free Space alert's excluded mount points (text[], the excluded_databases shape), APPENDED for
+           the same reason and under the same connect-time store gate. */
+        "excluded_volumes, " +
+        /* #5736 (V211): the relative Client Timeouts bars' two multiples, APPENDED for the same reason and under the same gate. */
+        "client_timeouts_warning_multiple, client_timeouts_critical_multiple";
 
     /// <summary>The single global alert-settings row (id=1), for the Settings window prefill + the migrate-in
     /// defaults check. Column order matches <see cref="AlertSettingsColumns"/>.</summary>
@@ -99,7 +110,7 @@ INSERT INTO config_alert_settings (id, " + AlertSettingsColumns + @", modified_a
 VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
         $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43,
         $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62,
-        $63, $64, $65, $66, $67, $68, $69, $70,
+        $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79,
         (now() AT TIME ZONE 'UTC'))
 ON CONFLICT (id) DO UPDATE SET
     enabled = EXCLUDED.enabled,
@@ -172,6 +183,15 @@ ON CONFLICT (id) DO UPDATE SET
     long_running_query_excluded_program_name_prefixes = EXCLUDED.long_running_query_excluded_program_name_prefixes,
     long_running_query_excluded_logins = EXCLUDED.long_running_query_excluded_logins,
     analysis_uncorroborated_route = EXCLUDED.analysis_uncorroborated_route,
+    runnable_queue_enabled = EXCLUDED.runnable_queue_enabled,
+    runnable_queue_warning_per_scheduler = EXCLUDED.runnable_queue_warning_per_scheduler,
+    runnable_queue_critical_per_scheduler = EXCLUDED.runnable_queue_critical_per_scheduler,
+    client_timeouts_enabled = EXCLUDED.client_timeouts_enabled,
+    client_timeouts_warning_per_minute = EXCLUDED.client_timeouts_warning_per_minute,
+    client_timeouts_critical_per_minute = EXCLUDED.client_timeouts_critical_per_minute,
+    excluded_volumes = EXCLUDED.excluded_volumes,
+    client_timeouts_warning_multiple = EXCLUDED.client_timeouts_warning_multiple,
+    client_timeouts_critical_multiple = EXCLUDED.client_timeouts_critical_multiple,
     modified_at = (now() AT TIME ZONE 'UTC')";
 
     /// <summary>The two <c>cpu_mode</c> values the service honors (it compares case-insensitively against
@@ -225,7 +245,7 @@ ON CONFLICT (id) DO UPDATE SET
         command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.FailedJobEnabled });                 // $20
         command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.FailedJobLookbackMinutes });          // $21
         command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.CooldownMinutes });                   // $22
-        AddTextArray(command, r.ExcludedDatabases);                                                             // $23
+        AddTextArray(command, ExcludedDatabaseNames.Normalize(r.ExcludedDatabases));                                                             // $23
         command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.AnalysisEnabled });                  // $24
         command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.AnalysisIntervalMinutes });           // $25
         command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.AnalysisNotificationsEnabled });     // $26
@@ -284,6 +304,24 @@ ON CONFLICT (id) DO UPDATE SET
            parameter keeps its type on the INSERT arm. */
         var route = FindingRouting.TryParseRoute(r.AnalysisUncorroboratedRoute);
         command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Text, Value = route is { } parsed ? FindingRouting.RouteText(parsed) : DBNull.Value }); // $70 (#3712, V137)
+        /* #5641 (V177): the Runnable Queue switch and bars. The bars go through the engine's own clamp (Warning at
+           least 1, Critical never below Warning) so the store never holds a pair the engine would rewrite on read. */
+        var (rqWarning, rqCritical) = RunnableQueueEvaluator.ClampBars(r.RunnableQueueWarningPerScheduler, r.RunnableQueueCriticalPerScheduler);
+        command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.RunnableQueueEnabled });          // $71 (#5641, V177)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = rqWarning });                        // $72 (#5641, V177)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = rqCritical });                       // $73 (#5641, V177)
+        /* #5640 (V179): the Client Timeouts switch and bars, through the engine's own clamp for the same reason. */
+        var (ctWarning, ctCritical) = AttentionEvaluator.ClampBars(r.ClientTimeoutsWarningPerMinute, r.ClientTimeoutsCriticalPerMinute);
+        command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.ClientTimeoutsEnabled });         // $74 (#5640, V179)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = ctWarning });                        // $75 (#5640, V179)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = ctCritical });                       // $76 (#5640, V179)
+        /* #6098 (V200): the excluded mount points, normalised on the way in (trim, blanks dropped, a trailing separator ignored
+           when de-duplicating) so the store holds the list the engine applies and get_alert_settings reports back. */
+        AddTextArray(command, VolumeExclusions.Normalize(r.ExcludedVolumes));                               // $77
+        /* #5736 (V211): the two multiples, through the shared clamp (each at least 1, Critical never below Warning). */
+        var (ctWarningMultiple, ctCriticalMultiple) = AttentionBaselineMath.ClampMultiples(r.ClientTimeoutsWarningMultiple, r.ClientTimeoutsCriticalMultiple);
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = ctWarningMultiple });                // $78 (#5736, V211)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = ctCriticalMultiple });               // $79 (#5736, V211)
     }
 
     private static AlertSettingsRow ReadAlertSettingsRow(NpgsqlDataReader reader) => new()
@@ -374,6 +412,19 @@ ON CONFLICT (id) DO UPDATE SET
         /* #3712 (V137) the route knob's store half appended at ordinal 69 (nullable text; NULL is the expected
            reading on every store nobody has written a route into, and it means "darling.json governs"). */
         AnalysisUncorroboratedRoute = reader.IsDBNull(69) ? null : reader.GetString(69),
+        /* #5641 (V177) Runnable Queue switch and bars appended at ordinals 70-72 (NOT NULL, DEFAULT true / 8 / 16). */
+        RunnableQueueEnabled = reader.GetBoolean(70),
+        RunnableQueueWarningPerScheduler = reader.GetInt32(71),
+        RunnableQueueCriticalPerScheduler = reader.GetInt32(72),
+        /* #5640 (V179) Client Timeouts switch and bars appended at ordinals 73-75 (NOT NULL, DEFAULT false / 10 / 60). */
+        ClientTimeoutsEnabled = reader.GetBoolean(73),
+        ClientTimeoutsWarningPerMinute = reader.GetInt32(74),
+        ClientTimeoutsCriticalPerMinute = reader.GetInt32(75),
+        /* #6098 (V200) excluded mount points appended at ordinal 76 (text[] NOT NULL, DEFAULT empty). */
+        ExcludedVolumes = reader.IsDBNull(76) ? new List<string>() : reader.GetFieldValue<string[]>(76).ToList(),
+        /* #5736 (V211) the relative bars' multiples appended at ordinals 77-78. */
+        ClientTimeoutsWarningMultiple = reader.GetInt32(77),
+        ClientTimeoutsCriticalMultiple = reader.GetInt32(78),
     };
 
     /// <summary>Maps the Settings window's CPU-mode combo tag ("Total"/"SqlOnly") to the store value.</summary>
@@ -500,6 +551,23 @@ public sealed class AlertSettingsRow
     public int DeadlockCountThreshold { get; set; } = 1;
     public bool PoisonWaitEnabled { get; set; } = true;
     public int PoisonWaitThresholdMs { get; set; } = 500;
+    /// <summary>#5641 (V177): the Runnable Queue alert's switch (default on, like Poison Wait).</summary>
+    public bool RunnableQueueEnabled { get; set; } = true;
+    /// <summary>#5641 (V177): Warning bar, runnable tasks per scheduler (average of the last 5 minutes' collections, or the newest 3 inside 10 minutes). Default 8.</summary>
+    public int RunnableQueueWarningPerScheduler { get; set; } = RunnableQueueEvaluator.DefaultWarningPerScheduler;
+    /// <summary>#5641 (V177): Critical bar, runnable tasks per scheduler. Default 16; never below the Warning bar.</summary>
+    public int RunnableQueueCriticalPerScheduler { get; set; } = RunnableQueueEvaluator.DefaultCriticalPerScheduler;
+    /// <summary>#5640 (V179): the Client Timeouts alert's switch. OFF by default. Its two bars are floors scaled by each server's own baseline (#5736).</summary>
+    public bool ClientTimeoutsEnabled { get; set; }
+    /// <summary>#5640 (V179), #5736: Warning FLOOR, client attentions (cancels and timeouts) per minute over the covered span. Default 10. The bar is
+    /// max(this, <see cref="ClientTimeoutsWarningMultiple"/> x the server's own baseline).</summary>
+    public int ClientTimeoutsWarningPerMinute { get; set; } = AttentionEvaluator.DefaultWarningPerMinute;
+    /// <summary>#5640 (V179), #5736: Critical FLOOR, attentions per minute. Default 60; never below the Warning floor.</summary>
+    public int ClientTimeoutsCriticalPerMinute { get; set; } = AttentionEvaluator.DefaultCriticalPerMinute;
+    /// <summary>#5736 (V211): the Warning bar is at least this many times the server's baseline (p99.9 of its 3-minute average attention rate over 7 days). Default 3.</summary>
+    public int ClientTimeoutsWarningMultiple { get; set; } = AttentionBaselineMath.DefaultWarningMultiple;
+    /// <summary>#5736 (V211): the Critical bar is at least this many times the baseline. Default 10; never below the Warning multiple.</summary>
+    public int ClientTimeoutsCriticalMultiple { get; set; } = AttentionBaselineMath.DefaultCriticalMultiple;
     public bool LongRunningQueryEnabled { get; set; } = true;
     public int LongRunningQueryThresholdMinutes { get; set; } = 30;
     public bool TempDbSpaceEnabled { get; set; } = true;
@@ -520,6 +588,12 @@ public sealed class AlertSettingsRow
     public int FailedJobLookbackMinutes { get; set; } = 60;
     public int CooldownMinutes { get; set; } = 5;
     public List<string> ExcludedDatabases { get; set; } = new();
+
+    /// <summary>#6098 (V200): mount points the Volume Free Space alert ignores on every server (the rule is
+    /// <c>VolumeExclusions</c> in the Alerting library: the whole mount point, case-insensitive, a trailing separator
+    /// ignored). Stored as <c>excluded_volumes</c> (<c>text[]</c>), edited as comma-separated text on the Settings
+    /// window like <see cref="ExcludedDatabases"/>. Empty by default.</summary>
+    public List<string> ExcludedVolumes { get; set; } = new();
 
     /// <summary>#3653 (A5, Q5): the Long-Running Query opt-out knob's <c>program_name</c> PREFIXES — sessions whose
     /// program name starts with one are NOT EVALUATED by the alert (case-insensitive, no wildcard grammar; the rule
@@ -614,6 +688,14 @@ public sealed class AlertSettingsRow
             && DeadlockCountThreshold == other.DeadlockCountThreshold
             && PoisonWaitEnabled == other.PoisonWaitEnabled
             && PoisonWaitThresholdMs == other.PoisonWaitThresholdMs
+            && RunnableQueueEnabled == other.RunnableQueueEnabled
+            && RunnableQueueWarningPerScheduler == other.RunnableQueueWarningPerScheduler
+            && RunnableQueueCriticalPerScheduler == other.RunnableQueueCriticalPerScheduler
+            && ClientTimeoutsEnabled == other.ClientTimeoutsEnabled
+            && ClientTimeoutsWarningPerMinute == other.ClientTimeoutsWarningPerMinute
+            && ClientTimeoutsCriticalPerMinute == other.ClientTimeoutsCriticalPerMinute
+            && ClientTimeoutsWarningMultiple == other.ClientTimeoutsWarningMultiple
+            && ClientTimeoutsCriticalMultiple == other.ClientTimeoutsCriticalMultiple
             && LongRunningQueryEnabled == other.LongRunningQueryEnabled
             && LongRunningQueryThresholdMinutes == other.LongRunningQueryThresholdMinutes
             && TempDbSpaceEnabled == other.TempDbSpaceEnabled
@@ -630,6 +712,7 @@ public sealed class AlertSettingsRow
             && FailedJobLookbackMinutes == other.FailedJobLookbackMinutes
             && CooldownMinutes == other.CooldownMinutes
             && (ExcludedDatabases ?? new List<string>()).SequenceEqual(other.ExcludedDatabases ?? new List<string>())
+            && (ExcludedVolumes ?? new List<string>()).SequenceEqual(other.ExcludedVolumes ?? new List<string>())
             && AnalysisEnabled == other.AnalysisEnabled
             && AnalysisIntervalMinutes == other.AnalysisIntervalMinutes
             && AnalysisNotificationsEnabled == other.AnalysisNotificationsEnabled

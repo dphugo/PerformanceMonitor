@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Runs one shard of the Darling.Tests suite: cuts the class list by hash, chunks it under the command-line
+  Runs one shard of the Darling.Tests suite: cuts the class list by recorded duration, chunks it under the command-line
   budget, and runs the test host once per chunk (#5616).
 
 .DESCRIPTION
@@ -38,20 +38,59 @@ $ErrorActionPreference = 'Stop'
 # The cut and the run must agree (#5459): the listing every shard cuts from leaves the Guard classes out exactly
 # when the Guard job ran them, so each remaining class still lands in exactly one shard. No artifact: all classes.
 $guardFilter = @(if ($GuardBuildUsed -eq 'true') { '-trait-'; 'Stage=Guard' })
-$scopeFilter = @($ScopeFilter -split ' ' | Where-Object { $_ })
-$lines = @(dotnet run --project Darling/Darling.Tests/Darling.Tests.csproj -c Release --no-build -- -list classes/json @guardFilter @scopeFilter)
-if ($LASTEXITCODE -ne 0) { throw "class listing failed with exit code $LASTEXITCODE" }
-# Only the runner's one-line JSON array is parsed: the dotnet CLI can print its own notice on stdout,
-# and a line starting "W" after the array failed a shard's ConvertFrom-Json on 2026-09-23.
-$json = @($lines | Where-Object { $_ -match '^\s*\[' })
-if ($json.Count -ne 1) { throw "expected one JSON array line from the class listing, got $($json.Count): $($lines -join ' | ')" }
-$classes = @($json[0] | ConvertFrom-Json)
+# Not named $scopeFilter: PowerShell variable names are case-insensitive, so that name is the typed [string] $ScopeFilter
+# parameter, which turns the array back into one string, and splatting a string hands the runner its characters as
+# separate arguments (exit 3 on every pull request that changes only Lite files).
+$scopeArgs = @($ScopeFilter -split ' ' | Where-Object { $_ })
+function Get-DarlingClasses([string[]] $scopeArgs) {
+    # The parameter shadows the caller's $scopeArgs on purpose: the listing takes the Guard exclusion first, then a scope.
+    $lines = @(dotnet run --project Darling/Darling.Tests/Darling.Tests.csproj -c Release --no-build -- -list classes/json @guardFilter @scopeArgs)
+    if ($LASTEXITCODE -ne 0) { throw "class listing failed with exit code $LASTEXITCODE" }
+    # Only the runner's one-line JSON array is parsed: the dotnet CLI can print its own notice on stdout,
+    # and a line starting "W" after the array failed a shard's ConvertFrom-Json on 2026-09-23.
+    $json = @($lines | Where-Object { $_ -match '^\s*\[' })
+    if ($json.Count -ne 1) { throw "expected one JSON array line from the class listing, got $($json.Count): $($lines -join ' | ')" }
+    return @($json[0] | ConvertFrom-Json)
+}
+# #5961: the Lite-reads part of a scope is the classes ci-select.py's source scan says read a Lite path, not a trait on
+# the assembly. xunit ANDs filters of different kinds, so the part cannot ride in the one listing call: the listing runs
+# once for the rest of the scope (the Guard stage) and once, unfiltered, to match the scan's names against. An empty scan
+# adds no class, which is what an empty `-trait Reads=Lite` listing did; a scope that ends up with no class at all still
+# stops at the zero check below, never at a runner given no -class arguments (that runs the whole suite).
+$readsLite = $false
+$restArgs = [System.Collections.Generic.List[string]]::new()
+for ($i = 0; $i -lt $scopeArgs.Count; $i++) {
+    if ($scopeArgs[$i] -eq '-trait' -and ($i + 1) -lt $scopeArgs.Count -and $scopeArgs[$i + 1] -eq 'Reads=Lite') { $readsLite = $true; $i++ }
+    else { $restArgs.Add($scopeArgs[$i]) }
+}
+if ($readsLite) {
+    $readsNames = @(python .github/scripts/ci-select.py reads-classes --suite darling | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0) { throw "ci-select.py reads-classes failed with exit code $LASTEXITCODE" }
+    Write-Host "Lite-reads scan: $($readsNames.Count) Darling.Tests classes read a Lite path"
+    $everyClass = @(Get-DarlingClasses @())
+    $restClasses = if ($restArgs.Count -gt 0) { @(Get-DarlingClasses $restArgs.ToArray()) } else { @() }
+    $classes = @($everyClass | Where-Object { $readsNames -contains $_ -or $restClasses -contains $_ })
+}
+else {
+    $classes = @(Get-DarlingClasses $scopeArgs)
+}
 if ($classes.Count -eq 0) { throw 'the class listing returned no classes - the shard would silently run nothing' }
 
-$sha = [System.Security.Cryptography.SHA256]::Create()
-$mine = @($classes | Where-Object {
-    ([System.BitConverter]::ToUInt32($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($_)), 0) % $ShardCount) -eq $Shard
-})
+# #5669: the cut balances the shards by recorded class duration (.github/scripts/darling-shard-pack.py, from the committed
+# table darling-shard-weights.json) instead of a class-name hash, which left one shard 4 to 6 minutes over the mean. Every
+# shard runs the same deterministic assignment over the same listing, and the packer proves each class lands in exactly one
+# shard before it prints. A packer failure stops this shard: falling back to the hash here would cut this shard differently
+# from the others and could run a class twice or never. A single-shard caller (the build job's Lite-reads pass) needs no cut.
+if ($ShardCount -le 1) {
+    $mine = $classes
+} else {
+    $classesFile = Join-Path ([System.IO.Path]::GetTempPath()) "darling-shard-classes-${Shard}.txt"
+    [System.IO.File]::WriteAllLines($classesFile, [string[]]$classes)
+    $packed = @(python .github/scripts/darling-shard-pack.py pack --classes $classesFile --shards $ShardCount --shard $Shard)
+    if ($LASTEXITCODE -ne 0) { throw "darling-shard-pack.py failed with exit code $LASTEXITCODE" }
+    Write-Host "shard ${Shard}: $($packed | Where-Object { $_ -like '#*' })"
+    $mine = @($packed | Where-Object { $_ -and $_ -notlike '#*' })
+}
 Write-Host "shard ${Shard}: $($mine.Count) of $($classes.Count) classes"
 if ($mine.Count -eq 0) { throw "shard ${Shard} selected zero of $($classes.Count) classes - refusing to run, because a runner with no -class arguments runs the whole suite" }
 
@@ -97,6 +136,20 @@ elseif ($EventName -eq 'pull_request') {
     if ($mine.Count -eq 0) { Write-Host "shard ${Shard}: every class of this shard is a skipped Cost=Slow class, so nothing runs"; exit 0 }
 }
 
+# #5942 the CI quarantine: a test that dev's own latest push broke is left out of an unrelated pull request. The
+# test-map-select job decided it once and put quarantine.json beside the selection (ci-select.py quarantine); the
+# honored tests of this suite become `-method- <test>` arguments on every chunk below. A missing or unreadable decision
+# leaves nothing out, so every doubt runs the test.
+$quarantineArgs = @()
+if ($EventName -eq 'pull_request' -and $SelectionFile) {
+    $quarantineFile = Join-Path (Split-Path -Parent $SelectionFile) 'quarantine.json'
+    if (Test-Path -LiteralPath $quarantineFile) {
+        $quarantineArgs = @(python .github/scripts/ci-select.py quarantine-args --quarantine $quarantineFile --suite darling | Where-Object { $_ })
+        if ($LASTEXITCODE -ne 0) { $quarantineArgs = @() }
+        if ($quarantineArgs.Count -gt 0) { Write-Host "shard ${Shard}: the CI quarantine leaves out $($quarantineArgs.Count / 2) test(s): $(($quarantineArgs | Where-Object { $_ -ne '-method-' }) -join ', ')" }
+    }
+}
+
 # One runner invocation per chunk, never one for the whole shard: Windows CreateProcess caps the
 # complete command line at 32,767 characters, and a Darling PG shard's -class list alone reached ~32,660
 # (#5100). The budget counts only the -class arguments; the other ~170 characters (the dotnet
@@ -132,7 +185,7 @@ foreach ($chunk in $chunks) {
     Write-Host "shard ${Shard} chunk $chunkNumber of $($chunks.Count): $($chunk.Count) classes, $chunkLength characters"
     # -xml: per-test durations for the darling-tests-timing artifact (#5459 change 4: the test map's
     # selection estimates need a per-class Darling time, and none was recorded before).
-    dotnet run --project Darling/Darling.Tests/Darling.Tests.csproj -c Release --no-build -- @chunkArgs -trx TestResults/$ResultPrefix-${Shard}-$chunkNumber.trx -xml TestResults/darling-timing-${Shard}-$chunkNumber-a${RunAttempt}.xml -longRunning 300 | Tee-Object -FilePath TestResults/darling-runner-${Shard}.log -Append
+    dotnet run --project Darling/Darling.Tests/Darling.Tests.csproj -c Release --no-build -- @chunkArgs @quarantineArgs -trx TestResults/$ResultPrefix-${Shard}-$chunkNumber.trx -xml TestResults/darling-timing-${Shard}-$chunkNumber-a${RunAttempt}.xml -longRunning 300 | Tee-Object -FilePath TestResults/darling-runner-${Shard}.log -Append
     if ($LASTEXITCODE -ne 0) {
         $failedChunks++
         Write-Host "shard ${Shard} chunk $chunkNumber of $($chunks.Count) failed with exit code $LASTEXITCODE"

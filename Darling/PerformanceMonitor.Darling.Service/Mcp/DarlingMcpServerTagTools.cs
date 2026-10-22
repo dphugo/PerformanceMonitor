@@ -18,6 +18,7 @@ using System.Threading.Tasks;
 using ModelContextProtocol.Server;
 using Npgsql;
 using PerformanceMonitor.Common;
+using PerformanceMonitor.Common.Tags;
 using PerformanceMonitor.Darling.Storage;
 
 #pragma warning disable CA1707 // MCP tools use snake_case naming convention
@@ -65,16 +66,16 @@ public sealed class DarlingMcpServerTagTools
         [Description("The parent tag id (from get_fleet_overview tags); omit for a root tag.")] int? parent_id = null,
         [Description("The colour as #RRGGBB; omit for the palette colour.")] string? colour = null,
         CancellationToken cancellationToken = default) =>
-        CreateServerTagCore(new ServerTagStore(postgres, WriteCommandSeconds), name, parent_id, colour, cancellationToken);
+        CreateServerTagCore(McpStore(postgres), name, parent_id, colour, cancellationToken);
 
     [McpServerTool(Name = "update_server_tag"), Description(
-        "PARTIAL edit of a fleet server tag: send only name, colour or parent_id in changes_json; an explicit null clears colour or moves the tag to the root. A move carries the subtree and its assignments, is refused if it would create a cycle or exceed four levels, and changes which servers custom alert rules scoped to old or new ancestors cover: affected_rules names them. Returns updated (re-read from the store), unchanged, or invalid/conflict/not_found with nothing written.")]
+        "PARTIAL edit of a fleet server tag: send only name, colour or parent_id in changes_json; an explicit null clears colour or moves the tag to the root. A move carries the subtree and its assignments, is refused on a cycle or past four levels, and changes which servers rules scoped to old or new ancestors cover: affected_rules names them. To reorder among siblings send {\"move\":\"up\"} or {\"move\":\"down\"} alone (edge = unchanged). Returns updated, unchanged, or invalid/conflict/not_found with nothing written.")]
     public static Task<string> UpdateServerTag(
         NpgsqlDataSource postgres,
         [Description("The tag id (from get_fleet_overview tags).")] int tag_id,
-        [Description("A JSON object with ONLY the fields to change: name, colour, parent_id (e.g. {\"name\":\"East\"}). An explicit null clears colour or moves the tag to the root.")] string changes_json,
+        [Description("A JSON object with ONLY the fields to change: name, colour, parent_id (e.g. {\"name\":\"East\"}). An explicit null clears colour or moves the tag to the root. Or the single field move, \"up\" or \"down\", to reorder the tag among its siblings.")] string changes_json,
         CancellationToken cancellationToken = default) =>
-        UpdateServerTagCore(new ServerTagStore(postgres, WriteCommandSeconds), tag_id, changes_json, cancellationToken);
+        UpdateServerTagCore(McpStore(postgres), tag_id, changes_json, cancellationToken);
 
     [McpServerTool(Name = "delete_server_tag"), Description(
         "Deletes a fleet server tag AND its whole subtree of child tags and their server assignments; servers and collected data are untouched. Permanent. If a custom alert rule is scoped to the tag or a descendant, that rule would match no server: the call answers confirm_required naming those rules and deletes nothing; repeat with confirm=true to proceed. Rules scoped to an ancestor are reported as losing servers. Returns deleted with the removed tag ids and assignment count.")]
@@ -83,7 +84,7 @@ public sealed class DarlingMcpServerTagTools
         [Description("The tag id (from get_fleet_overview tags).")] int tag_id,
         [Description("True to proceed when custom alert rules are scoped to the subtree; default false.")] bool confirm = false,
         CancellationToken cancellationToken = default) =>
-        DeleteServerTagCore(new ServerTagStore(postgres, WriteCommandSeconds), tag_id, confirm, cancellationToken);
+        DeleteServerTagCore(McpStore(postgres), tag_id, confirm, cancellationToken);
 
     [McpServerTool(Name = "assign_server_tag"), Description(
         "Assigns one fleet server tag to one or more servers (server_ids from get_fleet_overview) in one write; servers already carrying it are a no-op. Every server_id must be a monitored server or nothing is written. Custom alert rules scoped to the tag or an ancestor start covering the added servers: affected_rules names them. Returns assigned with added and already-assigned ids, unchanged, not_found or invalid.")]
@@ -92,7 +93,7 @@ public sealed class DarlingMcpServerTagTools
         [Description("The tag id (from get_fleet_overview tags).")] int tag_id,
         [Description("1-1000 server ids (from get_fleet_overview); duplicates are ignored.")] int[] server_ids,
         CancellationToken cancellationToken = default) =>
-        AssignServerTagCore(new ServerTagStore(postgres, WriteCommandSeconds), tag_id, server_ids, cancellationToken);
+        AssignServerTagCore(McpStore(postgres), tag_id, server_ids, cancellationToken);
 
     [McpServerTool(Name = "unassign_server_tag"), Description(
         "Removes one fleet server tag from one or more servers (server_ids) in one write; servers not carrying it are a no-op. Custom alert rules scoped to the tag or an ancestor stop covering a removed server unless another tag under the rule's scope still holds it: affected_rules names each rule and the servers it loses. No confirm step; assign again to undo. Returns unassigned, unchanged, not_found or invalid.")]
@@ -101,7 +102,12 @@ public sealed class DarlingMcpServerTagTools
         [Description("The tag id (from get_fleet_overview tags).")] int tag_id,
         [Description("1-1000 server ids (from get_fleet_overview); duplicates are ignored.")] int[] server_ids,
         CancellationToken cancellationToken = default) =>
-        UnassignServerTagCore(new ServerTagStore(postgres, WriteCommandSeconds), tag_id, server_ids, cancellationToken);
+        UnassignServerTagCore(McpStore(postgres), tag_id, server_ids, cancellationToken);
+
+    /// <summary>The store every tag tool writes through. <c>markMcpSurface</c> makes each write transaction set the session marker
+    /// the store's agent-route tag guard reads (#6281), so the guard holds for an MCP that connects as the store's owner and
+    /// through a pooler that drops startup options. The Viewer and the web build their own store without it.</summary>
+    private static ServerTagStore McpStore(NpgsqlDataSource postgres) => new(postgres, WriteCommandSeconds, markMcpSurface: true);
 
     // ---------------------------------------------------------------- cores
 
@@ -150,6 +156,13 @@ public sealed class DarlingMcpServerTagTools
     {
         try
         {
+            if (TryParseMove(changesJson, out var direction, out var moveError, out var moveCode))
+            {
+                return moveError is not null
+                    ? Refusal("invalid", moveCode ?? "invalid", moveError)
+                    : await MoveCoreAsync(store, tagId, direction, ct);
+            }
+
             var (edit, error, errorCode) = ParseChanges(changesJson);
             if (error is not null)
             {
@@ -215,10 +228,125 @@ public sealed class DarlingMcpServerTagTools
                 ["affected_rules"] = RulesNode(ServerTagCoverage.Diff(before, after), before, after),
             });
         }
+        catch (PostgresException ex) when (ex.SqlState == AgentRouteSqlState)
+        {
+            // #6281: the store refused the write because it would change which servers an agent route covers; nothing was written.
+            return Refusal("refused", AgentRouteRefusalCode, ex.MessageText);
+        }
+
         catch (Exception ex)
         {
             return McpHelpers.FormatError("update_server_tag", ex);
         }
+    }
+
+    /// <summary>The reorder half of update_server_tag (#6094), through the same store method the viewer uses. An
+    /// edge move answers <c>unchanged</c> and writes nothing; <c>order</c> lists the siblings' ids in their new
+    /// display order.</summary>
+    private static async Task<string> MoveCoreAsync(IServerTagStore store, int tagId, TagMoveDirection direction, CancellationToken ct)
+    {
+        var before = await store.ReadSnapshotAsync(ct);
+        var refusal = ServerTagRules.CheckMove(before.Tags, tagId);
+        if (refusal is not null)
+        {
+            return FromWriteResult(refusal, null)!;
+        }
+
+        var siblings = ServerTagRules.SiblingsOf(before.Tags, tagId);
+        if (!TagSiblingOrder.CanMove(siblings, tagId, direction))
+        {
+            return MoveUnchanged(before, tagId);
+        }
+
+        var written = await store.MoveAsync(tagId, direction, ct);
+        if (written is not ServerTagWriteResult.Ok ok)
+        {
+            return FromWriteResult(written, null)!;
+        }
+
+        var after = await store.ReadSnapshotAsync(ct);
+        var tag = after.Tags.FirstOrDefault(t => t.Id == tagId);
+        if (tag is null)
+        {
+            return ConcurrentlyGone(tagId);
+        }
+
+        // Another operator's move can land between the check above and the store's re-read under the tree lock,
+        // leaving the tag at the edge: the store then wrote nothing, so this answers unchanged, not updated.
+        if (!ok.Written)
+        {
+            return MoveUnchanged(after, tagId);
+        }
+
+        return Serialize(new JsonObject
+        {
+            ["status"] = "updated",
+            ["updated_fields"] = new JsonArray((JsonNode?)JsonValue.Create("sort_order")),
+            ["tag"] = TagNode(after, tag),
+            ["order"] = OrderNode(after.Tags, tagId),
+            ["affected_rules"] = new JsonArray(),
+        });
+    }
+
+    private static string MoveUnchanged(ServerTagSnapshot snapshot, int tagId) =>
+        Serialize(new JsonObject
+        {
+            ["status"] = "unchanged",
+            ["tag"] = TagNode(snapshot, snapshot.Tags.First(t => t.Id == tagId)),
+            ["order"] = OrderNode(snapshot.Tags, tagId),
+            ["affected_rules"] = new JsonArray(),
+        });
+
+    private static JsonArray OrderNode(IReadOnlyList<ServerTagRow> tags, int tagId) =>
+        new(TagSiblingOrder.InDisplayOrder(ServerTagRules.SiblingsOf(tags, tagId))
+            .Select(s => (JsonNode?)JsonValue.Create(s.Id))
+            .ToArray());
+
+    /// <summary>Recognises update_server_tag's reorder body, <c>{"move":"up"}</c> or <c>{"move":"down"}</c>, which
+    /// must be the only field. Returns false when the body has no <c>move</c> field (the ordinary edit parser then
+    /// answers, including for malformed JSON); returns true with the direction, or with the refusal text and code.</summary>
+    internal static bool TryParseMove(string? changesJson, out TagMoveDirection direction, out string? error, out string? code)
+    {
+        direction = TagMoveDirection.Up;
+        error = null;
+        code = null;
+        if (string.IsNullOrWhiteSpace(changesJson))
+        {
+            return false;
+        }
+
+        JsonNode? move;
+        int fields;
+        try
+        {
+            if (JsonNode.Parse(changesJson) is not JsonObject body || !body.ContainsKey("move"))
+            {
+                return false;
+            }
+
+            move = body["move"];
+            fields = body.Count;
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
+        {
+            return false;
+        }
+
+        if (fields > 1)
+        {
+            error = "'move' reorders the tag and must be the only field; send name, colour or parent_id in a separate call.";
+            return true;
+        }
+
+        var text = move is JsonValue value && value.TryGetValue<string>(out var t) ? t.Trim().ToLowerInvariant() : null;
+        if (text is "up" or "down")
+        {
+            direction = text == "up" ? TagMoveDirection.Up : TagMoveDirection.Down;
+            return true;
+        }
+
+        error = "'move' must be \"up\" or \"down\".";
+        return true;
     }
 
     /// <summary>delete_server_tag's body over the store seam.</summary>
@@ -272,6 +400,12 @@ public sealed class DarlingMcpServerTagTools
                 ["affected_rules"] = RulesNode(ServerTagCoverage.Diff(before, after), before, after),
             });
         }
+        catch (PostgresException ex) when (ex.SqlState == AgentRouteSqlState)
+        {
+            // #6281: the store refused the write because it would change which servers an agent route covers; nothing was written.
+            return Refusal("refused", AgentRouteRefusalCode, ex.MessageText);
+        }
+
         catch (Exception ex)
         {
             return McpHelpers.FormatError("delete_server_tag", ex);
@@ -361,6 +495,12 @@ public sealed class DarlingMcpServerTagTools
             result["affected_rules"] = RulesNode(ServerTagCoverage.Diff(before, after), before, after);
             return Serialize(result);
         }
+        catch (PostgresException ex) when (ex.SqlState == AgentRouteSqlState)
+        {
+            // #6281: the store refused the write because it would change which servers an agent route covers; nothing was written.
+            return Refusal("refused", AgentRouteRefusalCode, ex.MessageText);
+        }
+
         catch (Exception ex)
         {
             return McpHelpers.FormatError("assign_server_tag", ex);
@@ -417,6 +557,12 @@ public sealed class DarlingMcpServerTagTools
             result["affected_rules"] = RulesNode(ServerTagCoverage.Diff(before, after), before, after);
             return Serialize(result);
         }
+        catch (PostgresException ex) when (ex.SqlState == AgentRouteSqlState)
+        {
+            // #6281: the store refused the write because it would change which servers an agent route covers; nothing was written.
+            return Refusal("refused", AgentRouteRefusalCode, ex.MessageText);
+        }
+
         catch (Exception ex)
         {
             return McpHelpers.FormatError("unassign_server_tag", ex);
@@ -448,7 +594,7 @@ public sealed class DarlingMcpServerTagTools
 
     /// <summary>Parses update_server_tag's <c>changes_json</c> the way update_mute_rule parses its body: a
     /// whitelist, the first error wins, and nothing is written when any field is bad.</summary>
-    private static (ServerTagEdit? Edit, string? Error, string? Code) ParseChanges(string? changesJson)
+    internal static (ServerTagEdit? Edit, string? Error, string? Code) ParseChanges(string? changesJson)
     {
         if (string.IsNullOrWhiteSpace(changesJson))
         {
@@ -548,7 +694,7 @@ public sealed class DarlingMcpServerTagTools
                 case "id":
                     return (null, $"'{prop.Key}' is the tag's identity and cannot be edited. Pass the tag to edit as tag_id; send only the fields to change.", UnknownFieldCode);
                 case "sort_order":
-                    return (null, "'sort_order' is not editable here; the Viewer orders siblings.", UnknownFieldCode);
+                    return (null, "'sort_order' is not set directly. To reorder a tag among its siblings send {\"move\":\"up\"} or {\"move\":\"down\"} to update_server_tag.", UnknownFieldCode);
                 default:
                     return (null, $"Unknown field '{prop.Key}'. Editable fields: name, colour, parent_id.", UnknownFieldCode);
             }
@@ -563,6 +709,13 @@ public sealed class DarlingMcpServerTagTools
     }
 
     // -------------------------------------------------------------- results
+
+    /// <summary>The SQLSTATE the store's guard on these writes raises (V210, #6281) when a tag write would change which servers an
+    /// agent route covers. The message names the route.</summary>
+    private const string AgentRouteSqlState = "DL403";
+
+    /// <summary>The <c>refusal</c> code of that envelope.</summary>
+    internal const string AgentRouteRefusalCode = "agent_route";
 
     /// <summary>Maps a non-Ok store or rules result to its envelope; null for <c>Ok</c>.</summary>
     private static string? FromWriteResult(ServerTagWriteResult result, JsonObject? extra) => result switch

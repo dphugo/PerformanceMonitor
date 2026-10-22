@@ -8,6 +8,7 @@
 
 using System;
 using System.Globalization;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
@@ -112,8 +113,10 @@ VALUES ($1,$2,1,$3,'TestDb','dbo',$4,$5)", c);
             await DarlingModuleMap.RefreshRecentAsync(connection, null, Now, ct);
             Assert.Equal(Anchor.AddMinutes(30), await DarlingModuleMap.ReadWatermarkAsync(connection, ct));
 
-            /* The daily refresh obeys the same rule: its two-day window holds only the older row. */
-            await DarlingModuleMap.RefreshAsync(connection, null, ct);
+            /* The daily refresh obeys the same rule: its window holds only the older row. It runs on the explicit
+               clock: on the wall clock the 2026-01 anchor is past the lookback floor, and #5729 moves a watermark
+               over an empty span up to that floor. */
+            await DarlingModuleMap.RefreshFromWatermarkOrFullAsync(connection, null, Now, DarlingModuleMap.DailyRepairSlack, "module_map daily refresh", cancellationToken: ct);
             Assert.Equal(Anchor.AddMinutes(30), await DarlingModuleMap.ReadWatermarkAsync(connection, ct));
         });
     }
@@ -187,8 +190,9 @@ VALUES ($1,$2,1,$3,'TestDb','dbo',$4,$5)", c);
             await InsertProcAsync(connection, watermark.AddHours(-35), "0xSTART_FAR", "far", ct);
             await InsertProcAsync(connection, watermark.AddMinutes(30), "0xSTART_NEW", "new", ct);
 
-            /* The seed row at the watermark is re-read too: the slack reaches back past it. */
-            Assert.Equal(3, await DarlingModuleMap.RefreshAsync(connection, null, ct));
+            /* The seed row at the watermark is re-read too (the slack reaches back past it), but its names and
+               last_seen are what the map holds, so it is not rewritten and not counted (#5824): two rows written. */
+            Assert.Equal(2, await DarlingModuleMap.RefreshAsync(connection, null, ct));
             Assert.True(await InMapAsync(connection, "0xSTART_NEW", ct));
             Assert.True(await InMapAsync(connection, "0xSTART_BEHIND", ct));
             Assert.False(await InMapAsync(connection, "0xSTART_FAR", ct));
@@ -215,13 +219,15 @@ VALUES ($1,$2,1,$3,'TestDb','dbo',$4,$5)", c);
             await InsertProcAsync(connection, Ago(TimeSpan.FromHours(20)), "0xLATE_DAILY", "late-daily", ct);
             await InsertProcAsync(connection, Ago(TimeSpan.FromHours(26)), "0xLATE_START", "late-start", ct);
 
-            /* The hourly path cannot see either row. */
-            Assert.Equal(1, await DarlingModuleMap.RefreshRecentAsync(connection, null, DateTime.UtcNow, ct));
+            /* The hourly path cannot see either row. It re-reads the seed, which is unchanged, so it writes nothing
+               (#5824: an unchanged row is not rewritten). */
+            Assert.Equal(0, await DarlingModuleMap.RefreshRecentAsync(connection, null, DateTime.UtcNow, ct));
             Assert.False(await InMapAsync(connection, "0xLATE_DAILY", ct));
             Assert.False(await InMapAsync(connection, "0xLATE_START", ct));
 
-            /* The daily repairs both (a row stamped 26 hours before it is inside the 30-hour span). */
-            Assert.Equal(3, await DarlingModuleMap.RefreshAsync(connection, null, ct));
+            /* The daily repairs both (a row stamped 26 hours before it is inside the 30-hour span); the seed it
+               re-reads is unchanged and not rewritten (#5824). */
+            Assert.Equal(2, await DarlingModuleMap.RefreshAsync(connection, null, ct));
             Assert.True(await InMapAsync(connection, "0xLATE_DAILY", ct));
             Assert.True(await InMapAsync(connection, "0xLATE_START", ct));
         });
@@ -279,7 +285,8 @@ VALUES ($1,$2,1,$3,'TestDb','dbo',$4,$5)", c);
             await InsertProcAsync(connection, watermark.AddHours(-10), "0xDAILY_LATE10", "late10", ct);
             await InsertProcAsync(connection, watermark.AddHours(-40), "0xDAILY_TOOLATE", "toolate", ct);
 
-            Assert.Equal(3, await DarlingModuleMap.RefreshAsync(connection, null, ct));
+            /* Two rows written: the seed is re-read but unchanged, so it is not rewritten (#5824). */
+            Assert.Equal(2, await DarlingModuleMap.RefreshAsync(connection, null, ct));
             Assert.True(await InMapAsync(connection, "0xDAILY_LATE", ct));
             Assert.True(await InMapAsync(connection, "0xDAILY_LATE10", ct));
             Assert.False(await InMapAsync(connection, "0xDAILY_TOOLATE", ct));
@@ -329,7 +336,7 @@ VALUES ($1,$2,1,$3,'TestDb','dbo',$4,$5)", c);
         }
 
         Assert.Equal(2, refreshCalls.Count);
-        Assert.Contains("DarlingModuleMap.RefreshAsync(moduleMapConnection", worker, StringComparison.Ordinal);
+        Assert.Contains("DarlingModuleMap.RefreshAsync(moduleMapConnection, _logger, outcome", worker, StringComparison.Ordinal);
         Assert.Contains("DarlingModuleMap.RefreshRecentAsync(connection", worker, StringComparison.Ordinal);
         Assert.Contains("await RefreshModuleMapRecentAsync(stoppingToken);", worker, StringComparison.Ordinal);
 
@@ -397,6 +404,195 @@ VALUES ($1,$2,1,$3,'TestDb','dbo',$4,$5)", c);
             await DarlingModuleMap.RefreshRecentAsync(connection, null, Now, ct);
             Assert.Equal("after_rename", await ObjectNameForAsync(connection, "0xRECENT_R", ct));
             Assert.Equal(Anchor.AddMinutes(20), await ScalarAsync(connection, $"SELECT last_seen FROM collect.module_map WHERE server_name = '{Server}' AND sql_handle = '0xRECENT_R'", ct));
+        });
+    }
+
+    [Fact]
+    public async Task ARefreshOverUnchangedRows_WritesAndLocksNothing_AndCountsOnlyTheChangedRow()
+    {
+        await RunLiveAsync(async (connection, ct) =>
+        {
+            /* #5824: every refresh re-reads a slack behind the watermark, so it reads handles the map already holds
+               with the same names and last_seen. Those rows used to be rewritten (a new row version and its WAL on
+               every run). A rewritten row gets a new xmin; a row an ON CONFLICT arm only locked gets an xmax. An
+               unchanged row must get neither, and the count is the rows written. */
+            await InsertProcAsync(connection, Anchor, "0xSAME_A", "same_a", ct);
+            await InsertProcAsync(connection, Anchor, "0xSAME_B", "same_b", ct);
+            Assert.Equal(2, await DarlingModuleMap.RefreshRecentAsync(connection, null, Now, ct));
+            var tupleA = $"SELECT xmin::text || '/' || xmax::text FROM collect.module_map WHERE server_name = '{Server}' AND sql_handle = '0xSAME_A'";
+            var tupleB = $"SELECT xmin::text || '/' || xmax::text FROM collect.module_map WHERE server_name = '{Server}' AND sql_handle = '0xSAME_B'";
+            var beforeA = (string)(await ScalarAsync(connection, tupleA, ct))!;
+            var beforeB = (string)(await ScalarAsync(connection, tupleB, ct))!;
+            Assert.EndsWith("/0", beforeA, StringComparison.Ordinal);
+
+            Assert.Equal(0, await DarlingModuleMap.RefreshRecentAsync(connection, null, Now, ct));
+            Assert.Equal(beforeA, await ScalarAsync(connection, tupleA, ct));
+            Assert.Equal(beforeB, await ScalarAsync(connection, tupleB, ct));
+
+            /* B is seen again later under the same names: last_seen moves, so B alone is written. */
+            await InsertProcAsync(connection, Anchor.AddMinutes(5), "0xSAME_B", "same_b", ct);
+            Assert.Equal(1, await DarlingModuleMap.RefreshRecentAsync(connection, null, Now, ct));
+            Assert.Equal(beforeA, await ScalarAsync(connection, tupleA, ct));
+            Assert.NotEqual(beforeB, await ScalarAsync(connection, tupleB, ct));
+            Assert.Equal(Anchor.AddMinutes(5), await ScalarAsync(connection, $"SELECT last_seen FROM collect.module_map WHERE server_name = '{Server}' AND sql_handle = '0xSAME_B'", ct));
+        });
+    }
+
+    /// <summary>
+    /// #5824: the refresh's only deterministic lock order is the outer <c>ORDER BY n.server_name, n.sql_handle</c> on the
+    /// conflict key (the <c>NOT EXISTS</c> filter now wraps the DISTINCT ON whose sort used to give it), the #1801 rule for a
+    /// batch upsert. Two refreshes in two connections at once, the hourly shape (ten minutes behind the newest rows) and the
+    /// daily one (thirty hours behind), over overlapping handle sets: the daily one also reads handles the hourly window does
+    /// not reach. Every round gives every shared handle a newer row, so both statements write and lock the same rows. Both
+    /// must complete (a deadlock is 40P01 from one of them; the statement is run directly, because the refresh methods log a
+    /// failure and return 0), and the map must hold the newest row per handle.
+    /// </summary>
+    [Fact]
+    public async Task TwoConcurrentRefreshes_OverOverlappingHandles_BothComplete_AndTheMapHoldsTheNewestRowPerHandle()
+    {
+        await RunLiveAsync(async (connection, ct) =>
+        {
+            const int Shared = 3000;
+            const int DailyOnly = 500;
+            const int Rounds = 6;
+            const string SeedSql = @"INSERT INTO collect.procedure_stats (collection_id, collection_time, server_id, server_name, database_name, schema_name, object_name, sql_handle)
+SELECT $1 + g, $2, 1, $3, 'TestDb', 'dbo', $4 || g::text, $5 || lpad(g::text, 6, '0')
+FROM generate_series(1, $6) AS g";
+
+            async Task SeedAsync(DateTime at, string handlePrefix, string namePrefix, int count)
+            {
+                await using var cmd = new NpgsqlCommand(SeedSql, connection);
+                cmd.Parameters.AddWithValue(Interlocked.Add(ref s_collectionId, count + 1));
+                cmd.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = at });
+                cmd.Parameters.AddWithValue(Server);
+                cmd.Parameters.AddWithValue(namePrefix);
+                cmd.Parameters.AddWithValue(handlePrefix);
+                cmd.Parameters.AddWithValue(count);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            async Task RefreshAsync(NpgsqlConnection c, DateTime since, Barrier barrier)
+            {
+                await using var cmd = new NpgsqlCommand(DarlingModuleMap.RefreshSinceSql, c) { CommandTimeout = 120 };
+                cmd.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = since });
+                await cmd.PrepareAsync(ct);
+                barrier.SignalAndWait(ct);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            await SeedAsync(Anchor.AddHours(-2), "0xDAILY_", "daily_", DailyOnly);
+            await using var hourly = connection.CloneWith(connection.ConnectionString);
+            await using var daily = connection.CloneWith(connection.ConnectionString);
+            await hourly.OpenAsync(ct);
+            await daily.OpenAsync(ct);
+
+            for (var round = 1; round <= Rounds; round++)
+            {
+                var at = Anchor.AddMinutes(round);
+                await SeedAsync(at, "0xSHARED_", "r" + round.ToString(CultureInfo.InvariantCulture) + "_", Shared);
+                using var barrier = new Barrier(2);
+                var hourlyRun = Task.Run(() => RefreshAsync(hourly, at.AddMinutes(-10), barrier), ct);
+                var dailyRun = Task.Run(() => RefreshAsync(daily, at.AddHours(-30), barrier), ct);
+                try
+                {
+                    await Task.WhenAll(hourlyRun, dailyRun);
+                }
+                catch (PostgresException ex)
+                {
+                    Assert.Fail($"round {round}: a concurrent refresh failed with {ex.SqlState} ({ex.MessageText}); a 40P01 is the lock-order regression #1801 describes, and the fix is the order, not a retry.");
+                }
+
+                /* Every shared handle's newest row is this round's; every daily-only handle's is its one seed row. */
+                var wrong = await ScalarAsync(connection, $@"
+SELECT count(*)
+FROM (
+    SELECT DISTINCT ON (sql_handle) sql_handle, object_name, collection_time
+    FROM collect.procedure_stats
+    WHERE server_name = '{Server}'
+    ORDER BY sql_handle, collection_time DESC
+) AS newest
+LEFT JOIN collect.module_map AS m ON m.server_name = '{Server}' AND m.sql_handle = newest.sql_handle
+WHERE (m.object_name, m.last_seen) IS DISTINCT FROM (newest.object_name, newest.collection_time)", ct);
+                Assert.Equal(0L, wrong);
+            }
+
+            Assert.Equal((long)(Shared + DailyOnly), await ScalarAsync(connection, $"SELECT count(*) FROM collect.module_map WHERE server_name = '{Server}'", ct));
+            Assert.Equal(Anchor.AddMinutes(Rounds), await DarlingModuleMap.ReadWatermarkAsync(connection, ct));
+        });
+    }
+
+    private static readonly TimeSpan StaleBy = TimeSpan.FromDays(5);
+
+    private static async Task SeedStaleWatermarkAsync(NpgsqlConnection c, DateTime watermark, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(
+            "INSERT INTO collect.module_map_state (id, refreshed_through, refreshed_at) VALUES (1, $1, $1) ON CONFLICT (id) DO UPDATE SET refreshed_through = EXCLUDED.refreshed_through, refreshed_at = EXCLUDED.refreshed_at", c);
+        cmd.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Timestamp, Value = watermark });
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static int LookbackWarnings(CapturingTestLogger log) =>
+        log.Lines.Count(l => l.StartsWith("Warning:", StringComparison.Ordinal) && l.Contains("older than the 2-day lookback", StringComparison.Ordinal));
+
+    [Fact]
+    public async Task AStaleWatermark_WithNoRowsInTheSkippedSpan_DoesNotWarn_AndMovesToTheFloor_AndStaysQuiet()
+    {
+        await RunLiveAsync(async (connection, ct) =>
+        {
+            /* #5729: a quiet fleet. The watermark is five days behind the clock and procedure_stats holds nothing
+               between it and the two-day floor, so nothing was missed. */
+            var floor = Now - DarlingModuleMap.MaxLookback;
+            await SeedStaleWatermarkAsync(connection, Now - StaleBy, ct);
+            var log = new CapturingTestLogger();
+
+            await DarlingModuleMap.RefreshRecentAsync(connection, log, Now, ct);
+            Assert.True(LookbackWarnings(log) == 0, log.Joined);
+            Assert.Contains(log.Lines, l => l.StartsWith("Debug:", StringComparison.Ordinal) && l.Contains("nothing was missed", StringComparison.Ordinal));
+            Assert.Equal(floor, await DarlingModuleMap.ReadWatermarkAsync(connection, ct));
+
+            /* The next refresh starts from the floor, so it does not warn again. */
+            var second = new CapturingTestLogger();
+            await DarlingModuleMap.RefreshRecentAsync(connection, second, Now.AddHours(1), ct);
+            Assert.Equal(0, LookbackWarnings(second));
+            Assert.Equal(0, second.CountAtLevel(Microsoft.Extensions.Logging.LogLevel.Warning));
+        });
+    }
+
+    [Fact]
+    public async Task AStaleWatermark_WithARowInTheSkippedSpan_StillWarns_AndTheWatermarkStays()
+    {
+        await RunLiveAsync(async (connection, ct) =>
+        {
+            var stale = Now - StaleBy;
+            await SeedStaleWatermarkAsync(connection, stale, ct);
+            await InsertProcAsync(connection, Now.AddDays(-3), "0xSKIPPED", "skipped", ct);
+            var log = new CapturingTestLogger();
+
+            Assert.Equal(0, await DarlingModuleMap.RefreshRecentAsync(connection, log, Now, ct));
+            Assert.True(LookbackWarnings(log) == 1, log.Joined);
+            Assert.Equal(stale, await DarlingModuleMap.ReadWatermarkAsync(connection, ct));
+        });
+    }
+
+    [Fact]
+    public async Task TheDailyRefresh_SharesTheQuietSpanCheck()
+    {
+        await RunLiveAsync(async (connection, ct) =>
+        {
+            /* The daily path needs a map row to trust the watermark; seed one directly, with the watermark stale. */
+            await ExecAsync(connection, $"INSERT INTO collect.module_map (server_name, sql_handle, object_name, last_seen) VALUES ('{Server}', '0xDAILY', 'daily', now() AT TIME ZONE 'UTC')", ct);
+            await SeedStaleWatermarkAsync(connection, Now - StaleBy, ct);
+            var log = new CapturingTestLogger();
+
+            await DarlingModuleMap.RefreshFromWatermarkOrFullAsync(connection, log, Now, DarlingModuleMap.DailyRepairSlack, "module_map daily refresh", cancellationToken: ct);
+            Assert.True(LookbackWarnings(log) == 0, log.Joined);
+            Assert.Equal(Now - DarlingModuleMap.MaxLookback, await DarlingModuleMap.ReadWatermarkAsync(connection, ct));
+
+            await ExecAsync(connection, $"UPDATE collect.module_map_state SET refreshed_through = '{(Now - StaleBy):yyyy-MM-dd HH:mm:ss}'", ct);
+            await InsertProcAsync(connection, Now.AddDays(-3), "0xSKIPPED2", "skipped2", ct);
+            var withRow = new CapturingTestLogger();
+            await DarlingModuleMap.RefreshFromWatermarkOrFullAsync(connection, withRow, Now, DarlingModuleMap.DailyRepairSlack, "module_map daily refresh", cancellationToken: ct);
+            Assert.Equal(1, LookbackWarnings(withRow));
         });
     }
 

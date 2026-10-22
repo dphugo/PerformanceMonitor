@@ -554,6 +554,34 @@ AND   event_xml IS NOT NULL";
     }
 
     /// <summary>
+    /// #6441: the note the collector's NEWEST run left, when that run succeeded (null otherwise). A truncated ring buffer
+    /// is recorded only there (<see cref="PerformanceMonitor.Common.RingBufferTruncationNote"/>): the run is SUCCESS,
+    /// usually with 0 rows. Darling twin: <c>DarlingSystemHealthReader.GetLatestRunNoteAsync</c>.
+    /// </summary>
+    public async Task<string?> GetLatestCollectorRunNoteAsync(int serverId, string collectorName)
+    {
+        using var connection = await OpenConnectionAsync();
+        using var command = connection.CreateCommand();
+
+        command.CommandText = @"
+SELECT CASE WHEN cl.status = 'SUCCESS' THEN cl.error_message END
+FROM v_collection_log AS cl
+WHERE cl.server_id = $1
+AND   cl.collector_name = $2
+AND   cl.collection_time =
+      (
+          SELECT MAX(n.collection_time)
+          FROM v_collection_log AS n
+          WHERE n.server_id = $1
+          AND   n.collector_name = $2
+      )";
+
+        command.Parameters.Add(new DuckDBParameter { Value = serverId });
+        command.Parameters.Add(new DuckDBParameter { Value = collectorName });
+        return await command.ExecuteScalarAsync() as string;
+    }
+
+    /// <summary>
     /// How many raw events of one type the window held BEFORE any shred or significance gate - the count that
     /// lets a zero-row answer say "captured and gated out" (healthy) rather than "nothing here" (#3541 A12).
     /// <para>Run only on the empty path, and over the SAME window arithmetic the typed readers use
@@ -838,8 +866,15 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY database_id ORDER BY collection_time DES
         var endTime = clock.ToServerLocal(windowEndUtc).AddHours(1);
         var dbClause = BuildDbInClause(databaseNames, "database_name", 4, out var dbValues);
 
+        /* #5644 W6: DISTINCT drops the stored copies of one event (the Begin and Commit rows of a DDL that an older
+           build kept, and an event re-stored by the datetime watermark round trip): a copy repeats every column
+           selected here INCLUDING event_sequence. Two real events with identical columns (the same DBCC or audit event
+           from one spid in one 3.33 ms tick) carry different sequences and both stay; a row stored before the column
+           existed has a NULL sequence, which DISTINCT keeps as the column-only key. filename and event_class are
+           selected for the same reason as the MCP reader and the viewer key on them (the grid does not show them): two
+           Data File Auto Grow rows for different files in one tick are two events. */
         command.CommandText = @"
-SELECT
+SELECT DISTINCT
     event_time,
     event_name,
     database_name,
@@ -852,7 +887,10 @@ SELECT
     integer_data,
     severity,
     error_number,
-    text_data
+    text_data,
+    filename,
+    event_class,
+    event_sequence
 FROM v_default_trace_events
 WHERE server_id = $1
 AND   event_time >= $2

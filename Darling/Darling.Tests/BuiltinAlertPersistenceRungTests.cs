@@ -29,7 +29,6 @@ namespace Darling.Tests;
 /// claims, and they are stated against this rung's own NUMBER — read out of the ladder rather than taken
 /// from <see cref="StorageVersion.SchemaVersion"/>, which is no longer it.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
 public sealed class BuiltinAlertPersistenceRungTests
 {
     /// <summary>This rung's number, DERIVED from the ladder entry that owns the name rather than written as
@@ -100,7 +99,6 @@ public sealed class BuiltinAlertPersistenceRungTests
             ViewerDataService.StoreSchemaProbeSql, StringComparison.Ordinal);
 
         var viewer = RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Viewer", "ViewerDataService.cs");
-        Assert.Contains($"reader.GetBoolean({ProbeOrdinal})", viewer, StringComparison.Ordinal);
         Assert.Contains("hasBuiltinAlertPersistence", viewer, StringComparison.Ordinal);
 
         var method = typeof(ViewerDataService)
@@ -149,8 +147,9 @@ public sealed class BuiltinAlertPersistenceRungTests
     /// BATCH of samples rather than the latest one.
     ///
     /// <para>The batch is the load-bearing half and it is engine-specific. On SQL Server the 30-second
-    /// sweep is faster than the ~60-second sample, so "latest row, counted once when its instant moves"
-    /// loses nothing. Performance Insights is sampled at 60 seconds and <c>pg_cpu_utilization</c> is a
+    /// sweep is faster than the ~60-second sample, so a steady stream is seen sample by sample (#5642: the
+    /// shared engine also feeds a recent list sample by sample now, where it used to count only the latest
+    /// row when its instant moved). Performance Insights is sampled at 60 seconds and <c>pg_cpu_utilization</c> is a
     /// five-minute collector, so five points land together: counting only the newest would discard four in
     /// five and make three consecutive breaches take three BATCHES, about fifteen minutes. That is a
     /// saturation event reported long after it mattered, and it is exactly the failure the issue's own
@@ -347,7 +346,7 @@ public sealed class BuiltinAlertPersistenceRungTests
     /// without parsing comments at all. Two earlier spellings of this pin are the reason it is shaped this
     /// way. Scoped to the file, it flagged nine correct citations — those files cite V32, V40, V44, V50,
     /// V60, V61, V80 and V81 for their own tables, all right. Scoped to comment BLOCKS instead, it needed a
-    /// hand-rolled line-prefix comment filter, which <c>CommentFilterAdoptionTests</c> correctly refuses
+    /// hand-rolled line-prefix comment filter, which is unsound
     /// without a stated bound — and the bound I measured for it came back unreliable on its own terms. A
     /// phrase that names both the table and the rung needs neither: it cannot match another rung's citation
     /// because it does not describe another rung's subject.</para>
@@ -421,7 +420,7 @@ public sealed class BuiltinAlertPersistenceRungTests
     [Fact]
     public void TheReadmeAlertCatalogStatesTheSampleCountItActuallyUses()
     {
-        var readme = RepoFile.ReadRepoFileLf("README.md");
+        var readme = RepoFile.ReadRepoFileLf("docs", "alerts.md"); // #5860: the alert catalog moved from the root README to this page
 
         var row = readme
             .Split('\n')

@@ -74,6 +74,24 @@ public sealed class WebDatabaseFilterPickerBehaviourTests
         Assert.Equal("false", r.GetProperty("expandedAfterNavigation").GetString());
     }
 
+    /// <summary>
+    /// #4190 / #6310: the server page re-reads /api/fleet only for an unseen server, for the poll, or for a remembered card older than
+    /// 60 s. A tab click on a fresh card reuses it. Replaces the source-text pin
+    /// <c>WebFetchLayerTests.ServerJs_OnlyRefetchesFleetForAnUnseenServerOrThePoll</c>.
+    /// </summary>
+    [Fact]
+    public void ServerPage_RefetchesTheFleetCardOnlyForAnUnseenServerThePollOrAnOldCard()
+    {
+        var r = Run("fleetRefetch");
+
+        Assert.Equal(1, r.GetProperty("afterUnseen").GetInt32());
+        Assert.Equal(1, r.GetProperty("afterFreshClick").GetInt32());
+        Assert.Equal(2, r.GetProperty("afterPoll").GetInt32());
+        Assert.Equal(3, r.GetProperty("afterOldClick").GetInt32());
+        // The old-card refetch re-stamped the card, so the next click is fresh again.
+        Assert.Equal(3, r.GetProperty("afterClickOnRefreshedCard").GetInt32());
+    }
+
     [Fact]
     public void APostgreSqlServer_GetsNoPicker_AndNoFilter()
     {
@@ -158,6 +176,9 @@ public sealed class WebDatabaseFilterPickerBehaviourTests
         Assert.True(r.GetProperty("fiftyFirstDisabled").GetBoolean());
         Assert.Equal(50, r.GetProperty("checkedAfter").GetInt32());
         Assert.Equal("Limit reached: uncheck a database to pick another.", r.GetProperty("hint").GetString());
+        // #6159: the count says how many are picked and the most that may be; "0 / 50 selected" read as 50 databases listed.
+        Assert.Equal("0 selected (up to 50)", r.GetProperty("countAtOpen").GetString());
+        Assert.Equal("50 selected (up to 50)", r.GetProperty("countAtLimit").GetString());
         Assert.Equal(50, r.GetProperty("storedCount").GetInt32());
     }
 

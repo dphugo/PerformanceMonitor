@@ -85,6 +85,8 @@ public partial class MuteRuleEditDialog : Window
             WaitTypePatternBox.Text = context.WaitType;
         if (!string.IsNullOrEmpty(context.JobName))
             JobNamePatternBox.Text = context.JobName;
+        if (!string.IsNullOrEmpty(context.ClientAppName))
+            ClientAppPatternBox.Text = context.ClientAppName;
     }
 
     private void PopulateFromRule(MuteRule rule)
@@ -95,9 +97,19 @@ public partial class MuteRuleEditDialog : Window
         QueryTextPatternBox.Text = rule.QueryTextPattern ?? "";
         WaitTypePatternBox.Text = rule.WaitTypePattern ?? "";
         JobNamePatternBox.Text = rule.JobNamePattern ?? "";
+        ClientAppPatternBox.Text = rule.ClientAppPattern ?? "";
 
         if (!string.IsNullOrEmpty(rule.MetricName))
             SelectMetric(rule.MetricName);
+
+        /* #6231: a rule that already has a start keeps it unless the operator picks another: the first entry stands for the stored
+           start, so an edit that never touches the combo cannot move or drop it. */
+        if (rule.StartsAtUtc is { } storedStart)
+        {
+            _keptStart = storedStart;
+            StartCombo.Items.Insert(0, new ComboBoxItem { Content = $"Keep: {storedStart.ToLocalTime():g}" });
+            StartCombo.SelectedIndex = 0;
+        }
 
         if (rule.ExpiresAtUtc == null)
         {
@@ -138,6 +150,8 @@ public partial class MuteRuleEditDialog : Window
             ? WaitTypePatternBox.Text.Trim() : null;
         Rule.JobNamePattern = JobNamePatternBox.Visibility == Visibility.Visible && !string.IsNullOrWhiteSpace(JobNamePatternBox.Text)
             ? JobNamePatternBox.Text.Trim() : null;
+        Rule.ClientAppPattern = ClientAppPatternBox.Visibility == Visibility.Visible && !string.IsNullOrWhiteSpace(ClientAppPatternBox.Text)
+            ? ClientAppPatternBox.Text.Trim() : null;
 
         if (MetricCombo.SelectedIndex > 0 && MetricCombo.SelectedItem is ComboBoxItem selected)
             Rule.MetricName = selected.Content?.ToString();
@@ -152,8 +166,16 @@ public partial class MuteRuleEditDialog : Window
             _ => null
         };
 
+        Rule.StartsAtUtc = StartFromSelection(StartCombo.SelectedIndex, _keptStart, DateTime.UtcNow);
+        if (WindowRefusal(Rule.StartsAtUtc, Rule.ExpiresAtUtc) is { } windowProblem)
+        {
+            MessageBox.Show(windowProblem, "Mute Rule", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
         if (Rule.ServerName == null && Rule.MetricName == null && Rule.DatabasePattern == null
-            && Rule.QueryTextPattern == null && Rule.WaitTypePattern == null && Rule.JobNamePattern == null)
+            && Rule.QueryTextPattern == null && Rule.WaitTypePattern == null && Rule.JobNamePattern == null
+            && Rule.ClientAppPattern == null)
         {
             var result = MessageBox.Show(
                 "This rule has no filters and will mute ALL alerts. Are you sure?",
@@ -163,6 +185,31 @@ public partial class MuteRuleEditDialog : Window
 
         DialogResult = true;
     }
+
+    /// <summary>The start the Starts combo stands for (#6231). When the rule being edited already had a start, entry 0 is "Keep" and
+    /// the entries after it are the four offsets; otherwise entry 0 is "Now" (no start) and the entries after it are the same four.</summary>
+    internal static DateTime? StartFromSelection(int selectedIndex, DateTime? keptStart, DateTime nowUtc)
+    {
+        var offset = keptStart.HasValue ? selectedIndex - 1 : selectedIndex;
+        if (keptStart.HasValue && selectedIndex == 0)
+            return keptStart;
+        return offset switch
+        {
+            1 => nowUtc.AddHours(1),
+            2 => nowUtc.AddHours(4),
+            3 => nowUtc.AddHours(12),
+            4 => nowUtc.AddHours(24),
+            _ => null
+        };
+    }
+
+    /// <summary>The refusal for an end that is not after the start, or null.</summary>
+    internal static string? WindowRefusal(DateTime? startsAtUtc, DateTime? expiresAtUtc) =>
+        startsAtUtc.HasValue && expiresAtUtc.HasValue && expiresAtUtc.Value <= startsAtUtc.Value
+            ? "The rule would end before it starts. Pick a later 'Expires After' or an earlier start."
+            : null;
+
+    private DateTime? _keptStart;
 
     private void Cancel_Click(object sender, RoutedEventArgs e) => DialogResult = false;
 
@@ -174,17 +221,21 @@ public partial class MuteRuleEditDialog : Window
 
         /* #1839's "Blocking Wait Time" carries the same blocked-process context as "Blocking Detected",
            so it offers the same database/query-text pattern fields. */
-        bool showDatabase = metric is null or "(any)" or "Blocking Detected" or "Blocking Wait Time" or "Deadlocks Detected" or "Long-Running Query";
+        bool showDatabase = metric is null or "(any)" or "Blocking Detected" or "Blocking Wait Time" or "Deadlocks Detected" or "Long-Running Query" or AlertFamily.ClientTimeoutsMetric;
         bool showWaitType = metric is null or "(any)" or "Poison Wait" or "Long-Running Query";
         bool showQueryText = metric is null or "(any)" or "Blocking Detected" or "Blocking Wait Time" or "Long-Running Query";
         bool showJobName = metric is null or "(any)" or "Long-Running Job";
+        /* #5640: Client Timeouts offers Database AND Client Application, the two dimensions its alert carries, so the
+           same "Mute this alert" click makes the same rule here, in Lite and on the web page. */
+        bool showClientApp = metric is null or "(any)" or AlertFamily.ClientTimeoutsMetric;
 
         DatabaseLabel.Visibility = DatabasePatternBox.Visibility = showDatabase ? Visibility.Visible : Visibility.Collapsed;
         WaitTypeLabel.Visibility = WaitTypePatternBox.Visibility = showWaitType ? Visibility.Visible : Visibility.Collapsed;
         QueryTextLabel.Visibility = QueryTextPatternBox.Visibility = showQueryText ? Visibility.Visible : Visibility.Collapsed;
         JobNameLabel.Visibility = JobNamePatternBox.Visibility = showJobName ? Visibility.Visible : Visibility.Collapsed;
+        ClientAppLabel.Visibility = ClientAppPatternBox.Visibility = showClientApp ? Visibility.Visible : Visibility.Collapsed;
 
-        PatternFieldsGrid.Visibility = (showDatabase || showWaitType || showQueryText || showJobName)
+        PatternFieldsGrid.Visibility = (showDatabase || showWaitType || showQueryText || showJobName || showClientApp)
             ? Visibility.Visible : Visibility.Collapsed;
     }
 }

@@ -9,6 +9,7 @@
 using System;
 using Microsoft.Data.SqlClient;
 using Npgsql;
+using PerformanceMonitor.Darling.Storage;
 
 namespace PerformanceMonitor.Darling.Service;
 
@@ -34,7 +35,8 @@ public static class MonitoredServerConnection
 
         var builder = new SqlConnectionStringBuilder
         {
-            DataSource = server.Host,
+            /* tcp: so SqlClient never falls back to a named pipe over SMB with this process's Windows credentials (#6352). */
+            DataSource = PerformanceMonitor.Common.ServerHostSetting.TcpDataSource(server.Host),
             InitialCatalog = string.IsNullOrWhiteSpace(server.Database) ? "master" : server.Database,
             ApplicationName = "PerformanceMonitorDarling",
             ConnectTimeout = 15,
@@ -83,6 +85,53 @@ public static class MonitoredServerConnection
         {
             builder.IntegratedSecurity = true;
         }
+
+        return builder.ConnectionString;
+    }
+
+    /// <summary>
+    /// #6254: the connection string for reading Query Store from the server's readable replica, or null when the server has none,
+    /// is a PostgreSQL target (never has one) or is an Azure SQL Database (<paramref name="isAzureSqlDatabase"/>: it reads Query
+    /// Store from itself in this version, the same gate Lite's runner applies). It is the server's own connection string
+    /// (<see cref="BuildConnectionString"/>) with the host replaced by the replica (a host, <c>host,port</c> or listener name, taken
+    /// as typed) and <c>ApplicationIntent=ReadOnly</c>: the same login, authentication, encryption, certificate trust,
+    /// MultiSubnetFailover, database and timeouts. The ONE place the replica connection is built, so no caller assembles its own.
+    ///
+    /// <para><b>The replica and the password come from one place.</b> The replica is read from
+    /// <see cref="MonitoredServer.ConnectionIdentity"/>, the identity the stored password's seal is opened with
+    /// (<see cref="PasswordBinding.ForServer"/>), not from the free <see cref="MonitoredServer.QueryStoreReplica"/> property, and the
+    /// password is resolved here from the same server object (<see cref="DarlingSecrets.ResolvePassword(MonitoredServer, out bool, IPasswordKeyRing?)"/>),
+    /// never passed in: so a password opened for one replica host cannot be sent to another. A stored <c>env:</c>/<c>file:</c>
+    /// reference is not covered by a seal, so one is used for the replica only when darling.json declares it
+    /// (<see cref="MonitoredServer.EncryptedPasswordDeclaredByFile"/>); a store that holds one without the file's word refuses.
+    /// A refused or unresolvable password throws <see cref="InvalidOperationException"/>, as the primary connection's does.</para>
+    /// This builds a string and opens nothing.
+    /// </summary>
+    public static string? BuildQueryStoreReplicaConnectionString(MonitoredServer server, bool isAzureSqlDatabase, IPasswordKeyRing? ring = null)
+    {
+        if (server is null)
+        {
+            throw new ArgumentNullException(nameof(server));
+        }
+
+        if (server.IsPostgres || isAzureSqlDatabase
+            || QueryStoreReplicaSetting.Normalize(server.ConnectionIdentity.QueryStoreReplica) is not { } replica)
+        {
+            return null;
+        }
+
+        /* The last gate, for a value that reached the store without the surfaces' check (a direct write to the table). */
+        if (QueryStoreReplicaSetting.Refusal(replica) is { } replicaRefusal)
+        {
+            throw new InvalidOperationException($"servers['{server.DisplayName}'].queryStoreReplica: {replicaRefusal}");
+        }
+
+        var password = DarlingSecrets.ResolveReplicaPassword(server, ring);
+        var builder = new SqlConnectionStringBuilder(BuildConnectionString(server, password))
+        {
+            DataSource = PerformanceMonitor.Common.ServerHostSetting.TcpDataSource(replica),
+            ApplicationIntent = ApplicationIntent.ReadOnly,
+        };
 
         return builder.ConnectionString;
     }
@@ -144,7 +193,8 @@ public static class MonitoredServerConnection
 
         var builder = new SqlConnectionStringBuilder
         {
-            DataSource = server.Host,
+            /* tcp: so SqlClient never falls back to a named pipe over SMB with this process's Windows credentials (#6352). */
+            DataSource = PerformanceMonitor.Common.ServerHostSetting.TcpDataSource(server.Host),
             InitialCatalog = string.IsNullOrWhiteSpace(server.Database) ? "master" : server.Database,
             ApplicationName = RemediationApplicationName,
             ConnectTimeout = 15,
@@ -227,6 +277,72 @@ public static class MonitoredServerConnection
             builder.Port = server.Port;
         }
 
+        builder.Options = PinSearchPath(builder.Options);
+
+        /* #6143: Npgsql's own Search Path keyword is sent as a separate startup parameter, which the server applies
+           after the -c options and so would replace the pin. Cleared explicitly, whatever the stored string said. */
+        builder.SearchPath = null;
+
         return builder.ConnectionString;
+    }
+
+    /// <summary>The startup option every monitoring connection to a PostgreSQL target carries (#6143).</summary>
+    public const string PinnedSearchPathOption = "-c search_path=pg_catalog,pg_temp";
+
+    /// <summary>
+    /// Adds <see cref="PinnedSearchPathOption"/> to a connection's startup <c>Options</c>, keeping any option already
+    /// there (#6143).
+    /// <para>The collectors connect to every database on a target, and a database or role setting
+    /// (<c>ALTER DATABASE ... SET search_path</c>, <c>ALTER ROLE ... SET search_path</c>) would otherwise decide how
+    /// each unqualified function, operator and relation name in their SQL resolves. A setting sent at sign-in takes
+    /// precedence over both, so collector SQL resolves against pg_catalog, with pg_temp last. Extension objects are
+    /// named by the schema they were created in instead (<c>CollectorContext.PgExtensionSchema</c>).</para>
+    /// <para>The pin is always the LAST option: the server applies the options in order, so a later
+    /// <c>-c search_path=...</c> replaces an earlier one, and an option already present that merely contains the pin's
+    /// text (<c>-c search_path=pg_catalog,pg_temp,public</c>) is overridden rather than taken for the pin.</para>
+    /// </summary>
+    public static string PinSearchPath(string? options)
+    {
+        if (string.IsNullOrWhiteSpace(options))
+        {
+            return PinnedSearchPathOption;
+        }
+
+        var trimmed = options.TrimEnd();
+        return EndsWithPinOption(trimmed) ? trimmed : trimmed + " " + PinnedSearchPathOption;
+    }
+
+    /* True when the pin is the whole string or its last two tokens: preceded by whitespace that no backslash escapes
+       (the server splits options on unescaped whitespace, so an escaped space would join the pin to the token before). */
+    /// <summary>Whether <paramref name="options"/> ends with <see cref="PinnedSearchPathOption"/> as its own option, as
+    /// <see cref="PinSearchPath"/> leaves it (#6143).</summary>
+    internal static bool CarriesPin(string? options) =>
+        !string.IsNullOrWhiteSpace(options) && EndsWithPinOption(options.TrimEnd());
+
+    private static bool EndsWithPinOption(string options)
+    {
+        if (!options.EndsWith(PinnedSearchPathOption, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var start = options.Length - PinnedSearchPathOption.Length;
+        if (start == 0)
+        {
+            return true;
+        }
+
+        if (!DarlingServerConnector.IsPgListSpace(options[start - 1]))
+        {
+            return false;
+        }
+
+        var backslashes = 0;
+        for (var i = start - 2; i >= 0 && options[i] == '\\'; i--)
+        {
+            backslashes++;
+        }
+
+        return backslashes % 2 == 0;
     }
 }

@@ -35,7 +35,7 @@ namespace Darling.Tests;
 /// (no live PG). Also pins the tool surface, param contracts, snapshot-read SQL, the 27-setting database-config
 /// column list, and the Gemini-clean advertised schema.
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class DarlingMcpConfigHistoryToolsSurfaceAndSqlTests
 {
     private static readonly string[] ConfigToolSurface =
@@ -293,10 +293,11 @@ public sealed class DarlingMcpConfigHistoryToolsSurfaceAndSqlTests
             Assert.Contains(sentence, darling, StringComparison.Ordinal);
         }
 
-        /* The instructions rows and the web catalogue row name the fields too, so a client reading either
-           index rather than the tool list learns the row grew. */
-        Assert.Contains("`get_query_store_health` | Per-database Query Store health (latest hourly snapshot) — actual vs desired state, readonly_reason decoded, storage vs cap, cleanup thresholds, and the two capture modes (`query_capture_mode` ALL / AUTO / CUSTOM / NONE — ALL is the plan-churn factory; `wait_stats_capture_mode` ON / OFF; null = pre-rung row or pre-2017 engine) |", DarlingMcpInstructions.Text, StringComparison.Ordinal);
-        Assert.Contains("`get_query_store_health` | Per-database Query Store health (latest hourly snapshot) — actual vs desired state, readonly_reason decoded, storage vs cap, cleanup thresholds, and the two capture modes (`query_capture_mode` ALL / AUTO / CUSTOM / NONE — ALL is the plan-churn factory; `wait_stats_capture_mode` ON / OFF; null = pre-rung row or pre-2017 engine) |", RepoFile.ReadRepoFile("Lite", "Mcp", "McpInstructions.cs"), StringComparison.Ordinal);
+        /* The web catalogue row names the fields too, so a client reading that index rather than the tool list
+           learns the row grew. The server instructions carry no per-tool row (#5779): the tool's own
+           description is the one copy, pinned above. */
+        Assert.DoesNotContain("`get_query_store_health` |", DarlingMcpInstructions.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("`get_query_store_health` |", RepoFile.ReadRepoFile("Lite", "Mcp", "McpInstructions.cs"), StringComparison.Ordinal);
         Assert.Contains("[\"get_query_store_health\"] = R(CatConfig, \"Per-database Query Store health: actual vs desired state, readonly_reason, storage vs cap, and the two capture modes (query_capture_mode ALL / AUTO / CUSTOM / NONE, wait_stats_capture_mode ON / OFF; null on a pre-rung row or a pre-2017 engine).\"", RepoFile.ReadRepoFile("Darling", "PerformanceMonitor.Darling.Service", "DarlingWebEndpoints.cs"), StringComparison.Ordinal);
     }
 
@@ -580,7 +581,6 @@ public sealed class DarlingMcpConfigHistoryToolsSurfaceAndSqlTests
 /// asserts the change tools surface the change and the scoped-config tool round-trips.
 /// </summary>
 [Collection("live-postgres")]
-[Trait("Reads", "Lite")]
 public sealed class DarlingMcpConfigHistoryToolsLivePostgresTests
 {
     private const string ServerName = "darling-mcp-confighist-e2e";
@@ -734,7 +734,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
     /// <paramref name="stepMinutes"/> minutes from <paramref name="runsFrom"/> to <paramref name="runsTo"/> (none when null), and one config snapshot
     /// at each of <paramref name="snapshots"/>, each differing from the one before it (so every snapshot after the first is a change).</summary>
     private static async Task SeedWindowServerAsync(
-        NpgsqlConnection connection, string tool, string name, DateTime created, DateTime? runsFrom, DateTime runsTo, int stepMinutes, DateTime[] snapshots, System.Threading.CancellationToken ct)
+        NpgsqlConnection connection, string tool, string name, DateTime created, DateTime? runsFrom, DateTime runsTo, int stepMinutes, DateTime[] snapshots, System.Threading.CancellationToken ct, int runRows = 0)
     {
         var serverId = ServerIdHelper.GetDeterministicHashCode(name);
         await DeleteWindowServerAsync(connection, name, ct);
@@ -745,9 +745,9 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
         {
             await DarlingMcpTestData.ExecAsync(connection, ct,
                 @"INSERT INTO collection_log (log_id, server_id, server_name, collector_name, collection_time, duration_ms, status, rows_collected)
-SELECT row_number() OVER (), $1, $2, $3, t, 12, 'SUCCESS', 0
+SELECT row_number() OVER (), $1, $2, $3, t, 12, 'SUCCESS', $7
 FROM generate_series($4::timestamp, $5::timestamp, make_interval(mins => $6)) AS t",
-                serverId, name, TableOf(tool), DarlingMcpTestData.Naive(from), DarlingMcpTestData.Naive(runsTo), stepMinutes);
+                serverId, name, TableOf(tool), DarlingMcpTestData.Naive(from), DarlingMcpTestData.Naive(runsTo), stepMinutes, runRows);
         }
 
         for (var i = 0; i < snapshots.Length; i++)
@@ -972,7 +972,11 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
 
             /* The same server with one run 35 minutes into the window. */
             var start = end.AddHours(-1);
-            await SeedWindowServerAsync(connection, tool, name, end.AddDays(-30), start.AddMinutes(35), start.AddMinutes(35), 600, [end.AddDays(-3)], ct);
+            await SeedWindowServerAsync(connection, tool, name, end.AddDays(-30), start.AddMinutes(35), start.AddMinutes(35), 600, [end.AddDays(-3)], ct,
+                /* #5633 item 19: a successful trace_flags run that stored ZERO rows is an empty snapshot, so it would turn the seeded flag
+                   off inside the window and answer with that change instead of the covered empty answer this case is about. The run here
+                   is one that stored a row; the other two collectors' runs do not read rows. */
+                runRows: 1);
 
             var covered = Parse(await CallAsync(postgres, tool, name, 1, end)).GetProperty("hints");
             Assert.False(covered.GetProperty("window_truncated").GetBoolean(), tool);

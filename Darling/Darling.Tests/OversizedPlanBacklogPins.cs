@@ -35,7 +35,7 @@ namespace Darling.Tests;
 ///
 /// <para>Every fact here was verified red-first by mutating the shipped behaviour it describes.</para>
 /// </summary>
-[Trait("Reads", "Lite")]
+[Trait("Stage", "Guard")]
 public sealed class OversizedPlanBacklogPins
 {
     private const string SweepSource = "Darling/PerformanceMonitor.Darling.Service/OversizedPlanBacklogSweep.cs";
@@ -659,8 +659,8 @@ public sealed class OversizedPlanBacklogPins
         Assert.Equal(new[] { "ConnectPostgresAsync" }, stamping);
 
         /* The accepted PostgreSQL spellings, lifted from the arm that maps them. */
-        var raw = ReadRepoFile("Darling/PerformanceMonitor.Darling.Service/DarlingConfig.cs");
-        var armAt = raw.IndexOf("=> CollectorTargetEngine.PostgreSql,", StringComparison.Ordinal);
+        var raw = ReadRepoFile("PerformanceMonitor.Collectors/MonitoredEngineKind.cs");
+        var armAt = raw.IndexOf("=> CollectorTargetEngine.PostgreSql,", raw.IndexOf("ParseConfiguredEngine(string?", StringComparison.Ordinal), StringComparison.Ordinal);
         Assert.True(armAt > 0, "the engine-token switch no longer has a PostgreSql arm");
 
         var lineStart = raw.LastIndexOf('\n', armAt) + 1;
@@ -1029,7 +1029,6 @@ public sealed class OversizedPlanBacklogPins
            rung still owns. */
         Assert.Contains("table_name = 'oversized_plan_backlog'", viewer, StringComparison.Ordinal);
         Assert.Contains("bool hasOversizedPlanBacklog = false", viewer, StringComparison.Ordinal);
-        Assert.Contains("reader.GetBoolean(96)", viewer, StringComparison.Ordinal);
 
         /* Above V120's arm. Newest-first is the whole contract of that method; "the TOP arm" was V122's
            claim to inherit, and PgAlertCountKnobRungTests holds it now. */

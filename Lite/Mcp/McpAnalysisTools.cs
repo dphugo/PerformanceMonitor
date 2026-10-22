@@ -50,7 +50,7 @@ public sealed class McpAnalysisTools
             {
                 return JsonSerializer.Serialize(new
                 {
-                    server = resolved.ServerName,
+                    server = resolved.DisplayName,
                     status = "insufficient_data",
                     message = analysisService.InsufficientDataMessage
                 }, McpHelpers.JsonOptions);
@@ -88,7 +88,7 @@ public sealed class McpAnalysisTools
                 return McpHelpers.Status(
                     "unavailable",
                     analysisService.WindowEmptyMessage +
-                    " Check get_collection_health to see when collectors last succeeded and why they stopped." +
+                    " Check get_collection_health to see when each collector last succeeded." +
                     (unobservedCaveat is null ? string.Empty : $" COLLECTION CAVEAT: {unobservedCaveat}"),
                     unobservedCollection.Attach(new
                     {
@@ -168,7 +168,7 @@ public sealed class McpAnalysisTools
                serializer call, same bytes — and a JsonObject with collection_caveats appended last otherwise. */
             return JsonSerializer.Serialize(collection.Attach(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 status = "findings",
                 finding_count = findings.Count,
                 analysis_time = analysisService.LastAnalysisTime?.ToString("o"),
@@ -275,7 +275,7 @@ public sealed class McpAnalysisTools
         }
     }
 
-    [McpServerTool(Name = "get_analysis_facts"), Description("Raw scored facts from the inference engine's pipeline, WITHOUT graph traversal: facts, not findings. Includes ANOMALY_* facts with gate metadata even when they fired but stayed under the finding floor, so a fact here did not necessarily produce a finding. baseline_confidence (a fact's baseline trustworthiness) differs from a finding's confidence in analyze_server. collection_caveats is absent on a clean read; when present, the families it names were NOT read, so their absence is not evidence they were quiet. ranked is absent unless 2+ objects ride. <<GUIDE>> Exposes the raw scored facts from the inference engine's collect+score pipeline WITHOUT graph traversal. Shows every observation the engine sees: wait stats as fraction-of-period, blocking rates, config settings, memory stats, plus base severity, final severity after amplifiers, and which amplifiers matched. The anomaly detector runs on this read too, so the ANOMALY_* facts the full pass would score are here with the gate metadata the pass scored them on (deviation_sigma against fire_threshold, baseline_samples, baseline_tier, baseline_low_quality), including the ones that fired but stayed under the finding floor; the cost is the detector's baseline reads on top of the collector's. For ANOMALY_* facts the metadata carries baseline_confidence — the baseline's own trustworthiness (tier x sample density), which the scorer multiplies into that fact's severity; it is a different quantity from a finding's confidence in analyze_server. Use this to understand exactly what the engine is working with, or to investigate facts that didn't reach the severity threshold for findings. When one or more fact families could not be read (a timed-out, cancelled or failed collector read), the payload carries collection_caveats (families_failed, families_total, entries[{family, read, outcome, message}]) and the caveat says so; the field is absent on a clean read, and a fact set missing those families is not evidence that they were quiet. A fact whose read ranked several objects carries ranked: the objects it ranks, worst first, as [{object_name, database_name, value, figures}] with the family's own un-prefixed metadata names as the figure keys, entry [0] being the fact's own subject (same object_name and value). Absent unless two or more objects ride, and capped at three - the per-object lists are the get_pg_* reads. source accepts: anomaly, bad_actor, blocking, config, coverage, cpu, database_config, disk, io, jobs, memory, pg_bloat, pg_blocking, pg_buffer, pg_config, pg_cpu, pg_database, pg_growth, pg_io, pg_kernel, pg_memory, pg_plans, pg_posture, pg_queries, pg_replication, pg_sessions, pg_temp, pg_vacuum, pg_waits, pg_write, queries, sessions, tempdb, waits; omit it for all. total_facts counts every scored fact before the source and min_severity filters; shown counts the facts that passed them; filters echoes the two values applied.")]
+    [McpServerTool(Name = "get_analysis_facts"), Description("Raw scored facts from the inference engine's pipeline, WITHOUT graph traversal: facts, not findings. Includes ANOMALY_* facts with gate metadata even when they fired but stayed under the finding floor, so a fact here did not necessarily produce a finding. baseline_confidence (a fact's baseline trustworthiness) differs from a finding's confidence in analyze_server. collection_caveats is absent on a clean read; when present, the families it names were NOT read, so their absence is not evidence they were quiet. ranked is absent unless 2+ objects ride. <<GUIDE>> Exposes the raw scored facts from the inference engine's collect+score pipeline WITHOUT graph traversal. Shows every observation the engine sees: wait stats as fraction-of-period, blocking rates, config settings, memory stats, plus base severity, final severity after amplifiers, and which amplifiers matched. The anomaly detector runs on this read too, so the ANOMALY_* facts the full pass would score are here with the gate metadata the pass scored them on (deviation_sigma against fire_threshold, baseline_samples, baseline_tier, baseline_low_quality), including the ones that fired but stayed under the finding floor; the cost is the detector's baseline reads on top of the collector's. For ANOMALY_* facts the metadata carries baseline_confidence — the baseline's own trustworthiness (tier x sample density), which the scorer multiplies into that fact's severity; it is a different quantity from a finding's confidence in analyze_server. Use this to understand exactly what the engine is working with, or to investigate facts that didn't reach the severity threshold for findings. When one or more fact families could not be read (a timed-out, cancelled or failed collector read), the payload carries collection_caveats (families_failed, families_total, entries[{family, read, outcome, message}]) and the caveat says so; the field is absent on a clean read, and a fact set missing those families is not evidence that they were quiet. A fact whose read ranked several objects carries ranked: the objects it ranks, worst first, as [{object_name, database_name, value, figures}] with the family's own un-prefixed metadata names as the figure keys, entry [0] being the fact's own subject (same object_name and value). Absent unless two or more objects ride, and capped at three - the per-object lists are the get_pg_* reads. The PLAN_REGRESSION fact leaves out a regression whose statement is OPTION (RECOMPILE), whose newer plan returns 10x the rows per call with the cost gone per row, or whose two plans were compiled for different parameter values over unchanged statistics, and counts them in cross_input_excluded_count. Its worst_input_basis says how the worst kept offender's two plans were compared: 1 both plans were compiled for the same parameter values, 2 the compiled values differ and the statistics were updated between the compiles (a possible statistics-update flip), 0 not checked (a plan or the statement text was missing or withheld). source accepts: anomaly, bad_actor, blocking, config, coverage, cpu, database_config, disk, io, jobs, memory, pg_bloat, pg_blocking, pg_buffer, pg_config, pg_cpu, pg_database, pg_growth, pg_io, pg_kernel, pg_memory, pg_plans, pg_posture, pg_queries, pg_replication, pg_sessions, pg_temp, pg_vacuum, pg_waits, pg_write, queries, sessions, tempdb, waits; omit it for all. total_facts counts every scored fact before the source and min_severity filters; shown counts the facts that passed them; filters echoes the two values applied.")]
     public static async Task<string> GetAnalysisFacts(
         AnalysisService analysisService,
         ServerManager serverManager,
@@ -340,9 +340,9 @@ public sealed class McpAnalysisTools
                    after configuration alone knows audit_config still has it. */
                 return McpHelpers.Status(
                     "unavailable",
-                    $"The collector observed none of the requested window for {resolved.ServerName}, so no windowed fact (wait fractions, blocking or deadlock rates) exists to show. " +
+                    $"The collector observed none of the requested window for {resolved.DisplayName}, so no windowed fact (wait fractions, blocking or deadlock rates) exists to show. " +
                     $"{facts.Count} point-in-time fact(s) — configuration and current state — could still be read; audit_config reports those. " +
-                    "Check get_collection_health to see when collectors last succeeded and why they stopped." +
+                    "Check get_collection_health to see when each collector last succeeded." +
                     (collectionCaveat is null ? string.Empty : $" COLLECTION CAVEAT: {collectionCaveat}"),
                     collection.Attach(new { secondary_replica_note = secondaryReplicaNote, coverage = coverage?.ToPayload() }, McpHelpers.JsonOptions));
             }
@@ -392,7 +392,7 @@ public sealed class McpAnalysisTools
 
             return JsonSerializer.Serialize(collection.Attach(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 total_facts = facts.Count,
                 shown = result.Count,
                 filters = new { source, min_severity },
@@ -416,13 +416,13 @@ public sealed class McpAnalysisTools
         }
     }
 
-    [McpServerTool(Name = "compare_analysis"), Description("Compares two windows: comparison (hours_back long, ends at as_of/now) vs an earlier same-length baseline, baseline_hours_back back (must exceed hours_back, else refused). Verdicts band worse/better/stable: sigma where a per-server baseline exists, else ladder position; band_source/band_rules say which. Grouped by physical cause; BAD_ACTOR_<hash> is plan_cache_churn, never new/resolved. N=1 vs N=1: never proves causation. unavailable = BOTH windows had zero facts, not \"unchanged\". coverage_caveat flags a partly-collected side. For 30-day anomaly baselines use analyze_server. <<GUIDE>> Compares two time periods by running the inference engine's fact collection and scoring on each, then showing what changed. Use this to compare peak vs off-peak, yesterday vs today, or the windows around a change. Returns facts from both periods side-by-side, each banded worse / better / stable by how far the VALUE moved on the server's own scale, not by the severity formula's slope: a key with a stored per-server baseline (SQL Server: CPU %, read latency, connections; PostgreSQL: transactions/sec, session count, deadlocks/hour, CPU as % of capacity, read latency, replay lag bytes, WAL bytes/sec) is banded in that baseline's robust sigma for the comparison hour (delta_sigma, band_source \"baseline\"); every other key changes status only when the value moved at least a quarter of the larger side AND registers at least a quarter of the way up its own severity ladder (band_source \"absolute\"); the rules are stated in band_rules. Rows are grouped into physical-cause families (one I/O stall is one family row, not four worse keys), and BAD_ACTOR_<hash> appearances are reported as plan_cache_churn rather than as new or resolved issues. What \"worse\" does NOT mean: this is one window against one window — same-hour-yesterday at N=1 vs N=1 cannot show that a change CAUSED anything (DB time on an unchanged server routinely varies severalfold day to day), and a partly collected side flags every verdict with coverage_caveat. Note: for routine anomaly detection, use analyze_server instead — it automatically compares against 30-day time-bucketed baselines (hour-of-day x day-of-week). This tool is for explicit window-to-window comparisons. baseline_hours_back also fixes the baseline period's length: it is always the same duration as the comparison period.")]
+    [McpServerTool(Name = "compare_analysis"), Description("Compares two windows: comparison (hours_back long, ends at as_of/now) vs an earlier same-length baseline, baseline_hours_back back (>= 2 x hours_back, else refused). Verdicts band worse/better/stable: sigma where a per-server baseline exists, else ladder position; band_source/band_rules say which. Grouped by physical cause; BAD_ACTOR_<hash> is plan_cache_churn, never new/resolved. N=1 vs N=1: never proves causation. unavailable = BOTH windows had zero facts, not \"unchanged\". coverage_caveat flags a partly-collected side. For 30-day anomaly baselines use analyze_server. <<GUIDE>> Compares two time periods by running the inference engine's fact collection and scoring on each, then showing what changed. Use this to compare peak vs off-peak, yesterday vs today, or the windows around a change. Returns facts from both periods side-by-side, each banded worse / better / stable by how far the VALUE moved on the server's own scale, not by the severity formula's slope: a key with a stored per-server baseline (SQL Server: CPU %, read latency, connections; PostgreSQL: transactions/sec, session count, deadlocks/hour, CPU as % of capacity, read latency, replay lag bytes, WAL bytes/sec) is banded in that baseline's robust sigma for the comparison hour (delta_sigma, band_source \"baseline\"); every other key changes status only when the value moved at least a quarter of the larger side AND registers at least a quarter of the way up its own severity ladder (band_source \"absolute\"); the rules are stated in band_rules. Rows are grouped into physical-cause families (one I/O stall is one family row, not four worse keys), and BAD_ACTOR_<hash> appearances are reported as plan_cache_churn rather than as new or resolved issues. What \"worse\" does NOT mean: this is one window against one window — same-hour-yesterday at N=1 vs N=1 cannot show that a change CAUSED anything (DB time on an unchanged server routinely varies severalfold day to day), and a partly collected side flags every verdict with coverage_caveat. Note: for routine anomaly detection, use analyze_server instead — it automatically compares against 30-day time-bucketed baselines (hour-of-day x day-of-week). This tool is for explicit window-to-window comparisons. baseline_hours_back also fixes the baseline period's length: it is always the same duration as the comparison period.")]
     public static async Task<string> CompareAnalysis(
         AnalysisService analysisService,
         ServerManager serverManager,
         [Description("Server name or display name.")] string? server_name = null,
         [Description("Hours back for the comparison (recent) period. Default 4.")] int hours_back = 4,
-        [Description("Hours back for the baseline period start, measured from the end of the comparison window (now, or as_of). Default 28 (yesterday same time).")] int baseline_hours_back = 28,
+        [Description("Baseline start, hours back from the comparison's end. Default hours_back + 24; at least 2 x hours_back.")] int? baseline_hours_back = null,
         [Description(McpHelpers.AsOfDescription)] string? as_of = null,
         CancellationToken cancellationToken = default)
     {
@@ -431,11 +431,10 @@ public sealed class McpAnalysisTools
 
         var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
-        validation = McpHelpers.ValidateHoursBack(baseline_hours_back);
+        /* #5633 item 12: an omitted baseline follows hours_back, and an explicit one must leave the two windows
+           disjoint (baseline_hours_back >= 2 x hours_back); one shared check, so both products refuse alike. */
+        validation = McpHelpers.ValidateBaselineWindow(hours_back, baseline_hours_back, out var baselineHoursBack);
         if (validation != null) return validation;
-
-        if (baseline_hours_back <= hours_back)
-            return McpHelpers.Refusal("baseline_hours_back", "baseline_hours_back must be greater than hours_back. The baseline period must be earlier than the comparison period.");
 
         try
         {
@@ -444,8 +443,8 @@ public sealed class McpAnalysisTools
                silently change what the two windows are relative to each other. */
             var comparisonEnd = windowEnd;
             var comparisonStart = windowEnd.AddHours(-hours_back);
-            var baselineEnd = windowEnd.AddHours(-baseline_hours_back + hours_back);
-            var baselineStart = windowEnd.AddHours(-baseline_hours_back);
+            var baselineEnd = windowEnd.AddHours(-baselineHoursBack + hours_back);
+            var baselineStart = windowEnd.AddHours(-baselineHoursBack);
 
             var (baselineFacts, comparisonFacts, baselineCoverage, comparisonCoverage, dispersion, baselineSecondaries, comparisonSecondaries) = await analysisService.ComparePeriodsAsync(
                 resolved.ServerId, resolved.ServerName,
@@ -497,10 +496,10 @@ public sealed class McpAnalysisTools
                 */
                 return McpHelpers.Status(
                     "unavailable",
-                    $"No analysis facts were collected for {resolved.ServerName} in EITHER window, so there is nothing to compare — this is NOT a report that nothing changed. Fact collection needs collected data in the window it scores; check that collection covered both periods (get_collection_log) before drawing any conclusion from this comparison.",
+                    $"No analysis facts were collected for {resolved.DisplayName} in EITHER window, so there is nothing to compare — this is NOT a report that nothing changed. Fact collection needs collected data in the window it scores; check that collection covered both periods (get_collection_log) before drawing any conclusion from this comparison.",
                     new
                     {
-                        server = resolved.ServerName,
+                        server = resolved.DisplayName,
                         baseline_start = baselineStart.ToString("o"),
                         baseline_end = baselineEnd.ToString("o"),
                         comparison_start = comparisonStart.ToString("o"),
@@ -553,9 +552,13 @@ public sealed class McpAnalysisTools
                 ? null
                 : string.Join(" ", new[] { emptyCaveat }.Concat(coverageCaveats).Where(s => s is not null));
 
-            return JsonSerializer.Serialize(new
+            /* #6180: the fact rows are the bulk of this answer (about 650 bytes each, 48-57 KB measured), so they are cut to the
+               shared response target. Rows are already worse first, then better, then stable, so what is left off the end is
+               the stable tail; summary and families above still count every fact. */
+            var factRows = comparison.Rows.Select(r => r.ToPayload()).ToList();
+            return McpResponseBudget.FitPrefix(factRows.Count, factCount => JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 /* Null when both windows produced facts at full coverage — the ordinary case, where
                    nothing needs saying. */
                 caveat,
@@ -582,8 +585,14 @@ public sealed class McpAnalysisTools
                 summary = comparison.SummaryPayload(),
                 families = comparison.Families.Select(f => f.ToPayload()).ToList(),
                 plan_cache_churn = comparison.Churn.ToPayload(),
-                facts = comparison.Rows.Select(r => r.ToPayload()).ToList()
-            }, McpHelpers.JsonOptions);
+                truncated = factCount < factRows.Count,
+                facts_returned = factCount,
+                facts_total = factRows.Count,
+                size_note = factCount < factRows.Count
+                    ? $"{factRows.Count - factCount} of {factRows.Count} fact rows were left off the end (the lowest-ranked: stable rows come last) to keep this answer within about 32 KB. summary and families above still count every fact. For the rest, compare a shorter hours_back, or read one window's facts with get_analysis_facts (source / min_severity filters)."
+                    : null,
+                facts = factRows.Take(factCount)
+            }, McpHelpers.JsonOptions)).Json;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -618,7 +627,11 @@ public sealed class McpAnalysisTools
             var totalMemoryMb = factsByKey.TryGetValue("MEMORY_TOTAL_PHYSICAL_MB", out var memFact) ? memFact.Value : 0;
             var totalDbSizeMb = factsByKey.TryGetValue("DATABASE_TOTAL_SIZE_MB", out var dbFact) ? dbFact.Value : 0;
 
-            var editionName = AuditEditionName(edition);
+            /* #5633 item 10: the Edition property the store already holds (what get_server_properties reports), so a
+               Developer or Evaluation server is not called Enterprise. The engine-edition label is only the fallback
+               for a store with no properties snapshot, and then edition_note says so. */
+            var propertiesRow = await dataService.GetLatestServerPropertiesAsync(resolved.ServerId);
+            var (editionName, editionNote) = AuditEditionLabel(propertiesRow?.Edition, edition);
             /* The recommended MAXDOP follows the cores per socket the SERVER_HARDWARE fact carries. On an Azure SQL Database the fact carries its vCores instead, because the stored
                cores_per_socket is the host's (see FactRemediation.MaxdopBasisFrom). */
             var maxdopBasis = FactRemediation.MaxdopBasisFrom(factsByKey);
@@ -771,10 +784,10 @@ public sealed class McpAnalysisTools
             {
                 /* Same engine question get_server_config asks on its miss: an engine that never collects
                    server_config (Azure SQL Database) gets the permanent-gap answer, not "may not have run yet". */
-                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.ServerName, "server_config")
+                return await McpEngineCapability.NotCollectedStatusAsync(dataService, resolved.ServerId, resolved.DisplayName, "server_config")
                     ?? JsonSerializer.Serialize(new
                     {
-                        server = resolved.ServerName,
+                        server = resolved.DisplayName,
                         status = "no_config_data",
                         message = "No configuration data found. The config collector may not have run yet."
                     }, McpHelpers.JsonOptions);
@@ -782,8 +795,9 @@ public sealed class McpAnalysisTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 edition = editionName,
+                edition_note = editionNote,
                 total_physical_memory_mb = totalMemoryMb > 0 ? totalMemoryMb : (double?)null,
                 total_database_size_mb = totalDbSizeMb > 0 ? totalDbSizeMb : (double?)null,
                 summary = new
@@ -819,6 +833,26 @@ public sealed class McpAnalysisTools
         engineEdition == CollectorEngineCapability.UnknownEngineEdition
             ? "Unknown"
             : CollectorEngineCapability.DescribeEngineEdition(engineEdition);
+
+    /// <summary>
+    /// The <c>edition</c> and <c>edition_note</c> audit_config echoes (#5633 item 10). The stored <c>Edition</c> property
+    /// ("Developer Edition (64-bit)", "Enterprise Evaluation Edition ...") is reported as is, exactly as
+    /// <c>get_server_properties</c> does; the note is null. Engine edition 3 covers Enterprise, Developer and Evaluation, so
+    /// the engine label ("Enterprise") is only the fallback when the store holds no Edition string, and the note then says
+    /// the word is the engine edition, not the SKU. No audit rule keys on the label.
+    /// </summary>
+    internal static (string Name, string? Note) AuditEditionLabel(string? storedEdition, int engineEdition)
+    {
+        if (!string.IsNullOrWhiteSpace(storedEdition))
+        {
+            return (storedEdition.Trim(), null);
+        }
+
+        var label = AuditEditionName(engineEdition);
+        return label == "Unknown"
+            ? (label, "No server properties snapshot holds the Edition string yet, and the engine edition is unknown.")
+            : (label, "This is the engine edition, not the SKU: no server properties snapshot holds the Edition string yet, and engine edition 3 covers Enterprise, Developer and Evaluation alike.");
+    }
 
     /// <summary>See Darling's <c>DarlingMcpTools.DefaultFindingLimit</c> twin for the #4198 measurement this was sized from.</summary>
     private const int DefaultFindingLimit = 18;
@@ -913,7 +947,7 @@ public sealed class McpAnalysisTools
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 finding_count = groups.Count,
                 total_finding_count = totalFindingCount,
                 total_occurrences = findings.Count,
@@ -1099,6 +1133,47 @@ public sealed class McpAnalysisTools
         catch (Exception ex)
         {
             return McpHelpers.FormatError("mute_analysis_finding", ex);
+        }
+    }
+
+    [McpServerTool(Name = "unmute_analysis_finding"), Description("Write: removes the mute that mute_analysis_finding registered for story_path_hash, in the scope of server_name (all servers when omitted), so the pattern appears in later analysis runs again. status: unmuted (removed is at least 1), not_muted (that scope held no mute; nothing changed), error (the delete failed; the mute may still be in force). <<GUIDE>> Undoes a mute. Served only when the operator sets mcp_allow_writes to true in settings.json, with mute_analysis_finding. A mute registered for all servers is not removed by naming one server, and a per-server mute is not removed by omitting server_name: pass the same server_name (or none) the mute used. removed is the number of registry rows deleted. Findings the pattern would have produced while it was muted were never stored, so nothing comes back until the next analysis pass finds the pattern again.")]
+    public static async Task<string> UnmuteAnalysisFinding(
+        AnalysisService analysisService,
+        ServerManager serverManager,
+        [Description("The story_path_hash of the muted pattern.")] string story_path_hash,
+        [Description("Server name. If omitted, removes the all-servers mute.")] string? server_name = null)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(story_path_hash))
+            {
+                return McpHelpers.Refusal("story_path_hash", "story_path_hash is required.");
+            }
+
+            int? serverId = null;
+            if (server_name != null)
+            {
+                var (resolved, error) = ServerResolver.ResolveOrError(serverManager, server_name);
+                if (error != null) return error;
+                serverId = resolved.ServerId;
+            }
+
+            var removed = await analysisService.UnmuteFindingAsync(serverId, story_path_hash);
+
+            return JsonSerializer.Serialize(new
+            {
+                status = removed > 0 ? "unmuted" : "not_muted",
+                story_path_hash,
+                server = server_name ?? "(all servers)",
+                removed,
+                note = removed > 0
+                    ? $"Removed {removed} mute row(s) for this scope. The pattern is no longer skipped and is reported again when a later analysis pass finds it."
+                    : "This scope holds no mute for this story_path_hash, so nothing changed. A mute registered for all servers is removed by omitting server_name; a per-server mute by naming that server.",
+            }, McpHelpers.JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return McpHelpers.FormatError("unmute_analysis_finding", ex);
         }
     }
 
@@ -1444,6 +1519,14 @@ internal static class ToolRecommendations
     /// (#3653), so a recommendation naming a tool or a parameter this SKU does not serve fails there rather
     /// than sending an agent to a call that returns an error.</summary>
     internal static IReadOnlyCollection<string> FactKeys => ByFactKey.Keys;
+
+    /// <summary>Every distinct tool name this table's <c>next_tools</c> can name (#5820): the investigation brief's
+    /// nameable tools read this, so a brief names exactly what <c>analyze_server</c> can. Ordinal, deduplicated.</summary>
+    internal static IReadOnlyCollection<string> AllToolNames { get; } =
+        ByFactKey.Values
+            .SelectMany(recommendations => recommendations)
+            .Select(recommendation => recommendation.Tool)
+            .ToHashSet(StringComparer.Ordinal);
 
     /// <summary>
     /// Returns tool recommendations for every fact key one finding is about — its chain AND the config levers

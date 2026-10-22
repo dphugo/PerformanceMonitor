@@ -32,6 +32,7 @@ namespace Darling.Tests;
 /// missed from the web surface (it fails this test until it is wired or explicitly excluded). The response-kind
 /// and query-parse pins cover the thin glue around the reused tool methods.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class DarlingWebEndpointsTests
 {
     /// <summary>Every <c>[McpServerTool(Name = ...)]</c> across every <c>[McpServerToolType]</c> class in the
@@ -61,7 +62,7 @@ public sealed class DarlingWebEndpointsTests
     }
 
     [Fact]
-    public void ReadEndpoints_AreExactlyTheReadToolCatalog_MinusTheDocumentedExclusions()
+    public void EveryReadTool_HasAReadEndpoint_UnlessDocumentedAsExcluded()
     {
         var catalog = ReflectToolCatalog();
         var endpoints = DarlingWebEndpoints.BuildReadDispatch().Keys.ToHashSet(StringComparer.Ordinal);
@@ -71,12 +72,11 @@ public sealed class DarlingWebEndpointsTests
         /* The web page's own keyed reads (#5241) have no tool behind them, by design: exactly this set is added. */
         expected.UnionWith(DarlingWebEndpoints.WebOnlyReadNames);
 
-        /* Symmetric-difference messages so a miss names the exact tool. */
+        /* One direction (#5950): a read-only tool with no /api/read endpoint fails by name. An endpoint whose
+           tool has since been renamed or removed is not asserted here. */
         var missing = expected.Except(endpoints).OrderBy(n => n, StringComparer.Ordinal).ToArray();
-        var extra = endpoints.Except(expected).OrderBy(n => n, StringComparer.Ordinal).ToArray();
 
         Assert.True(missing.Length == 0, "read-only tools with no /api/read endpoint: " + string.Join(", ", missing));
-        Assert.True(extra.Length == 0, "/api/read endpoints with no matching read-only tool: " + string.Join(", ", extra));
     }
 
     /// <summary>#4782: the test-only extra dispatch entry belongs to the async flow that set it. It is not a
@@ -148,33 +148,6 @@ public sealed class DarlingWebEndpointsTests
     }
 
     [Fact]
-    public void ExcludedToolNames_AreTheNonReadSurfaceTools()
-    {
-        /* The six original non-read tools (analyze_server, the mute write, the four analyze_*_plan), the eight
-           Custom Views tools (#1599 + describe_custom_view_catalog) served by /api/views + /api/compose/run +
-           /api/catalog, the eight custom-alert-rule tools (#3285 — create/update/delete write, get/list/validate
-           read against the compose catalog, test_custom_alert_rule (#3299) evaluate-now, and
-           list_custom_alert_templates (#3285 Component 7) starter templates, none a
-           /api/read/{tool} mirror), the five alert-tuning WRITE tools — of which the four mute-rule verbs are
-           served by their OWN dedicated /api/mute-rules endpoints since #3450, the Custom Views disposition,
-           so they STAY excluded from the generic mirror for the same reason those do, while
-           update_alert_settings remains a write with no web surface at all — and the two server-onboarding
-           WRITE tools (add_servers / remove_server). All with no /api/read/{tool} 1:1 mirror, like
-           mute_analysis_finding. get_tool_guide (#3898) reads no data: it serves the MCP tools' reading guides from
-           the MCP host's registration-time catalog, so there is nothing for a web read to mirror. */
-        Assert.Equal(
-            new[]
-            {
-                "add_servers", "analyze_plan_xml", "analyze_procedure_plan", "analyze_query_plan", "analyze_query_store_plan",
-                "analyze_server", "assign_server_tag", "create_custom_alert_rule", "create_custom_view", "create_mute_rule", "create_server_tag", "delete_custom_alert_rule",
-                "delete_custom_view", "delete_mute_rule", "delete_notification_route", "delete_server_tag", "describe_custom_view_catalog", "edit_server", "get_custom_alert_rule", "get_custom_view", "get_tool_guide",
-                "list_custom_alert_rules", "list_custom_alert_templates", "list_custom_views", "mute_analysis_finding", "remove_server", "run_custom_view_panel",
-                "set_mute_rule_enabled", "set_notification_route_enabled", "test_custom_alert_rule", "unassign_server_tag", "update_alert_settings", "update_custom_alert_rule", "update_custom_view", "update_mute_rule", "update_server_tag", "validate_custom_alert_rule", "validate_custom_view",
-            },
-            DarlingWebEndpoints.ExcludedToolNames.OrderBy(n => n, StringComparer.Ordinal).ToArray());
-    }
-
-    [Fact]
     public void ReadEndpoints_IncludeTheNewFleetOverviewTool()
     {
         /* get_fleet_overview is a read tool born with this feature — it must be in both the catalog and the
@@ -192,22 +165,6 @@ public sealed class DarlingWebEndpointsTests
         Assert.Contains("get_ag_health", DarlingWebEndpoints.BuildReadDispatch().Keys);
     }
 
-    [Fact]
-    public void ReadEndpoints_ActiveQueries_KeepsTheTwoThousandCharacterWebPreview()
-    {
-        /* #4198 lane W2: the MCP default fell to a 500-char (now 400) query_text preview (QueryTextPreviewLength), but
-           the web viewer isn't that budget's caller — its /api/read row calls the internal budget-taking
-           overload with an explicit 2000, the pre-#4198 McpHelpers.Truncate budget every caller got, so the
-           Active Queries tab doesn't shrink under it. A regression here (dropping the overload, or the literal
-           2000) silently starves that tab's query text down to the MCP preview (400 characters). Source-text pin rather than a
-           live call: no rig in this lane. #5245: the entry now binds the chosen databases (DatabaseNames(c)), so the pin
-           matches the call and not the whole entry; the 2000 is what it guards. */
-        var source = RepoFile.ReadRepoFileLf("Darling", "PerformanceMonitor.Darling.Service", "DarlingWebEndpoints.cs");
-        Assert.Contains(
-            "DarlingMcpSessionTools.GetActiveQueries(pg, Server(c), Hours(c, 1), databases, QueryBool(c, \"blocking_only\", false), Str(c, \"wait_type\"), Rows(c, \"limit\", 50), 2000, AsOf(c), logger, c.RequestAborted)",
-            source, StringComparison.Ordinal);
-    }
-
     /// <summary>
     /// #5235: the Active Queries page sends <c>?wait_type=</c> to <c>/api/read/get_active_queries</c>, so the web read
     /// has to declare it and pass it on. The catalog row lists it as optional text between blocking_only and limit (the
@@ -220,7 +177,7 @@ public sealed class DarlingWebEndpointsTests
     {
         var read = DarlingWebEndpoints.CatalogDescriptors["get_active_queries"];
         Assert.Equal(
-            new[] { "server", "hours", "database_name", "blocking_only", "wait_type", "limit", "as_of" },
+            new[] { "server", "hours", "database_name", "blocking_only", "wait_type", "limit", "as_of", "tag", "collection_time", "snapshots_only" },
             read.Params.Select(p => p.Name).ToArray());
         var waitType = Assert.Single(read.Params, p => p.Name == "wait_type");
         Assert.Equal("text", waitType.Type);
@@ -432,8 +389,8 @@ public sealed class DarlingWebEndpointsTests
 
     /// <summary>The bare-string arm survives as the floor under everything the producers no longer emit: the
     /// four sentences here WERE the wire shape of these refusals until #3739 (they are the envelope's <c>message</c>
-    /// now, and classify as <c>Refusal</c> above); what still reaches this arm is the <c>list_servers</c> miss on
-    /// an empty registry. The resolver's registry-read fault used to reach it too; since #4283 it is a server error
+    /// now, and classify as <c>Refusal</c> above); <c>list_servers</c> on an empty registry used to reach it and now answers
+    /// the <c>empty</c> envelope (#6277). The resolver's registry-read fault used to reach it too; since #4283 it is a server error
     /// (the fact below). Kept at 400 so a producer nobody shaped is still refused rather than passed through as
     /// data.</summary>
     [Theory]
@@ -441,7 +398,6 @@ public sealed class DarlingWebEndpointsTests
     [InlineData("Invalid hours_back value '9999'. Must be a positive integer (1-168).")]
     [InlineData("Missing required parameter 'wait_type'.")]
     [InlineData("baseline_hours_back must be greater than hours_back.")]
-    [InlineData("No servers are registered yet. The service registers each monitored server on its first successful connection.")]
     [InlineData("")]
     public void ClassifyToolResponse_OtherBareStrings_AreClientErrors(string result) =>
         Assert.Equal(DarlingWebEndpoints.ToolResponseKind.ClientError, DarlingWebEndpoints.ClassifyToolResponse(result));
@@ -463,6 +419,124 @@ public sealed class DarlingWebEndpointsTests
     [InlineData("not-a-number", 10)]
     public void ParseInt_DefaultsOnMissOrGarbage(string? raw, int expected) =>
         Assert.Equal(expected, DarlingWebEndpoints.ParseInt(raw, 10));
+
+    /// <summary>
+    /// #5644 W22: a present, non-integer integer knob is refused (the 400 envelope), not read as the default, so
+    /// <c>?hours=abc</c> and <c>?hours=1.5</c> no longer answer 200 for a different window than the one asked for.
+    /// Absent and empty knobs still take the default; a whole number (even out of range) is the tool's to judge.
+    /// </summary>
+    [Theory]
+    [InlineData("hours", "abc")]
+    [InlineData("hours", "1.5")]
+    [InlineData("hours", "1e2")]
+    [InlineData("hours_back", "24h")]
+    [InlineData("limit", "ten")]
+    [InlineData("top", "5.0")]
+    [InlineData("days_back", "x")]
+    [InlineData("bucket_minutes", "five")]
+    [InlineData("worst_count", "-")]
+    public void NonIntegerParamRefusal_RefusesAPresentNonInteger(string key, string raw)
+    {
+        var refusal = DarlingWebEndpoints.NonIntegerParamRefusal(k => k == key ? raw : null);
+
+        Assert.NotNull(refusal);
+        Assert.True(McpHelpers.IsRefusalEnvelope(refusal));
+        var envelope = JsonNode.Parse(refusal)!;
+        Assert.Equal("invalid", (string?)envelope["status"]);
+        Assert.Equal(key, (string?)envelope["hints"]!["parameter"]);
+        Assert.Equal($"Invalid {key} value '{raw}'. Must be a whole number.", (string?)envelope["message"]);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("24")]
+    [InlineData("-5")]      // readable: the tool owns the range refusal ("Must be a positive integer")
+    [InlineData("500")]
+    [InlineData("+7")]
+    public void NonIntegerParamRefusal_LeavesAbsentEmptyAndWholeNumbersToTheTool(string? raw)
+    {
+        foreach (var key in DarlingWebEndpoints.IntegerQueryKeys)
+        {
+            Assert.Null(DarlingWebEndpoints.NonIntegerParamRefusal(k => k == key ? raw : null));
+        }
+    }
+
+    /* #5644 W22: the tools refuse an out-of-range window as hours_back; a web caller that sent hours is told about hours. */
+    private static string HoursBackRefusal(int value) =>
+        McpHelpers.ValidateHoursBack(value)!;
+
+    [Theory]
+    [InlineData(-5)]
+    [InlineData(500)]
+    public void WindowRefusal_NamesTheHoursParameterTheWebCallerSent(int value)
+    {
+        var refusal = HoursBackRefusal(value);
+        Assert.Contains("hours_back", refusal);
+
+        var named = DarlingWebEndpoints.NameWindowParameterTheCallerSent(refusal, k => k == "hours" ? value.ToString() : null);
+
+        var doc = System.Text.Json.JsonDocument.Parse(named).RootElement;
+        Assert.Equal("invalid", doc.GetProperty("status").GetString());
+        Assert.Equal("hours", doc.GetProperty("hints").GetProperty("parameter").GetString());
+        var message = doc.GetProperty("message").GetString()!;
+        Assert.DoesNotContain("hours_back", message);
+        Assert.Contains($"hours value '{value}'", message);
+    }
+
+    [Fact]
+    public void WindowRefusal_ForAnMcpStyleRequest_OrAnotherParameter_IsLeftAlone()
+    {
+        var refusal = HoursBackRefusal(-5);
+
+        /* The caller sent hours_back (alone or beside hours): the tool's own wording is right. */
+        Assert.Equal(refusal, DarlingWebEndpoints.NameWindowParameterTheCallerSent(refusal, k => k == "hours_back" ? "-5" : null));
+        Assert.Equal(refusal, DarlingWebEndpoints.NameWindowParameterTheCallerSent(refusal, k => k is "hours" or "hours_back" ? "-5" : null));
+        /* No window parameter sent, and a result that is data rather than a refusal. */
+        Assert.Equal(refusal, DarlingWebEndpoints.NameWindowParameterTheCallerSent(refusal, _ => null));
+        const string Data = "{\"status\":\"ok\",\"hints\":{\"parameter\":\"hours_back\"}}";
+        Assert.Equal(Data, DarlingWebEndpoints.NameWindowParameterTheCallerSent(Data, k => k == "hours" ? "1" : null));
+        /* A refusal for a different parameter keeps its wording, even when it mentions hours_back. */
+        var other = McpHelpers.Refusal("baseline_hours_back", "baseline_hours_back must be greater than hours_back.");
+        Assert.Equal(other, DarlingWebEndpoints.NameWindowParameterTheCallerSent(other, k => k == "hours" ? "4" : null));
+    }
+
+    [Fact]
+    public void NonIntegerParamRefusal_ThroughTheQueryString_ReadsTheFirstNonEmptyValue()
+    {
+        var context = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        context.Request.QueryString = new Microsoft.AspNetCore.Http.QueryString("?server_name=SQL1&hours=abc");
+        Assert.NotNull(DarlingWebEndpoints.NonIntegerParamRefusal(k => DarlingWebEndpoints.First(context, k)));
+
+        context.Request.QueryString = new Microsoft.AspNetCore.Http.QueryString("?hours=&hours=12");
+        Assert.Null(DarlingWebEndpoints.NonIntegerParamRefusal(k => DarlingWebEndpoints.First(context, k)));
+    }
+
+    /// <summary>
+    /// #5644 W22 source pin: the /api/read dispatch loop and /api/fleet both call the check BEFORE any tool or reader
+    /// runs, and every key the dispatch reads through QueryInt/Rows/Hours is in the list.
+    /// </summary>
+    [Fact]
+    public void NonIntegerParamRefusal_RunsBeforeEveryReadAndCoversEveryIntegerKnob()
+    {
+        var source = RepoFile.ReadRepoFile("Darling/PerformanceMonitor.Darling.Service/DarlingWebEndpoints.cs");
+
+        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(source, @"NonIntegerParamRefusal\(context\) is \{ \}").Count);
+        Assert.True(source.IndexOf("NonIntegerParamRefusal(context) is { } nonIntegerRefusal", StringComparison.Ordinal)
+            < source.IndexOf("result = await handler(context, postgres, analysis);", StringComparison.Ordinal));
+
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
+            source, @"(?:QueryInt\((?:c|context), ""|Rows\(c, "")([a-z_]+)"""))
+        {
+            keys.Add(m.Groups[1].Value);
+        }
+
+        keys.Add("hours");
+        keys.Add("hours_back");
+        Assert.NotEmpty(keys);
+        Assert.All(keys, k => Assert.Contains(k, DarlingWebEndpoints.IntegerQueryKeys));
+    }
 
     [Theory]
     [InlineData("true", false, true)]
@@ -600,7 +674,7 @@ public sealed class DarlingWebEndpointsTests
     public async Task ServerTagToolResult_ConfirmRequired_KeepsTheEnvelopeAsTheBodyUnder409()
     {
         var envelope = "{\"status\":\"confirm_required\",\"refusal\":\"rules_affected\",\"affected_rules\":[{\"rule_id\":1}]}";
-        var result = DarlingWebEndpoints.ServerTagToolResult(envelope, "/api/server-tags/{id}", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, 5);
+        var result = DarlingWebEndpoints.ServerTagToolResult(envelope, "/api/server-tags/{id}", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, 5, System.Threading.CancellationToken.None);
         var context = new Microsoft.AspNetCore.Http.DefaultHttpContext { RequestServices = new Microsoft.Extensions.DependencyInjection.ServiceCollection().AddLogging().BuildServiceProvider() };
         context.Response.Body = new System.IO.MemoryStream();
         await result.ExecuteAsync(context);
@@ -709,54 +783,68 @@ public sealed class DarlingWebEndpointsTests
     }
 
     /// <summary>
-    /// #4198: <c>get_analysis_findings</c> grew a default <c>limit</c> (18 chains) and a default text preview
-    /// (<c>full_text: false</c>), sized for a chat caller watching its own token budget. The web viewer's two
-    /// "Analysis Findings" tables never asked for that budget and render no field the preview cuts — a
-    /// regression here would silently drop rows past the 18th from the table with no error, which a JSON-shape
-    /// test cannot catch because the response is still well-formed, just short. No rig: this reads the
-    /// dispatch-row SOURCE rather than invoking it, because invoking it needs a live Postgres connection.
+    /// #5644 (review of W22): /api/fleet refuses an out-of-range window or a negative worst_count with the
+    /// {"status":"invalid"} envelope, naming the spelling the caller sent, and still answers the in-range requests
+    /// (the bare route, hours=24, the edges 1 and 168, worst_count=0) with no refusal. It used to clamp
+    /// (hours=500 answered 200 over 168 hours, worst_count=-3 over zero).
     /// </summary>
-    [Fact]
-    public void GetAnalysisFindingsRow_PassesTheOldViewerDefaults_EveryChainFullText()
+    [Theory]
+    [InlineData("hours", 500, "hours")]
+    [InlineData("hours", 0, "hours")]
+    [InlineData("hours", -5, "hours")]
+    [InlineData("hours", 169, "hours")]
+    [InlineData("hours_back", 500, "hours_back")]
+    [InlineData("hours_back", 0, "hours_back")]
+    public void FleetParamRefusal_RefusesAnOutOfRangeWindow_NamingTheParameterSent(string key, int value, string expectedParameter)
     {
-        var source = ReadSource(WebEndpointsSourcePath);
+        var refusal = DarlingWebEndpoints.FleetParamRefusal(value, 3, k => k == key ? value.ToString() : null);
 
-        var line = source
-            .Split('\n')
-            .FirstOrDefault(l => l.Contains("[\"get_analysis_findings\"] = (c, pg, an) =>", StringComparison.Ordinal));
-
-        Assert.True(line is not null,
-            "#4198: the /api/read dispatch row for get_analysis_findings has moved or been renamed; update this pin's search text.");
-
-        Assert.Contains("Rows(c, \"limit\", MaxRowLimit)", line, StringComparison.Ordinal);
-        Assert.Contains("QueryBool(c, \"full_text\", true)", line, StringComparison.Ordinal);
-
-        /* #4316 M2: GetAnalysisFindings grew a trailing ILogger? logger parameter so a web-path force-plan
-           read failure logs instead of riding along unlabelled in the payload note. This row builds the
-           service off the DI-resolved postgres/an directly, not through a logger-less helper, so dropping the
-           argument here is the whole regression — there is no second call site downstream to catch it. */
-        Assert.Contains("logger: logger", line, StringComparison.Ordinal);
+        Assert.NotNull(refusal);
+        Assert.True(McpHelpers.IsRefusalEnvelope(refusal));
+        var envelope = JsonNode.Parse(refusal)!;
+        Assert.Equal("invalid", (string?)envelope["status"]);
+        Assert.Equal(expectedParameter, (string?)envelope["hints"]!["parameter"]);
     }
 
-    /// <summary>
-    /// #4316 M2: <c>MapAll</c> used to build the web host's <see cref="DarlingAnalysisService"/> with no
-    /// logger, so both fact collectors on the web path (audit_config, get_analysis_facts) logged nothing on
-    /// failure and the collection-failure note's "the log has the full error" was false there. No rig: this
-    /// reads the construction site's SOURCE rather than invoking it.
-    /// </summary>
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-3)]
+    public void FleetParamRefusal_RefusesANegativeWorstCount(int worstCount)
+    {
+        var refusal = DarlingWebEndpoints.FleetParamRefusal(24, worstCount, k => k == "worst_count" ? worstCount.ToString() : null);
+
+        Assert.NotNull(refusal);
+        var envelope = JsonNode.Parse(refusal)!;
+        Assert.Equal("invalid", (string?)envelope["status"]);
+        Assert.Equal("worst_count", (string?)envelope["hints"]!["parameter"]);
+    }
+
+    [Theory]
+    [InlineData(1, 0)]
+    [InlineData(1, 5)]
+    [InlineData(24, 5)]
+    [InlineData(168, 5)]
+    public void FleetParamRefusal_AnswersInRangeRequests(int hours, int worstCount)
+    {
+        Assert.Null(DarlingWebEndpoints.FleetParamRefusal(hours, worstCount, k => k == "hours" ? hours.ToString() : null));
+    }
+
+    /// <summary>The /api/fleet route runs that refusal before it reads, and no longer clamps the window or the count.</summary>
     [Fact]
-    public void MapAll_BuildsTheAnalysisServiceWithTheHostsLogger()
+    public void FleetRoute_RefusesBeforeReading_AndDoesNotClamp()
     {
         var source = ReadSource(WebEndpointsSourcePath);
+        var start = source.IndexOf("app.MapGet(\"/api/fleet\"", StringComparison.Ordinal);
+        Assert.True(start >= 0, "the /api/fleet route has moved; update this pin.");
+        var end = source.IndexOf("app.MapGet(", start + 10, StringComparison.Ordinal);
+        var route = source[start..end];
 
-        var line = source
-            .Split('\n')
-            .FirstOrDefault(l => l.Contains("new DarlingAnalysisService(", StringComparison.Ordinal));
-
-        Assert.True(line is not null,
-            "#4316: the web host's DarlingAnalysisService construction has moved or been renamed; update this pin's search text.");
-
-        Assert.Contains("logger: logger", line, StringComparison.Ordinal);
+        Assert.Contains("FleetParamRefusal(", route, StringComparison.Ordinal);
+        Assert.DoesNotContain("Math.Clamp", route, StringComparison.Ordinal);
+        Assert.DoesNotContain("Math.Max", route, StringComparison.Ordinal);
+        Assert.True(
+            route.IndexOf("FleetParamRefusal(", StringComparison.Ordinal) < route.IndexOf("GetFleetOverviewAsync", StringComparison.Ordinal),
+            "the refusal must come before the read");
     }
 
     private static string ReadSource(string relative)

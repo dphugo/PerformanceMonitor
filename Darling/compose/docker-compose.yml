@@ -3,10 +3,23 @@
 # postgres.managed stays false and this file's `store` service takes its place.
 #
 # Quickstart (from this directory):
-#   1. cp darling.sample.json darling.json           # then edit: servers, tokens, alerting
-#   2. echo 'YourSqlPassword' > secrets/sql_password.txt   # one file per secret; see `secrets:` below
+#   1. ./setup.sh                      # makes secrets/ (the store password and connection string, the web and MCP
+#                                      # tokens, and the SQL login's password, which it asks for) and darling.json
+#   2. edit darling.json               # servers, alerting
 #   3. docker compose up -d
-#   4. web dashboard: http://<host>:5153  ·  MCP: http://<host>:5152 (bearer token; https with mcp.network.tls)
+#   4. web dashboard: http://127.0.0.1:5153 on the docker host only (MCP, if enabled: http://127.0.0.1:5152; bearer token,
+#      https with mcp.network.tls).
+#      Both ports are published on the host's loopback address, so nothing off the box can reach them until
+#      you decide it should. To open the dashboard to a network deliberately, do all three together:
+#        - serve HTTPS: mount the PEM pair as the web_tls_cert / web_tls_key secrets below and point
+#          web.network.tls at them in darling.json — or terminate TLS in a reverse proxy in front of the port
+#          and list that proxy in web.network.trustedProxies so the cookie and the OIDC redirect know they are
+#          behind HTTPS;
+#        - publish the port on the interface you mean: change "127.0.0.1:5153:5153" to "<lan-ip>:5153:5153";
+#        - set web.network.allowFrom to the subnet your operators sit on, not the docker bridge placeholder.
+#      Without TLS the access token and the session cookie cross the network in the clear; the service says
+#      so at Warning on every start of a plain-HTTP network listener, and it does not fall back to loopback
+#      on its own (inside a container that would mean unreachable).
 #
 # Secrets never land in darling.json: the config references them (env:NAME / file:/path — #1804 stage 1),
 # and compose delivers them as env vars or mounted secret files. The web/MCP network blocks are honored
@@ -41,14 +54,19 @@ services:
     # dropped — see the PR body's closing note.
     #
     # timescaledb.max_background_workers / max_worker_processes: tune sizes these from CPU count, not from
-    # the hypertable count, and measured at 2 GB / 8 GB it gives 16 / 34 — PostgreSQL's own default shape,
+    # the hypertable count, and measured at 2 GB / 8 GB it gives 16 / 34 - PostgreSQL's own default shape,
     # which is exactly what the managed Windows store exists to avoid (build.yml ~936-952: TimescaleDB's
     # per-hypertable compression/retention/CAGG policy jobs launch background workers, and at 16 slots most
-    # policy runs never happen). The values below are the SAME formula the managed store writes
-    # (BuildWorkerSizingConfAppend): max_background_workers = HypertableCount + 2, max_worker_processes =
-    # 3 + max_background_workers + 8. HypertableCount is 72 today (TimescaleSupport.HypertableCount) — 74
-    # and 85. CiComposeWorkerSizingTests pins these two numbers against that same live formula, so an added
-    # collector fails this file's test instead of drifting silently.
+    # policy runs never happen). The values below are the FLOOR of the formula the managed store writes
+    # (DeriveWorkerFloor): max_background_workers = HypertableCount + 2, max_worker_processes = 3 + that + 8.
+    # HypertableCount is 72 today (TimescaleSupport.HypertableCount) - 74 and 85. The managed store raises the
+    # pair with host RAM (16 slots per GB, up to every policy job the schema carries, 177 / 188 at 12 GB or
+    # more; DeriveWorkerSettings); a compose container has no host-RAM figure to read, and a 2 GB container
+    # is at the floor under that rule anyway. A container with a mem_limit of 12 GB or more may raise the two
+    # flags to those numbers: a migrated store has 142 policy jobs, all overdue at a restart, and 74 slots
+    # launch them in retried waves (61-68 "out of background workers" lines measured, none lost).
+    # CiComposeWorkerSizingTests pins these two numbers against the live floor, so an added collector fails
+    # this file's test instead of drifting silently.
     #
     # work_mem: tune measured 4 MB at 2/4 GB and ~3.9 MB at 8 GB (#4322 lane-4322m) — below the managed
     # store's own floor at EVERY size in this range: DeriveMemorySettings' clamp(RAM/512, 16 MB, 64 MB)
@@ -59,8 +77,13 @@ services:
     # deriving a second one to make tune's OWN work_mem come out right). Safety at the smallest supported
     # container: tune gives max_connections = 25 at 2 GB (measured), so worst case (all connections running
     # a worker's ~3 concurrent sort/hash nodes at once, the same bound DeriveMemorySettings documents) is
-    # 25 x 3 x 16 MB = 1200 MB, plus shared_buffers' 512 MB = 1712 MB — under the 2 GB limit with headroom
-    # for the rest of the server. cc #4310.
+    # 25 x 3 x 16 MB = 1200 MB, plus shared_buffers' 512 MB = 1712 MB. That counts CLIENT connections only:
+    # background workers do not count against max_connections, and each slot a restart fills is a backend of
+    # its own (74 slots = up to 73 job backends at about 4-6 MB private each, measured on an empty store, so
+    # about 0.4 GB, plus the sort/hash memory of the refresh jobs that run together: 23 x 3 x 16 MB = 1.1 GB if
+    # all 23 overlap). The connection worst case and the restart burst do not coincide in practice (the
+    # service's pools are idle while the store restarts), but a mem_limit under about 4 GB has no headroom for
+    # both: give a store with real data 4 GB or more. cc #4310.
     command: ["postgres", "-c", "shared_preload_libraries=timescaledb,pg_stat_statements", "-c", "pg_stat_statements.track_utility=off", "-c", "timescaledb.max_background_workers=74", "-c", "max_worker_processes=85", "-c", "work_mem=16MB"]
     # Uncomment and set to the host's own budget if this container should be capped — left commented
     # because a host's memory varies and a wrong default could starve a big store (#4322). Example for an
@@ -87,8 +110,9 @@ services:
       retries: 12
 
   darling:
-    # The newest release image (#5629: not :nightly, which is the newest dev build). Substitute a version tag
-    # for something pinned, or build from a checkout:
+    # In a source checkout this is the newest release image (#5629: not :nightly, which is the newest dev build).
+    # The copy in a release's PerformanceMonitorDarling-compose-<version>.tar.gz names that release's own tag
+    # instead (#6123). Substitute a version tag for something pinned, or build from a checkout:
     #   build: { context: ../.., dockerfile: Darling/Dockerfile }
     image: ghcr.io/erikdarlingdata/performancemonitor-darling:latest
     restart: unless-stopped
@@ -134,10 +158,13 @@ services:
       - store_connection
       - sql_password
       - web_token
-      - mcp_token
+      # MCP is off in the sample, so its token is not mounted: uncomment this and the mcp_token entry in the
+      # `secrets:` block at the bottom, and set mcp.enabled to true in darling.json, to turn MCP on (#6140).
+      # - mcp_token
       # Uncomment with the `secrets:` entries at the bottom to serve the dashboard over HTTPS (#2562),
       # then point web.network.tls at these paths in darling.json. Without them the web token and its
-      # session cookie cross the network in the clear.
+      # session cookie cross the network in the clear — which is why the ports below stay on the host's
+      # loopback address until TLS (or a TLS proxy) is in place. See the quickstart's step 4 at the top.
       # - web_tls_cert
       # - web_tls_key
       # The same for MCP (#5288): uncomment with the `secrets:` entries at the bottom, then point
@@ -146,8 +173,11 @@ services:
       # - mcp_tls_cert
       # - mcp_tls_key
     ports:
-      - "5153:5153"   # web dashboard (token → cookie gate; plain HTTP unless web.network.tls is set)
-      - "5152:5152"   # MCP (bearer token; plain HTTP unless mcp.network.tls is set)
+      # Published on the docker host's loopback address only. A mapping with no address (port:port alone)
+      # would publish on every host interface, and the sample's plain-HTTP listener would then hand the
+      # token to anyone on the segment. Change the address to the LAN interface you mean once TLS is set up.
+      - "127.0.0.1:5153:5153"   # web dashboard (token → cookie gate; plain HTTP unless web.network.tls is set)
+      - "127.0.0.1:5152:5152"   # MCP (bearer token; plain HTTP unless mcp.network.tls is set)
     # #4733: reports unhealthy once a startup failure has stopped collection for good. The process stays up after
     # such a failure on purpose (exiting would restart a plain config error in a loop), so without this the
     # container shows as running although it never collects. `restart: unless-stopped` does not act on health,
@@ -174,8 +204,9 @@ secrets:
     file: ./secrets/sql_password.txt
   web_token:
     file: ./secrets/web_token.txt
-  mcp_token:
-    file: ./secrets/mcp_token.txt
+  # MCP's bearer token (#6140) - uncomment together with the `secrets:` list above to turn MCP on.
+  # mcp_token:
+  #   file: ./secrets/mcp_token.txt
   # HTTPS for the dashboard (#2562) — uncomment together with the `secrets:` list above.
   # web_tls_cert:
   #   file: ./secrets/web_tls_cert.pem

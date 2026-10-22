@@ -38,6 +38,7 @@ namespace Darling.Tests;
 /// a <c>Grid</c> are checked: an attached <c>Grid.Row</c> on something nested inside a <c>StackPanel</c> is
 /// inert, and reading it as an assignment against the enclosing grid would invent offenders.</para>
 /// </summary>
+[Trait("Stage", "Guard")] // #5798: walks the repo tree, so the guard stage runs it
 public sealed class XamlGridRowRangeTests
 {
     [Fact]
@@ -277,7 +278,7 @@ public sealed class XamlGridRowRangeTests
             .Any(segment => string.Equals(segment, "bin", StringComparison.OrdinalIgnoreCase)
                             || string.Equals(segment, "obj", StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>Same walk-up idiom as <c>DocCommentHygieneTests.FindRepoRoot</c>.</summary>
+    /// <summary>Walks up from the test binary to the repository root.</summary>
     private static string? FindRepoRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

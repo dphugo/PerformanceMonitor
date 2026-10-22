@@ -85,7 +85,7 @@ public sealed class ViewerDisabledListBoxThemeTests
             var themeStyle = Assert.IsType<Style>(LoadTheme(themeFile)[typeof(ListBox)]);
             var withThemeStyle = new ResourceDictionary { [typeof(ListBox)] = themeStyle };
 
-            var stock = RenderSample(null, enabled: true);
+            var stock = RenderSample(StockListBox(), enabled: true);
             var themed = RenderSample(withThemeStyle, enabled: true);
             int differing = stock.Where((b, i) => b != themed[i]).Count();
             Assert.True(differing == 0,
@@ -93,10 +93,16 @@ public sealed class ViewerDisabledListBoxThemeTests
 
             /* Guard against a vacuous pass: were the style not reaching the list, both renders above would be
                the stock one and match trivially. Disabled, the two templates must part ways (stock white). */
-            Assert.False(RenderSample(null, enabled: false).SequenceEqual(RenderSample(withThemeStyle, enabled: false)),
+            Assert.False(RenderSample(StockListBox(), enabled: false).SequenceEqual(RenderSample(withThemeStyle, enabled: false)),
                 $"{themeFile}: the implicit ListBox style did not reach the sample list");
         });
     }
+
+    /// <summary>#6175: the "stock" baseline. An Application another test class created and themed (the viewer's
+    /// App.xaml supplies the same theme at run time) sits above every element in the process, so a render with no
+    /// resources of its own is not stock if that theme is merged there. An empty implicit ListBox style in the host's
+    /// own resources is found before the Application's, and adds nothing: the control's built-in template renders.</summary>
+    private static ResourceDictionary StockListBox() => new() { [typeof(ListBox)] = new Style(typeof(ListBox)) };
 
     private static void AssertInteriorIsThemedAndDimmed(ListBox list, ResourceDictionary theme, string label)
     {
@@ -172,18 +178,24 @@ public sealed class ViewerDisabledListBoxThemeTests
         return (ResourceDictionary)XamlReader.Load(stream);
     }
 
-    /// <summary>The real <c>ServerList</c> element, minus what only the window can supply: the two handler
-    /// attributes, and the row templates in <c>ListBox.Resources</c> / <c>ListBox.ItemTemplateSelector</c>
+    private static readonly XNamespace Ui = "clr-namespace:PerformanceMonitor.Ui;assembly=PerformanceMonitor.Ui";
+
+    /// <summary>The real <c>ServerList</c> element (the Ui project's InvokableListBox, #6138), minus what only the window can supply: the four handler
+    /// attributes (ItemInvoked, SelectionChanged, MouseDoubleClick, KeyDown), and the row templates in <c>ListBox.Resources</c> / <c>ListBox.ItemTemplateSelector</c>
     /// (they name code-behind handlers and Window-level resources). Everything else, the Background /
     /// BorderBrush / BorderThickness attributes included, is parsed as shipped.</summary>
     private static ListBox ParseServerList()
     {
         var element = new XElement(XDocument
             .Load(PathTo("Darling", "PerformanceMonitor.Darling.Viewer", "MainWindow.xaml"))
-            .Descendants(Wpf + "ListBox")
+            .Descendants(Ui + "InvokableListBox")
             .Single(e => (string?)e.Attribute(X + "Name") == "ServerList"));
+        /* Parsed as the stock ListBox it derives from: the theme's template, the Style attribute and the brushes are what this test is about. */
+        element.Name = Wpf + "ListBox";
+        element.Attribute("ItemInvoked")?.Remove();
         element.Attribute("SelectionChanged")?.Remove();
         element.Attribute("MouseDoubleClick")?.Remove();
+        element.Attribute("KeyDown")?.Remove();
         element.Element(Wpf + "ListBox.Resources")?.Remove();
         element.Element(Wpf + "ListBox.ItemTemplateSelector")?.Remove();
         element.SetAttributeValue(XNamespace.Xmlns + "x", X.NamespaceName);

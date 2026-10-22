@@ -448,7 +448,7 @@ public sealed class DarlingPeerDisclosureTests
 
         /* Placement is load-bearing: an agent must learn WHICH store it is talking to before it reads the
            tool census and starts planning. */
-        var readOnly = text.IndexOf("## CRITICAL: Read-Only Access", StringComparison.Ordinal);
+        var readOnly = text.IndexOf("## What this server can and cannot do", StringComparison.Ordinal);
         var coverage = text.IndexOf("## Fleet Coverage", StringComparison.Ordinal);
         var census = text.IndexOf("This server exposes", StringComparison.Ordinal);
         Assert.True(readOnly >= 0 && coverage > readOnly && census > coverage,
@@ -458,7 +458,15 @@ public sealed class DarlingPeerDisclosureTests
            (Lite.Tests/CrossAppMcpToolInventoryPinTests) lives in it, and the workflow section (#3898 Phase 2
            trimmed the old tool tables, not the body's tail) still ends the text. */
         Assert.Contains("are unique to Darling", text, StringComparison.Ordinal);
-        Assert.EndsWith("`mute_analysis_finding` to silence an accepted pattern.", text.TrimEnd(), StringComparison.Ordinal);
+        /* The facts the instructions state, not the closing sentence (#5950): the tool count split between the
+           names Lite also exposes and the ones unique to Darling, the write-tool gate, and the engine note on an
+           empty read. Wording around them can change; losing a fact must fail. */
+        Assert.Matches(@"exposes \d+ tools\. \d+ are the same names Lite exposes\. The remaining \d+ are unique to Darling", text);
+        Assert.Contains("mcp.allowWrites", text, StringComparison.Ordinal);
+        Assert.Contains("mcp.allowServerAdmin", text, StringComparison.Ordinal);
+        Assert.Contains("not_collected", text, StringComparison.Ordinal);
+        Assert.Contains("engine", text, StringComparison.OrdinalIgnoreCase);
+        Assert.True(text.LastIndexOf("## Workflow", StringComparison.Ordinal) > census, "the workflow section no longer follows the census");
     }
 
     [Fact]

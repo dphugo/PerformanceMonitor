@@ -31,7 +31,6 @@ namespace Lite.Tests;
 /// reference one SQL const directly and read the other's source: <c>Lite.Tests</c> has no reference to any
 /// Darling project. What lives here is Lite's own behaviour and Lite's own wiring.</para>
 /// </summary>
-[Trait("Reads", "Darling")]
 public sealed class CollectionOutputBesideCostTests
 {
     /* Named to mirror the Darling twin, which these fixtures are meant to match line-for-line. */
@@ -200,10 +199,13 @@ public sealed class CollectionOutputBesideCostTests
            #3754: the faulted-run count (a RUN-CLASS count, like the note count beside it) and the
            event-collector bool, computed by the caller from the name on IsEventCollector's own name-list
            pattern, precisely so that this method still takes no string. */
-        Assert.Equal(6, parameters.Length);
+        /* #5644: the zero-is-normal bool joined the event bool, computed from a name list the same way. */
+        /* #6177: the NO_PERMISSIONS-band bool joined them. The caller reduces the band word to a bool, so it is
+           a run-class fact like the others: no string, no note text, nothing that changes from run to run. */
+        Assert.Equal(8, parameters.Length);
 
         Assert.Equal(
-            new[] { "rowsStored", "totalRuns", "deniedSinceLastSuccess", "noteCount", "faultedRuns", "isEventCollector" },
+            new[] { "rowsStored", "totalRuns", "deniedSinceLastSuccess", "noteCount", "faultedRuns", "isEventCollector", "isZeroNormal", "bandedNoPermissions" },
             parameters.Select(p => p.Name!).ToArray());
 
         Assert.DoesNotContain(parameters, p => p.ParameterType == typeof(string));
@@ -246,8 +248,9 @@ public sealed class CollectionOutputBesideCostTests
            output or denial-currency term, which is what this pin refuses; #4000 then removed isOnLoad
            (an on-load collector is no longer a distinct input to the ladder, only a distinct CADENCE the
            caller resolves before calling in), netting 9; #4748 then appended latestRunNote - the newest run's
-           own partial-failure note, a text input that is neither an output count nor denial currency - netting 10. */
-        Assert.Equal(10, parameters.Length);
+           own partial-failure note, a text input that is neither an output count nor denial currency - netting 10; #5646 then appended trailingSuccessRuns - how many of the newest runs in a row
+           succeeded, a run outcome like the counts beside it - netting 11. */
+        Assert.Equal(11, parameters.Length);
         Assert.DoesNotContain(parameters, p => p.Contains("rows", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(parameters, p => p.Contains("output", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(parameters, p => p.Contains("denied", StringComparison.OrdinalIgnoreCase)

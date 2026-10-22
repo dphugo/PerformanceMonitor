@@ -114,12 +114,15 @@ const sandbox = {
   favoriteStar: () => null,
   alertBadge: () => null,
   initSidebarCollapse() {},
+  initNarrowNav() {},
   initSidebarSearch() {},
   paintServerList() {},
+  makeScrollReset: () => () => false,
   initSeverityColorSettings() {},
   readTool: async () => ({ kind: "empty" }),
   getSession: async () => null,
   listViews: async () => [],
+  onViewsChanged() {},
 };
 
 vm.createContext(sandbox);

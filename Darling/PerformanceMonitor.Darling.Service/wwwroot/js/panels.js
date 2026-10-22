@@ -38,12 +38,18 @@ import {
   getPath,
   parseUtc,
   applyFormat,
+  tickDecimals,
   bandClass,
   sevClass,
   windowFromHours,
   dbScopeChip,
   dbFilteredEmptyText,
   sourceStrip,
+  clampText,
+  disclosure,
+  markPartialSubtitle,
+  localizeIsoText,
+  localizeAlertDetail,
 } from "./util.js";
 import { zoomableLineChart, chartZoomScope, SERIES_COLORS } from "./charts.js";
 import { plainText, plainTextNamed } from "./plain-text.js";
@@ -86,13 +92,46 @@ export function getPanelSignal() {
 }
 
 /**
+ * The sentence an empty envelope shows (#5644 W16). A panel that sets `emptyWins` has ONE agreed sentence for its
+ * empty state (the Blocking tab's deadlock panels, whose reads each worded "nothing happened" differently), and it
+ * replaces the read's own message; every other panel keeps the server's message.
+ */
+export function emptyHeadline(desc, res) {
+  /* Only a TRUE negative (status "empty") takes the panel's sentence. A "not_collected" (an Azure SQL Database has no system_health
+     session), "unavailable" or "precondition" envelope is a different statement, and "No deadlocks" over it would be a false
+     all-clear that also drops the server's own engine-gate line; those keep the read's message. */
+  return desc && desc.emptyWins && desc.emptyText && res.status === "empty" ? desc.emptyText : res.message;
+}
+
+/**
+ * A panel whose wording depends on which collector answered (#5644 W16, the blocking trend: blocked process reports, or the DMV
+ * snapshot rows it falls back to). `desc.bySource` maps the answer's `desc.sourceKey` value to `{ title, label, unit }`; the
+ * returned descriptor carries the series label and axis unit, and the heading's title text is replaced in place. A descriptor
+ * without `bySource`, or an answer whose source has no entry, comes back as given.
+ */
+export function applySourceWording(desc, data, panel) {
+  const alt = desc.bySource && desc.sourceKey ? desc.bySource[getPath(data, desc.sourceKey)] : null;
+  if (!alt) return desc;
+  const head = panel ? Array.from(panel.children || [])[0] : null;
+  const titleNode = head ? head.firstChild : null;
+  if (titleNode && alt.title) titleNode.textContent = alt.title;
+  return {
+    ...desc,
+    title: alt.title || desc.title,
+    unit: alt.unit ?? desc.unit,
+    series: Array.isArray(desc.series) ? desc.series.map((x) => ({ ...x, label: alt.label || x.label })) : desc.series,
+  };
+}
+
+/**
  * Build a panel node. It returns immediately with a loading strip and fills itself once the fetch resolves,
  * mapping the API response kinds (data / empty envelope / error / aborted / auth) to the right UI.
  */
 export function renderPanel(desc, onSettled) {
   const signal = panelSignal;
   const body = el("div", { class: "panel-body" }, [loadingStrip()]);
-  const panel = el("div", { class: "panel card" + (desc.span === 2 ? " span-2" : "") }, [
+  /* #5701: `data-panel` (the read) and `data-title` are the hooks the web UI smoke check finds a panel by. */
+  const panel = el("div", { class: "panel card" + (desc.span === 2 ? " span-2" : ""), "data-panel": desc.read || desc.title, "data-title": desc.title }, [
     /* The database-scope chip (#5245): while the page's database filter is active it says whether this panel's read took it
        (dbScopeChip in util.js; `desc.dbScope` overrides the read's own class for a panel fed by a shared read). */
     el("h3", {}, [desc.title, desc.subtitle ? el("span", { class: "panel-sub", text: " " + desc.subtitle }) : null, dbScopeChip(desc.read, desc.dbScope)]),
@@ -165,11 +204,12 @@ async function loadPanelBody(desc, body, signal) {
        window's start (the server adds the note to that envelope only, never to an unavailable or not_collected one), so a
        new server's empty week does not read as a quiet one. windowFloorStrip is null for a chart and for an envelope
        without the note. */
-    mount(body, [kept, windowFloorStrip(res.data, desc), emptyStrip(res.message)]);
+    mount(body, [kept, windowFloorStrip(res.data, desc), emptyStrip(emptyHeadline(desc, res))]);
     return;
   }
 
-  const render = VIZ[desc.viz];
+  /* #6293: a panel whose picture is its own (the Query Heatmap grid) hands its draw function as `desc.render`. */
+  const render = typeof desc.render === "function" ? desc.render : VIZ[desc.viz];
   if (!render) {
     mount(body, errorStrip("Unknown visualization: " + desc.viz));
     return;
@@ -192,9 +232,12 @@ async function loadPanelBody(desc, body, signal) {
     const moreNotes = (desc.moreNoteKeys || []).map((k) => getPath(res.data, k));
     /* #4966: a grid says where its table's data starts when that is after the window's start (windowFloorStrip). */
     const floor = windowFloorStrip(res.data, desc);
+    /* #5644 W12: a row-capped panel stops claiming the window it was asked for in its heading. */
+    markPartialSubtitle(body.parentNode, res.data, desc);
     /* A narrowed read draws its chart over the hours it answered for, not the Range it was asked for (#2802).
        A copy, so the caller's descriptor keeps the window it asked for. */
     if (res.keptHours) desc = { ...desc, windowHours: res.keptHours };
+    desc = applySourceWording(desc, res.data, body.parentNode);
     const rendered = render(res.data, desc);
 
     mount(body, [
@@ -233,7 +276,7 @@ export const VIZ = {
  */
 const NO_FIELDS_MSG = "No fields configured — edit this view and run Auto-detect fields.";
 
-/* table: desc = { rowsKey, columns:[{key,label,format,align,wrap,mono,pre,sevKey,statusSev,sortable,sortValue,csv,copy,copyValue}], sortable, sortId, onRow(row, tr), rowClass(row)|string, tools:false }
+/* table: desc = { rowsKey, columns:[{key,label,format,align,wrap,clamp,mono,pre,sevKey,statusSev,sortable,sortValue,csv,copy,copyValue}], sortable, sortId, onRow(row, tr), rowClass(row)|string, tools:false }
 
    Column-header sort (#4843). A header click cycles ascending -> descending -> the server's own order, with a ▲/▼
    indicator and aria-sort; Enter and Space on the focused header do the same. The comparison reads the RAW row value
@@ -250,7 +293,24 @@ function vizTable(data, desc) {
      a function from the rows to the rows in the order to show. A header click still sorts from there. */
   const rows = typeof desc.orderRows === "function" && Array.isArray(read) ? desc.orderRows(read) : read;
   /* #5244: a filtered read that has a snapshot but no row for the chosen databases must not say there is no snapshot. */
-  return gridTable(rows, rows.length ? desc : { ...desc, emptyText: dbFilteredEmptyText(desc.read, desc.emptyText, desc.dbScope) });
+  const grid = gridTable(rows, rows.length ? desc : { ...desc, emptyText: dbFilteredEmptyText(desc.read, desc.emptyText, desc.dbScope) });
+  /* #5506 part 3: `statusKey` names a live-state object in the payload (get_read_latency's admission, never stored) that
+     draws as one line above the grid; a payload without it draws the grid alone. */
+  const line = desc.statusKey === "admission" ? admissionLine(getPath(data, desc.statusKey)) : null;
+  return line ? el("div", {}, [noticeStrip(line), grid]) : grid;
+}
+
+/**
+ * #5506 part 3: the status line of get_read_latency's grid, from the answer's live `admission` object: the long reads
+ * running and waiting in this service process right now, against the limit (0 is no limit). Null when the answer has none.
+ */
+function admissionLine(admission) {
+  if (!admission || typeof admission !== "object") return null;
+  const running = Number(admission.running) || 0;
+  const queued = Number(admission.queued) || 0;
+  const limit = Number(admission.limit) || 0;
+  const slots = limit > 0 ? `${running} of ${limit} long-read slots in use` : `${running} long reads running (no limit set)`;
+  return `Now, in this service process: ${slots}, ${queued} waiting.`;
 }
 
 /** The grid every table on the web draws through (#4843): sort, column groups, per-column filters, Copy cell / row /
@@ -289,8 +349,15 @@ export function gridTable(rows, desc) {
   const table = el("table", { class: "data" }, [el("thead", {}, [head]), tbody]);
   const wrap = el("div", { class: "table-wrap" }, filterBar ? [filterBar, table] : [table]);
   const picker = columnPicker(desc, cols, head, tbody);
-  if (desc.tools === false) return picker ? el("div", { class: "grid-box" }, [picker, wrap]) : wrap;
-  return el("div", { class: "grid-box" }, picker ? [picker, gridTools(desc, cols, tbody), wrap] : [gridTools(desc, cols, tbody), wrap]);
+  /* #5701: `data-grid` names the grid for the web UI smoke check. A tools-less, picker-less grid is the bare wrapper, which
+     carries the hook itself so the check finds every grid the same way. */
+  const gridName = String(desc.id || desc.sortId || desc.read || desc.title || "grid");
+  if (desc.tools === false && !picker) {
+    wrap.setAttribute("data-grid", gridName);
+    return wrap;
+  }
+  if (desc.tools === false) return el("div", { class: "grid-box", "data-grid": gridName }, [picker, wrap]);
+  return el("div", { class: "grid-box", "data-grid": gridName }, picker ? [picker, gridTools(desc, cols, tbody), wrap] : [gridTools(desc, cols, tbody), wrap]);
 }
 
 /* Column groups (#4843). A descriptor with `groups: ["Memory detail", ...]` and `defaultGroups: [...]` marks wide
@@ -999,7 +1066,7 @@ function gridFilter(desc, cols, head, tbody) {
 /* An unsortable header cell. The sortable one is built by makeGridSort().headerCell; both are the place a later
    header affordance (a filter, a menu) attaches. */
 function headerCell(c) {
-  return el("th", { text: c.label, class: isNumericCol(c) ? "num" : null });
+  return el("th", { text: c.label, class: isNumericCol(c) ? "num" : null, title: c.hint || null });
 }
 
 /* The sort state of every grid, at MODULE scope so the 60 s poll's rebuild of a page re-applies the chosen sort.
@@ -1099,7 +1166,8 @@ function makeGridSort(desc, cols, rows) {
       const live = sortable[i];
       th.className = live ? "sortable" + (isNumericCol(c) ? " num" : "") : isNumericCol(c) ? "num" : "";
       th.setAttribute("tabindex", live ? "0" : "-1");
-      th.setAttribute("title", live ? "Sort by " + c.label : "");
+      /* The column's `hint` is its header tooltip; this refresh runs after the header is built, so it must not replace it. */
+      th.setAttribute("title", live ? (c.hint ? c.hint + " (click to sort)" : "Sort by " + c.label) : c.hint || "");
       const on = live && st && st.col === colId(c);
       th.setAttribute("aria-sort", on ? (st.dir === "asc" ? "ascending" : "descending") : "none");
       th.sortInd.textContent = on ? (st.dir === "asc" ? " ▲" : " ▼") : "";
@@ -1132,7 +1200,7 @@ function makeGridSort(desc, cols, rows) {
     eligible: cols.map((c) => c.sortable !== false),
     headerCell(c, i) {
       const ind = el("span", { class: "sort-ind", "aria-hidden": "true" });
-      const th = el("th", { class: "sortable" + (isNumericCol(c) ? " num" : ""), tabindex: "0", "aria-sort": "none", title: "Sort by " + c.label }, [c.label, ind]);
+      const th = el("th", { class: "sortable" + (isNumericCol(c) ? " num" : ""), tabindex: "0", "aria-sort": "none", title: c.hint ? c.hint + " (click to sort)" : "Sort by " + c.label }, [c.label, ind]);
       th.sortInd = ind;
       const cycle = () => {
         if (!sortable[i]) return;
@@ -1203,7 +1271,7 @@ export function visibleColumns(cols, rows) {
 }
 
 function isNumericCol(c) {
-  return c.align === "right" || ["int", "num1", "num2", "rate", "ms", "mb", "pct"].includes(c.format);
+  return c.align === "right" || ["int", "num1", "num2", "rate", "ms", "mb", "bytes", "pct"].includes(c.format);
 }
 
 function cell(row, c) {
@@ -1211,26 +1279,34 @@ function cell(row, c) {
      query-text expander. It owns its own content; wrap/mono classes still apply if the column asks for them. */
   if (typeof c.render === "function") {
     const rcls = [];
-    if (c.wrap) rcls.push("wrap");
+    /* #6353: a render column keeps the numeric alignment its header already has (`align: "right"` or a numeric format) and the
+       server-computed band its `sevKey` names, as a plain column does. The Compare delta cells set both and were drawn left-aligned and
+       uncoloured. Only the Compare deltas set `sevKey` with `render`; the two FinOps size columns that set `align: "right"` with `render`
+       now align their cells under their right-aligned headers. */
+    if (isNumericCol(c)) rcls.push("num");
+    if (c.clamp) rcls.push("clamp");
+    else if (c.wrap) rcls.push("wrap");
     if (c.mono) rcls.push("mono");
     if (c.pre) rcls.push("pre");
+    if (c.sevKey) rcls.push(sevClass(getPath(row, c.sevKey)));
     if (typeof c.cellClass === "function") { const k = c.cellClass(row); if (k) rcls.push(k); }
     return el("td", { class: rcls.join(" ") || null }, [c.render(row)]);
   }
   const raw = getPath(row, c.key);
   const cls = [];
   if (isNumericCol(c)) cls.push("num");
-  if (c.wrap) cls.push("wrap");
+  if (c.clamp) cls.push("clamp");
+  else if (c.wrap) cls.push("wrap");
   if (c.mono) cls.push("mono");
   if (c.pre) cls.push("pre");
   if (c.sevKey) cls.push(sevClass(getPath(row, c.sevKey)));
   if (c.statusSev) cls.push(sevClass(statusToSev(raw)));
   if (typeof c.cellClass === "function") { const k = c.cellClass(row); if (k) cls.push(k); }
-  /* nullKey names another field of the SAME row that says why this one is empty (get_file_io_stats' size_note:
+  /* nullKey names another field of the same row that says why this one is empty (get_file_io_stats' size_note:
      "n/a (log service)" for the log file of a Hyperscale database). The server wrote the sentence; the page only
      shows it in place of the bare em dash. */
   const why = raw == null && c.nullKey ? getPath(row, c.nullKey) : null;
-  const text =
+  const shown =
     why != null && why !== ""
       ? String(why)
       : typeof c.display === "function"
@@ -1244,6 +1320,28 @@ function cell(row, c) {
             : c.plain
               ? plainText(String(raw))
               : String(raw);
+  /* #5644 W20: a column marked `localizeText` (a message or note: collection-health notes, collector errors) shows any ISO
+     instant in its sentence in local time, like the grids beside it. Opt-in: query text, statement text, details and
+     identifiers are data, and a literal such as '2026-01-01T00:00:00' inside them must show as written. */
+  /* #5644 W20: `localizeAlertDetail` is the same opt-in for an alert's stored body (get_alert_history's detail_text): only the
+     labelled time lines ("Incident Since:", "Started:", "From:", "To:", "Window:", ...) and the sample-age line shift, because the
+     same body carries query and SQL lines that must print as written. Never use `localizeText` on a column that holds SQL. */
+  const text = c.localizeAlertDetail && !c.format
+    ? localizeAlertDetail(shown, getPath(row, "newest_sample"))
+    : c.localizeText && !c.format ? localizeIsoText(shown) : shown;
+  if (c.clamp) return el("td", { class: cls.join(" ") || null }, [clampText(text)]);
+  /* #6154: `detailKey` names a field of the same row that holds the long explanation. The cell shows only its short value and the
+     explanation opens under it on a click (a <details>, so the keyboard works), so a row stays one line tall. Text that is the same
+     for every row belongs in the column's `hint` (the header tooltip) instead. */
+  if (c.detailKey) {
+    const full = getPath(row, c.detailKey);
+    if (typeof full === "string" && full !== "") {
+      const detail = el("p", { class: "cell-detail-text", text: plainText(full) });
+      const box = disclosure(text, detail, { max: 60 });
+      box.classList.add("cell-detail");
+      return el("td", { class: cls.join(" ") || null }, [box]);
+    }
+  }
   return el("td", { class: cls.join(" ") || null, text });
 }
 
@@ -1288,8 +1386,11 @@ function vizStat(data, desc) {
       const valueClass = "value" + (s.small ? " small" : "") + (sev ? " " + sevClass(sev) : "");
       const raw = getPath(data, s.key);
       const why = raw == null && s.nullKey ? getPath(data, s.nullKey) : null;
+      /* `appendKey` adds a second field of the payload after the value, when it has one: the product level "RTM" and its update level "CU20" read "RTM CU20" (#6159). */
+      const extra = raw != null && s.appendKey ? getPath(data, s.appendKey) : null;
+      const shownValue = applyFormat(s.format, raw) + (extra != null && extra !== "" ? " " + String(extra) : "");
       return el("div", { class: "stat" }, [
-        el("div", { class: valueClass, text: why != null && why !== "" ? String(why) : applyFormat(s.format, raw) }),
+        el("div", { class: valueClass, text: why != null && why !== "" ? String(why) : shownValue }),
         el("div", { class: "label", text: s.label }),
       ]);
     })
@@ -1317,7 +1418,8 @@ function vizLine(data, desc) {
     label: s.label,
     color: s.color || SERIES_COLORS[i % SERIES_COLORS.length],
   }));
-  const formatValue = desc.format ? (v) => applyFormat(desc.format, v) : (v) => String(Math.round(v));
+  /* The second argument is the axis tick step the chart passes (#6158), so a small range prints enough decimals that no two ticks read alike. */
+  const formatValue = desc.format ? (v, o) => applyFormat(desc.format, v, o) : (v, o) => (o && o.step > 0 && tickDecimals(o.step) ? Number(v).toFixed(tickDecimals(o.step)) : String(Math.round(v)));
   /* Percentage charts cap the y-domain at 100 so a 96% reading never rounds the axis up past 100% (B3). */
   const clampMax = desc.clampMax ?? (desc.format === "pct" ? 100 : null);
   /* #2802: span the x-axis over the REQUESTED window ("last N hours" ending now), not the data's own extent, so a
@@ -1415,6 +1517,7 @@ export function statusToSev(status) {
     case "HEALTHY":
     case "OK":
     case "SUCCESS":
+    case "ANALYZED":
     case "ONLINE":
       return "Healthy";
     case "STALE":

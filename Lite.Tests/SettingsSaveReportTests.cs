@@ -97,6 +97,96 @@ public sealed class SettingsSaveReportTests
             SettingsSaveReport.Classify(documentWritten: true, mcpChanged: false,
                 alertsValid, mcpValid, webhooksValid));
     }
+
+    /// <summary>
+    /// #5772: a password, webhook URL or routing key that Credential Manager refused is an objection too:
+    /// the page reached disk, so the report is "written with objections" and the success toast is suppressed.
+    /// </summary>
+    [Fact]
+    public void ACredentialThatWasNotStored_SuppressesTheToast_WhenThePageWasWritten()
+    {
+        Assert.Equal(
+            SettingsSaveOutcome.WrittenWithObjections,
+            SettingsSaveReport.Classify(documentWritten: true, mcpChanged: true,
+                alertsValid: true, mcpValid: true, webhooksValid: true, credentialsSaved: false));
+    }
+
+    /// <summary>
+    /// And when the page was not written either, the failed write still outranks it: the answer is that
+    /// nothing was saved, and the credential failures ride along in that one dialog.
+    /// </summary>
+    [Fact]
+    public void ACredentialThatWasNotStored_DoesNotOutrankAFailedWrite()
+    {
+        Assert.Equal(
+            SettingsSaveOutcome.NothingWritten,
+            SettingsSaveReport.Classify(documentWritten: false, mcpChanged: false,
+                alertsValid: true, mcpValid: true, webhooksValid: true, credentialsSaved: false));
+    }
+
+    private const string TeamsFailure = "The Teams webhook URL was not saved because it is 1,400 characters long, "
+        + "and Windows Credential Manager stores at most 1,280.";
+
+    private const string SmtpFailure = "The SMTP password was not saved because Windows returned error 5 (Access is denied).";
+
+    /// <summary>The page was written but a webhook was not stored: the one dialog says the rest was saved.</summary>
+    [Fact]
+    public void CredentialFailureText_PageWritten_NamesTheValue_AndSaysTheRestWasSaved()
+    {
+        var text = SettingsSaveReport.CredentialFailureText(true, new[] { TeamsFailure }, webhookValueHeld: true);
+
+        Assert.Equal(
+            TeamsFailure + "\n\nThe rest of this page was saved. Lite keeps using the value you typed until it "
+            + "restarts, then goes back to the value saved before, if there was one.",
+            text);
+        Assert.DoesNotContain("could not be written", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Nothing was written: the dialog never says the rest was saved. It says the opposite, in the same
+    /// dialog as the failed values, so one click gets one true answer.
+    /// </summary>
+    [Fact]
+    public void CredentialFailureText_NothingWritten_NamesTheValue_AndSaysNothingElseWasSaved()
+    {
+        var text = SettingsSaveReport.CredentialFailureText(false, new[] { TeamsFailure }, webhookValueHeld: true);
+
+        Assert.Equal(
+            TeamsFailure + "\n\n" + SettingsSaveReport.NothingWrittenText
+            + " Lite keeps using the value you typed until it restarts, then goes back to the value saved "
+            + "before, if there was one.",
+            text);
+        Assert.Contains("nothing was saved", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("The rest of this page was saved", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Your other settings were saved", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>The SMTP password is read from Credential Manager every time, so the in-memory note is left off.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void CredentialFailureText_SmtpOnly_LeavesOutTheNoteAboutTheTypedValue(bool documentWritten)
+    {
+        var text = SettingsSaveReport.CredentialFailureText(documentWritten, new[] { SmtpFailure }, webhookValueHeld: false);
+
+        Assert.StartsWith(SmtpFailure, text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Lite keeps using", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CredentialFailureText_SeveralFailures_ListsEachOnItsOwnParagraph()
+    {
+        var text = SettingsSaveReport.CredentialFailureText(true, new[] { TeamsFailure, SmtpFailure }, webhookValueHeld: true);
+
+        Assert.StartsWith(TeamsFailure + "\n\n" + SmtpFailure + "\n\n", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CredentialFailureText_NoFailures_IsNull()
+    {
+        Assert.Null(SettingsSaveReport.CredentialFailureText(true, Array.Empty<string>(), webhookValueHeld: true));
+        Assert.Null(SettingsSaveReport.CredentialFailureText(false, Array.Empty<string>(), webhookValueHeld: true));
+    }
 }
 
 /// <summary>
@@ -120,7 +210,7 @@ public sealed class SettingsSaveButtonHonestyTests
     [Fact]
     public void TheSaveButton_AsksTheClassifierBeforeItSaysAnything()
     {
-        var body = MethodBody(SettingsWindowSource(), "SaveButton_Click");
+        var body = SavePath(SettingsWindowSource());
 
         Assert.Contains("App.WriteSettingsDocument(", body, StringComparison.Ordinal);
         Assert.Contains("SettingsSaveReport.Classify(", body, StringComparison.Ordinal);
@@ -130,9 +220,30 @@ public sealed class SettingsSaveButtonHonestyTests
         var classify = body.IndexOf("SettingsSaveReport.Classify(", StringComparison.Ordinal);
         var firstToast = body.IndexOf("Settings saved", StringComparison.Ordinal);
         Assert.True(classify < firstToast,
-            "SaveButton_Click can reach \"Settings saved.\" without going through SettingsSaveReport.Classify, " +
+            "The Save path can reach \"Settings saved.\" without going through SettingsSaveReport.Classify, " +
             "which is #2433: the toast is about whether the boxes validated rather than whether anything " +
             "reached disk.");
+    }
+
+    /// <summary>
+    /// #5772: the credential failures are reported from the Save button, after the settings.json write is
+    /// known. A mutator that raised its own dialog before the write could only guess at the rest of the page,
+    /// and once said "Your other settings were saved." over a save that then failed.
+    /// </summary>
+    [Fact]
+    public void CredentialFailures_AreReportedAfterTheWrite_AndNoMutatorClaimsTheRestWasSaved()
+    {
+        var source = SettingsWindowSource();
+        var body = SavePath(source);
+
+        var write = body.IndexOf("App.WriteSettingsDocument(", StringComparison.Ordinal);
+        var report = body.IndexOf("SettingsSaveReport.CredentialFailureText(", StringComparison.Ordinal);
+        Assert.True(write >= 0 && report > write,
+            "The Save path must build the credential failure text after the settings.json write is known.");
+        Assert.Contains("credentialsSaved:", body, StringComparison.Ordinal);
+
+        Assert.DoesNotContain("Your other settings were saved", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("The rest of this page was saved", source, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -144,14 +255,14 @@ public sealed class SettingsSaveButtonHonestyTests
     public void EveryWriterTheSaveButtonCalls_TakesTheSharedDocument()
     {
         var source = SettingsWindowSource();
-        var body = MethodBody(source, "SaveButton_Click");
+        var body = SavePath(source);
 
         var called = Regex.Matches(body, @"\b(Save[A-Za-z]+)\(root\)")
             .Select(m => m.Groups[1].Value)
             .ToList();
 
         Assert.True(called.Count >= 9,
-            $"SaveButton_Click hands the shared document to only {called.Count} writer(s) — the rest are " +
+            $"The Save path hands the shared document to only {called.Count} writer(s) — the rest are " +
             "opening settings.json for themselves again.");
 
         foreach (var name in called)
@@ -170,7 +281,7 @@ public sealed class SettingsSaveButtonHonestyTests
     public void TheLiveThemePreview_OnlySurvivesASaveThatWrote()
     {
         var source = SettingsWindowSource();
-        var body = MethodBody(source, "SaveButton_Click");
+        var body = SavePath(source);
 
         Assert.Contains("_saved = written;", body, StringComparison.Ordinal);
         Assert.DoesNotContain("_saved = true;", body, StringComparison.Ordinal);
@@ -189,7 +300,7 @@ public sealed class SettingsSaveButtonHonestyTests
     [Fact]
     public void TheMcpRestart_OnlyFollowsASaveThatWrote()
     {
-        var body = MethodBody(SettingsWindowSource(), "SaveButton_Click");
+        var body = SavePath(SettingsWindowSource());
 
         Assert.Contains("if (mcpChanged && written) McpSettingsChanged = true;", body, StringComparison.Ordinal);
     }
@@ -206,7 +317,7 @@ public sealed class SettingsSaveButtonHonestyTests
     [Fact]
     public void EveryMutator_SitsInsideTheGuardedRegion()
     {
-        var body = MethodBody(SettingsWindowSource(), "SaveButton_Click");
+        var body = SavePath(SettingsWindowSource());
 
         var openTry = body.IndexOf("try", StringComparison.Ordinal);
         var firstMutator = body.IndexOf("SaveMcpSettingsAsync(root)", StringComparison.Ordinal);
@@ -214,12 +325,24 @@ public sealed class SettingsSaveButtonHonestyTests
         var theCatch = body.IndexOf("catch (Exception", StringComparison.Ordinal);
 
         Assert.True(openTry >= 0 && firstMutator >= 0 && lastMutator >= 0 && theCatch >= 0,
-            "SaveButton_Click no longer has the shape this guard describes — its anchors moved and it is " +
+            "SaveCoreAsync no longer has the shape this guard describes — its anchors moved and it is " +
             "testing nothing.");
         Assert.True(openTry < firstMutator && lastMutator < theCatch,
-            "A mutator sits outside SaveButton_Click's try, so an exception building a settings value " +
+            "A mutator sits outside SaveCoreAsync's try, so an exception building a settings value " +
             "escapes into App's generic unhandled-exception dialog instead of the honest \"Nothing was " +
             "saved\" this method owes the user.");
+    }
+
+    /// <summary>
+    /// The body of the Save path. #5846 split the button: <c>SaveButton_Click</c> now only awaits
+    /// <c>SaveCoreAsync</c> and then selects the leftmost tab holding an invalid value, so the confirm, the
+    /// guarded mutators, the write and the classifier all live in <c>SaveCoreAsync</c>. The click is checked to
+    /// still call it, so these rules cannot pass over a method the button no longer runs.
+    /// </summary>
+    private static string SavePath(string source)
+    {
+        Assert.Contains("await SaveCoreAsync();", MethodBody(source, "SaveButton_Click"), StringComparison.Ordinal);
+        return MethodBody(source, "Task SaveCoreAsync");
     }
 
     private static string MethodBody(string source, string methodName)

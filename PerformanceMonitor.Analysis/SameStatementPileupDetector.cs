@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using PerformanceMonitor.Common;
 
 namespace PerformanceMonitor.Analysis;
 
@@ -445,7 +446,7 @@ public static class SameStatementPileupDetector
 
     /// <summary>
     /// The statement identity a pileup groups and fingerprints on: the row's <c>query_hash</c> when
-    /// present (the sys.dm_exec_requests statement hash — identical across sessions running the same
+    /// it is a usable hash (the sys.dm_exec_requests statement hash — identical across sessions running the same
     /// parameterized statement, and independent of Query Store), else a text-hash surrogate over the
     /// whitespace-normalized statement prefix. The surrogate exists for the rare null-hash row; it is
     /// honest about its reach (readers cap the projected text, so two distinct giant statements
@@ -455,22 +456,15 @@ public static class SameStatementPileupDetector
     /// <see cref="Evaluate"/> leaves it out). The marker is what a collector stores for any statement it
     /// withheld, so a text hash over it would put every withheld statement in one group and fire a pileup
     /// on statements that have nothing in common.</para>
+    /// <para>#5711 / #5758: an all-zero hash (<c>0x0000000000000000</c>) is "the engine did not say", not a query: the
+    /// DMV reports it for requests with no statement hash (BACKUP, DBCC, some maintenance commands), and keying
+    /// on it pooled every such request in one database into one "statement". It takes the null-hash path, and
+    /// a row with no text has no identity (null) rather than a shared <c>text:empty</c> group. The rule has ONE
+    /// definition, <c>QueryHashIdentity.Identity</c> in PerformanceMonitor.Common, which this method calls; that
+    /// definition also returns null for the withheld marker (#4348), so no marker check lives here.</para>
     /// </summary>
-    public static string? StatementIdentity(SnapshotRow row)
-    {
-        if (!string.IsNullOrWhiteSpace(row.QueryHash))
-        {
-            return row.QueryHash.Trim().ToLowerInvariant();
-        }
-
-        if (WithheldStatementMarker.IsMarker(row.QueryText))
-        {
-            return null;
-        }
-
-        var text = NormalizeText(row.QueryText);
-        return text.Length == 0 ? "text:empty" : "text:" + ShortHash(text);
-    }
+    public static string? StatementIdentity(SnapshotRow row) =>
+        QueryHashIdentity.Identity(row.QueryHash, row.QueryText);
 
     private static Detection BuildDetection(
         string serverName,
@@ -680,6 +674,8 @@ public static class SameStatementPileupDetector
         return false;
     }
 
+    /* Display-only: the preview text. The statement IDENTITY is QueryHashIdentity.Identity in PerformanceMonitor.Common
+       (#5758), not this. */
     private static string NormalizeText(string? text)
     {
         if (string.IsNullOrWhiteSpace(text))

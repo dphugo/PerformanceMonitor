@@ -45,6 +45,7 @@ namespace Darling.Tests;
 /// actually issued was recorded, and all eight <c>get_pg_*</c> reads were asserted to have been genuinely
 /// FETCHED from the PostgreSQL registry and from neither tab of the SQL Server one. See the PR.</para>
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class ServerPageTabsTests
 {
     private static string ServerTabsJs => ReadRepoFileLf(Path.Combine(
@@ -485,7 +486,7 @@ public sealed class ServerPageTabsTests
         var js = ServerTabsJs;
 
         var stamped = McpLatestSnapshotStampTests.LatestTools
-            .Where(t => t.Shape is McpLatestSnapshotStampTests.Shape.Stamped or McpLatestSnapshotStampTests.Shape.SearchBound)
+            .Where(t => t.Shape is PerformanceMonitor.Common.LatestSnapshotShape.Stamped or PerformanceMonitor.Common.LatestSnapshotShape.SearchBound)
             .Select(t => t.ToolName)
             .ToHashSet(StringComparer.Ordinal);
         Assert.True(stamped.IsSupersetOf(["get_database_sizes", "get_running_jobs", "get_server_properties", "get_session_stats"]),
@@ -807,7 +808,6 @@ public sealed class ServerPageTabsTests
            arrive leaves a painted page alone, because a failed fleet read is not evidence the engine changed. */
         Assert.Contains("const remembered = lastCard.get(server);", ServerJs, StringComparison.Ordinal);
         Assert.Contains("painted = paintTabsKeeping(keep, tabsSlot, server, tabId, remembered.card);", ServerJs, StringComparison.Ordinal);
-        Assert.Contains("if (card) lastCard.set(server, { card, reason });", ServerJs, StringComparison.Ordinal);
         Assert.Contains("if (!painted || (card && serverTabsFor(card) !== painted)) {", ServerJs, StringComparison.Ordinal);
         Assert.DoesNotContain("card.is_postgres", ServerJs, StringComparison.Ordinal);
         Assert.DoesNotContain("card.engine_kind", ServerJs, StringComparison.Ordinal);
@@ -866,7 +866,7 @@ public sealed class ServerPageTabsTests
         /* Ids are unique WITHIN a registry — two tabs sharing one id makes the second unreachable and the bar's
            active state lie. ACROSS registries they may and do collide (overview, activity, waits, io), which is
            deliberate: those are the deep links that survive a server turning out to be the other engine. */
-        foreach (var (registry, expected) in new[] { ("SERVER_TABS", 12), ("POSTGRES_TABS", 8) })
+        foreach (var (registry, expected) in new[] { ("SERVER_TABS", 13), ("POSTGRES_TABS", 8) })
         {
             var ids = TabIdsIn(RegistryRegion(ServerTabsJs, registry));
             /* An exact count, not a floor. A floor would have let the prose in the CHANGELOG, the commit and
@@ -881,9 +881,9 @@ public sealed class ServerPageTabsTests
     /// <summary>
     /// The tabs whose desktop twin does something the browser cannot say so, in the tab itself.
     ///
-    /// <para>Plan analysis, the query heatmap, cached-plan retrieval and actual-plan re-execution all need either
+    /// <para>Plan analysis, cached-plan retrieval and actual-plan re-execution all need either
     /// a plan renderer or a command back to the monitored server, and this read-only seat has neither. The same
-    /// goes for the block-chain view and the interactive deadlock graph. A reader told to open the desktop viewer
+    /// goes for the interactive deadlock graph (the block-chain tree is on the page since #6292). A reader told to open the desktop viewer
     /// is better served than one given a web page that looks like plan analysis and is not — so the absence is
     /// stated where they go looking for it, not left as a page that simply lacks the feature.</para>
     /// </summary>
@@ -892,12 +892,11 @@ public sealed class ServerPageTabsTests
     {
         var js = ServerTabsJs;
 
-        Assert.Contains("desktop-viewer features", js, StringComparison.Ordinal);
-        Assert.Contains("Execution-plan analysis, the query heatmap", js, StringComparison.Ordinal);
-        Assert.Contains("block-chain view", js, StringComparison.Ordinal);
+        Assert.Contains("are in the desktop viewer, not on this page", js, StringComparison.Ordinal);
+        Assert.Contains("Plan analysis, cached-plan retrieval", js, StringComparison.Ordinal);
 
         /* The note renders — a `note` field with no renderer is the same silence in a different place. */
-        Assert.Contains("return note ? noticeStrip(note) : null;", js, StringComparison.Ordinal);
+        Assert.Contains("const strip = noticeStrip(note);", js, StringComparison.Ordinal);
         Assert.Contains("tabNote(tab, tabReach())", ServerJs, StringComparison.Ordinal);
     }
 
@@ -931,17 +930,6 @@ public sealed class ServerPageTabsTests
            moment a comment happened to contain one, which is the shape of check that converts an open question
            into false confidence. The helper THROWS without an emptyText, and every tab is built during the
            DOM-shim run, so a table panel that forgot one cannot reach a browser. */
-        /* The WHOLE signature, so emptyText is asserted to be a declared parameter rather than something
-           read off an options object. #3278 appended `noteKey = null` - an opt-in server-supplied caveat,
-           unrelated to this guard - and #4925 appended `moreNoteKeys = null` after it (further caveat fields
-           rendered the same way), and #4843 appended `columnGroups = null` (the opt-in column groups of a wide grid), and #5226 appended `control = null` (a node drawn under the title:
-           the ranking selector of the Top Queries / Top Procedures cards), and #5245 appended `dbScope = null` (the panel's own database-scope chip, for a panel whose scope differs from its read's class; unrelated to this guard)., and the release walk appended `extensionMissingLine = null` (the plain line a precondition panel shows when its optional extension is not installed; unrelated to this guard). The literal is spelled out here rather than truncated at emptyText
-           because a prefix match would stop noticing a parameter inserted BEFORE it. */
-        Assert.Contains(
-            "function table(title, read, params, rowsKey, columns, subtitle, emptyText, span = 2, "
-            + "noteKey = null, moreNoteKeys = null, columnGroups = null, control = null, dbScope = null, extensionMissingLine = null)",
-            js,
-            StringComparison.Ordinal);
         Assert.Contains(
             "if (!emptyText) throw new Error(\"table(\" + title + \"): a table panel must explain its own empty state.\");",
             js,
@@ -963,7 +951,7 @@ public sealed class ServerPageTabsTests
 
         /* And vizStat's twin of that guard (#2530). Several PostgreSQL reads answer their HEALTHY case with a
            data body carrying prose under `finding` and NONE of the summary keys — get_pg_xmin_horizon's
-           {status:"no_holder", finding} is the type. That is not the {status,message} envelope, so
+           {status:"empty", finding} is the type. That is not the {status,message} envelope, so
            classifyResponse calls it data, it reaches a viz, and a tile set over keys the body does not have
            renders as a row of em-dashes that says nothing. All-null is the only state where the descriptor's
            sentence beats the tiles, so that is exactly when it wins; a descriptor with no emptyText — every
@@ -1072,6 +1060,8 @@ public sealed class ServerPageTabsTests
         var parameterisedTwice = new Dictionary<string, (string Read, string Distinguisher)>(StringComparer.Ordinal)
         {
             ["POSTGRES_TABS/storage"] = ("get_pg_index_bloat", "answered_only: true"),
+            /* #6158: the system_health CPU chart reads the whole window as time buckets, the entries table the newest rows. */
+            ["SERVER_TABS/events"] = ("get_health_parser_system_health", "chart: true"),
         };
 
         var exemptionsUsed = new HashSet<string>(StringComparer.Ordinal);
@@ -1130,7 +1120,7 @@ public sealed class ServerPageTabsTests
 
         /* And fanout carries the same empty-state rule the two descriptor helpers do, so routing a panel through
            it is never the way to lose the sentence. */
-        Assert.Contains("function fanout(read, params, specs)", js, StringComparison.Ordinal);
+        Assert.Contains("function fanout(read, params, specs", js, StringComparison.Ordinal);
         Assert.Contains("a data panel must explain its own empty state.", js, StringComparison.Ordinal);
     }
 

@@ -95,6 +95,15 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
                     }
                 }
 
+                foreach (var warning in opened.Warnings)
+                {
+                    now.Add(warning);
+                    if (!_reportedFailures.Contains(warning))
+                    {
+                        _logger?.LogWarning("{Warning}", warning);
+                    }
+                }
+
                 _reportedFailures = now;
                 _opened = opened;
                 _openedSignature = signature;
@@ -115,6 +124,7 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
                 texts.Add(failure.Text);
             }
 
+            texts.AddRange(Opened.Warnings);
             return texts;
         }
     }
@@ -127,6 +137,8 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     public bool BlockingEnabled => _config.Alerts.BlockingEnabled;
     public bool DeadlockEnabled => _config.Alerts.DeadlockEnabled;
     public bool PoisonWaitEnabled => _config.Alerts.PoisonWaitEnabled;
+    public bool RunnableQueueEnabled => _config.Alerts.RunnableQueueEnabled;
+    public bool ClientTimeoutsEnabled => _config.Alerts.ClientTimeoutsEnabled;
     public bool LongRunningQueryEnabled => _config.Alerts.LongRunningQueryEnabled;
     public bool TempDbSpaceEnabled => _config.Alerts.TempDbSpaceEnabled;
     public bool LowDiskEnabled => _config.Alerts.LowDiskEnabled;
@@ -162,6 +174,22 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
         _config.Alerts.DeadlockCountThreshold);
     /* #3539 A4: pass-through of a knob the engine no longer reads — see the interface member's doc. */
     public int PoisonWaitThresholdMs => _config.Alerts.PoisonWaitThresholdMs;
+    /* #5641: the pair as the engine reads it - Warning at least 1, Critical never below Warning. The MCP write bound
+       is the same floor, so update_alert_settings cannot accept a value this clamp then rewrites. */
+    public int RunnableQueueWarningPerScheduler =>
+        RunnableQueueEvaluator.ClampBars(_config.Alerts.RunnableQueueWarningPerScheduler, _config.Alerts.RunnableQueueCriticalPerScheduler).Warning;
+    public int RunnableQueueCriticalPerScheduler =>
+        RunnableQueueEvaluator.ClampBars(_config.Alerts.RunnableQueueWarningPerScheduler, _config.Alerts.RunnableQueueCriticalPerScheduler).Critical;
+    /* #5640: the Client Timeouts pair as the engine reads it - Warning at least 1, Critical never below Warning. */
+    public int ClientTimeoutsWarningPerMinute =>
+        AttentionEvaluator.ClampBars(_config.Alerts.ClientTimeoutsWarningPerMinute, _config.Alerts.ClientTimeoutsCriticalPerMinute).Warning;
+    public int ClientTimeoutsCriticalPerMinute =>
+        AttentionEvaluator.ClampBars(_config.Alerts.ClientTimeoutsWarningPerMinute, _config.Alerts.ClientTimeoutsCriticalPerMinute).Critical;
+    /* #5736: the two multiples of the relative bars, clamped the way the floors are (each at least 1, Critical never below Warning). */
+    public int ClientTimeoutsWarningMultiple =>
+        AttentionBaselineMath.ClampMultiples(_config.Alerts.ClientTimeoutsWarningMultiple, _config.Alerts.ClientTimeoutsCriticalMultiple).Warning;
+    public int ClientTimeoutsCriticalMultiple =>
+        AttentionBaselineMath.ClampMultiples(_config.Alerts.ClientTimeoutsWarningMultiple, _config.Alerts.ClientTimeoutsCriticalMultiple).Critical;
     public int LongRunningQueryThresholdMinutes => _config.Alerts.LongRunningQueryThresholdMinutes;
     public int TempDbSpaceThresholdPercent => _config.Alerts.TempDbSpaceThresholdPercent;
     public int LowDiskThresholdPercent => Math.Clamp(_config.Alerts.LowDiskThresholdPercent, 0, 100);
@@ -278,6 +306,10 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     public int CooldownMinutes => Math.Clamp(_config.Alerts.CooldownMinutes, 1, 120);
 
     public IReadOnlyList<string> ExcludedDatabases => _config.Alerts.ExcludedDatabases;
+
+    /* #6098: the Volume Free Space alert's fleet-wide excluded mount points, by reference like ExcludedDatabases so
+       the store's value (loaded over the file's) is what the engine reads. */
+    public IReadOnlyList<string> ExcludedVolumes => _config.Alerts.ExcludedVolumes;
 
     /// <summary>
     /// The GLOBAL deadlock/blocking delivery mode (#1141), read live through the by-reference config seam so a
@@ -410,6 +442,10 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     public bool GenericWebhookEnabled => !string.IsNullOrWhiteSpace(Opened.Webhooks.GenericUrl);
     public string GenericWebhookUrl => Opened.Webhooks.GenericUrl;
     public string GenericWebhookHeadersJson => Opened.Webhooks.GenericHeaders;
+
+    /* #5998: the settings row's generic URL's signing keys, opened. */
+    public WebhookSigningKeys GenericWebhookSigning => Opened.Webhooks.GenericSigning ?? WebhookSigningKeys.None;
+    public bool GenericSigningKeyUnreadable => System.Linq.Enumerable.Any(Opened.Failures, f => f.SigningKey);
     public string GenericWebhookBodyTemplate => Opened.Webhooks.GenericBodyTemplate;
     public string GenericWebhookProxyAddress => Opened.Webhooks.GenericProxy;
 
@@ -421,11 +457,16 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     /* V166: the store column (authoritative), so a Viewer save lands on the next firing without a restart. */
     public bool PagerDutyAutoResolve => Opened.Webhooks.PagerDutyAutoResolve;
 
+    /// <summary>V187 (#5825): the per-channel "send resolutions" flags, read live from the store like the toggle above.
+    /// The send path asks <see cref="NotificationRouteResolutions.SendsResolutions"/> with these and the route that
+    /// carried the fire.</summary>
+    public ResolutionChannelFlags ResolutionFlags => ResolutionChannelFlags.From(Opened.Webhooks, _config.Smtp);
+
     /// <summary>#3598 (V131): the sparse notification routes, read live through the by-reference config seam
     /// like every sibling — <c>StoreConfigProvider.ApplyToConfig</c> swaps the list on every beacon change,
     /// which the routes table's own trigger bumps, so a route authored in the Viewer lands on the next firing
-    /// with no restart. The ONLY adapter that overrides the interface's empty default: Lite has no routes
-    /// table and resolves every firing to its parent channels.</summary>
+    /// with no restart. Lite's adapter (<c>AppAlertSettings</c>) overrides the interface's empty default too, from its own
+    /// DuckDB routes table (#5750); an adapter with no routes table resolves every firing to its parent channels.</summary>
     public IReadOnlyList<NotificationRoute> NotificationRoutes => Opened.Routes;
 
     /* Scheduled-analysis notifications (AN3): the shared AnalysisNotificationService's severity floor
@@ -515,7 +556,11 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     /// credential are the operator's own configuration and still get a link; the last of those gets a
     /// one-time startup warning instead (<c>PerformanceMonitor.Notifications.TriageLink.DescribeCredentialShapedBaseWarning</c>).</para>
     /// </summary>
-    public string TriageBaseUrl => _config.Web.Enabled ? (_config.Web.PublicBaseUrl ?? "") : "";
+    public string TriageBaseUrl => TriageBaseUrlOf(_config);
+
+    /// <summary>The one definition of <see cref="TriageBaseUrl"/>, for a seat that holds the config and not this object
+    /// (the MCP host's brief reader, #5914): <c>web.publicBaseUrl</c> while the dashboard serves, else empty.</summary>
+    internal static string TriageBaseUrlOf(DarlingConfig config) => config.Web.Enabled ? (config.Web.PublicBaseUrl ?? "") : "";
 }
 
 /// <summary>

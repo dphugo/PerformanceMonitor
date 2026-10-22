@@ -91,7 +91,9 @@
     //                                    // holds the config-table service-credential pivot), or BOTH as
     //                                    // "admin,viewer" — one hostssl line per role, so an admin seat
     //                                    // and read-only seats reach the same store, and narrowing
-    //                                    // allowFrom later tightens every one of them. Never the
+    //                                    // allowFrom later tightens every one of them. "sources" admits
+    //                                    // the external alert source logins (--add-alert-source) through
+    //                                    // one "+darling_alert_sources" line, e.g. "viewer,sources". Never the
     //                                    // superuser, never all; one bad element rejects the whole value.
     // }
   },
@@ -136,21 +138,39 @@
       "encryptedPassword": "<output of --encrypt-password>",
       "trustServerCertificate": false,
       "encryptMode": "Mandatory",
-      // OPTIONAL second credential, for #2138 operator-initiated remediation only. The monitoring
-      // credential above stays READ-ONLY forever and is never used for a write; a remediation action
-      // travels on this identity or it does not travel. Omit both keys (the default) and this server
-      // simply has no remediation surface -- there is nothing to disable and nothing to explain.
+      // OPTIONAL second credential, for operator-initiated remediation (#2138) and for the Level 3 server actions an
+      // agent can run (#5632): force or unforce a plan, evict a cached plan, kill a session. The monitoring
+      // credential above stays READ-ONLY forever and is never used for a write. Omit both keys (the default) and a
+      // server you add has no remediation login. On a server that is already registered, omitting them changes nothing.
       // Both halves are required; one alone counts as unarmed and the service says so at connect.
-      // Least privilege: ALTER on each database you intend to force a plan in, and -- only if you want
-      // evict-first -- ALTER SERVER STATE, which is what targeted DBCC FREEPROCCACHE(plan_handle) needs.
-      // That second grant is the expensive one and is genuinely optional: without it the flow degrades
-      // to force-only with a named reason rather than silently. The service PROBES for it with a
-      // read-only has_perms_by_name check instead of guessing per platform, and Azure SQL Database has
-      // no DBCC FREEPROCCACHE at all, which no grant changes.
-      // Same blob format as encryptedPassword (--encrypt-password on THIS machine, or an env:/file:
-      // reference). There is deliberately no plaintext variant of this one.
+      // Least privilege: ALTER on each database you intend to force a plan in. ALTER SERVER STATE only if you want
+      // to evict a plan. ALTER ANY CONNECTION only if you want an agent to kill a session (it can kill ANY session).
+      // An agent action also needs a Level 3 route and that server's action switch, which is off until the store owner
+      // turns it on (docs/darling-agent-dispatch.md).
+      // An env:NAME or file:/path reference works everywhere. A DPAPI blob (--encrypt-password on THIS
+      // machine, same format as encryptedPassword) still works for operator remediation, but agent server
+      // actions (plan force, eviction, kill) refuse it: use a reference for those. There is deliberately
+      // no plaintext variant of this one. When BOTH keys are set they are re-read on every start and replace the
+      // registered server's login, but only on the server that pairs with this entry and connects the same way. Removing
+      // the keys, or setting only one, leaves the server's login as it is: it disarms nothing. To stop agent actions on
+      // a server, turn off its action switches, or turn off agent changes service-wide (the switches cover agent actions only,
+      // not operator remediation from the Viewer). To remove a server's remediation login entirely, so neither agents nor
+      // operators can use it, take both keys out of this file and run, as the store owner: UPDATE config_monitored_servers
+      // SET remediation_username = NULL, remediation_encrypted_password = NULL, modified_at = now() AT TIME ZONE 'UTC'
+      // WHERE name = 'alpha-sql-01';  A server that is not in this file is never touched. Services that share one store
+      // should declare the same logins, because each copies its own file when it starts.
       "remediationUsername": "",
       "remediationEncryptedPassword": "",
+      // OPTIONAL, PostgreSQL targets only (#6170). The login the "Test an index" check runs under. The check never runs
+      // under the monitoring login, because planning a statement can run a function another role created. With neither key
+      // set the check is refused and says what to set up. The login needs CONNECT on the database, USAGE on the schemas and
+      // SELECT on the tables of the statements to test, and nothing else: no pg_monitor, pg_read_all_stats,
+      // pg_read_all_data or superuser. The password is an env:NAME or file:/path reference only. When BOTH keys are set
+      // here they are applied to the registered server on every start (set, or replaced), and the log says so. Leaving
+      // them out never clears a login already on the server, because it can also be set on the store row. Only a
+      // reference is written, and only to the server that pairs with this entry and connects the same way.
+      "hypotheticalIndexUsername": "",
+      "hypotheticalIndexEncryptedPassword": "",
       "excludedDatabases": [ "StageDb" ]
     }
   ],
@@ -217,7 +237,7 @@
   "procedureStatsDeferredPlanFetch": "on",
 
   // The alert engine (optional section). Every default mirrors Performance Monitor Lite's:
-  // cpu 80% (total mode), blocking 1, deadlock 1, poison wait 500 ms, long-running query
+  // cpu 80% (total mode), blocking 1, deadlock 1, poison wait 500 ms, runnable queue 8 / 16 per scheduler, client timeouts OFF (floors 10 / 60 per minute, times 3 / 10 the server's baseline), long-running query
   // 30 min, tempdb 80%, low disk 10% / 5 GB, job multiplier 3x, failed-job lookback 60 min,
   // cooldown 5 min. Omit the whole section (or any key) for those defaults.
   "alerts": {
@@ -259,7 +279,12 @@
     // store row wins afterwards, and a list cleared there stays cleared. [] excludes nothing on that arm.
     "longRunningQueryExcludedProgramNamePrefixes": ["SQLAgent - TSQL JobStep"],
     "longRunningQueryExcludedLogins": ["NT AUTHORITY\\SYSTEM", "NT AUTHORITY\\NETWORK SERVICE"],
-    "excludedDatabases": []
+    "excludedDatabases": [],
+    // Mount points the Volume Free Space alert ignores on every server, e.g. ["S:\\", "/mnt/scratch"]. The
+    // whole mount point, any case; a trailing \ or / on either side is ignored (S: = S:\ = s:\). Dropped
+    // before the breach test, so a server whose only low volumes are excluded resolves. Seeded into the store
+    // on first run (V200); the store row wins afterwards. [] (the default) excludes nothing.
+    "excludedVolumes": []
   },
 
   // Scheduled analysis (optional section). The engine analyzes each server on a cadence and persists
@@ -387,6 +412,11 @@
     "enabled": false,
     "port": 5152,
 
+    // Uncomment to serve claim_investigation_request and submit_investigation_report to your own agent (#5632).
+    // They write only investigation state, need a bearer token (mcp.network.encryptedToken or token), and stay
+    // off while "allowWrites" is on: one token cannot tell an agent from a person. Default off.
+    // "allowInvestigations": true,
+
     // Uncomment to expose MCP on the LAN (a comma already follows "port" above):
     // "network": {
     //   "listen": "192.168.1.205",                     // specific bind IP preferred; "0.0.0.0" = all interfaces.
@@ -431,8 +461,8 @@
   //
   // OPT-IN NETWORK EXPOSURE for the dashboard (managed mode only) -- omit "network" for the secure default
   // (loopback-only HTTP, today's behavior). When present with a non-loopback "listen", the web host binds the
-  // LAN interface behind an in-app CIDR check and a token gate: a browser presents the token ONCE via
-  // ?token=, which is exchanged for an HMAC-signed session cookie (then the token is stripped from the URL).
+  // LAN interface behind an in-app CIDR check and a token gate: a browser pastes the token ONCE into the sign-in form,
+  // which is exchanged for an HMAC-signed session cookie.
   // LOOPBACK is exempt from the CIDR check ONLY -- while exposed it presents the token like anyone else
   // (#1649: the Custom Views composer is a write path, so a tokenless local process could mutate views).
   // A dashboard with NO token configured registers no auth middleware at all and stays tokenless. A "token" or
@@ -465,8 +495,7 @@
     // dashboard is loopback-only, and when this names a host other than "network.listen" -- this exact host
     // is admitted to the Host-header allowlist as one extra name for that reason (#4220), so a DNS name (or
     // a proxied/NATed address) works end to end instead of every request to it getting a 400. A value that
-    // includes a query string, a fragment, or user:pass@ -- e.g. this dashboard's own sign-in link,
-    // "http://host:port/?token=..." -- is sent as configured, not refused; the service logs a warning once
+    // includes a query string, a fragment, or user:pass@ -- is sent as configured, not refused; the service logs a warning once
     // at startup so that stays a deliberate choice.
     //
     // OIDC sign-in (see "oidc" below): register "{this value}/auth/oidc/callback" at the IdP too, beside

@@ -48,7 +48,7 @@ public sealed class CollectionHealthPayloadBudgetLiveTests
         var path = FindRepoFile("Darling", "PerformanceMonitor.Darling.Service", "DarlingWebEndpoints.cs");
         var source = System.IO.File.ReadAllText(path);
         Assert.Contains(
-            "[\"get_collection_health\"] = (c, pg, an) => DarlingMcpDataTools.GetCollectionHealth(pg, Server(c), full_detail: true, cancellationToken: c.RequestAborted)",
+            "[\"get_collection_health\"] = (c, pg, an) => DarlingMcpDataTools.GetCollectionHealth(pg, Server(c), full_detail: true, collector_name: Str(c, \"collector_name\"), hours_back: Hours(c, 24), cancellationToken: c.RequestAborted)",
             source, StringComparison.Ordinal);
     }
 
@@ -217,6 +217,19 @@ public sealed class CollectionHealthPayloadBudgetLiveTests
                 "every boring-healthy collector should compact.");
 
             using var fullDoc = JsonDocument.Parse(fullJson);
+
+            /* #6180: full_detail asks for ~30 fields on every collector, which is past the response target on a store this size.
+               It still answers within the target: the leading whole rows that fit, with the cut counted and the way to the rest named. */
+            Assert.True(fullBytes <= McpResponseBudget.DefaultBytes,
+                $"full_detail get_collection_health is {fullBytes:N0} bytes, over the {McpResponseBudget.DefaultBytes:N0}-byte budget.");
+            Assert.True(fullDoc.RootElement.GetProperty("truncated").GetBoolean(), "full_detail on this store is over the budget, so it must say it was cut.");
+            Assert.Equal(defaultRows.Count, fullDoc.RootElement.GetProperty("collectors_total").GetInt32());
+            Assert.Equal(fullDoc.RootElement.GetProperty("collectors").GetArrayLength(), fullDoc.RootElement.GetProperty("collectors_returned").GetInt32());
+            Assert.True(fullDoc.RootElement.GetProperty("collectors_returned").GetInt32() < defaultRows.Count);
+            Assert.Contains("without full_detail", fullDoc.RootElement.GetProperty("size_note").GetString(), StringComparison.Ordinal);
+            Assert.False(defaultDoc.RootElement.GetProperty("truncated").GetBoolean());
+            Assert.Equal(JsonValueKind.Null, defaultDoc.RootElement.GetProperty("size_note").ValueKind);
+
             Assert.All(fullDoc.RootElement.GetProperty("collectors").EnumerateArray(), r =>
             {
                 Assert.False(r.TryGetProperty("compact", out _), "full_detail=true must serve every field on every row.");
@@ -233,6 +246,90 @@ public sealed class CollectionHealthPayloadBudgetLiveTests
         {
             await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) => await DeleteRowsAsync(cleanup, cleanupCt));
         }
+    }
+
+    /// <summary>
+    /// #5748, Darling's twin of Lite's <c>McpReadToolBudgetTests.CollectionHealthWorstCaseAnswersUnder75PercentOfTheBudget</c>:
+    /// every SQL Server collector has mixed SUCCESS and ERROR runs, so no row can compact and every one is a partial_detail
+    /// row. That is the worst case, and each collector added moves it up by one row. A partial row leaves out every key
+    /// whose value is null, false or 0, so the answer stays at or under 75% of the default budget (24,576 B).
+    /// </summary>
+    [Fact]
+    public async Task WorstCase_EveryCollectorNeedsALook_AnswersUnder75PercentOfTheBudget()
+    {
+        var cs = ConnectionString;
+        Assert.SkipWhen(string.IsNullOrEmpty(cs), "Set DARLING_TEST_PG to run the live get_collection_health budget test.");
+        var ct = TestContext.Current.CancellationToken;
+
+        using var connection = new NpgsqlConnection(cs);
+        await connection.OpenAsync(ct);
+        await PgMigrations.MigrateAsync(connection, ct);
+        await DeleteRowsAsync(connection, ct);
+
+        await using var postgres = NpgsqlDataSource.Create(cs!);
+        var bodySucceeded = false;
+        try
+        {
+            await RegisterServerAsync(connection, ct);
+
+            var now = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
+            var sqlServerCollectors = CollectorCatalog.All
+                .Where(d => d.TargetEngine == CollectorTargetEngine.SqlServer)
+                .Select(d => d.Name)
+                .ToArray();
+
+            foreach (var name in sqlServerCollectors)
+            {
+                for (var s = 0; s < 10; s++)
+                {
+                    await InsertLogRowAsync(connection, name, now.AddMinutes(-5 * s), s % 6 == 0 ? "ERROR" : "SUCCESS", 100 + s,
+                        s % 6 == 0 ? null : 50 + s, s % 6 == 0 ? "Login failed for user 'darling_monitor'." : null, ct);
+                }
+            }
+
+            var json = await DarlingMcpDataTools.GetCollectionHealth(postgres, ServerName);
+            var bytes = Encoding.UTF8.GetByteCount(json);
+            var breakdown = CollectionHealthBreakdown(json);
+            _output.WriteLine(breakdown);
+
+            Assert.True(bytes <= McpResponseBudget.DefaultBytes * 3 / 4,
+                $"get_collection_health's worst case answered {bytes:N0} B, over 75% of the {McpResponseBudget.DefaultBytes:N0} B budget (#5748). {breakdown}");
+
+            bodySucceeded = true;
+        }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) => await DeleteRowsAsync(cleanup, cleanupCt));
+        }
+    }
+
+    /// <summary>The byte breakdown #5748 asked for: partial rows, split into key names, null/false/0 values and the
+    /// rest, and the bytes outside the rows.</summary>
+    private static string CollectionHealthBreakdown(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        long rows = 0, keyNames = 0, defaultKeys = 0, defaults = 0, other = 0;
+        var count = 0;
+        string? sample = null;
+        foreach (var row in doc.RootElement.GetProperty("collectors").EnumerateArray())
+        {
+            if (!row.TryGetProperty("partial_detail", out _)) continue;
+            count++;
+            rows += Encoding.UTF8.GetByteCount(row.GetRawText());
+            sample ??= row.GetRawText();
+            foreach (var prop in row.EnumerateObject())
+            {
+                var value = prop.Value;
+                var key = Encoding.UTF8.GetByteCount(prop.Name) + 4;
+                keyNames += key;
+                var raw = Encoding.UTF8.GetByteCount(value.GetRawText());
+                var isDefault = value.ValueKind is JsonValueKind.Null or JsonValueKind.False
+                    || (value.ValueKind == JsonValueKind.Number && value.GetDouble() == 0);
+                if (isDefault) { defaults += raw; defaultKeys += key; } else other += raw;
+            }
+        }
+        var total = Encoding.UTF8.GetByteCount(json);
+        return $"total {total:N0} B; {count} partial rows {rows:N0} B (key names+punctuation {keyNames:N0}, of which on null/false/0 values {defaultKeys:N0}; null/false/0 values {defaults:N0}; other values {other:N0}); outside the rows {total - rows:N0} B; sample row {sample}";
     }
 
     /// <summary>

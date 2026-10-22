@@ -25,7 +25,7 @@ import { VIZ } from "../panels.js";
 import { pageRangePicker, windowOfSpec } from "../page-range.js";
 import { relativeSpec } from "../time-range.js";
 import { orderServers } from "../server-order.js";
-import { el, mount, clear, loadingStrip, emptyStrip, noticeStrip, errorStrip, readErrorStrip, readTool, readToolWithinKeptHistory, keptWindowStrip, localTime, makeActivatable } from "../util.js";
+import { el, mount, clear, loadingStrip, emptyStrip, noticeStrip, errorStrip, readErrorStrip, readTool, readToolWithinKeptHistory, keptWindowStrip, localTime, makeActivatable, clampText } from "../util.js";
 
 /** The default range, in hours. The range itself is the shared time range picker's (#5562). */
 export const DEFAULT_HOURS = 24;
@@ -42,7 +42,9 @@ export const STATUSES = [
 /** The row limits on offer (the read takes at most 1000). */
 export const LIMITS = [100, 250, 500, 1000];
 
-/** The desktop grid's columns, in its order: Run Time, Server, Job, Category, Step, Status, Duration, Retries, Last Success, Message. */
+/** The grid's columns, in the desktop grid's order: Run Time, Server, Job, Category, Step, Status, Duration, Retries, Message.
+ *  #5644 W21: the desktop grid's Last Success column is not here. The read's `last_success` is the JOB's current last
+ *  success, the same on every run row of a job, so an older run showed a time later than its own run. */
 export const JOB_HISTORY_COLUMNS = [
   { key: "run_time", label: "Run Time", format: "time" },
   { key: "server", label: "Server" },
@@ -52,16 +54,16 @@ export const JOB_HISTORY_COLUMNS = [
   { key: "status", label: "Status" },
   { key: "duration_formatted", label: "Duration", sortValue: (r) => r.duration_seconds },
   { key: "retries", label: "Retries", format: "int" },
-  { key: "last_success", label: "Last Success", format: "time" },
-  { key: "message", label: "Message", wrap: true, render: messageCell },
+  { key: "message", label: "Message", clamp: true, render: messageCell },
 ];
 
 /* The Message column (the morning walk, W2). A failed step's message can run to thousands of characters and sat in a
-   column the table squeezed to about 90 px, so each row grew 150-250 px tall. The cell now has a readable width and
-   shows the first few lines only; the whole message opens in the detail pane when the row is clicked. */
+   column the table squeezed to about 90 px, so each row grew 150-250 px tall. The cell has a readable width and is
+   clipped to ONE line (#5644 W11, was three), with the full text in the tooltip;
+   the whole message opens in the detail pane when the row is clicked. */
 function messageCell(r) {
   const text = r && r.message != null ? String(r.message) : "";
-  return el("div", { class: "jh-message", title: text || null, text });
+  return el("div", { class: "jh-message" }, [clampText(text, { expandable: false })]);
 }
 
 /* A run has no id in the read, so the open row is found again after a rebuild by what identifies it. */
@@ -80,8 +82,13 @@ function selectionInside(node) {
 /* The filter state, kept across the 60 s rebuild. `jobDraft` is the job text as typed, applied on Enter or when
    the box loses focus; `job` is the text the last read used. */
 const state = { server: "", spec: relativeSpec(DEFAULT_HOURS * 3600000), status: "", category: "", limit: 100, job: "", jobDraft: "", jobFocused: false, jobCaret: null };
-/* The categories seen in any answer, so the Category choices survive a filter that narrows the next answer. */
-const seenCategories = new Set();
+/* The categories seen in any answer, kept per selected server ("" is the all-servers view), so the Category choices survive a
+   filter that narrows the next answer yet never list another server's categories (#6439). */
+const seenCategories = new Map();
+function seenFor(server) {
+  if (!seenCategories.has(server)) seenCategories.set(server, new Set());
+  return seenCategories.get(server);
+}
 /* The server choices from the last list_servers read, so the rebuild paints its select at once. */
 let knownServers = [];
 let pageSeq = 0;
@@ -93,6 +100,13 @@ function serverRows(data) {
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data.servers)) return data.servers;
   return [];
+}
+
+/** #6178: the sentence for a server whose engine is Azure SQL Database, which has no SQL Agent, so no job will ever match. The service
+    says "not_collected" and names the engine for it; any other answer keeps its own sentence. */
+const AZURE_NO_AGENT_LINE = "Azure SQL Database has no SQL Agent, so it has no job history.";
+export function noAgentLine(res) {
+  return res && res.status === "not_collected" && /runs on Azure SQL Database \(EngineEdition 5\)/.test(String(res.message || "")) ? AZURE_NO_AGENT_LINE : null;
 }
 
 /* Agent history exists only on SQL Server targets; a server whose engine is not stamped yet stays on offer. */
@@ -127,8 +141,9 @@ function serverOptions() {
 }
 
 function categoryOptions() {
-  const names = [...seenCategories];
-  if (state.category && !seenCategories.has(state.category)) names.push(state.category);
+  const seen = seenFor(state.server);
+  const names = [...seen];
+  if (state.category && !seen.has(state.category)) names.push(state.category);
   names.sort((a, b) => a.localeCompare(b));
   return [{ value: "", label: "All categories" }, ...names.map((n) => ({ value: n, label: n }))];
 }
@@ -182,11 +197,16 @@ export function retainedNote(data) {
     : "partial window: the store keeps less job history than the window asks for, so earlier runs are not shown.";
 }
 
-/** The notice for a list the row limit cut, or null. */
-export function limitNote(data) {
+/** The notice for a list the row limit cut, or null. `server` is the Server pick ("" for All servers): a list already scoped to one server is not told to pick one. */
+export function limitNote(data, server) {
   if (!data || data.truncated !== true) return null;
   const shown = Array.isArray(data.runs) ? data.runs.length : data.shown;
-  return "Showing the newest " + shown + " runs; more matched. Raise the row limit or narrow the filters to see the rest.";
+  /* #5703: under All servers the limit keeps the newest runs of the whole fleet, so one busy server's latest runs can fill it and push an
+     older run on another server out; the note names how far back the list reaches and offers a single server. */
+  const oldest = Array.isArray(data.runs) && data.runs.length ? data.runs[data.runs.length - 1].run_time : null;
+  const reach = oldest ? " They reach back to " + localTime(oldest) + "." : "";
+  const advice = server ? " Raise the row limit or narrow the filters to see the rest." : " Raise the row limit, pick a server or narrow the filters to see the rest.";
+  return "Showing the newest " + shown + " runs; more matched." + reach + advice;
 }
 
 /** The description the tool serves for a server whose collector found no SQL Agent service (DarlingJobReader.NoAgentServiceDescription). */
@@ -251,6 +271,8 @@ export function renderJobHistory(main) {
   const win = { label: el("div", { class: "range-control" }, [el("span", { text: "Window" }), rangePicker.node]) };
   const server = select("Server", serverOptions(), state.server, (v) => {
     state.server = v;
+    /* A category picked for the last server may not exist on this one; the new server starts on all of its categories. */
+    state.category = "";
     reload();
   });
   const status = select("Status", STATUSES, state.status, (v) => {
@@ -337,9 +359,11 @@ export function renderJobHistory(main) {
       const kept = keptWindowStrip(res);
       showAgent(res.kind === "empty" ? res.hints : data);
       if (res.kind === "empty") {
-        return mount(body, [kept, noticeFor(retainedNote(res.hints)), emptyStrip(res.message)]);
+        /* An answer with no runs (an Azure SQL Database has no SQL Agent) offers only the categories this server has been seen to have. */
+        fill(category.sel, categoryOptions(), state.category);
+        return mount(body, [kept, noticeFor(retainedNote(res.hints)), emptyStrip(noAgentLine(res) || res.message)]);
       }
-      for (const r of data.runs || []) if (r.category) seenCategories.add(r.category);
+      for (const r of data.runs || []) if (r.category) seenFor(state.server).add(r.category);
       fill(category.sel, categoryOptions(), state.category);
       /* The detail pane (W2): a click, or Enter, on a run opens its whole message above the grid. */
       const pane = el("div", { class: "jh-detail" });
@@ -375,7 +399,7 @@ export function renderJobHistory(main) {
       mount(body, [
         kept,
         noticeFor(retainedNote(data)),
-        noticeFor(limitNote(data)),
+        noticeFor(limitNote(data, state.server)),
         el("div", { class: "muted", text: (data.runs || []).length + " runs shown" }),
         pane,
         VIZ.table(data, { id: "job-history", rowsKey: "runs", columns: JOB_HISTORY_COLUMNS, rowClass: runRowClass, onRow, emptyText: "No job runs matched in the requested time range." }),

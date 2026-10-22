@@ -24,7 +24,7 @@
  */
 
 import { el, mount, readTool, apiSend, buildQuery, loadingStrip, errorStrip, emptyStrip, noticeStrip, disclosure,
-         ALERT_STATE_LABELS, alertDeliveryState, parseUtc } from "../util.js";
+         ALERT_STATE_LABELS, alertDeliveryState, parseUtc, localizeAlertDetail, rowsUnder } from "../util.js";
 import { VIZ, reapplyGridSort, gridRowOf } from "../panels.js";
 import { copyText } from "../grid-tools.js";
 import { pageRangePicker, windowResultOfSpec } from "../page-range.js";
@@ -50,8 +50,17 @@ const ALERT_COLUMNS = [
   { key: "threshold_value", label: "Threshold", format: "num1" },
   { key: "status", label: "Status", render: (a) => statusCell(a) },
   { key: "detail_text", label: "Detail", render: (a) => detailCell(a), copyValue: (a) => detailFullText(a) },
-  { key: "triage", label: "Triage", csv: false, render: (a) => triageCell(a) },
 ];
+
+/* W14 (#5644): Triage and Mute are the grid's FIRST columns. At 1600 px the 1,791 px grid sat in a 1,298 px box and the
+   two actions were the last things reached by horizontal scroll. The checkbox column (a seat that can edit) stays
+   ahead of them. */
+const TRIAGE_COLUMN = { key: "triage", label: "Triage", csv: false, render: (a) => triageCell(a) };
+/* #5654: the External source column - the name of the service that queued an external alert, from the row's
+   external_source (null for every built-in alert). Shown only while a fetched row carries one, so a store that never
+   receives external alerts keeps the table it had. drawAlerts flips showExternal and rebuilds the table when that changes. */
+let showExternal = false;
+const EXTERNAL_COLUMN = { key: "external_source", label: "External source" };
 
 /* The Mute column exists only for a seat whose session reports can_edit (the server enforces the write gate;
    this is only the affordance). Both links open the Mute Rules create form pre-filled from the row. "Mute this
@@ -61,7 +70,10 @@ const ALERT_COLUMNS = [
 let canMute = false;
 const MUTE_COLUMN = { key: "mute", label: "Mute", csv: false, render: (a) => muteCell(a) };
 function alertColumns() {
-  return canMute ? [SELECT_COLUMN].concat(ALERT_COLUMNS, [MUTE_COLUMN]) : ALERT_COLUMNS;
+  const base = showExternal
+    ? ALERT_COLUMNS.slice(0, 3).concat([EXTERNAL_COLUMN], ALERT_COLUMNS.slice(3))
+    : ALERT_COLUMNS;
+  return canMute ? [SELECT_COLUMN, TRIAGE_COLUMN, MUTE_COLUMN].concat(base) : [TRIAGE_COLUMN].concat(base);
 }
 
 /* Dismiss (the web twin of the Viewer's Dismiss Selected / Dismiss All), for a seat that can edit. The checked
@@ -215,9 +227,10 @@ function detailFullText(a) {
 
 function detailCell(a) {
   const hasDetail = a.detail_text != null && String(a.detail_text).trim().length > 0;
-  if (!hasDetail && !a.send_error) return el("span", { class: "muted", text: "—" });
+  if (!hasDetail && !a.send_error && !a.resolution_outcome) return el("span", { class: "muted", text: "—" });
 
-  const summary = hasDetail ? a.detail_text : "Delivery error: " + a.send_error;
+  const summary = hasDetail ? localizeAlertDetail(a.detail_text, a.newest_sample)
+    : a.send_error ? "Delivery error: " + a.send_error : "Resolution: " + a.resolution_outcome;
   const placeholder = el("div", {});
   const node = disclosure(summary, placeholder, { max: 120 });
 
@@ -263,6 +276,26 @@ function alertAdvice(a) {
   return adviceCache.get(key);
 }
 
+/* #5642: "Newest Query Store sample: 15:43:29 UTC, 5m 20s old", or "CPU reading: 15:43:29 UTC, 5m 20s old" for a source that
+ * ends in " reading" (the breaching reading a High CPU card's percentage came from) - the same wording AlertDetailText.SampleAgeLine writes into
+ * detail_text, built from the persisted newest_sample field. Null when the row has none. age_seconds is TRUNCATED to the
+ * millisecond on the wire (AlertNewestSampleWire), never rounded, so the Math.floor below is exactly the C# (int) truncation
+ * AlertDetailText.FormatAge does: 59.6 s is "59s old" here and in the email, not "1m 0s old". */
+function sampleAgeLine(sample) {
+  if (sample == null || typeof sample.source !== "string" || sample.source.trim().length === 0) return null;
+  const at = new Date(sample.instant_utc);
+  if (Number.isNaN(at.getTime())) return null;
+  const two = (n) => String(n).padStart(2, "0");
+  const total = Math.max(0, Math.floor(Number(sample.age_seconds) || 0));
+  let age;
+  if (total < 60) age = total + "s";
+  else if (total < 3600) age = Math.floor(total / 60) + "m " + (total % 60) + "s";
+  else if (total < 86400) age = Math.floor(total / 3600) + "h " + Math.floor((total % 3600) / 60) + "m";
+  else age = Math.floor(total / 86400) + "d " + Math.floor((total % 86400) / 3600) + "h";
+  const lead = sample.source.endsWith(" reading") ? sample.source : "Newest " + sample.source + " sample";
+  return lead + ": " + two(at.getUTCHours()) + ":" + two(at.getUTCMinutes()) + ":" + two(at.getUTCSeconds()) + " UTC, " + age + " old";
+}
+
 /* The expansion body: unchanged shape from the pre-#4194 eager version (see detailCell above), just built lazily. */
 function detailBody(a, details) {
   const hasDetail = a.detail_text != null && String(a.detail_text).trim().length > 0;
@@ -271,14 +304,31 @@ function detailBody(a, details) {
    * the fix script. They replace the parsed detail_text, which is the same headings and fields without the prose.
    * A row without them (not an Analysis alert, no advice, a failed fetch) keeps the detail_text rendering below. */
   const items = Array.isArray(details) && details.length > 0 ? details : null;
-  const fields = !items && hasDetail ? parseDetailFields(a.detail_text) : null;
+  /* #5644 W20: the stored text names UTC instants ("Incident Since: ...Z", the sample-age line's time of day); the page shows them
+   * in the grids' local format. The stored text, the copy and the CSV keep the stored form. */
+  const shownDetail = hasDetail ? localizeAlertDetail(a.detail_text, a.newest_sample) : null;
+  const fields = !items && hasDetail ? parseDetailFields(shownDetail) : null;
   const body = [];
   if (items) {
     for (const item of items) body.push(...detailItem(item));
+    /* #5642: the structured items replace detail_text, which is where the fire-time sample-age line lives, so the
+     * line is shown here from the row's newest_sample field (source, instant_utc, age_seconds: the carrier the
+     * engine persisted when the alert fired, never re-measured against this page's clock) - once, and only when the
+     * carrier is set. The detail_text branches below already carry the line in the text and must not add it again. */
+    const ageLine = sampleAgeLine(a.newest_sample);
+    if (ageLine !== null) body.push(el("div", { class: "detail-sample-age", text: localizeAlertDetail(ageLine, a.newest_sample) }));
   } else if (fields) {
     body.push(el("div", { class: "detail-fields" }, fields.map(fieldRow)));
   } else if (hasDetail) {
-    body.push(el("div", { class: "detail-raw", text: a.detail_text }));
+    body.push(el("div", { class: "detail-raw", text: shownDetail }));
+  }
+  /* #5825: what a resolution row's send did. get_alert_history sets the three fields on such a row only. */
+  if (a.resolution_outcome) {
+    body.push(el("div", { class: "detail-fields" }, [
+      ["Resolution outcome", a.resolution_outcome],
+      ["Resolution channels", a.resolution_channels || "—"],
+      ["Resolution sent", parseUtc(a.resolution_sent_at)?.toLocaleString() ?? "—"],
+    ].map(fieldRow)));
   }
   if (a.send_error) {
     body.push(el("div", { class: "detail-fields detail-error" }, [fieldRow(["Delivery error", a.send_error])]));
@@ -635,8 +685,11 @@ export async function renderAlerts(main) {
     el("label", { class: "range-control" }, [dismissedBox, el("span", { text: "Show dismissed" })]),
     filter,
   ]);
-  live = { main, headEl, meta, noticeBox, tableBox, filter, alerts: [], tbody: null, rowMap: null, seq: 0, dismiss: null };
-  mount(main, canMute ? [headEl, buildDismissBar(live), noticeBox, tableBox] : [headEl, noticeBox, tableBox]);
+  const investigations = buildInvestigationsPanel();
+  live = { main, headEl, meta, noticeBox, tableBox, filter, alerts: [], tbody: null, rowMap: null, seq: 0, dismiss: null, investigations };
+  mount(main, canMute
+    ? [headEl, buildDismissBar(live), noticeBox, tableBox, investigations.panel]
+    : [headEl, noticeBox, tableBox, investigations.panel]);
 
   /* A changed choice refetches and reconciles the table that is already drawn, the same path a poll tick takes.
      It also drops the checked rows: they were picked from the list the old choice showed. */
@@ -654,12 +707,164 @@ export async function renderAlerts(main) {
   await refreshAlerts(live);
 }
 
+/* #5632 Phase A: the Investigations panel, read only. The web seat's role is SELECT-only on the investigation tables, so
+ * the panel lists and never closes a request, decides a note or saves a profile (the desktop viewer's Investigations
+ * window does those). It is a collapsed <details> under the alert table that reads only when opened: a closed panel
+ * costs the page nothing, and the 60 s poll re-reads it only while it is open. Two reads over /api/read:
+ * list_investigation_requests (the requests, state computed by the store's list) and get_investigation_reports (the
+ * reports of the same window, joined here to show each request's latest verdict and summary). A request's journal is
+ * read on first expand of its row, for that request only. Every value reaches the DOM through el()/textContent. */
+const INVESTIGATION_HOURS = 168;
+
+const INVESTIGATION_COLUMNS = [
+  { key: "opened_at", label: "Opened", format: "time" },
+  { key: "server_name", label: "Server" },
+  { key: "family", label: "Family" },
+  { key: "state", label: "State" },
+  { key: "alert_count", label: "Alerts" },
+  { key: "verdict", label: "Verdict" },
+  { key: "summary", label: "Summary" },
+  { key: "links", label: "Links", csv: false, render: (r) => reportLinksCell(r.links) },
+  { key: "journal", label: "Journal", csv: false, render: (r) => journalCell(r) },
+];
+
+/* The scheme and authority marker, built from two parts: DarlingWebSelfContainmentTests scans every wwwroot file for an
+ * absolute-URL literal (the air-gap rule) and reads one here as an off-origin reference. */
+const HTTPS_PREFIX = "https:" + "//";
+
+/* #5914: why a report link's URL may not be rendered as a link, or null when it may. The rule of
+ * InvestigationReportLinks.UrlProblem, checked again here on render whatever the submit checked: an absolute https URL with
+ * a host, at most 1000 characters, no whitespace or control character, no backslash, no user info. A file or UNC link
+ * opened on Windows sends the user's credentials to its host. Pure. ReportLinksPageTests runs it (and reportLinksCell) under Node
+ * over Darling.Tests/report-link-vectors.json, the same list InvestigationReportLinksTests pins UrlProblem with, so the two copies
+ * of the rule cannot drift apart unnoticed. */
+export function reportLinkProblem(url) {
+  if (typeof url !== "string" || !url.trim()) return "missing.";
+  if (url.length > 1000) return `${url.length} characters, over 1000.`;
+  if (/[\s\u0000-\u001f\u007f-\u009f]/.test(url)) return "contains whitespace or a control character.";
+  if (url.startsWith("//") || url.includes("\\")) return "a UNC path is refused.";
+  const lower = url.toLowerCase();
+  if (lower.startsWith("file:")) return "a file URL is refused.";
+  if (lower.startsWith("http:")) return "http is refused; use https.";
+  if (!lower.startsWith(HTTPS_PREFIX)) return "not an https URL.";
+  const rest = url.slice(HTTPS_PREFIX.length);
+  const end = rest.search(/[/?#]/);
+  if ((end < 0 ? rest : rest.slice(0, end)).includes("@")) return "user info (a name or password before @) is refused.";
+  let parsed;
+  try { parsed = new URL(url); } catch { return "not an absolute https URL with a host."; }
+  if (parsed.protocol !== "https:" || !parsed.hostname) return "not an https URL.";
+  if (parsed.username || parsed.password) return "user info (a name or password before @) is refused.";
+  return null;
+}
+
+/* A report's links: each URL the rule passes is an <a> that opens in a new tab with no opener (its title is the URL, so the
+ * reader sees where an agent's link goes before clicking, as the viewer shows it); a refused one is plain text that says why. No links: an empty cell. */
+export function reportLinksCell(links) {
+  if (!Array.isArray(links) || !links.length) return el("span", {});
+  return el("div", {}, links.filter((l) => l && typeof l === "object").map((l) => {
+    const label = [l.kind, l.key].filter((x) => x != null && x !== "").join(" ") || "link";
+    const problem = reportLinkProblem(l.url);
+    return problem
+      ? el("div", { text: `${label}: ${String(l.url ?? "")} (shown as text: ${problem})` })
+      : el("div", {}, [el("a", { href: l.url, target: "_blank", rel: "noopener noreferrer", title: l.url, text: label })]);
+  }));
+}
+
+/* The requests of list_investigation_requests, each with the verdict and summary of its newest report from
+ * get_investigation_reports (by submitted_at; a request with no report shows none). Pure; ReportLinksPageTests checks that the
+ * newest report's links reach the row. */
+export function investigationRows(listData, reportsData) {
+  const latest = new Map();
+  for (const rep of rowsUnder(reportsData, "reports")) {
+    if (!rep || rep.request_id == null) continue;
+    const prev = latest.get(String(rep.request_id));
+    if (!prev || String(rep.submitted_at || "") > String(prev.submitted_at || "")) latest.set(String(rep.request_id), rep);
+  }
+  return rowsUnder(listData, "requests").map((r) => {
+    const rep = latest.get(String(r.request_id)) || null;
+    return {
+      request_id: r.request_id,
+      opened_at: r.opened_at,
+      server_name: r.server_name,
+      family: r.family,
+      state: r.state,
+      alert_count: r.alert_count,
+      verdict: rep ? rep.verdict : null,
+      summary: rep ? (rep.summary || rep.root_cause || null) : null,
+      links: rep && Array.isArray(rep.links) ? rep.links : null,
+    };
+  });
+}
+
+/* One journal row as a line: time, event, actor and the reason when there is one. */
+function journalLine(j) {
+  const when = parseUtc(j.event_time);
+  return [when ? when.toLocaleString() : String(j.event_time || ""), j.event, j.actor, j.reason].filter((x) => x != null && x !== "").join(" · ");
+}
+
+/* The row's journal, read on the first expand for this request only. A failed read is not kept: opening it again asks again. */
+function journalCell(r) {
+  const body = el("div", {});
+  const node = disclosure("Journal", body);
+  let built = false;
+  node.addEventListener("toggle", async () => {
+    if (built || !node.open) return;
+    built = true;
+    mount(body, [loadingStrip()]);
+    const res = await readTool("get_investigation_reports", { request_id: r.request_id, hours_back: INVESTIGATION_HOURS });
+    if (res.kind === "error") { built = false; mount(body, errorStrip(res.message)); return; }
+    const rows = res.kind === "empty" ? [] : rowsUnder(res.data, "journal").filter((j) => j && String(j.request_id ?? r.request_id) === String(r.request_id));
+    const lines = rows.length ? rows.map((j) => el("div", { text: journalLine(j) })) : [emptyStrip("No journal rows for this request.")];
+    /* #5834: the journal is a page of the newest rows; say so when the request held more. */
+    if (res.data && res.data.journal_truncated) lines.unshift(noticeStrip(`Showing the newest ${rows.length} journal rows; older ones are not listed.`));
+    mount(body, lines);
+  });
+  return node;
+}
+
+function buildInvestigationsPanel() {
+  const box = el("div", {});
+  const panel = el("details", { class: "disclosure investigations-panel" }, [
+    el("summary", { class: "disc-summary", text: "Investigations (agent requests, read only)" }),
+    box,
+  ]);
+  const state = { panel, box, seq: 0 };
+  panel.addEventListener("toggle", () => { if (panel.open) refreshInvestigations(state); });
+  return state;
+}
+
+async function refreshInvestigations(state) {
+  const seq = ++state.seq;
+  if (!state.box.firstChild) mount(state.box, loadingStrip("Loading investigations…"));
+  const [list, reports] = await Promise.all([
+    readTool("list_investigation_requests", { limit: 100 }),
+    readTool("get_investigation_reports", { hours_back: INVESTIGATION_HOURS }),
+  ]);
+  if (seq !== state.seq) return;
+  if (list.kind === "error" || list.kind === "empty") {
+    mount(state.box, list.kind === "error" ? errorStrip(list.message) : emptyStrip(list.message));
+    return;
+  }
+  const rows = investigationRows(list.data, reports.kind === "error" || reports.kind === "empty" ? null : reports.data);
+  if (!rows.length) { mount(state.box, emptyStrip("No investigation requests.")); return; }
+  const parts = [VIZ.table({ requests: rows }, { rowsKey: "requests", columns: INVESTIGATION_COLUMNS })];
+  if (reports.kind === "error") parts.unshift(noticeStrip("The reports could not be read, so no verdicts are shown: " + reports.message));
+  /* #5834: both reads are pages of the newest requests; say when either one held more than it returned. */
+  if (list.data && list.data.truncated) parts.unshift(noticeStrip(`Showing the newest ${rows.length} requests; older ones are not listed.`));
+  if (reports.kind !== "error" && reports.data && reports.data.truncated) {
+    parts.unshift(noticeStrip(`The last ${INVESTIGATION_HOURS} hours held more requests than one reports read returns, so older requests may show no verdict.`));
+  }
+  mount(state.box, parts);
+}
+
 /* Re-fetches with the current choices, then hands the new alerts to drawAlerts() to reconcile in place. Unlike
  * the first mount, a poll tick never shows the loading strip - the previous table stays exactly as it is until
  * the new page is ready, so a healthy 60s tick with no new alert produces no visible change and no DOM churn at
  * all. A changed window or server reconciles the same way: rows that left the window are removed, new ones land
  * in order. A reply that arrives after a newer request was made is dropped. */
 async function refreshAlerts(state) {
+  /* #5632 Phase A: an open Investigations panel is re-read with the alerts; a closed one is not read at all. */
+  if (state.investigations && state.investigations.panel.open) await refreshInvestigations(state.investigations);
   const seq = ++state.seq;
   const req = readRequest();
   const res = req.error ? { kind: "error", message: "This range cannot be read yet: " + req.error } : await readTool("get_alert_history", req.params);
@@ -700,6 +905,15 @@ function drawAlerts(state) {
     state.rowMap = null;
     mount(state.tableBox, emptyStrip(q ? 'No alerts match "' + state.filter.value + '".' : "No alerts in this window."));
     return;
+  }
+
+  /* #5654: the External source column appears and disappears with the fetched rows, so the header has to be rebuilt
+     when that changes - the keyed refresh below leaves the header alone. */
+  const wantExternal = state.alerts.some((a) => a.external_source);
+  if (wantExternal !== showExternal) {
+    showExternal = wantExternal;
+    state.tbody = null;
+    state.rowMap = null;
   }
 
   if (state.tbody) {

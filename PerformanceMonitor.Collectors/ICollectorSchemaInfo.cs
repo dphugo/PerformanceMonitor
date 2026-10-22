@@ -161,4 +161,37 @@ public interface ICollectorSchemaInfo
     /// <see cref="CollectorCatalog.All"/> without the row type.</para>
     /// </summary>
     IReadOnlyList<PgExtensionDependency> RequiredPgExtensions => Array.Empty<PgExtensionDependency>();
+
+    /// <summary>
+    /// True when this collector's table stays a PLAIN table on every store: no hypertable, no compression and no
+    /// TimescaleDB retention policy, and its rows are purged by the time-sliced DELETE path instead (#5640). False
+    /// for every other definition.
+    ///
+    /// <para><b>Why a declaration.</b> Every catalog entry becomes a hypertable
+    /// (<c>TimescaleSupport.HypertableTables</c>), and the hypertable count is a grid decision: the compression band,
+    /// the worker sizing and the refresh watch lines all derive from it (#3035, #3044, #3107). An exception to the
+    /// rule therefore has to be explicit, named in one place and counted by a census test, so it cannot spread
+    /// silently. The one holder is the attention collector, whose rows are low volume (the ring buffer caps the
+    /// detail at 1,000 events per read, the ring_buffer MAX_EVENTS_LIMIT default, and a healthy server reads near zero).</para>
+    ///
+    /// <para>A default interface implementation, the choice <see cref="RequiredPgExtensions"/> made, so the existing
+    /// definitions and the test doubles need no change.</para>
+    /// </summary>
+    bool StaysPlainTable => false;
+
+    /// <summary>
+    /// True when only Darling stores and schedules this collector: Lite creates no table for it, lists no schedule row and never
+    /// dispatches it (#5632). False for every other definition. A default interface implementation, the choice
+    /// <see cref="StaysPlainTable"/> made, so the existing definitions and the test doubles need no change. The holder today is
+    /// <c>query_store_forced_plans</c>, whose reader is a Darling MCP read; its Lite twin is a follow-up.
+    /// </summary>
+    bool IsDarlingOnly => false;
+
+    /// <summary>
+    /// True when this PostgreSQL collector calls Aurora built-in functions on an Aurora target (#6143), so the host
+    /// reads each one's schema from <c>pg_catalog.pg_proc</c> before it builds the query
+    /// (<see cref="CollectorContext.PgFunctionSchemas"/>). A default interface implementation, the choice
+    /// <see cref="StaysPlainTable"/> made.
+    /// </summary>
+    bool ReadsAuroraFunctions => false;
 }

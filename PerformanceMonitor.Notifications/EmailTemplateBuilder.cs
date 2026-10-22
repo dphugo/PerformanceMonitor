@@ -7,6 +7,8 @@
  */
 
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Net;
 using System.Text;
 
@@ -65,7 +67,8 @@ internal static class EmailTemplateBuilder
         /* Severity/color map on the immutable metric name (AlertSeverity's key); a custom rule's human name
            only replaces the metric name in the VISIBLE heading, never in ForMetric. */
         var (accentColor, badgeText, _) = AlertSeverity.ForMetric(metricName, context?.SeverityOverride);
-        var titleName = string.IsNullOrEmpty(displayName) ? metricName : displayName;
+        /* #5654: an alert another service submitted carries its source in the title, so it cannot pass as Darling's own. */
+        var titleName = WebhookAlertService.ExternalTitle(string.IsNullOrEmpty(displayName) ? metricName : displayName, context);
         var prose = AlertDetailText.ProseForDelivery(detailText, context);
 
         var html = BuildHtmlBody(titleName, serverName, currentValue,
@@ -76,6 +79,43 @@ internal static class EmailTemplateBuilder
             thresholdValue, utcNow, localNow, emailCooldownMinutes, branding, context, prose, triageUrl);
 
         return (html, plain);
+    }
+
+    /// <summary>
+    /// Builds both bodies for an alert resolution email (#5825): the resolution's own name as the heading, a data table of
+    /// the server, the alert, when it fired and cleared, how long it lasted and the last value, the resolution's message,
+    /// and the triage link the fire carried. No cooldown footer: a resolution is sent once.
+    /// </summary>
+    public static (string HtmlBody, string PlainTextBody) BuildResolutionEmail(AlertResolutionFacts facts, AlertBranding branding)
+    {
+        ArgumentNullException.ThrowIfNull(facts);
+        var (accentColor, badgeText, _) = AlertSeverity.ForMetric(facts.Title, null);
+        var rows = facts.Rows();
+        var prose = string.IsNullOrWhiteSpace(facts.Message) ? null : facts.Message;
+        var html = BuildHtmlBody(facts.Title, facts.ServerName, "", "", facts.ClearedAtUtc, facts.ClearedAtUtc.ToLocalTime(),
+            accentColor, badgeText, branding, context: null, emailCooldownMinutes: 0, prose: prose, triageUrl: facts.TriageUrl,
+            dataRows: rows);
+
+        var plain = new StringBuilder();
+        plain.Append(CultureInfo.InvariantCulture, $"{branding.EditionName} Alert Resolved\r\n");
+        plain.Append("-------------------------------\r\n");
+        plain.Append(CultureInfo.InvariantCulture, $"{facts.Title}\r\n");
+        foreach (var (label, value) in rows)
+        {
+            plain.Append(CultureInfo.InvariantCulture, $"{label}: {value}\r\n");
+        }
+
+        if (prose is not null)
+        {
+            plain.Append(CultureInfo.InvariantCulture, $"\r\n{prose}\r\n");
+        }
+
+        if (!string.IsNullOrEmpty(facts.TriageUrl))
+        {
+            plain.Append(CultureInfo.InvariantCulture, $"\r\nTriage: {facts.TriageUrl}\r\n");
+        }
+
+        return (html, plain.ToString());
     }
 
     /// <summary>
@@ -112,7 +152,8 @@ internal static class EmailTemplateBuilder
         AlertContext? context = null,
         int emailCooldownMinutes = 15,
         string? prose = null,
-        string? triageUrl = null)
+        string? triageUrl = null,
+        IReadOnlyList<(string Label, string Value)>? dataRows = null)
     {
         var sb = new StringBuilder(2048);
 
@@ -159,6 +200,14 @@ internal static class EmailTemplateBuilder
             AppendDataRow(sb, "Status", "SMTP configuration is working correctly", false);
             AppendDataRow(sb, "Sent at", localNow.ToString("yyyy-MM-dd HH:mm:ss"), true);
         }
+        else if (dataRows is not null)
+        {
+            /* #5825: a resolution's own facts in place of the fire's value, threshold and time. */
+            for (var i = 0; i < dataRows.Count; i++)
+            {
+                AppendDataRow(sb, dataRows[i].Label, dataRows[i].Value, i == dataRows.Count - 1);
+            }
+        }
         else
         {
             AppendDataRow(sb, "Server", serverName, false);
@@ -174,7 +223,7 @@ internal static class EmailTemplateBuilder
         /* Detail section: the alert's prose detail (#3297) leads, then the structured items (blocking
            chains, deadlock participants). Either can be absent — a self-alert has only the prose, an
            engine alert only the structure — so the section renders when EITHER is present. */
-        if (prose is not null || context?.Details?.Count > 0)
+        if (prose is not null || context?.Details?.Count > 0 || AlertDetailText.SampleAgeLineFor(context, prose) is not null)
         {
             AppendDetailSection(sb, context, prose);
         }
@@ -202,7 +251,7 @@ internal static class EmailTemplateBuilder
         sb.Append("<tr><td style=\"padding:12px 24px 16px 24px;\">");
         sb.Append($"<span style=\"font-family:{FontStack};font-size:11px;color:#E4E6EB;\">");
         sb.Append($"Sent by {WebUtility.HtmlEncode(branding.EditionName)}");
-        if (!isTest)
+        if (!isTest && dataRows is null)
         {
             sb.Append($" &middot; {emailCooldownMinutes}-minute cooldown between repeat alerts");
         }
@@ -249,6 +298,16 @@ internal static class EmailTemplateBuilder
             {
                 sb.Append($"<p style=\"margin:0 0 8px 0;font-family:{FontStack};font-size:13px;color:#E0E0E0;line-height:1.5;\">{WebUtility.HtmlEncode(para)}</p>");
             }
+            sb.Append("</td></tr>");
+        }
+
+        /* #5642: the newest-sample age, once per body. The fire-time age the engine persisted with the alert,
+           not one measured here; the plain-text body prints the same line. */
+        var ageLine = AlertDetailText.SampleAgeLineFor(context, prose);
+        if (ageLine is not null)
+        {
+            sb.Append("<tr><td style=\"padding:2px 24px 8px 24px;\">");
+            sb.Append($"<p style=\"margin:0 0 8px 0;font-family:{FontStack};font-size:13px;color:#B0B0B0;line-height:1.5;\">{WebUtility.HtmlEncode(ageLine)}</p>");
             sb.Append("</td></tr>");
         }
 
@@ -372,7 +431,8 @@ internal static class EmailTemplateBuilder
         /* The HTML body's Details section, in parallel (BuildHtmlBody / AppendDetailSection): the #3297
            prose leads, the structured items follow, and either half alone still opens the section. The two
            bodies are maintained together — a change to one must touch the other. */
-        if (prose is not null || context?.Details?.Count > 0)
+        var plainAgeLine = AlertDetailText.SampleAgeLineFor(context, prose);
+        if (prose is not null || context?.Details?.Count > 0 || plainAgeLine is not null)
         {
             sb.Append($"\r\n--- Details ---\r\n");
 
@@ -382,6 +442,12 @@ internal static class EmailTemplateBuilder
                 {
                     sb.Append($"\r\n  {para}\r\n");
                 }
+            }
+
+            /* #5642: the HTML body's sample-age line, in parallel (AppendDetailSection). */
+            if (plainAgeLine is not null)
+            {
+                sb.Append($"\r\n  {plainAgeLine}\r\n");
             }
 
             foreach (var item in context?.Details ?? EmptyDetails)

@@ -74,6 +74,15 @@ function appendChildren(node, children) {
   node.appendChild(document.createTextNode(String(children))); // safe: text node
 }
 
+/**
+ * One coloured tag pill (#2020, #5987): the stored #RRGGBB when it is well formed, else the neutral pill. The hex is format-checked
+ * before it reaches the style attribute. Server tags on the fleet cards and query tags on the query grids both draw through this one helper.
+ */
+export function tagPill(name, colour) {
+  const safe = /^#[0-9a-fA-F]{6}$/.test(colour || "") ? colour : null;
+  return el("span", { class: "tag-pill", text: name, title: name, style: safe ? "background:" + safe : null });
+}
+
 /** Remove all children from a node. */
 export function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
@@ -103,6 +112,46 @@ export function disclosure(summaryText, detail, opts = {}) {
     truncate(summaryText, opts.max || 120),
   ]);
   return el("details", { class: "disclosure" }, [summary, el("div", { class: "disc-body" }, detail)]);
+}
+
+/* Text longer than this many characters (or holding a line break) gets the expand toggle; shorter text fits a cell as is. */
+const CLAMP_MIN_CHARS = 60;
+
+/**
+ * A long text cell shown on ONE line (#5644 W11): the full text stays in the node (so a selection, the tooltip and a
+ * screen reader read all of it) and the stylesheet clips it with an ellipsis (`.clamp-text`); a click, or Enter/Space,
+ * opens the rest in place (`.open`) and closes it again. Long collector notes, errors and job messages made rows
+ * hundreds of pixels tall. Copy and CSV export read the row data, not this node, so they still give the full text.
+ * `expandable: false` is for a cell whose row already opens the whole text elsewhere (the Job History detail pane).
+ * The toggle stops its event so a clickable row (Collectors) is not also activated.
+ */
+export function clampText(text, opts = {}) {
+  const full = String(text == null ? "" : text);
+  const node = el("span", { class: "clamp-text", title: full || null, text: full });
+  const long = full.length > CLAMP_MIN_CHARS || /[\r\n]/.test(full);
+  if (opts.expandable === false || !long) return node;
+  node.setAttribute("role", "button");
+  node.setAttribute("tabindex", "0");
+  node.setAttribute("aria-expanded", "false");
+  const toggle = (e) => {
+    /* A click that ends a text selection inside the cell is the reader copying, not opening it. */
+    if (e && e.type === "click" && typeof window !== "undefined" && window.getSelection) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && String(sel).length > 0 && sel.anchorNode && node.contains(sel.anchorNode)) return;
+    }
+    if (e && e.stopPropagation) e.stopPropagation();
+    const open = node.getAttribute("aria-expanded") !== "true";
+    node.setAttribute("aria-expanded", open ? "true" : "false");
+    node.classList.toggle("open", open);
+  };
+  node.addEventListener("click", toggle);
+  node.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggle(e);
+    }
+  });
+  return node;
 }
 
 /*
@@ -135,12 +184,116 @@ export function errorStrip(message) {
   return el("div", { class: "strip error", role: "alert" }, [message]);
 }
 export function emptyStrip(message) {
-  return el("div", { class: "strip empty" }, [message]);
+  return el("div", { class: "strip empty" }, [localizeIsoText(plainText(message))]);
 }
-/** A non-fatal caveat about otherwise-good data (e.g. the #1665 partial-window notice). */
+/** #6445: the note a page that lists only shows. The advice depends on the store: a managed store refuses postgres.webConnectionString,
+    so it says only that this dashboard lists and the Viewer app makes the change; a store you brought yourself may give the web an
+    admin store login. `lists` finishes "so ..." and `toChange` starts the sentence that names the Viewer. The service's own 403
+    sentences come from DarlingWebStoreWrites and say the same. */
+export function listOnlyNote(managedStore, lists, toChange) {
+  return managedStore === true
+    ? "This dashboard lists only on this store, so " + lists + ". " + toChange + ", use the Viewer app."
+    : "This dashboard's store login cannot make changes, so " + lists + ". " + toChange +
+      ", use the Viewer app, or give the web an admin store login (set postgres.webConnectionString to an admin login).";
+}
+
+/** A non-fatal caveat about otherwise-good data (e.g. the #1665 partial-window notice). The sentence may be one the service
+    wrote for an MCP caller (a width note, a truncation note), so it passes through plainText like every message (#5644 W8). */
 export function noticeStrip(message) {
-  return el("div", { class: "strip notice", role: "status" }, [message]);
+  return el("div", { class: "strip notice", role: "status" }, [localizeIsoText(plainText(message))]);
 }
+/** A note line under a chart, from a payload's own `aggregate_note`: written for an MCP caller, said in the page's words (#5644 W8). */
+export function metricNote(text) {
+  return el("div", { class: "mp-metric-note", text: plainText(text) });
+}
+
+/**
+ * What one point of a bucketed trend covers, from the read's own `bucket_minutes` / `bucket` fields: "covers 1 hour",
+ * "is one collection", or null when the read states neither (#6359).
+ */
+export function bucketWidthText(d) {
+  const minutes = d && typeof d.bucket_minutes === "number" && d.bucket_minutes > 0 ? d.bucket_minutes : null;
+  if (minutes !== null) {
+    if (minutes % 1440 === 0) return "covers " + (minutes === 1440 ? "1 day" : minutes / 1440 + " days");
+    if (minutes % 60 === 0) return "covers " + (minutes === 60 ? "1 hour" : minutes / 60 + " hours");
+    return "covers " + (minutes === 1 ? "1 minute" : minutes + " minutes");
+  }
+  return d && d.bucket === "per-collection" ? "is one collection" : null;
+}
+
+/**
+ * The sentence a chart owes its reader about what a point is (#6359), said from the read's own width fields in the page's
+ * words. The payload's `aggregate_note` is written for an MCP caller (it names `peak_*` fields and says to pass a
+ * `bucket_minutes`), so no panel prints it. `kind` is what the PANEL's read returns, never read from the note's text:
+ * "summed" for counts, waits and I/O (a bucket the window cuts short holds smaller counts; rates are true rates over the
+ * time it covers), "level" for CPU, memory, tempdb and other gauges (each point averages the samples in its bucket), or
+ * omitted when only the width is worth saying. One collection per point needs neither fact. Null when the read states no width.
+ */
+export function chartNoteText(data, kind) {
+  const width = bucketWidthText(data);
+  if (!width) return null;
+  if (width === "is one collection") return "Each point is one collection.";
+  const sentence = (kind === "level" ? "Each point " + width + " and is the average of the samples in it." : "Each point " + width + ".") +
+    (kind === "summed" ? " A bucket the window cuts short holds smaller counts; rates are true rates over the time the bucket covers." : "");
+  return data.source === "hourly" ? sentence + " " + HOURLY_TRAIL_TEXT : sentence;
+}
+
+/**
+ * What a read served from the hourly rollup owes its reader: the series trails the clock by up to two hours, because the
+ * current hour is never materialized and the one before it lands on the next refresh (DurationTrendRouting, #6359). Said when
+ * the read's own `source` field is "hourly", never from the note's text; without it the empty right edge reads as missing data.
+ */
+const HOURLY_TRAIL_TEXT = "The newest hour or two is not in this chart yet: hourly totals are added after each hour ends.";
+
+/** The note line under a chart for a trend read (see chartNoteText), or null when the read states no width. */
+export function chartNote(data, kind) {
+  const text = chartNoteText(data, kind);
+  return text ? el("div", { class: "mp-metric-note", text }) : null;
+}
+
+/**
+ * Rewrites every UTC instant inside a sentence (a server message, a status line, a note, an alert body) into the grids'
+ * local-time format (#5644 W20): "stored at 2026-10-09T14:37:35.0158630", "since 2026-10-12T19:18:38Z", "until
+ * 2026-10-11 12:48:52Z" (the alert text's space-separated form) and "2026-10-12 23:13:00 UTC" printed raw UTC beside grids
+ * in local time. The separator is a "T" or a space and the fraction is 0-7 digits. A "T" stamp with no zone is UTC, as
+ * parseUtc reads it everywhere; a space-separated one is rewritten ONLY with a "Z" or " UTC" after it, because the same
+ * shape without one is a monitored server's own wall clock ("2026-09-27 21:32:43 (server clock)") and shifting it would
+ * state the wrong hour. Text with no such stamp, and a non-string, come back as given.
+ */
+export function localizeIsoText(text) {
+  if (typeof text !== "string") return text;
+  return text.replace(/(\d{4}-\d\d-\d\d)([T ])(\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?(Z(?![A-Za-z])| UTC(?![A-Za-z])|[+-]\d\d:?\d\d)?/g, (m, date, sep, time, frac, zone) => {
+    if (sep === " " && !zone) return m;
+    const iso = date + "T" + time + (frac ? "." + frac.slice(0, 3).padEnd(3, "0") : "") + (zone === " UTC" ? "Z" : zone || "");
+    const d = parseUtc(iso);
+    return d ? d.toLocaleString() : m;
+  });
+}
+
+/**
+ * An alert's stored body text in the grids' local-time format (#5644 W20, Alert History and Triage). The instants the alert
+ * builders write ("Incident Since: 2026-10-12 23:13:00Z", "Failed At: 2026-10-12 07:00:00Z", and the Started, Snapshot, From,
+ * To and Window lines) go through localizeIsoText. Only those labelled lines do: the same body carries "Blocked Query", "Query"
+ * and "Victim SQL" lines, and a literal such as '2026-01-01 00:00:00Z' inside a statement is data. The sample-age line ("Newest blocked process sample: 23:12:45 UTC, 5m 20s old") carries a time of day
+ * with no date, which cannot be shifted safely alone, so it takes its date from the row's own `newest_sample.instant_utc`
+ * (the carrier the engine persisted when the alert fired) and only when that instant's UTC time of day IS the one written
+ * on the line. The stored and emailed text is not changed (the same line feeds email, webhooks and Lite's windows); only
+ * what this page shows is. A copy of the text for the clipboard or CSV keeps the stored form.
+ */
+export function localizeAlertDetail(text, sample) {
+  if (typeof text !== "string") return text;
+  let out = text.replace(/^(\s*(?:Incident Since|Started|Failed At|Snapshot|From|To|Window): )(.*)$/gm,
+    (m, lead, value) => lead + localizeIsoText(value));
+  const at = sample && typeof sample.instant_utc === "string" ? parseUtc(sample.instant_utc) : null;
+  if (at) {
+    const two = (n) => String(n).padStart(2, "0");
+    const clock = two(at.getUTCHours()) + ":" + two(at.getUTCMinutes()) + ":" + two(at.getUTCSeconds());
+    out = out.replace(/^(\s*(?:Newest .+? sample|.+? reading)): (\d\d:\d\d:\d\d) UTC(?=, .* old\s*$)/gm,
+      (m, lead, time) => (time === clock ? lead + ": " + at.toLocaleString() : m));
+  }
+  return out;
+}
+
 /**
  * The two collectors the blocking reads draw from (#5244): the blocked-process-report XE session when it holds a row in the window
  * for the chosen databases, and the DMV snapshot only when it holds none. The MCP answers name the one that answered in `source`;
@@ -248,12 +401,83 @@ export function keptWindowStrip(res) {
  * `floorKey`, and the fields are read from there instead of from the top level. The note is text, never markup (R4).
  */
 export function windowFloorStrip(data, desc) {
-  if (!desc || desc.windowNote === false || (desc.viz !== "table" && desc.viz !== "stat")) return null;
+  if (!desc || desc.windowNote === false) return null;
+  const chart = desc.viz === "line";
+  if (desc.viz !== "table" && desc.viz !== "stat" && !chart) return null;
   if (desc.noteKey === "truncation_note" || (desc.moreNoteKeys || []).includes("truncation_note")) return null;
   const source = desc.floorKey ? getPath(data, desc.floorKey) : data;
-  if (!source || source.window_truncated !== true) return null;
-  const note = source.truncation_note;
-  return typeof note === "string" && note.trim() ? noticeStrip(note) : null;
+  if (source && source.window_truncated === true) {
+    const note = source.truncation_note;
+    if (typeof note !== "string" || !note.trim()) return null;
+    if (!chart) return noticeStrip(note);
+    /* A chart draws only the row-capped note (#5644 W12): its time axis already shows the empty span of a data start that
+       falls after the window's start, but a chart built from the newest N rows plots nothing before its oldest row while
+       the axis and the title claim the whole window. That note names the oldest row shown (oldest_shown_utc). */
+    if (typeof source.oldest_shown_utc !== "string") return null;
+    return noticeStrip(note.replace("this grid shows", "this chart shows").replace("The grid covers", "The chart covers"));
+  }
+  const capped = cappedReadNote(data, desc);
+  return capped ? noticeStrip(capped.text) : null;
+}
+
+/*
+ * The partial-window facts of a read that stopped at its row limit (#5644 W12), or null. Two shapes carry them: the server's
+ * window-floor fields (`window_truncated` with `oldest_shown_utc`: the reads WebDataStartNote lists, rewritten by readTool), and a
+ * newest-first page that says it was cut (`truncated: true` with `oldest_returned_collection_time` and an `*_desc` order: the
+ * active-query page, whose cap of 50 rows covers about an hour of a "last 24 hours" panel). A cut that names no time (a list
+ * ranked by something other than time) is not a partial window, so it gets nothing. `{ text, oldest }`: the sentence for a
+ * strip above the panel, and the page's oldest instant.
+ */
+export function cappedReadNote(data, desc) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  if (desc && (desc.windowNote === false || (desc.viz !== "table" && desc.viz !== "line"))) return null;
+  if (desc && (desc.noteKey === "truncation_note" || (desc.moreNoteKeys || []).includes("truncation_note"))) return null;
+  if (data.window_truncated === true) return null;
+  if (data.truncated !== true) return null;
+  const oldest = data.oldest_returned_collection_time;
+  if (typeof oldest !== "string" || !parseUtc(oldest)) return null;
+  if (!/_desc$|newest/.test(String(data.order == null ? "" : data.order))) return null;
+  const noun = desc && desc.viz === "line" ? "chart" : "grid";
+  const shown = Number(data.snapshots_returned);
+  const total = Number(data.total_snapshots);
+  const counts = shown > 0 && total > shown ? shown.toLocaleString() + " of " + total.toLocaleString() + " snapshots" : "rows";
+  return {
+    text: "partial window: this " + noun + " shows only the newest " + counts + ", back to " + localTime(oldest) + ", because it stops at its row limit.",
+    oldest,
+  };
+}
+
+/**
+ * The subtitle a row-capped panel gets in place of its window label (#5644 W12): "last 24 hours" over a page that reaches back
+ * one hour claimed a window the data does not cover. Null when the panel is not a row-capped one (the label stays).
+ */
+export function partialWindowSubtitle(data, desc) {
+  if (desc && desc.windowNote === false) return null;
+  if (data && typeof data === "object" && data.window_truncated === true) {
+    if (typeof data.oldest_shown_utc !== "string" || !parseUtc(data.oldest_shown_utc)) return null;
+    if (desc && desc.viz !== "table" && desc.viz !== "line") return null;
+    return "newest rows only, back to " + localTime(data.oldest_shown_utc);
+  }
+  const capped = cappedReadNote(data, desc);
+  return capped ? "newest rows only, back to " + localTime(capped.oldest) : null;
+}
+
+/** Replaces the window label in a panel's heading (its `.panel-sub` span) when the read was row-capped. A no-op otherwise. */
+export function markPartialSubtitle(panel, data, desc) {
+  const text = partialWindowSubtitle(data, desc);
+  if (!text || !panel) return;
+  const find = (node) => {
+    for (const c of Array.from(node.children || [])) {
+      const k = c.className || (typeof c.getAttribute === "function" ? c.getAttribute("class") : null);
+      if (k === "panel-sub") return c;
+      const deeper = find(c);
+      if (deeper) return deeper;
+    }
+    return null;
+  };
+  const head = Array.from(panel.children || [])[0];
+  const sub = head ? find(head) : null;
+  if (sub) sub.textContent = " " + text;
 }
 
 /**
@@ -338,6 +562,13 @@ export function parseUtc(s) {
   return isNaN(d.getTime()) ? null : d;
 }
 
+/** The rows of a read's reply under `key`, or the reply itself when it is an array; [] for anything else. One definition for the pages that unwrap a tool's reply (alerts, investigations). */
+export function rowsUnder(data, key) {
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data[key])) return data[key];
+  return [];
+}
+
 /** Full localized date-time, or an em dash for null/unparseable. */
 export function localTime(s) {
   const d = parseUtc(s);
@@ -406,12 +637,70 @@ export function windowFromHours(hours) {
   return { windowStart: windowEnd - h * 3600000, windowEnd };
 }
 
+/**
+ * #6359: the window a panel draws when it reads the WHOLE hours the grid ranked over (a row's History; see readTool's
+ * `wholeWindow`): [end - hours, end], where end is the custom range's end (or now), not the exact pair the reader picked.
+ * Without a custom range it is windowFromHours's window.
+ */
+export function wholeWindowFromHours(hours) {
+  const h = Number(hours);
+  if (!isFinite(h) || h < 1) return null;
+  if (liveRange() && h === activeRange.hours) {
+    const windowEnd = activeRange.asOf ? activeRange.endMs : Date.now();
+    return { windowStart: windowEnd - h * 3600000, windowEnd };
+  }
+  return windowFromHours(hours);
+}
+
+/**
+ * #6359: the sentence a History panel owes when the window it reads is wider than the range the reader picked, or null when
+ * they are the same (a preset, or a range of whole hours). The grids rank over whole hours back from the end of the range, so
+ * "Past 5 minutes" ranks over an hour; History reads that same window (readTool's `wholeWindow`), and says so here.
+ */
+export function widenedWindowNote(hours) {
+  const range = liveRange();
+  const h = Number(hours);
+  if (!range || !isFinite(h) || h < 1 || h !== range.hours) return null;
+  if (h * 3600000 - (range.endMs - range.startMs) < 60000) return null;
+  const end = range.asOf ? range.endMs : Date.now();
+  const at = (ms) => localTime(new Date(ms).toISOString());
+  return (
+    "This history covers the window the grid ranked over, " + at(end - h * 3600000) + " to " + (range.asOf ? at(end) : "now") +
+    ", which is wider than the range you picked (" + at(range.startMs) + " to " + (range.asOf ? at(range.endMs) : "now") + ")."
+  );
+}
+
 /* ─────────────────────────── value formatters ─────────────────────────── */
 
-export function fmtInt(v) {
+/* Axis tick labels (#6158). A chart's tick step is a nice 1, 2 or 5 times a power of ten, so on a small range it is 0.2 or
+   0.5, and a formatter that rounds to whole numbers printed one label several times over ("1 ms, 1 ms, 0 ms, 0 ms").
+   The chart passes each formatter { step } as a second argument; a formatter that gets one prints enough decimals that two
+   ticks one step apart never read the same. Called without it (a tooltip, a table cell) a formatter reads as it always did.
+   The second argument is checked to be that object, so `array.map(fmtMs)` (which passes an index) is unaffected. */
+export function tickDecimals(step) {
+  const s = Number(step);
+  if (!isFinite(s) || s <= 0 || s >= 1) return 0;
+  return Math.min(8, Math.ceil(-Math.log10(s) - 1e-9));
+}
+function stepOf(o) {
+  return o && typeof o === "object" && isFinite(o.step) && o.step > 0 ? Number(o.step) : null;
+}
+/* The decimals a tick label needs: the step's own, in the unit the label is printed in (`per` source units to one shown unit). */
+function placesFor(o, min = 0, per = 1) {
+  const step = stepOf(o);
+  return Math.max(min, step == null ? 0 : tickDecimals(step / per));
+}
+function fixed(n, places) {
+  return n.toLocaleString(undefined, { minimumFractionDigits: places, maximumFractionDigits: places });
+}
+const stepArg = (o) => (stepOf(o) == null ? null : { step: stepOf(o) });
+
+export function fmtInt(v, o) {
   if (v == null) return "—";
   const n = Number(v);
-  return isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : "—";
+  if (!isFinite(n)) return "—";
+  const places = placesFor(o);
+  return places > 0 ? fixed(n, places) : n.toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 export function fmtNum(v, d = 1) {
   if (v == null) return "—";
@@ -429,26 +718,61 @@ export function fmtRate(v) {
     ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
     : n.toLocaleString(undefined, { maximumSignificantDigits: 2 });
 }
-export function fmtPct(v) {
+export function fmtPct(v, o) {
   if (v == null) return "—";
   const n = Number(v);
-  return isFinite(n) ? Math.round(n) + "%" : "—";
+  if (!isFinite(n)) return "—";
+  const places = placesFor(o);
+  return places > 0 ? fixed(n, places) + "%" : Math.round(n) + "%";
 }
-export function fmtMs(v) {
+export function fmtMs(v, o) {
   if (v == null) return "—";
   const n = Number(v);
   if (!isFinite(n)) return "—";
   const abs = Math.abs(n);
-  if (abs < 1000) return fmtInt(n) + " ms";
-  if (abs < 60000) return fmtNum(n / 1000, 1) + " s";
-  if (abs < 3600000) return fmtNum(n / 60000, 1) + " min";
-  return fmtNum(n / 3600000, 1) + " h";
+  if (abs < 1000) return fmtInt(n, stepArg(o)) + " ms";
+  if (abs < 60000) return fmtNum(n / 1000, placesFor(o, 1, 1000)) + " s";
+  if (abs < 3600000) return fmtNum(n / 60000, placesFor(o, 1, 60000)) + " min";
+  return fmtNum(n / 3600000, placesFor(o, 1, 3600000)) + " h";
 }
-export function fmtMb(v) {
+export function fmtMb(v, o) {
   if (v == null) return "—";
   const n = Number(v);
   if (!isFinite(n)) return "—";
-  return n >= 1024 ? fmtNum(n / 1024, 1) + " GB" : fmtInt(n) + " MB";
+  return n >= 1024 ? fmtNum(n / 1024, placesFor(o, 1, 1024)) + " GB" : fmtInt(n, stepArg(o)) + " MB";
+}
+/* A size in `unit` (kb, mb, gb or tb, any case) stepped up to the unit that keeps it under 1,024, written "MB", "GB": the
+   same rule fmtMb applies, so 80,000 MB reads "78.1 GB" and never a cut-off "80,000.0 mb". Null when `unit` is not a size. */
+const SIZE_UNITS = ["KB", "MB", "GB", "TB"];
+export function fmtSize(v, unit, o) {
+  const at = SIZE_UNITS.indexOf(String(unit == null ? "" : unit).toUpperCase());
+  if (at < 0) return null;
+  if (v == null) return "—";
+  const n = Number(v);
+  if (!isFinite(n)) return "—";
+  let value = n;
+  let i = at;
+  let per = 1;
+  while (Math.abs(value) >= 1024 && i < SIZE_UNITS.length - 1) {
+    value /= 1024;
+    per *= 1024;
+    i++;
+  }
+  /* A tooltip or table cell keeps one decimal, as every composed value does; an axis tick prints as many as its step needs. */
+  const places = stepOf(o) == null ? 1 : placesFor(o, i > at ? 1 : 0, per);
+  return fixed(value, places) + " " + SIZE_UNITS[i];
+}
+/* A byte count in human units (B, KB, MB, GB; 1024-based). A null is the dash, never 0 bytes: 0 is a real answer. The table sorts
+   a column on the raw number, so "900 KB" sorts below "2.0 MB" whatever the text says. */
+export function fmtBytes(v) {
+  if (v == null) return "—";
+  const n = Number(v);
+  if (!isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (abs < 1024) return fmtInt(n) + " B";
+  if (abs < 1024 * 1024) return fmtNum(n / 1024, 1) + " KB";
+  if (abs < 1024 * 1024 * 1024) return fmtNum(n / (1024 * 1024), 1) + " MB";
+  return fmtNum(n / (1024 * 1024 * 1024), 1) + " GB";
 }
 export function fmtText(v) {
   return v == null || v === "" ? "—" : String(v);
@@ -460,21 +784,22 @@ export function fmtBool(v) {
 /** Named formatters a panel descriptor can reference (the #1563-friendly, string-keyed registry). */
 export const FORMATTERS = {
   int: fmtInt,
-  num1: (v) => fmtNum(v, 1),
-  num2: (v) => fmtNum(v, 2),
+  num1: (v, o) => fmtNum(v, placesFor(o, 1)),
+  num2: (v, o) => fmtNum(v, placesFor(o, 2)),
   rate: fmtRate,
   pct: fmtPct,
   ms: fmtMs,
   mb: fmtMb,
+  bytes: fmtBytes,
   time: localTime,
   reltime: relTime,
   bool: fmtBool,
   text: fmtText,
 };
 
-export function applyFormat(name, value) {
+export function applyFormat(name, value, opts) {
   const f = (name && FORMATTERS[name]) || FORMATTERS.text;
-  return f(value);
+  return f(value, opts);
 }
 
 /* ─────────────────────────── band / severity classes ─────────────────────────── */
@@ -902,13 +1227,22 @@ export function alertDeliveryState(a) {
   return ALERT_STATE_LABELS[a.notification_type] || null;
 }
 
-/** GET a read-only tool by its MCP name with query-string params. `signal` — see apiGet (#4191). */
-export function readTool(tool, params, signal) {
-  const plan = planCustomRange(tool, params);
+/** GET a read-only tool by its MCP name with query-string params. `signal` — see apiGet (#4191). `options.wholeWindow` (#6359): under
+ *  a custom range the read is still anchored at the range's end, but its rows are NOT cut to the exact picked pair, so a read
+ *  that answers over the whole hours the grid ranked over (a row's History) shows all of that window. */
+export function readTool(tool, params, signal, options) {
+  const plan = planCustomRange(tool, params, !!(options && options.wholeWindow));
+  const selection = params ? params[TRIM_TO] : undefined;
   return apiGetJoined("/api/read/" + tool + buildQuery(withDatabaseFilter(tool, plan.params)), signal)
     .then(localizeWindowNote)
-    .then((res) => finishCustomRange(res, plan));
+    .then((res) => finishCustomRange(res, plan))
+    .then((res) => (selection && res && res.kind === "data" ? { ...res, data: trimToRange(res.data, selection.startMs, selection.endMs, 0) } : res));
 }
+
+/** #6301: a read of an event list (blocking, deadlocks, active snapshots) that carries this key, as `{ startMs, endMs }`, has its rows cut to
+ *  that exact pair afterwards. A narrowed read is whole hours back from the selection's end, so without the cut the grid would list events from
+ *  before the selection. A symbol, so it never reaches the query string. Totals and rankings do not carry it: they aggregate. */
+export const TRIM_TO = Symbol("trimTo");
 
 /* ─────────────────────────── custom range (server page) ─────────────────────────── */
 
@@ -924,6 +1258,14 @@ let activeRange = null;
  *  the start of the trim applies. */
 export function setActiveRange(range) {
   activeRange = range || null;
+}
+
+/** #6300: where server `server`'s current window ends, in ms: the custom range's end, or now for a live range. A read that
+ *  looks at an earlier period (the Compare picker) shifts this end back and names it as `as_of`. */
+export function windowEndMs(server) {
+  const range = liveRange();
+  const end = range && range.server === server && range.asOf ? Date.parse(range.asOf) : NaN;
+  return Number.isFinite(end) ? end : Date.now();
 }
 
 /* The wait the Active Queries grid is filtered to, per server (#5235): set when a wait row or the wait trend chart opens
@@ -954,7 +1296,7 @@ export function waitIsLinked(w) {
 /* The windowed reads that take no `as_of` (the catalog's `hours` without an `as_of`): they keep answering "the last N
    hours ending now", and say so. Every other windowed read takes `as_of`. WebServerPageRangeTests pins this list
    against the read catalog. */
-const READS_WITHOUT_AS_OF = new Set(["get_fleet_overview", "get_read_latency", "get_slow_reads", "get_finops", "get_store_query_history"]);
+const READS_WITHOUT_AS_OF = new Set(["get_fleet_overview", "get_investigation_reports", "get_read_latency", "get_slow_reads", "get_finops", "get_store_query_history"]);
 
 /* The row fields that stamp one sample, event or run at an instant. A list under a read's answer whose rows carry one of
    these is cut to the exact range. Fields that say when something last happened (last_execution_time and its kin, and
@@ -977,7 +1319,7 @@ export function activeRangeStamp() {
 /* Marks the retry readWithinKeptHistory sends for fewer hours, with the hours the read first asked for. */
 const NARROWED_FROM = Symbol("narrowedFrom");
 
-function planCustomRange(tool, params) {
+function planCustomRange(tool, params, wholeWindow) {
   const range = liveRange();
   const narrowedFrom = params ? params[NARROWED_FROM] : undefined;
   const asked = narrowedFrom != null ? Number(narrowedFrom) : Number(params && params.hours);
@@ -986,6 +1328,7 @@ function planCustomRange(tool, params) {
   }
   if (READS_WITHOUT_AS_OF.has(tool)) return { params, range: null, ignored: true };
   const withEnd = range.asOf ? { ...params, as_of: range.asOf } : params;
+  if (wholeWindow) return { params: withEnd, range: null, ignored: false };
   if (narrowedFrom == null) return { params: withEnd, range, ignored: false };
   /* The kept-history retry: the same end, the hours the store keeps, and only the part of the range those hours reach. */
   const kept = Number(params.hours);

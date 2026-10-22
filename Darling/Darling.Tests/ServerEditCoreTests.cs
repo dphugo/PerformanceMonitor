@@ -77,7 +77,7 @@ public sealed class ServerEditCoreTests : IDisposable
             Task.FromResult(OtherKeys.ToList());
 
         public Task<Edit.ServerEditWrite> WriteAsync(
-            int serverId, DateTime expectedModifiedAt, IReadOnlyList<Edit.EditColumnValue> sets, string? newStorageKey, string? actualStorageKey, CancellationToken cancellationToken)
+            int serverId, DateTime expectedModifiedAt, IReadOnlyList<Edit.EditColumnValue> sets, string? newStorageKey, string? actualStorageKey, Edit.HeldCheck? heldCheck, CancellationToken cancellationToken)
         {
             Writes++;
             LastSets = sets.ToList();
@@ -101,6 +101,72 @@ public sealed class ServerEditCoreTests : IDisposable
 
     private static Task<string> Run(FakeStore store, string changes, Edit.ServerProbe? probe = null, IPasswordKeyRing? ring = null, ILogger? logger = null) =>
         Edit.EditServerCoreAsync(store, 41, changes, probe ?? ThrowingProbe, ring ?? TestKeyRings.Healthy, logger, CancellationToken.None);
+
+    private static Task<string> RunAsMcp(FakeStore store, string changes, DarlingMcpAddServersPolicy policy, Edit.ServerProbe? probe = null) =>
+        Edit.EditServerCoreAsync(store, 41, changes, probe ?? ThrowingProbe, TestKeyRings.Healthy, null, CancellationToken.None, policy: policy);
+
+    [Theory]
+    [InlineData("{\"host\":\"other.example.test\",\"trust_server_certificate\":true}")]
+    [InlineData("{\"host\":\"other.example.test\",\"encrypt_mode\":\"Optional\"}")]
+    [InlineData("{\"trust_server_certificate\":true}")]
+    public async Task McpEdit_OfAWindowsServer_ToAnUnverifiedConnection_IsRefusedBeforeTheProbe_AndNothingIsWritten(string changes)
+    {
+        var store = new FakeStore { Row = SqlRow(auth: "integrated") };
+
+        /* The probe throws if it runs: the screen has to answer first. */
+        var answer = await RunAsMcp(store, changes, DarlingMcpAddServersPolicy.Default);
+
+        Assert.Equal("invalid", Status(answer));
+        Assert.Contains(DarlingMcpAddServersPolicy.UnverifiedWindowsAuthSetting, answer, StringComparison.Ordinal);
+        Assert.Contains("Not saved", answer, StringComparison.Ordinal);
+        Assert.DoesNotContain("Not added", answer, StringComparison.Ordinal);
+        Assert.Equal(0, store.Writes);
+    }
+
+    [Fact]
+    public async Task McpEdit_SwitchingToWindowsAuth_WithAnUnverifiedConnection_IsRefused()
+    {
+        var store = new FakeStore { Row = SqlRow() };
+
+        var answer = await RunAsMcp(store, "{\"auth\":\"Windows\",\"trust_server_certificate\":true}", DarlingMcpAddServersPolicy.Default);
+
+        Assert.Equal("invalid", Status(answer));
+        Assert.Equal(0, store.Writes);
+    }
+
+    [Fact]
+    public async Task McpEdit_OfAWindowsServer_ToAVerifiedConnection_IsProbedAndSaved()
+    {
+        var store = new FakeStore { Row = SqlRow(auth: "integrated") };
+
+        var answer = await RunAsMcp(store, "{\"host\":\"other.example.test\"}", DarlingMcpAddServersPolicy.Default, Reachable);
+
+        Assert.Equal("updated", Status(answer));
+        Assert.Equal(1, store.Writes);
+    }
+
+    [Fact]
+    public async Task McpEdit_WithTheOperatorSettingOn_ProbesAnUnverifiedWindowsServer()
+    {
+        var store = new FakeStore { Row = SqlRow(auth: "integrated") };
+
+        var answer = await RunAsMcp(
+            store, "{\"host\":\"other.example.test\",\"trust_server_certificate\":true}",
+            new DarlingMcpAddServersPolicy(allowWindowsAuthOverUnverifiedTls: true), Reachable);
+
+        Assert.Equal("updated", Status(answer));
+    }
+
+    [Fact]
+    public async Task TheWebRoute_PassesNoMcpPolicy_SoTheScreenDoesNotApplyToIt()
+    {
+        var store = new FakeStore { Row = SqlRow(auth: "integrated") };
+
+        var answer = await Edit.EditServerCoreAsync(
+            store, 41, "{\"host\":\"other.example.test\",\"trust_server_certificate\":true}", Reachable, TestKeyRings.Healthy, null, CancellationToken.None);
+
+        Assert.Equal("updated", Status(answer));
+    }
 
     private static string Status(string answer) => JsonNode.Parse(answer)!["status"]!.GetValue<string>();
 
@@ -204,7 +270,7 @@ public sealed class ServerEditCoreTests : IDisposable
         };
 
         Assert.Empty(Edit.EditColumnOfField.Values.Intersect(forbidden));
-        Assert.Equal(14, Edit.EditColumnOfField.Count);
+        Assert.Equal(15, Edit.EditColumnOfField.Count);
     }
 
     [Fact]
@@ -218,7 +284,7 @@ public sealed class ServerEditCoreTests : IDisposable
                 new Edit.EditColumnValue("password", "encrypted_password", NpgsqlDbType.Text, "blob"),
             ]);
 
-        Assert.Equal(17, parameters.Count);
+        Assert.Equal(18, parameters.Count);
         Assert.Equal(["name", "encrypted_password"], (string[])parameters[2].Value!);
         Assert.Equal(token, (DateTime)parameters[1].Value!);
         Assert.Equal("x", parameters[3].Value);
@@ -228,6 +294,38 @@ public sealed class ServerEditCoreTests : IDisposable
         Assert.Equal(
             Edit.EditColumnOfField.Values.Order(StringComparer.Ordinal).ToArray(),
             Edit.EditFunctionColumns.Select(c => c.Column).Order(StringComparer.Ordinal).ToArray());
+    }
+
+    // #6254: the Query Store replica is a field of how the server is reached, so an edit that changes only it needs the password again.
+    [Fact]
+    public void AReplicaOnlyEdit_OfASqlServer_NeedsThePassword_AndWithOneSealsItForTheNewReplica()
+    {
+        var (refusedPlan, refusal) = Plan(SqlRow(), """{"query_store_replica":" replica-a,1433 "}""");
+        Assert.Null(refusedPlan);
+        Assert.Equal(Edit.EditPasswordNeededText, refusal);
+
+        var (plan, error) = Plan(SqlRow(), """{"query_store_replica":" replica-a,1433 ","password":"not-a-real-password"}""");
+        Assert.Null(error);
+        Assert.Equal("replica-a,1433", plan!.ProbeConfig!.QueryStoreReplica);
+        Assert.Equal("replica-a,1433", plan.Sets.Single(set => set.Column == "query_store_replica").Value);
+    }
+
+    [Fact]
+    public void ABlankReplica_RemovesIt_AnAbsentOneKeepsIt_AndAPostgresTargetRefusesOne()
+    {
+        var row = SqlRow() with { QueryStoreReplica = "replica-a" };
+
+        var (cleared, clearError) = Plan(row, """{"query_store_replica":"","password":"not-a-real-password"}""");
+        Assert.Null(clearError);
+        Assert.Null(cleared!.Sets.Single(set => set.Column == "query_store_replica").Value);
+
+        var (kept, keptError) = Plan(row, """{"display_name":"renamed"}""");
+        Assert.Null(keptError);
+        Assert.DoesNotContain(kept!.Sets, set => set.Column == "query_store_replica");
+        Assert.Equal("replica-a", kept.ProbeConfig!.QueryStoreReplica);
+
+        var (_, postgresError) = Plan(SqlRow(auth: "sql", engine: "postgres"), """{"query_store_replica":"replica-a","password":"not-a-real-password"}""");
+        Assert.Equal("query_store_replica is for SQL Server servers only.", postgresError);
     }
 
     [Fact]
@@ -603,12 +701,12 @@ public sealed class ServerEditCoreTests : IDisposable
         var row = SqlRow();
         var binding = PasswordBinding.ForServer(ServerConnectionIdentity.FromStoredColumns(
             "b.example.test", row.Port, row.Engine, row.Database, row.ReadOnlyIntent, row.Auth, row.Username, row.EncryptMode,
-            row.TrustServerCertificate, row.MultiSubnetFailover));
+            row.TrustServerCertificate, row.MultiSubnetFailover, null));
         Assert.Equal(Secret, TestKeyRings.Healthy.Open((string)stored.Value!, binding));
         Assert.NotEqual(Secret, stored.Value);
         var movedAgain = PasswordBinding.ForServer(ServerConnectionIdentity.FromStoredColumns(
             row.Host, row.Port, row.Engine, row.Database, row.ReadOnlyIntent, row.Auth, row.Username, row.EncryptMode,
-            row.TrustServerCertificate, row.MultiSubnetFailover));
+            row.TrustServerCertificate, row.MultiSubnetFailover, null));
         Assert.Throws<PasswordSealException>(() => { _ = TestKeyRings.Healthy.Open((string)stored.Value!, movedAgain); });
     }
 
@@ -737,7 +835,58 @@ public sealed class ServerEditCoreTests : IDisposable
         var answer = JsonNode.Parse(await Run(store, "{\"monthly_cost_usd\":5}"))!;
 
         Assert.Equal("invalid", answer["status"]!.GetValue<string>());
-        Assert.Equal("This server has a remediation login stored. Change how it is reached on the service host, in the configuration file or with --add-server.", answer["message"]!.GetValue<string>());
+        Assert.Equal("This server has a remediation or hypothetical-index login stored. Change how it is reached on the service host, in the configuration file or with --add-server.", answer["message"]!.GetValue<string>());
         Assert.Equal(Edit.EditRemediationKeptText, answer["message"]!.GetValue<string>());
+    }
+
+    /* #6352: a changed host is never a named pipe, an admin connection or a path; an unchanged one stays editable. */
+    [Theory]
+    [InlineData("np:beta-01.example.test")]
+    [InlineData("admin:beta-01.example.test")]
+    [InlineData("\\\\beta-01.example.test\\pipe\\sql\\query")]
+    [InlineData("//beta-01.example.test/pipe/sql/query")]
+    public async Task AnEditThatMovesTheHostToAPipeOrAdminOrPath_IsRefusedBeforeTheProbe_AndNothingIsWritten(string host)
+    {
+        var store = new FakeStore { Row = SqlRow() };
+        var changes = new JsonObject { ["host"] = host, ["password"] = Secret }.ToJsonString();
+
+        var answer = JsonNode.Parse(await Run(store, changes))!;
+
+        Assert.Equal("invalid", answer["status"]!.GetValue<string>());
+        Assert.Contains("is not accepted", answer["message"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Equal(0, store.Writes);
+    }
+
+    [Fact]
+    public async Task ARowSavedWithAPipeHostBeforeTheRule_StaysEditableWhileItsHostIsLeftAlone()
+    {
+        var store = new FakeStore { Row = SqlRow(host: "np:legacy-host.example.test") };
+
+        var answer = JsonNode.Parse(await Run(store, "{\"host\":\"np:legacy-host.example.test\",\"display_name\":\"renamed\"}"))!;
+
+        Assert.Equal("updated", answer["status"]!.GetValue<string>());
+        Assert.Equal(1, store.Writes);
+    }
+
+    [Fact]
+    public async Task AnEditThatMovesAnUnrecognisedEngineRowToAPipeHost_IsRefused_BecauseThatRowIsSqlServer()
+    {
+        // A darling.json seed stores the engine as written; "mssql" is read as SQL Server everywhere else.
+        var store = new FakeStore { Row = SqlRow(engine: "mssql") };
+
+        var answer = JsonNode.Parse(await Run(store, new JsonObject { ["host"] = "np:attacker.example.test", ["password"] = Secret }.ToJsonString()))!;
+
+        Assert.Equal("invalid", answer["status"]!.GetValue<string>());
+        Assert.Contains("is not accepted", answer["message"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Equal(0, store.Writes);
+    }
+
+    [Fact]
+    public void AnUnrecognisedEngineRow_IsNotHeldToThePostgreSqlSqlAuthRule()
+    {
+        var (plan, error) = Plan(SqlRow(auth: "integrated", engine: "mssql"), "{\"display_name\":\"renamed\"}");
+
+        Assert.Null(error);
+        Assert.NotNull(plan);
     }
 }

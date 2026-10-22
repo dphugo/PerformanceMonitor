@@ -24,8 +24,8 @@ namespace Darling.Tests;
 
 /// <summary>
 /// #4203: a superseded or abandoned <c>/api/read/{tool}</c> request must stop its store query, not just stop
-/// answering it. Both halves of the ratchet read the CODE, never a hand-written tool list — the same shape
-/// <see cref="LiveCleanupConversionRatchetTests"/> uses for its own conversion sweep — and the one hand-kept
+/// answering it. Both halves of the ratchet read the CODE, never a hand-written tool list —
+/// and the one hand-kept
 /// list, <see cref="DarlingWebEndpoints.CancellationAllowlist"/>, may only shrink: a PR converts a tool's
 /// dispatch entry AND its <c>[McpServerTool]</c> method together and removes the name here, never adds one.
 ///
@@ -54,14 +54,14 @@ public sealed class WebReadCancellationPinTests
     /// <summary>
     /// An <see cref="HttpContext"/> whose request is already aborted, carrying query values for the few
     /// required text parameters (<c>get_query_trend</c>'s <c>query_hash</c> / <c>database_name</c>, and
-    /// <c>get_wait_trend</c>'s <c>wait_type</c>, <c>get_alert_details</c>'s alert key) so a dispatch entry with a synchronous "is this parameter
+    /// <c>get_wait_trend</c>'s <c>wait_type</c>, <c>get_alert_details</c>'s alert key, <c>get_overview_baselines</c>'s window start, <c>get_plan_force_precheck</c>'s <c>plan_id</c>) so a dispatch entry with a synchronous "is this parameter
     /// present" gate still reaches its store call instead of returning a missing-parameter envelope with
     /// nothing cancelled.
     /// </summary>
     private static HttpContext CancelledRequest()
     {
         var context = new DefaultHttpContext();
-        context.Request.QueryString = new QueryString("?kind=query_hash&query_hash=deadbeef&database_name=probe&counter_name=x&wait_type=CXPACKET&metric=total_waits&query_id=1&sql_handle=0x01&collection_time=2026-01-01T00:00:00.000000Z&session_id=1&event_time=2026-01-01T00:00:00.000000Z&blocked_spid=1&blocking_spid=2&deadlock_time=2026-01-01T00:00:00.000000Z&server_id=1&metric_name=x&alert_time=2026-01-01T00:00:00Z");
+        context.Request.QueryString = new QueryString("?kind=query_hash&query_hash=deadbeef&database_name=probe&counter_name=x&wait_type=CXPACKET&metric=total_waits&query_id=1&plan_id=1&sql_handle=0x01&collection_time=2026-01-01T00:00:00.000000Z&window_start=2026-01-01T00:00:00.000000Z&session_id=1&event_time=2026-01-01T00:00:00.000000Z&blocked_spid=1&blocking_spid=2&deadlock_time=2026-01-01T00:00:00.000000Z&server_id=1&metric_name=x&alert_time=2026-01-01T00:00:00Z");
         context.RequestAborted = new CancellationToken(canceled: true);
         return context;
     }
@@ -189,8 +189,7 @@ public sealed class WebReadCancellationPinTests
     /// <summary>
     /// A name stays on the allowlist only while its tool method has nowhere to put a token. Once BOTH halves
     /// convert — the method gains a <see cref="CancellationToken"/> parameter and its dispatch entry passes
-    /// <c>RequestAborted</c> — the entry is stale and must be removed, the discipline
-    /// <see cref="LiveCleanupConversionRatchetTests"/> holds for its own ceiling.
+    /// <c>RequestAborted</c> — the entry is stale and must be removed.
     /// </summary>
     [Fact]
     public void CancellationAllowlist_HasNoStaleEntry()

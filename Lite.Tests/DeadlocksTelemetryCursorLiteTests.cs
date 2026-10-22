@@ -26,7 +26,6 @@ namespace Lite.Tests;
 /// (<c>database_name = 'master'</c>) almost never finds a row and every run re-reads the last ten minutes.
 /// The arm keeps its own cursor in collector state: the newest <c>deadlock_time</c> the arm itself returned.
 /// </summary>
-[Trait("Reads", "Darling")]
 public class DeadlocksTelemetryCursorLiteTests
 {
     private const string Key = "dl_telemetry_cursor";
@@ -162,14 +161,16 @@ public class DeadlocksTelemetryCursorLiteTests
         var root = FindRepoRoot();
         Assert.True(root is not null, "repo root not found -- the source pin cannot run");
 
-        foreach (var (host, write, serverWriteText) in new[]
+        /* #5813: Lite's Azure loop reads from the reader its read budget opened (openedRead.Reader), so each host
+           names its own per-database read. */
+        foreach (var (host, readText, write, serverWriteText) in new[]
         {
-            ("Darling/PerformanceMonitor.Darling.Service/DarlingCollectorRunner.cs", "WriteBatchAsync(pgConnection, definition, batch", "WriteBatchAsync(pgConnection, definition, rows"),
-            ("Lite/Services/RemoteCollectorService.DefinitionRunner.cs", "WriteBatch(duckConnection, definition, batch", "WriteBatch(duckConnection, definition, rows"),
+            ("Darling/PerformanceMonitor.Darling.Service/DarlingCollectorRunner.cs", "batch = await definition.ReadAsync(dbReader", "WriteBatchAsync(pgConnection, definition, batch", "WriteBatchAsync(pgConnection, definition, rows"),
+            ("Lite/Services/RemoteCollectorService.DefinitionRunner.cs", "batch = await definition.ReadAsync(openedRead.Reader", "WriteBatch(duckConnection, definition, batch", "WriteBatch(duckConnection, definition, rows"),
         })
         {
             var source = File.ReadAllText(Path.Combine(root!, host.Replace('/', Path.DirectorySeparatorChar)));
-            var read = source.IndexOf("batch = await definition.ReadAsync(dbReader", StringComparison.Ordinal);
+            var read = source.IndexOf(readText, StringComparison.Ordinal);
             Assert.True(read > 0, $"{host}: per-database read not found");
             var drop = source.LastIndexOf("context.DropStagedItemState();", read, StringComparison.Ordinal);
             var flush = source.IndexOf(write, read, StringComparison.Ordinal);
@@ -190,10 +191,24 @@ public class DeadlocksTelemetryCursorLiteTests
             var readItem = source.IndexOf("readItem: async (item, ct) =>", StringComparison.Ordinal);
             var complete = source.IndexOf("onItemComplete: (item, batchCount", readItem, StringComparison.Ordinal);
             Assert.True(readItem > 0 && complete > readItem, $"{host}: enumerated hooks not found");
-            var itemDrop = source.IndexOf("context.DropStagedItemState();", readItem, StringComparison.Ordinal);
-            var itemQuery = source.IndexOf("BuildPerItemQuery(item, context)", readItem, StringComparison.Ordinal);
+            /* #6254: Darling's readItem hands each read to ReadQueryStoreItemAsync (the replica attempt, and the primary read a failed
+               replica read falls back to), which holds the drop and the query. The rule is unchanged: the drop comes first in the
+               body that runs the per-item query, and readItem reaches that body before onItemComplete. */
+            var itemBody = source.IndexOf("Task<List<TRow>> ReadQueryStoreItemAsync(", StringComparison.Ordinal);
+            if (itemBody < 0)
+            {
+                itemBody = readItem;
+            }
+            else
+            {
+                var viaHelper = source.IndexOf("ReadQueryStoreItemAsync(item, ", readItem, StringComparison.Ordinal);
+                Assert.True(viaHelper > readItem && viaHelper < complete, $"{host}: readItem must run its reads through the helper that drops first");
+            }
+
+            var itemDrop = source.IndexOf("context.DropStagedItemState();", itemBody, StringComparison.Ordinal);
+            var itemQuery = source.IndexOf("BuildPerItemQuery(item, context)", itemBody, StringComparison.Ordinal);
             var itemLand = source.IndexOf("context.LandStagedItemState();", readItem, StringComparison.Ordinal);
-            Assert.True(itemDrop > readItem && itemDrop < itemQuery && itemQuery < complete, $"{host} must drop first in readItem, before the per-item query");
+            Assert.True(itemDrop > itemBody && itemDrop < itemQuery && itemQuery < complete, $"{host} must drop first in readItem, before the per-item query");
             Assert.True(itemLand > complete, $"{host} must land inside onItemComplete, not readItem");
         }
     }

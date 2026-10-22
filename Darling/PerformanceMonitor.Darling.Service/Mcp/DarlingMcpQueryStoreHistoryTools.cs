@@ -80,19 +80,34 @@ public sealed class DarlingMcpQueryStoreHistoryTools
     /// (the newest collection_time, then the largest execution_count), so no total adds one interval twice. The
     /// partition is the one <c>DarlingDataReader.QueryStoreTopRawPrefix</c> uses; PostgreSQL matches NULL to NULL in it.
     /// </summary>
-    internal const string HistorySql = """
+    internal const string HistoryDedupeCte = """
         WITH deduped AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY plan_id, runtime_stats_interval_id, first_execution_time, execution_type_desc, replica_role
                                          ORDER BY collection_time DESC, execution_count DESC) AS rn
             FROM query_store_stats
             WHERE server_id = $1 AND database_name = $2 AND query_id = $3
             AND collection_time >= $4 AND collection_time <= $5)
+        """;
+
+    internal const string HistorySql = HistoryDedupeCte + "\n" + """
         SELECT plan_id, collection_time, execution_count,
                CAST(avg_duration_us AS double precision) / 1000.0,
                CAST(avg_cpu_time_us AS double precision) / 1000.0,
                first_execution_time, last_execution_time, is_forced_plan
         FROM deduped WHERE rn = 1
         """ + " " + HistoryOrder;
+
+    /// <summary>
+    /// The interval-table read's FROM and WHERE (#5300, #5807, #5523), shared with <c>get_plan_force_precheck</c> (#5632) so a
+    /// second reader of the same table takes the same index-friendly predicates and cannot drift from them.
+    /// </summary>
+    internal static readonly string HistoryTableFromWhere = $$"""
+        FROM query_store_interval_wide
+        WHERE server_id = $1 AND database_name = $2 AND query_id = $3
+        AND collection_time >= $4 AND collection_time <= $5
+        AND first_execution_time >= $4 - {{QueryStoreIntervalWide.PurgeEdgeMarginSql}}
+        AND first_execution_time <= $5 + {{QueryStoreIntervalWide.FirstExecUpperSlackSql}}
+        """;
 
     /// <summary>
     /// The interval table's twin of <see cref="HistorySql"/> (#5300), the tier the grid reads below raw retention:
@@ -104,20 +119,18 @@ public sealed class DarlingMcpQueryStoreHistoryTools
     /// walk the server's newer rows; it drops a row only for a monitored-server clock more than the slack (twelve hours)
     /// ahead of the service's, or a collection cycle longer than that
     /// (<see cref="QueryStoreIntervalWide.FirstExecUpperSlack"/>'s summary). A static readonly because the interval literal is derived from a TimeSpan; <c>$$"""</c> keeps <c>$1</c> literal.
+    /// <para><b>Index (#5807).</b> The three equalities and the <c>first_execution_time</c> range are exactly the key of
+    /// <see cref="QueryStoreBackgroundIndexes.WideDatabaseQueryFirstExec"/>, so each partition the bound reaches is one
+    /// range scan over this query's rows; <c>collection_time</c> and the order are applied to those rows only. Keep every
+    /// predicate on the bare column (no cast or expression on it), or the planner can no longer take that index or prune
+    /// on the bound. A store that has not built the index yet reads through the older ones, as before.</para>
     /// </summary>
     internal static readonly string HistoryTableSql = $$"""
         SELECT plan_id, collection_time, execution_count,
                CAST(avg_duration_us AS double precision) / 1000.0,
                CAST(avg_cpu_time_us AS double precision) / 1000.0,
                first_execution_time, last_execution_time, is_forced_plan
-        FROM query_store_interval_wide
-        WHERE server_id = $1 AND database_name = $2 AND query_id = $3
-        AND collection_time >= $4 AND collection_time <= $5
-        AND first_execution_time >= $4 - {{QueryStoreIntervalWide.PurgeEdgeMarginSql}}
-        AND first_execution_time <= $5 + {{QueryStoreIntervalWide.FirstExecUpperSlackSql}}
-        """ + " " + HistoryOrder;
-
-    private const string SetTransactionReadOnlySql = "SET TRANSACTION READ ONLY";
+        """ + "\n" + HistoryTableFromWhere + " " + HistoryOrder;
 
     internal readonly record struct HistoryRow(
         long PlanId, DateTime CollectionTime, long ExecutionCount, double? AvgDurationMs, double? AvgCpuMs,
@@ -205,8 +218,17 @@ public sealed class DarlingMcpQueryStoreHistoryTools
     /// decision and the read it authorizes see one snapshot. Null (never an empty list) when the gate says raw or anything
     /// before the table read fails; a fault falls back to raw, as the grid's does. Cancellation propagates.
     /// </summary>
-    private static async Task<(List<HistoryRow> Rows, QueryStoreIntervalWide.WideReadPlan Plan)?> TryReadFromTableAsync(
-        NpgsqlDataSource postgres, int serverId, string databaseName, long queryId, DateTime start, DateTime end, CancellationToken cancellationToken)
+    private static Task<(List<HistoryRow> Rows, QueryStoreIntervalWide.WideReadPlan Plan)?> TryReadFromTableAsync(
+        NpgsqlDataSource postgres, int serverId, string databaseName, long queryId, DateTime start, DateTime end, CancellationToken cancellationToken) =>
+        TryReadFromTableAsync(postgres, serverId, databaseName, queryId, start, end, HistoryTableSql, ReadRowsAsync, cancellationToken);
+
+    /// <summary>
+    /// The tier choice with the row shape and the select list left to the caller (#5632): <c>get_plan_force_precheck</c> reads
+    /// the same table under the same gate with more columns. <paramref name="tableSql"/> takes $1 to $5 as <see cref="HistoryTableSql"/> does.
+    /// </summary>
+    internal static async Task<(List<T> Rows, QueryStoreIntervalWide.WideReadPlan Plan)?> TryReadFromTableAsync<T>(
+        NpgsqlDataSource postgres, int serverId, string databaseName, long queryId, DateTime start, DateTime end,
+        string tableSql, Func<NpgsqlDataReader, CancellationToken, Task<List<T>>> readRows, CancellationToken cancellationToken)
     {
         if (!DarlingDataReader.QueryStoreTopMayReadTable(start, end)) return null;
         var gateDecided = false;
@@ -214,14 +236,14 @@ public sealed class DarlingMcpQueryStoreHistoryTools
         {
             await using var connection = await postgres.OpenConnectionAsync(cancellationToken);
             await using var transaction = await connection.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead, cancellationToken);
-            await using (var readOnly = new NpgsqlCommand(SetTransactionReadOnlySql, connection) { Transaction = transaction, CommandTimeout = McpCommandDeadlines.ReadSeconds })
+            await using (var readOnly = new NpgsqlCommand(DarlingDataReader.SetTransactionReadOnlySql, connection) { Transaction = transaction, CommandTimeout = McpCommandDeadlines.ReadSeconds })
             {
                 await readOnly.ExecuteNonQueryAsync(cancellationToken);
             }
 
             var plan = await QueryStoreIntervalWide.ResolveReadAsync(
                 connection, serverId, start, end, end, DarlingDataReader.QueryStoreTopMinWindow,
-                McpCommandDeadlines.ReadSeconds, ReadScope.Current?.Logger, cancellationToken);
+                McpCommandDeadlines.ReadSeconds, ReadScope.Current?.Logger, legacyRows: QueryStoreIntervalWide.LegacyRows.Allow, cancellationToken);
             if (!plan.UseTable)
             {
                 if (plan.DecisionFailed) ReadScope.Note(ReadFallback.GateFailed);
@@ -229,14 +251,14 @@ public sealed class DarlingMcpQueryStoreHistoryTools
             }
 
             gateDecided = true;
-            await using var command = new NpgsqlCommand(HistoryTableSql, connection) { Transaction = transaction, CommandTimeout = McpCommandDeadlines.ReadSeconds };
+            await using var command = new NpgsqlCommand(tableSql, connection) { Transaction = transaction, CommandTimeout = McpCommandDeadlines.ReadSeconds };
             command.Parameters.AddWithValue(serverId);
             command.Parameters.AddWithValue(databaseName);
             command.Parameters.AddWithValue(queryId);
             command.Parameters.AddWithValue(NpgsqlTypes.NpgsqlDbType.Timestamp, DateTime.SpecifyKind(plan.ReadStart, DateTimeKind.Unspecified));
             command.Parameters.AddWithValue(NpgsqlTypes.NpgsqlDbType.Timestamp, DateTime.SpecifyKind(end, DateTimeKind.Unspecified));
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            var rows = await ReadRowsAsync(reader, cancellationToken);
+            var rows = await readRows(reader, cancellationToken);
             ReadScope.NoteSource(ReadScope.SourceIntervalTable);
             return (rows, plan);
         }
@@ -247,12 +269,35 @@ public sealed class DarlingMcpQueryStoreHistoryTools
         }
     }
 
+    /// <summary>
+    /// The forces of one query that stand in their database's newest forced-plan capture in the window (#5632), with their state. A read that
+    /// fails leaves the history answer whole and says so in <c>forced_plans_status</c>: a history is still worth giving without the forces.
+    /// </summary>
+    private static async Task<(List<ForcedPlanFact> Facts, string Status)> TryReadForcedPlansAsync(
+        NpgsqlDataSource postgres, int serverId, string databaseName, long queryId, DateTime start, DateTime end, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var read = await DarlingForcedPlanStateReader.ReadAsync(
+                postgres, serverId, DatabaseFilter.One(databaseName), queryId, start, end, null, McpCommandDeadlines.ReadSeconds, cancellationToken);
+            var facts = read.Plans.Where(f => f.QueryId == queryId && f.State != ForcedPlanState.Removed).Take(MaxPlans).ToList();
+            return (facts, read.Captures.Count == 0 ? "no_capture_in_window" : "ok");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ReadScope.NoteFallback(ReadFallback.FallbackRaw, "#5632 forced plans read", ex);
+            return (new List<ForcedPlanFact>(), "unavailable");
+        }
+    }
+
     [McpServerTool(Name = "get_query_store_query_history"), Description(
         "One Query Store query's history, plan by plan: per-plan executions, duration and CPU, plus a per-interval series. window_truncated marks a history floor. <<GUIDE>>" +
         "Per-plan averages are execution-weighted (total over executions), so they can differ from get_query_store_top, which averages the interval averages. " +
         "Outcomes (Regular, Aborted, Exception) and replica roles are combined, execution-weighted, into one value per plan and collection time. " +
-        "Reads the raw tier, or the per-interval table (kept 9 days) past raw retention, by get_query_store_top's own rule, so it covers what that grid does; effective_start is where complete history begins. " +
-        "points keeps the newest 150 of the listed plans (points_truncated) and plans the 20 longest by total duration (plans_truncated).")]
+        "Reads the raw tier, or the per-interval table (kept 10 days) past raw retention, by get_query_store_top's own rule, so it covers what that grid does; effective_start is where complete history begins. " +
+        "points keeps the newest 150 of the listed plans (points_truncated) and plans the 20 longest by total duration (plans_truncated). " +
+        "Every plan of the query forced in its database's newest forced-plan capture is listed (forced_state: WORKING, NOT_EXERCISED, IGNORED, FAILING or UNKNOWN_PLAN_NOT_COLLECTED; get_forced_plans explains the states), even with no executions in the window. " +
+        "Each forced_plans entry also lists variant_plans (plans SQL Server compiled to run the force, which count as the forced plan running) and plan_guide (a plan guide that covers the query), as get_forced_plans does.")]
     public static async Task<string> GetQueryStoreQueryHistory(
         NpgsqlDataSource postgres,
         [Description("The database_name from get_query_store_top.")] string database_name,
@@ -265,7 +310,7 @@ public sealed class DarlingMcpQueryStoreHistoryTools
         var (resolved, error) = await DarlingServerResolver.ResolveOrErrorAsync(postgres, server_name, cancellationToken);
         if (error != null) return error;
 
-        var validation = McpHelpers.ValidateWindow(hours_back, as_of, out var windowEnd);
+        var validation = DarlingReadWindow.Validate(hours_back, as_of, out var windowEnd);
         if (validation != null) return validation;
         var start = windowEnd.AddHours(-hours_back);
 
@@ -316,8 +361,12 @@ public sealed class DarlingMcpQueryStoreHistoryTools
                 emptyHints = DarlingMcpWindowNotice.Build(floor, start, "query_store_stats", emptyAnswer: true).AsHints();
             }
 
-            if (rows.Count == 0)
-                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.ServerName, "query_store", cancellationToken)
+            /* #5632: the forced plans of this query, read apart from the history rows (HistorySql and HistoryTableSql are unchanged), so a forced
+               plan that never ran in the window still appears. */
+            var forced = await TryReadForcedPlansAsync(postgres, resolved.ServerId, database_name, query_id, start, windowEnd, cancellationToken);
+
+            if (rows.Count == 0 && forced.Facts.Count == 0)
+                return await DarlingEngineCapability.NotCollectedStatusAsync(postgres, resolved.ServerId, resolved.DisplayName, "query_store", cancellationToken)
                     ?? McpHelpers.Status("empty",
                         $"No Query Store history for query_id {query_id} in database '{database_name}' in the {hours_back}-hour window searched.",
                         emptyHints);
@@ -325,6 +374,13 @@ public sealed class DarlingMcpQueryStoreHistoryTools
             var allPlans = FoldPlans(rows);
             var plansTruncated = allPlans.Count > MaxPlans;
             var plans = plansTruncated ? allPlans.OrderByDescending(p => p.TotalDurationMs).Take(MaxPlans).OrderBy(p => p.PlanId).ToList() : allPlans;
+            var forcedById = forced.Facts.ToDictionary(f => f.PlanId);
+            /* A plan forced in the newest capture is always listed, cut or not, run or not. */
+            plans = plans
+                .Concat(allPlans.Where(p => forcedById.ContainsKey(p.PlanId) && !plans.Any(k => k.PlanId == p.PlanId)))
+                .Concat(forced.Facts.Where(f => !allPlans.Any(p => p.PlanId == f.PlanId))
+                    .Select(f => new PlanTotals(f.PlanId, 0, null, 0, null, 0, null, null, true)))
+                .OrderBy(p => p.PlanId).ToList();
             var allPoints = BuildPoints(rows, plans.Select(p => p.PlanId));
             var points = NewestWithinBudget(allPoints, p => JsonSerializer.SerializeToUtf8Bytes(p, McpHelpers.JsonOptions).Length, MaxPoints, PointByteBudget);
             var pointsTruncated = points.Count < allPoints.Count;
@@ -344,9 +400,12 @@ public sealed class DarlingMcpQueryStoreHistoryTools
                     total_cpu_ms = p.TotalCpuMs,
                     first_execution_time = p.FirstExecutionTime?.ToString("o", CultureInfo.InvariantCulture),
                     last_execution_time = p.LastExecutionTime?.ToString("o", CultureInfo.InvariantCulture),
-                    is_forced_plan = p.IsForcedPlan
+                    is_forced_plan = p.IsForcedPlan || forcedById.ContainsKey(p.PlanId),
+                    forced_state = forcedById.TryGetValue(p.PlanId, out var forcedFact) ? DarlingMcpForcedPlanTools.StateName(forcedFact.State) : null
                 }),
                 plans_truncated = plansTruncated,
+                forced_plans = forced.Facts.Select(DarlingMcpForcedPlanTools.ForceNode),
+                forced_plans_status = forced.Status,
                 points,
                 points_truncated = pointsTruncated
             }, McpHelpers.JsonOptions);

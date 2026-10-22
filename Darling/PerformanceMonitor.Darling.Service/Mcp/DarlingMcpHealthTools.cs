@@ -76,11 +76,11 @@ public sealed class DarlingMcpHealthTools
             if (summary.HasNoData)
                 return McpHelpers.Status(
                     "unavailable",
-                    $"No data available for {resolved.ServerName}. The collector may not have run yet.");
+                    $"No data available for {resolved.DisplayName}. The collector may not have run yet.");
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 cpu_percent = summary.CpuPercent,
                 /* #3541 A10: each latest figure carries ITS OWN clock. last_collection below is the newest
                    collection of ANY collector — a live collection log beside a dead CPU collector made a
@@ -121,7 +121,7 @@ public sealed class DarlingMcpHealthTools
         }
     }
 
-    [McpServerTool(Name = "get_daily_summary"), Description("Gets one day's health band (Healthy/Warning/Critical/NoData), wait time (sec), top wait, unique queries, deadlocks, blocking, high-CPU samples, memory pressure, errors, alerts for summary_date (UTC day, default today). status empty: no row for that day. Before retention_horizon: status unavailable, data_state purged, zeros are absences, no verdict; past_horizon if a signal table still holds the day (band NoData, non-zero counts real). Inside retention (collected or no_run_record) the band stands on real zeros, no_run_record too; only its collection-error share has no denominator. <<GUIDE>> Gets a daily health summary: overall composite health band (Healthy/Warning/Critical), total wait time, top wait type, unique query count, deadlocks, blocking events, memory pressure (and severe memory pressure), high-CPU samples, collection errors, and actionable alert count for one day. Use this for a quick overview to decide which areas need investigation. A day before the store's retention_horizon (the oldest day the shortest-lived signal table still holds) returns status=unavailable with data_state=purged rather than a health band: its per-signal counts would be COALESCEd zeros, not measurements, and a zero is only a measurement inside retention. A returned day carries data_state=collected (a verdict), past_horizon (before the horizon but some signal table still holds rows - the purge has not reached it; health_band=NoData, non-zero counts real) or no_run_record (inside retention, no collector run recorded - banded on the counts as read, which are measurements there; the collection-error share has no denominator). unique_queries is null (NOT 0) when the rollup tier that answers a day older than the raw window never materialized this server's day while the rollup's source still holds the day's rows - 'not carried at this tier', not 'no queries ran' - and days_missing names that day (empty otherwise); the service repairs such a day at its next start, and the band does not read this count.")]
+    [McpServerTool(Name = "get_daily_summary"), Description("Gets one day's health band (Healthy/Warning/Critical/NoData), wait time (sec), top wait, unique queries, deadlocks, blocking, high-CPU samples, memory pressure, errors, alerts for summary_date (UTC day, default today). status empty: no row for that day. Before retention_horizon: status unavailable, data_state purged, zeros are absences, no verdict; past_horizon if a signal table still holds the day (band NoData, non-zero counts real). Inside retention (collected or no_run_record) the band stands on real zeros, no_run_record too; only its collection-error share has no denominator. <<GUIDE>> Gets a daily health summary: overall composite health band (Healthy/Warning/Critical), total wait time, top wait type, unique query count, deadlocks, blocking events, memory pressure (and severe memory pressure), high-CPU samples, collection errors, and actionable alert count for one day. Use this for a quick overview to decide which areas need investigation. reasons lists the lines that say why the day has its band (the desktop calendar's day detail) and drills names the drill-downs that fit the day (Deadlocks, Blocking, TopQueries). A day before the store's retention_horizon (the oldest day the shortest-lived signal table still holds) returns status=unavailable with data_state=purged rather than a health band: its per-signal counts would be COALESCEd zeros, not measurements, and a zero is only a measurement inside retention. A returned day carries data_state=collected (a verdict), past_horizon (before the horizon but some signal table still holds rows - the purge has not reached it; health_band=NoData, non-zero counts real) or no_run_record (inside retention, no collector run recorded - banded on the counts as read, which are measurements there; the collection-error share has no denominator). unique_queries is null (NOT 0) when the rollup tier that answers a day older than the raw window never materialized this server's day while the rollup's source still holds the day's rows - 'not carried at this tier', not 'no queries ran' - and days_missing names that day (empty otherwise); the service repairs such a day at its next start, and the band does not read this count.")]
     public static async Task<string> GetDailySummary(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -151,7 +151,7 @@ public sealed class DarlingMcpHealthTools
             if (row.DataState == DailySummaryDataState.Purged)
                 return McpHelpers.Status(
                     "unavailable",
-                    $"{row.SummaryDate:yyyy-MM-dd} is before {resolved.ServerName}'s retention_horizon ({row.RetentionHorizon:yyyy-MM-dd}): the per-signal tables the health band reads (deadlocks, blocking, CPU, memory, waits) have been purged for that day, so no health verdict is possible and the counts would be zeros by construction, not by measurement. Longer-lived sources may still record the day — collection_runs and alert_count below are real where non-zero.",
+                    $"{row.SummaryDate:yyyy-MM-dd} is before {resolved.DisplayName}'s retention_horizon ({row.RetentionHorizon:yyyy-MM-dd}): the per-signal tables the health band reads (deadlocks, blocking, CPU, memory, waits) have been purged for that day, so no health verdict is possible and the counts would be zeros by construction, not by measurement. Longer-lived sources may still record the day — collection_runs and alert_count below are real where non-zero.",
                     new
                     {
                         summary_date = row.SummaryDate.ToString("yyyy-MM-dd"),
@@ -165,12 +165,12 @@ public sealed class DarlingMcpHealthTools
             if (!row.HasData)
                 return McpHelpers.Status(
                     "empty",
-                    $"No data collected for {resolved.ServerName} on {row.SummaryDate:yyyy-MM-dd}.",
+                    $"No data collected for {resolved.DisplayName} on {row.SummaryDate:yyyy-MM-dd}.",
                     new { summary_date = row.SummaryDate.ToString("yyyy-MM-dd"), overall_health = row.HealthBand.ToString() });
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 summary_date = row.SummaryDate.ToString("yyyy-MM-dd"),
                 /* #3653 (A15/A16, one vocabulary): overall_health and health_band are the SAME band and now
                    carry the SAME spelling — the enum token (Healthy / Warning / Critical / NoData), which is
@@ -211,6 +211,12 @@ public sealed class DarlingMcpHealthTools
                    reading the null has the disclosure beside it rather than only in the description. Empty on
                    every carried day, which is every raw-tier day. */
                 days_missing = row.UniqueQueries is null ? new[] { row.SummaryDate.ToString("yyyy-MM-dd") } : Array.Empty<string>(),
+                /* #6294, additive and trailing: the Performance Calendar's day detail, built by the SAME shared
+                   calculator the desktop viewers use, so the web's month calendar prints the viewer's own "why this
+                   day is <band>" lines and offers the viewer's drill buttons without re-deriving either from the
+                   counts. `drills` are DayDrillTarget names (Deadlocks, Blocking, TopQueries). */
+                reasons = DailyHealthBandCalculator.BuildReasons(row.ToSignals(), row.MaxBlockDurationMs),
+                drills = DailyHealthBandCalculator.AvailableDrills(row.ToSignals()).Select(target => target.ToString()),
             }, McpHelpers.JsonOptions);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -255,6 +261,7 @@ public sealed class DarlingMcpHealthTools
             var lastDay = windowEnd.Date;
             var fromDate = lastDay.AddDays(-(days_back - 1));
             var toDate = lastDay.AddDays(1);
+            ReadScope.NoteWindow(fromDate, toDate); // #5814: the whole days this range reads, ending on the anchor day
 
             /* The anchor is also the clock the still-forming day's window clamps against (#3525 review):
                a backdated as_of must clamp its own "today" against ITSELF, not the process clock. */
@@ -284,17 +291,17 @@ public sealed class DarlingMcpHealthTools
                 return everCollected
                     ? McpHelpers.Status(
                         "empty",
-                        $"No collected days for {resolved.ServerName} between {fromDate:yyyy-MM-dd} and {lastDay:yyyy-MM-dd}. A day with ANY collection appears here even when every signal was quiet, so this range is outside what the store holds for this server rather than a stretch of quiet days — widen days_back, or move as_of.",
+                        $"No collected days for {resolved.DisplayName} between {fromDate:yyyy-MM-dd} and {lastDay:yyyy-MM-dd}. A day with ANY collection appears here even when every signal was quiet, so this range is outside what the store holds for this server rather than a stretch of quiet days — widen days_back, or move as_of.",
                         new { from_date = fromDate.ToString("yyyy-MM-dd"), to_date = lastDay.ToString("yyyy-MM-dd") })
                     : McpHelpers.Status(
                         "unavailable",
-                        $"No collector runs have EVER been recorded for {resolved.ServerName}, so the calendar is empty because nothing has been collected — not because those days were quiet. Check that the service is running and that the server is enabled for collection.",
+                        $"No collector runs have EVER been recorded for {resolved.DisplayName}, so the calendar is empty because nothing has been collected — not because those days were quiet. Check that the service is running and that the server is enabled for collection.",
                         new { from_date = fromDate.ToString("yyyy-MM-dd"), to_date = lastDay.ToString("yyyy-MM-dd") });
             }
 
             return JsonSerializer.Serialize(new
             {
-                server = resolved.ServerName,
+                server = resolved.DisplayName,
                 days_back,
                 /* The bounds the read actually used, echoed back: with an anchor in play, a caller cannot
                    otherwise tell which days they were given from the days they got. */

@@ -26,6 +26,11 @@ public sealed class McpHostService : BackgroundService
     private readonly DuckDbInitializer _duckDb;
     private readonly ScheduleManager? _scheduleManager;
     private readonly int _port;
+    private readonly bool _allowWrites;
+    private readonly bool _allowInvestigations;
+    private readonly McpDataDetail _dataDetail;
+    private readonly IPseudonymKeySource? _pseudonymKeys;
+    private readonly IInvestigationRequestStore _investigationStore;
     private WebApplication? _app;
 
     /// <summary>
@@ -35,16 +40,28 @@ public sealed class McpHostService : BackgroundService
     /// </summary>
     public int Port => _port;
 
+    /// <param name="investigationStore">#5820: the one investigation store, required: <c>get_notification_routes</c> is served in every
+    /// configuration and takes it as a service parameter, so a host without it would advertise it as a tool argument nobody can fill.</param>
     /// <param name="scheduleManager">#3896: the collector schedules, so the analysis tools bound each
     /// latest-value read by the cadence its collector runs at. Null bounds by the shipped defaults.</param>
-    public McpHostService(LocalDataService dataService, ServerManager serverManager, MuteRuleService muteRuleService, DuckDbInitializer duckDb, int port, ScheduleManager? scheduleManager = null)
+    /// <param name="allowWrites">Whether the write tools are served (<see cref="McpSettings.AllowWrites"/>, the
+    /// <c>mcp_allow_writes</c> setting). Default off: a write tool is then absent from the served set and a call
+    /// to it fails as an unknown tool. See <see cref="McpWritePolicy"/>.</param>
+    public McpHostService(LocalDataService dataService, ServerManager serverManager, MuteRuleService muteRuleService, DuckDbInitializer duckDb, int port, IInvestigationRequestStore investigationStore, ScheduleManager? scheduleManager = null, bool allowWrites = false,
+        bool allowInvestigations = false, McpDataDetail dataDetail = McpDataDetail.Full,
+        IPseudonymKeySource? pseudonymKeys = null)
     {
+        _pseudonymKeys = pseudonymKeys;
         _dataService = dataService;
         _serverManager = serverManager;
         _muteRuleService = muteRuleService;
         _duckDb = duckDb;
         _port = port;
         _scheduleManager = scheduleManager;
+        _allowWrites = allowWrites;
+        _allowInvestigations = allowInvestigations;
+        _dataDetail = dataDetail;
+        _investigationStore = investigationStore ?? throw new ArgumentNullException(nameof(investigationStore));
 
         /* #4999: the health read judges each collector by the interval it is scheduled at on that server, the
            same answer the analysis tools bound their reads by (see RegisterAnalysisService below), not by the
@@ -114,6 +131,113 @@ public sealed class McpHostService : BackgroundService
         });
     }
 
+    /// <summary>
+    /// The write switch (<see cref="McpWritePolicy"/>) and the SDK's MCP server with every tool class, filter and
+    /// transport option the host serves. Extracted so the tests that drive <c>tools/call</c> through a real web
+    /// host register the SAME tools and the SAME policy production does, not a hand-built set.
+    /// </summary>
+    internal static void RegisterMcpServer(IServiceCollection services, bool allowWrites,
+        bool allowInvestigations = false, McpDataDetail dataDetail = McpDataDetail.Full, IPseudonymKeySource? pseudonymKeys = null)
+    {
+        /* #6066: Lite's pseudonym key (Credential Manager), for the data-detail filter and the brief composer at metadataOnly. None: logins are numbered per answer. */
+        if (pseudonymKeys is not null) services.AddSingleton<IPseudonymKeySource>(pseudonymKeys);
+        /* #5820: the four investigation tools are served only with mcp_allow_investigations on AND the writes off
+           (McpInvestigationPolicy). Registered BEFORE the write policy so its instructions census (built there) counts
+           only the tools this start offers. */
+        services.AddMcpInvestigationPolicy(McpInvestigationPolicy.Served(allowInvestigations, allowWrites));
+
+        /* #5820: mcp_data_detail, read once per start. McpDataDetailFilter (AddCallToolFilters) reads this singleton on
+           every call; Full passes everything through. */
+        services.AddSingleton(new McpDataDetailSetting(dataDetail));
+
+        /* The write switch (McpWritePolicy): once the SDK has gathered every registered tool, drop the writes
+           unless mcp_allow_writes is on and stamp the annotation hints. Registered here, ahead of AddMcpServer,
+           so it is a PostConfigure over the SDK's own options and sees the full tool set. */
+        services.AddMcpWritePolicy(allowWrites);
+
+        /* Register MCP server with all tool classes */
+        services
+            .AddMcpServer(options =>
+            {
+                options.ServerInfo = new()
+                {
+                    Name = "PerformanceMonitorLite",
+                    Version = "1.2.0"
+                };
+                /* ServerInstructions is set by AddMcpWritePolicy above, from the served set (#5789). */
+            })
+            /* Stateless mode: each request is self-contained (no Mcp-Session-Id round-trip).
+               Required for clients like Google Antigravity that don't echo the session id,
+               which otherwise connect but list zero tools (issue #1074). */
+            .WithHttpTransport(options => options.Stateless = true)
+            /* WithGeminiCompatibleTools (not the SDK's WithTools) rewrites parameter schemas into
+               the subset Gemini/Antigravity accepts — collapsing nullable type unions and
+               dropping the default keyword. The companion to stateless transport for issue #1074. */
+            .WithGeminiCompatibleTools<McpDiscoveryTools>()
+            .WithGeminiCompatibleTools<McpHealthTools>()
+            .WithGeminiCompatibleTools<McpWaitTools>()
+            .WithGeminiCompatibleTools<McpBlockingTools>()
+            /* #2028 get_plan_corrections — automatic plan correction activity + per-database
+               FORCE_LAST_GOOD_PLAN enablement; twin of Darling's DarlingMcpPlanCorrectionTools. */
+            .WithGeminiCompatibleTools<McpPlanCorrectionTools>()
+            /* #2029 get_pvs_stats — the ADR persistent version store; twin of Darling's DarlingMcpPvsTools. */
+            .WithGeminiCompatibleTools<McpPvsTools>()
+            .WithGeminiCompatibleTools<McpLongQueryTools>()
+            /* #5992 get_resource_use_by_tag; twin of Darling's DarlingMcpQueryTagRollupTools. */
+            .WithGeminiCompatibleTools<McpQueryTagUsageTools>()
+            /* #6114 get_cpu_by_database, get_load_by_caller and get_query_pileups; twins of Darling's DarlingMcpWhoDroveItTools (#6072). */
+            .WithGeminiCompatibleTools<McpWhoDroveItTools>()
+            .WithGeminiCompatibleTools<McpClientTimeoutTools>()
+            .WithGeminiCompatibleTools<McpQueryTools>()
+            .WithGeminiCompatibleTools<McpCpuTools>()
+            .WithGeminiCompatibleTools<McpMemoryTools>()
+            .WithGeminiCompatibleTools<McpIoTools>()
+            .WithGeminiCompatibleTools<McpTempDbTools>()
+            .WithGeminiCompatibleTools<McpPerfmonTools>()
+            .WithGeminiCompatibleTools<McpAlertTools>()
+            /* #5820: the Level 1 investigation tools, served only by the mcp_allow_investigations gate (McpInvestigationPolicy). */
+            .WithGeminiCompatibleTools<McpInvestigationTools>()
+            .WithGeminiCompatibleTools<McpJobTools>()
+            .WithGeminiCompatibleTools<McpPlanTools>()
+            .WithGeminiCompatibleTools<McpConfigTools>()
+            .WithGeminiCompatibleTools<McpServerInfoTools>()
+            .WithGeminiCompatibleTools<McpSessionTools>()
+            .WithGeminiCompatibleTools<McpObjectStatsTools>()
+            .WithGeminiCompatibleTools<McpLatchSpinlockTools>()
+            .WithGeminiCompatibleTools<McpPlanCacheSchedulerTools>()
+            .WithGeminiCompatibleTools<McpConfigHistoryTools>()
+            .WithGeminiCompatibleTools<McpDefaultTraceTools>()
+            /* #5991: the query-tag and query-tag-rule tools; twin of Darling's DarlingMcpQueryTagTools and DarlingMcpQueryTagRuleTools. */
+            .WithGeminiCompatibleTools<McpQueryTagTools>()
+            .WithGeminiCompatibleTools<McpHealthParserTools>()
+            .WithGeminiCompatibleTools<McpAnalysisTools>()
+            /* #3898 D1: get_tool_guide serves the reading guides tools/list leaves out (the tails split off
+               at McpToolGuide.Marker in WithGeminiCompatibleTools) and the cross-tool topics. Darling twin:
+               DarlingMcpToolGuideTools. */
+            .WithGeminiCompatibleTools<McpToolGuideTools>()
+            /* The unknown-argument guard (#3870): ONE call-tool filter, registered once, covering
+               every tool with no per-tool change. A call carrying an argument no tool parameter
+               declares is refused before dispatch — the refusal names the key and lists what the
+               tool accepts — instead of being run with the key silently dropped. The SDK binds
+               arguments by name and ignores the rest, so a misremembered parameter used to produce
+               an answer to a different question with nothing anywhere saying so; for a surface whose
+               callers are language models, a silently dropped key is a confidently wrong answer.
+               The SAME filter object Darling's host registers (shared from
+               PerformanceMonitor.Common), so the two SKUs cannot refuse differently.
+
+               #4198 ruled out a second filter here that trimmed any oversized result after the
+               fact: it would make a tool's own truncated/*_returned fields wrong, cut calls that
+               explicitly asked for more rows, and drop the newest rows of anything sorted
+               oldest-first. Each tool sizes its own defaults to fit instead — see
+               McpResponseBudget.DefaultBytes, the one shared size target both SKUs read.
+
+               The statement filter (#4348, SensitiveStatementOutputFilter) is registered LAST, as Darling's
+               host does: the first filter added is the outermost, so the last one sits next to the tool and
+               reads each result as the tool's own JSON. It covers every tool with no per-tool change, error
+               results included. The list lives in AddCallToolFilters so a test runs the REAL registration. */
+            .WithRequestFilters(AddCallToolFilters);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
@@ -139,79 +263,15 @@ public sealed class McpHostService : BackgroundService
             var planFetcher = new SqlPlanFetcher(_serverManager);
             /* #4726: registered PER CALL, through the method a test also calls (see RegisterAnalysisService). */
             RegisterAnalysisService(builder.Services, _duckDb, planFetcher, _serverManager, _scheduleManager);
+            /* #5820: the investigation brief's reader and composer, for the claim tool (the composer's own file registers both). */
+            PerformanceMonitorLite.Investigations.LiteInvestigationServices.AddInvestigationBrief(builder.Services, _duckDb,
+                InvestigationServerNameLookup.FromServerManager(_serverManager));
+            /* #5820: the one investigation store MainWindow built, as a singleton, for the four tools and get_notification_routes. */
+            builder.Services.AddSingleton<IInvestigationRequestStore>(_investigationStore);
 
-            /* Register MCP server with all tool classes */
-            builder.Services
-                .AddMcpServer(options =>
-                {
-                    options.ServerInfo = new()
-                    {
-                        Name = "PerformanceMonitorLite",
-                        Version = "1.2.0"
-                    };
-                    options.ServerInstructions = McpInstructions.Text;
-                })
-                /* Stateless mode: each request is self-contained (no Mcp-Session-Id round-trip).
-                   Required for clients like Google Antigravity that don't echo the session id,
-                   which otherwise connect but list zero tools (issue #1074). */
-                .WithHttpTransport(options => options.Stateless = true)
-                /* WithGeminiCompatibleTools (not the SDK's WithTools) rewrites parameter schemas into
-                   the subset Gemini/Antigravity accepts — collapsing nullable type unions and
-                   dropping the default keyword. The companion to stateless transport for issue #1074. */
-                .WithGeminiCompatibleTools<McpDiscoveryTools>()
-                .WithGeminiCompatibleTools<McpHealthTools>()
-                .WithGeminiCompatibleTools<McpWaitTools>()
-                .WithGeminiCompatibleTools<McpBlockingTools>()
-                /* #2028 get_plan_corrections — automatic plan correction activity + per-database
-                   FORCE_LAST_GOOD_PLAN enablement; twin of Darling's DarlingMcpPlanCorrectionTools. */
-                .WithGeminiCompatibleTools<McpPlanCorrectionTools>()
-                /* #2029 get_pvs_stats — the ADR persistent version store; twin of Darling's DarlingMcpPvsTools. */
-                .WithGeminiCompatibleTools<McpPvsTools>()
-                .WithGeminiCompatibleTools<McpLongQueryTools>()
-                .WithGeminiCompatibleTools<McpQueryTools>()
-                .WithGeminiCompatibleTools<McpCpuTools>()
-                .WithGeminiCompatibleTools<McpMemoryTools>()
-                .WithGeminiCompatibleTools<McpIoTools>()
-                .WithGeminiCompatibleTools<McpTempDbTools>()
-                .WithGeminiCompatibleTools<McpPerfmonTools>()
-                .WithGeminiCompatibleTools<McpAlertTools>()
-                .WithGeminiCompatibleTools<McpJobTools>()
-                .WithGeminiCompatibleTools<McpPlanTools>()
-                .WithGeminiCompatibleTools<McpConfigTools>()
-                .WithGeminiCompatibleTools<McpServerInfoTools>()
-                .WithGeminiCompatibleTools<McpSessionTools>()
-                .WithGeminiCompatibleTools<McpObjectStatsTools>()
-                .WithGeminiCompatibleTools<McpLatchSpinlockTools>()
-                .WithGeminiCompatibleTools<McpPlanCacheSchedulerTools>()
-                .WithGeminiCompatibleTools<McpConfigHistoryTools>()
-                .WithGeminiCompatibleTools<McpDefaultTraceTools>()
-                .WithGeminiCompatibleTools<McpHealthParserTools>()
-                .WithGeminiCompatibleTools<McpAnalysisTools>()
-                /* #3898 D1: get_tool_guide serves the reading guides tools/list leaves out (the tails split off
-                   at McpToolGuide.Marker in WithGeminiCompatibleTools) and the cross-tool topics. Darling twin:
-                   DarlingMcpToolGuideTools. */
-                .WithGeminiCompatibleTools<McpToolGuideTools>()
-                /* The unknown-argument guard (#3870): ONE call-tool filter, registered once, covering
-                   every tool with no per-tool change. A call carrying an argument no tool parameter
-                   declares is refused before dispatch — the refusal names the key and lists what the
-                   tool accepts — instead of being run with the key silently dropped. The SDK binds
-                   arguments by name and ignores the rest, so a misremembered parameter used to produce
-                   an answer to a different question with nothing anywhere saying so; for a surface whose
-                   callers are language models, a silently dropped key is a confidently wrong answer.
-                   The SAME filter object Darling's host registers (shared from
-                   PerformanceMonitor.Common), so the two SKUs cannot refuse differently.
-
-                   #4198 ruled out a second filter here that trimmed any oversized result after the
-                   fact: it would make a tool's own truncated/*_returned fields wrong, cut calls that
-                   explicitly asked for more rows, and drop the newest rows of anything sorted
-                   oldest-first. Each tool sizes its own defaults to fit instead — see
-                   McpResponseBudget.DefaultBytes, the one shared size target both SKUs read.
-
-                   The statement filter (#4348, SensitiveStatementOutputFilter) is registered LAST, as Darling's
-                   host does: the first filter added is the outermost, so the last one sits next to the tool and
-                   reads each result as the tool's own JSON. It covers every tool with no per-tool change, error
-                   results included. The list lives in AddCallToolFilters so a test runs the REAL registration. */
-                .WithRequestFilters(AddCallToolFilters);
+            /* The write switch and the SDK's tool registration live in RegisterMcpServer, the method the tests that
+               drive tools/call also use (see there). */
+            RegisterMcpServer(builder.Services, _allowWrites, _allowInvestigations, _dataDetail, _pseudonymKeys);
 
             _app = builder.Build();
 
@@ -241,6 +301,32 @@ public sealed class McpHostService : BackgroundService
 
             AppLogger.Info("MCP", $"Starting MCP server on http://localhost:{_port}");
 
+            /* One line at every start, because an install that used the mute tool before the switch existed loses
+               it on upgrade until the operator turns the setting on. */
+            if (_allowWrites)
+            {
+                AppLogger.Warn("MCP",
+                    $"MCP write tools are ON ({McpWritePolicy.WritesSetting}): the write tools (mute_analysis_finding, unmute_analysis_finding, set_notification_route_enabled, delete_notification_route) are served to any client that reaches this port.");
+            }
+            else
+            {
+                AppLogger.Info("MCP",
+                    $"MCP write tools are off (the default): the write tools (mute_analysis_finding, unmute_analysis_finding, set_notification_route_enabled, delete_notification_route) are not served. To serve them set {McpWritePolicy.WritesSetting} to true in settings.json and restart.");
+            }
+
+            var gateLine = McpInvestigationPolicy.StartupLine(_allowInvestigations, _allowWrites);
+            if (gateLine is { } line)
+            {
+                if (line.Level == LogLevel.Critical)
+                {
+                    AppLogger.Error(LogLevel.Critical, "MCP", line.Message, null);
+                }
+                else
+                {
+                    AppLogger.Info("MCP", line.Message);
+                }
+            }
+
             await _app.RunAsync(stoppingToken);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -254,12 +340,14 @@ public sealed class McpHostService : BackgroundService
     }
 
     /// <summary>
-    /// The call-tool filters, in registration order: the unknown-argument guard (#3870), then the statement filter
-    /// (#4348). The same two objects Darling's host registers, from <c>PerformanceMonitor.Common</c>, so the two SKUs
-    /// cannot answer differently. Registered through this one method so a test can start a server with the REAL list.
+    /// The call-tool filters, in registration order: the unknown-argument guard (#3870), the data-detail filter
+    /// (#5820, <c>mcp_data_detail</c>), then the statement filter (#4348). The same objects Darling's host registers, in
+    /// its order, from <c>PerformanceMonitor.Common</c>, so the two SKUs cannot answer differently. Lite's write and
+    /// investigation gates are not filters: an unserved tool is absent from the served collection. Registered through this one method so a test can start a server with the REAL list.
     /// </summary>
     internal static void AddCallToolFilters(IMcpRequestFilterBuilder filters) => filters
         .AddCallToolFilter(McpUnknownArgumentGuard.Instance)
+        .AddCallToolFilter(McpDataDetailFilter.Instance)
         .AddCallToolFilter(SensitiveStatementOutputFilter.Instance);
 
     public override async Task StopAsync(CancellationToken cancellationToken)

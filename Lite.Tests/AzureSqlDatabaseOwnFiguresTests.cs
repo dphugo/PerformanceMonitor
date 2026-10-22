@@ -416,13 +416,13 @@ public sealed class AzureSqlDatabaseOwnFiguresTests
     }
 
     [Fact]
-    public void CpuCoreNoun_IsVcoresOnAzureSqlDatabase_AndCoresEverywhereElse()
+    public void CpuCoreNoun_IsVcoresOnAzureSqlDatabase_AndLogicalCpusEverywhereElse()
     {
         /* The FinOps CPU right-sizing text prints the utilization read's count: the vCores on an Azure SQL Database, which it
            names the way the utilization card does, and a CPU count everywhere else, in the word it has always used. */
         Assert.Equal("vCores", ServerHardwareScope.CpuCoreNoun(5));
         foreach (var engineEdition in new int?[] { 1, 2, 3, 4, 8, null })
-            Assert.Equal("cores", ServerHardwareScope.CpuCoreNoun(engineEdition));
+            Assert.Equal("logical CPUs", ServerHardwareScope.CpuCoreNoun(engineEdition));
     }
 
     [Fact]
@@ -737,7 +737,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
             cmd.CommandText = @"
 INSERT INTO cpu_utilization_stats
     (collection_id, collection_time, server_id, server_name, sample_time, sqlserver_cpu_utilization, other_process_cpu_utilization)
-VALUES ($1, $2, $3, $4, $2, 50, 2)";
+/* twelve samples: a window with fewer gets no verdict (#6139) */
+SELECT $1 - i * 1000000, $2, $3, $4, $2, 50, 2 FROM range(12) t(i)";
             cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
             cmd.Parameters.Add(new DuckDBParameter { Value = _now });
             cmd.Parameters.Add(new DuckDBParameter { Value = serverId });

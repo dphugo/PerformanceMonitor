@@ -9,8 +9,8 @@ cc29d98125 Darling.Tests.RepoFileAdoptionTests
 e6dbdbea94 Darling.Tests.IncidentAttachmentDeliveryTests
 
 # A Lite class failed on a Darling-only diff, before the Reads=Darling selection (build.yml, 2026-10-04)
-# existed or while the pull request still carried the older workflow. DarlingReadsTraitGuardTests derives the
-# Reads=Darling tag from the class source, so a class without it reads no Darling file: the diff did not cause
+# existed or while the pull request still carried the older workflow. The Reads=Darling set is derived from the
+# class source (the ci-select.py reads-classes scan since #5961; DarlingReadsTraitGuardTests before it), so a class outside it reads no Darling file: the diff did not cause
 # the failure.
 d0d482835c PerformanceMonitorLite.Tests.PerformanceCalendarDataTests
 cd34bbcb31 PerformanceMonitorLite.Tests.StatusBarSizeReadLockTests
@@ -33,7 +33,7 @@ a75333e8e2 PerformanceMonitorLite.Tests.ScenarioTests
 eca647c2f4 PerformanceMonitorLite.Tests.QueryStoreRegressionsToolTests
 eca647c2f4 PerformanceMonitorLite.Tests.SignificantWaitsToolTests
 # A Darling class failed on a pull request whose recorded changes are Lite files only (cut 3a/3c of #5459). The
-# class source names no Lite path (LiteReadsTraitGuardTests derives the Reads=Lite tag from it, and these carry
+# class source names no Lite path (the Reads=Lite set is derived from it, by the ci-select.py reads-classes scan since #5961 and by LiteReadsTraitGuardTests before that, and these carry
 # none; the one 'Lite' in PlanSync4512CancellationTests is a doc comment), so no Lite edit can reach what it
 # tests: each is a timing or live-store test that failed on a first attempt, not a selection gap.
 c3a18e1785 Darling.Tests.PgTargetWaitTests
@@ -127,3 +127,14 @@ f1a1894fd8 Darling.Tests.EventWindowedReadsAreBoundedLivePostgresTests
 # on the same error. Attempt 2 of the same head passed every shard. A first-attempt environment fault of the
 # shard's server; the 28 changed files (viewer data-start work) did not cause it.
 3bb3ae8fe9 Darling.Tests.StoreMetricsLatestSkipScanLiveTests
+
+# Shared-project replay (#5951): four failures on three pull requests that changed PerformanceMonitor.Common files, found when
+# the keep-full rule for the shared projects was narrowed to constants, enums and registration files. None of the four classes has a
+# map edge to the shared file the pull request changed, and each failure is not caused by it. LiteDeltaSeederTests (7859d25653) and
+# DarlingUpgradeInstallTreeWaitTests (950bb7dbbd) failed on a first attempt and are green on the same sha now.
+# LatestValueLookbackLivePostgresTests (1e52a8e34f, 28c0765ab1) failed a plan-shape assertion on PgFactCollector.DatabaseSizeSql,
+# a file that pull request never touched.
+7859d25653 PerformanceMonitorLite.Tests.LiteDeltaSeederTests
+950bb7dbbd Darling.Tests.DarlingUpgradeInstallTreeWaitTests
+1e52a8e34f Darling.Tests.LatestValueLookbackLivePostgresTests
+28c0765ab1 Darling.Tests.LatestValueLookbackLivePostgresTests

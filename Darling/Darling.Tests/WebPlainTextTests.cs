@@ -22,11 +22,12 @@ namespace Darling.Tests;
 /// service writes for an MCP client (<c>hints.captures</c>, <c>hours_back</c>, <c>denied_since_last_success</c>, collector
 /// measurement counts, the engine-gate sentence) into words for the web page. Node is skipped when it is not installed.
 /// </summary>
+[Trait("Stage", "Guard")]
 public sealed class WebPlainTextTests
 {
     private static string[] Run(string[] inputs, out string notCollectedLine) => RunDoc(inputs, out notCollectedLine).Out;
 
-    private static (string[] Out, string[] Named, string[] Tools, string[] Labels) RunDoc(string[] inputs, out string notCollectedLine)
+    private static (string[] Out, string[] Named, string[] Tools, string[] Labels, string[] Actions) RunDoc(string[] inputs, out string notCollectedLine)
     {
         var psi = new ProcessStartInfo("node") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         psi.ArgumentList.Add(PathTo("Darling", "Darling.Tests", "web-plain-text-harness.mjs"));
@@ -42,7 +43,7 @@ public sealed class WebPlainTextTests
         {
             Assert.Skip("Node is not installed, so the shipped page script cannot be run.");
             notCollectedLine = "";
-            return ([], [], [], []);
+            return ([], [], [], [], []);
         }
 
         using (proc)
@@ -59,7 +60,7 @@ public sealed class WebPlainTextTests
             using var doc = JsonDocument.Parse(output.Split('\n').First(l => l.StartsWith('{')));
             notCollectedLine = doc.RootElement.GetProperty("line").GetString()!;
             string[] Strs(string name) => doc.RootElement.GetProperty(name).EnumerateArray().Select(e => e.GetString()!).ToArray();
-            return (Strs("out"), Strs("named"), Strs("tools"), Strs("labels"));
+            return (Strs("out"), Strs("named"), Strs("tools"), Strs("labels"), Strs("actions"));
         }
     }
 
@@ -95,6 +96,85 @@ public sealed class WebPlainTextTests
     {
         var o = Run(["latest run: shred_gated=1 events_read=0 report_xml_empty=0"], out _);
         Assert.Equal("latest run: shred gated: 1, events read: 0, report xml empty: 0", o[0]);
+    }
+
+    /* #5644 W8 (live check): the CPU and Memory pages have no bucket control, the Waits and Activity notes print raw field names, and a
+       window count printed "24 hour(s)". */
+    [Fact]
+    public void TrendNotes_NameTheTimeRange_TheColumnLabels_AndAgreeInNumber()
+    {
+        var o = Run(
+        [
+            "Each point averages the samples in one 5-minute bucket and is stamped at the bucket's start. A level is averaged, never summed, so a spike inside a bucket is smoothed into its average; narrow the bucket to see it. The width was chosen to keep this answer near 1500 points; pass bucket_minutes (1-1440) for another width, or narrow hours_back for finer points.",
+            "wait_time_ms_per_second is recomputed from the summed wait time over the seconds the collections covered.",
+            "collisions_per_second is recomputed from the summed delta.",
+            "The session counts are levels, averaged, never summed; top_application_name, top_application_connections, top_host_name and top_host_connections are the newest collection's own values in the bucket.",
+            "No query-stats group on SRV in the last 24 hour(s) has a cached plan.",
+            "No blocking was recorded in the last 1 hour(s). 288 collector run(s) DID execute; 1 collector run(s) failed.",
+            "3 query(s) failed, 1 query(s) retried, 2 policy(s) skipped.",
+        ], out _);
+        Assert.DoesNotContain("narrow the bucket", o[0]);
+        Assert.Contains("narrow the time range to see it", o[0]);
+        Assert.DoesNotContain("wait_time_ms_per_second", o[1]);
+        Assert.StartsWith("Wait ms/s is recomputed", o[1]);
+        Assert.StartsWith("Coll/s is recomputed", o[2]);
+        Assert.DoesNotContain("top_application_name", o[3]);
+        Assert.Contains("the top application, its connection count, the top host and its connection count are", o[3]);
+        Assert.Equal("No query-stats group on SRV in the last 24 hours has a cached plan.", o[4]);
+        Assert.Equal("No blocking was recorded in the last 1 hour. 288 collector runs did execute; 1 collector run failed.", o[5]);
+        /* a noun ending in a consonant plus y takes "ies", not a bare "s" */
+        Assert.Equal("3 queries failed, 1 query retried, 2 policies skipped.", o[6]);
+    }
+
+    /* #5644 W8: the clauses that point an MCP caller at a parameter the page has no control for. */
+    [Fact]
+    public void ParameterClauses_ForAnMcpCaller_AreDroppedOrSaidInThePagesWords()
+    {
+        var o = Run(
+        [
+            "The width was chosen to keep this answer near 1500 points; pass bucket_minutes (1-1440) for another width, or narrow hours_back for finer points.",
+            "TRUNCATED: 300 indexes match and 200 were returned. Rows are ordered by total wait time descending; raise limit to see more.",
+            "TRUNCATED: 9 indexes match database 'x' and 5 were returned. This says nothing about databases outside the filter — raise limit to see more.",
+            "TRUNCATED: 9 indexes match and 5 were returned. This is not evidence that a database was not collected — pass database_name to ask about one, or raise limit.",
+            " truncated: 5 of 9 returned; raise limit (now 5) for more.",
+            "The row limit of 50 was REACHED: databases[] holds the 50 biggest spillers and the totals above still cover every database - raise limit to see the rest of the rows.",
+            "At least one database's statistics WERE reset in this window - see stats_reset_count per database, and raise limit if none of the databases returned shows one - so its totals are lower bounds.",
+            "No active query snapshots on SQL2025 in the last 1 hour(s) matched blocking_only. The filters were applied in SQL over the whole window.",
+            "No active query snapshots on SQL2025 in the last 1 hour(s) matched database_name 'Sales' with blocking_only with wait_type 'LCK_M_X'.",
+            "3 sp_server_diagnostics event(s) were captured for SQL2025 in the last 1 hour(s) and none qualified. Events ARE being captured, so this is the healthy answer for this read rather than missing data.",
+            "TRUNCATED: 40 groups were in scope; only the top 25 (by name) are returned. Scope by server_name, or raise limit, to see the rest.",
+        ], out _);
+
+        Assert.Equal("The width was chosen to keep this answer near 1500 points; narrow the time range for finer points.", o[0]);
+        Assert.Equal("TRUNCATED: 300 indexes match and 200 were returned. Rows are ordered by total wait time descending.", o[1]);
+        Assert.EndsWith("outside the filter.", o[2]);
+        Assert.EndsWith("filter by database to ask about one.", o[3]);
+        Assert.Equal(" truncated: 5 of 9 returned.", o[4]);
+        Assert.EndsWith("still cover every database.", o[5]);
+        Assert.Contains("per database - so its totals", o[6]);
+        Assert.Equal("No active query snapshots on SQL2025 in the last 1 hour matched blocking queries only. The filters were applied in SQL over the whole window.", o[7]);
+        Assert.Contains("matched database 'Sales' with blocking queries only with wait type 'LCK_M_X'.", o[8]);
+        Assert.Contains("so this is a normal result, not missing data.", o[9]);
+        Assert.EndsWith("Select a single server to see the rest.", o[10]);
+        foreach (var line in o)
+        {
+            Assert.DoesNotContain("raise limit", line);
+            Assert.DoesNotContain("bucket_minutes", line);
+            Assert.DoesNotContain("blocking_only", line);
+            Assert.DoesNotContain("healthy answer for this read", line);
+        }
+    }
+
+    [Fact]
+    public void AParameterNamedInRealText_IsLeftAlone()
+    {
+        string[] same =
+        [
+            "Column limit_value was reset",
+            "relation database_name_idx does not exist",
+            "blocking_only_tbl",
+        ];
+        Assert.Equal(same, Run(same, out _));
     }
 
     [Fact]
@@ -144,7 +224,7 @@ public sealed class WebPlainTextTests
             "column \"last_error\" of relation \"x\" does not exist",
             "denied_since_last_success is true; move as_of or widen days_back",
         ];
-        var (_, named, _, _) = RunDoc(inputs, out _);
+        var (_, named, _, _, _) = RunDoc(inputs, out _);
         Assert.Equal("Could not find 'dbo.get_orders' (timeout=30); widen the time range or use get_collection_health", named[0]);
         /* Round-2 L1: a Last Error can quote a real relation or column, so field and table names are not rewritten here. */
         Assert.Equal("latest run: events_read=4 shred_gated=1 and last_error shows it", named[1]);
@@ -154,33 +234,103 @@ public sealed class WebPlainTextTests
     }
 
     [Fact]
+    public void AToolReference_BecomesThePagesWords_OrTheSentenceIsDropped()
+    {
+        var o = Run(
+        [
+            /* DarlingMcpTools.cs: the empty Analysis Findings answer. The page has no analysis action, so the sentence goes. */
+            "No findings in the requested time range. Run analyze_server to generate new findings.",
+            /* A read a tab shows becomes that tab. */
+            "If a replica is SUPPOSED to be attached, check get_pg_replication_slots.",
+            /* CollectorRuntimePrecondition: a collector becomes its display name. */
+            "The trace_flags collector has never run against this server, while the server itself is up.",
+            "No rows. Check the trace_flags collector's latest successful run.",
+            /* A tool no tab shows: the trailing clause goes, the sentence before it stays. */
+            "3 point-in-time fact(s) could still be read here; audit_config reports those.",
+            /* A user's own get_ word is no tool and stays. */
+            "Could not find dbo.get_orders; ask for get_pg_xmin_horizon again.",
+            "Nothing to report.",
+        ], out _);
+        Assert.Equal("No findings in the requested time range.", o[0]);
+        Assert.Equal("If a replica is supposed to be attached, check the Replication tab.", o[1]);
+        Assert.Equal("The Trace Flags collector has never run against this server, while the server itself is up.", o[2]);
+        Assert.Equal("No rows. Check the Trace Flags collector's latest successful run.", o[3]);
+        Assert.Equal("3 point-in-time fact(s) could still be read here.", o[4]);
+        Assert.Equal("Could not find dbo.get_orders; ask for the Vacuum tab again.", o[5]);
+        Assert.Equal("Nothing to report.", o[6]);
+        foreach (var line in o)
+        {
+            Assert.DoesNotMatch(@"(analyze_server|audit_config|trace_flags|get_pg_replication_slots)", line);
+        }
+    }
+
+    [Fact]
+    public void CapitalsForEmphasis_AreLowerCased_AndAcronymsWaitTypesAndNamesAreNot()
+    {
+        var o = Run(
+        [
+            /* Real messages: DarlingMcpBlockingTools, DarlingMcpPgReplicationStatsTools, DarlingMcpPgXminTools. */
+            "5 collector run(s) DID execute, so this is a genuine all-clear. Collection HAS run for this server, NOT the trailing 7 days.",
+            "No holder rows AND no successful captures. This is MEASURED rather than estimated; a replica SUPPOSED to be attached is not.",
+            "NOT an all-clear: nothing was captured.",
+            /* Acronyms, units, wait types, settings and SQL stay. */
+            "Gave 4 MB of WAL to the CPU, XID 12 and LSN 0/16B, over TLS in UTC: I/O on the AG via the DMV, OK per MCP and PG, RPO and RTO, TDE, OS, RAM, NUMA, CU, RTM.",
+            "Waits were PAGEIOLATCH_SH and CXPACKET, with track_io_timing OFF and READ_ONLY on PG18 as ERROR 42P01.",
+            /* A capital next to another capital word is a statement or permission name. */
+            "Grant ALTER ANY EVENT SESSION; the column IS NOT NULL.",
+            /* A name the reader typed. */
+            "No rows for PRODSQL or database SALESDB.",
+        ], out _);
+        Assert.Equal("5 collector runs did execute, so this is a genuine all-clear. Collection has run for this server, not the trailing 7 days.", o[0]);
+        Assert.Equal("No holder rows and no successful captures. This is measured rather than estimated; a replica supposed to be attached is not.", o[1]);
+        Assert.Equal("Not an all-clear: nothing was captured.", o[2]);
+        Assert.Equal("Gave 4 MB of WAL to the CPU, XID 12 and LSN 0/16B, over TLS in UTC: I/O on the AG via the DMV, OK per MCP and PG, RPO and RTO, TDE, OS, RAM, NUMA, CU, RTM.", o[3]);
+        Assert.Equal("Waits were PAGEIOLATCH_SH and CXPACKET, with track_io_timing OFF and READ_ONLY on PG18 as ERROR 42P01.", o[4]);
+        Assert.Equal("Grant ALTER ANY EVENT SESSION; the column IS NOT NULL.", o[5]);
+        Assert.Equal("No rows for PRODSQL or database SALESDB.", o[6]);
+    }
+
+    [Fact]
+    public void ThePlainNamedPath_NeverLowerCasesOrDropsAnything()
+    {
+        var (_, named, _, _, _) = RunDoc(["Last error: DID NOT connect; try analyze_server"], out _);
+        Assert.Equal("Last error: DID NOT connect; try analyze_server", named[0]);
+    }
+
+    [Fact]
     public void TheToolNameList_IsExactlyTheRegisteredGetTools()
     {
         /* The get_ rule rewrites only these names, so the list must be the MCP tool registry's get_ tools, both ways. */
-        var (_, _, tools, _) = RunDoc([], out _);
+        var (_, _, tools, _, actions) = RunDoc([], out _);
         if (tools.Length == 0)
         {
             return;
         }
 
-        var registry = typeof(PerformanceMonitor.Darling.Service.Mcp.DarlingMcpAlertTools).Assembly.GetTypes()
+        var all = typeof(PerformanceMonitor.Darling.Service.Mcp.DarlingMcpAlertTools).Assembly.GetTypes()
             .Where(t => t.GetCustomAttribute<ModelContextProtocol.Server.McpServerToolTypeAttribute>() is not null)
             .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
             .Select(m => m.GetCustomAttribute<ModelContextProtocol.Server.McpServerToolAttribute>()?.Name)
-            .Where(n => n is not null && n.StartsWith("get_", StringComparison.Ordinal))
+            .Where(n => n is not null)
             .Select(n => n!)
-            .ToHashSet(StringComparer.Ordinal);
+            .ToList();
+        var registry = all.Where(n => n.StartsWith("get_", StringComparison.Ordinal)).ToHashSet(StringComparer.Ordinal);
+        var others = all.Where(n => !n.StartsWith("get_", StringComparison.Ordinal)).ToHashSet(StringComparer.Ordinal);
 
         Assert.True(registry.Count > 100, $"the registry walk found only {registry.Count} get_ tools");
         Assert.Empty(registry.Except(tools).OrderBy(n => n, StringComparer.Ordinal));
         Assert.Empty(tools.Except(registry).OrderBy(n => n, StringComparer.Ordinal));
         Assert.Equal(tools.Length, tools.Distinct(StringComparer.Ordinal).Count());
+
+        /* The sentence-dropping rule needs every other tool too (analyze_server, list_servers, the write tools). */
+        Assert.Empty(others.Except(actions).OrderBy(n => n, StringComparer.Ordinal));
+        Assert.Empty(actions.Except(others).OrderBy(n => n, StringComparer.Ordinal));
     }
 
     [Fact]
     public void TheMeasurementLabelList_CoversEveryLabelTheCollectorsWrite()
     {
-        var (_, _, tools, labels) = RunDoc([], out _);
+        var (_, _, tools, labels, _) = RunDoc([], out _);
         if (tools.Length == 0)
         {
             return;
@@ -214,6 +364,36 @@ public sealed class WebPlainTextTests
         Assert.Equal(line, o[0]);
         Assert.DoesNotContain("AppliesTo", o[0]);
         Assert.Equal("No stored plan for this query. pg_stat_statements has none.", o[1]);
+    }
+
+    /// <summary>#6178: the sentence the service writes for an Azure SQL Database names the engine on the page, from the real gate text; the
+    /// PostgreSQL sentence keeps the generic line.</summary>
+    [Fact]
+    public void TheEngineGateSentence_NamesAzureSqlDatabase_WhenThatIsTheEngine()
+    {
+        var azure = PerformanceMonitor.Collectors.CollectorEngineCapability.NotCollectedMessage("example-azure-db", 5, null, "cpu_scheduler_stats")!;
+        var o = Run([azure], out var generic);
+        Assert.Equal("Azure SQL Database does not have this data.", o[0]);
+        Assert.NotEqual(generic, o[0]);
+    }
+
+    /// <summary>#6439: the tempdb File I/O Latency panel on an Azure SQL Database says the same short line as the other Azure panels, not "check
+    /// that collection is running"; any other engine gets no such answer and keeps its own miss.</summary>
+    [Fact]
+    public void TheTempDbFileIoAzureAnswer_IsNotCollected_AndBecomesTheAzureLine()
+    {
+        var json = PerformanceMonitor.Darling.Service.Mcp.DarlingEngineCapability.TempDbFileIoNotCollectedStatus("example-azure-db", 5)!;
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        Assert.Equal("not_collected", doc.RootElement.GetProperty("status").GetString());
+        var message = doc.RootElement.GetProperty("message").GetString()!;
+        Assert.DoesNotContain("Check that collection is running", message);
+
+        var o = Run([message], out _);
+        Assert.Equal("Azure SQL Database does not have this data.", o[0]);
+
+        Assert.Null(PerformanceMonitor.Darling.Service.Mcp.DarlingEngineCapability.TempDbFileIoNotCollectedStatus("example-sql", 3));
+        Assert.Null(PerformanceMonitor.Darling.Service.Mcp.DarlingEngineCapability.TempDbFileIoNotCollectedStatus("example-mi", 8));
+        Assert.Null(PerformanceMonitor.Darling.Service.Mcp.DarlingEngineCapability.TempDbFileIoNotCollectedStatus("unknown", 0));
     }
 }
 

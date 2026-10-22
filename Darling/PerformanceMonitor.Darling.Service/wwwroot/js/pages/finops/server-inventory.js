@@ -24,6 +24,8 @@ const PROVISIONING = {
   OVER_PROVISIONED: ["OVER PROVISIONED", "Warning"],
   UNDER_PROVISIONED: ["UNDER PROVISIONED", "Critical"],
   NOT_APPLICABLE: ["N/A", null],
+  /* The Viewer's grid words (ProvisioningVerdict.NotEnoughDataShortLabel): too few CPU samples in the window for a verdict. */
+  NOT_ENOUGH_DATA: ["not enough data yet", null],
 };
 
 const COLUMNS = [
@@ -37,7 +39,7 @@ const COLUMNS = [
   { key: "cores_per_socket", label: "Cores/Socket", format: "int" },
   { key: "hardware_note", label: "Hardware note", wrap: true },
   { key: "provisioning_status", label: "Status", sevKey: "provisioning_sev" },
-  { key: "avg_cpu_pct", label: "Avg CPU %", format: "num1" },
+  { key: "avg_cpu_pct", label: "Avg SQL Server CPU %", format: "num1" },
   { key: "storage_total_gb", label: "Storage GB", format: "num1" },
   { key: "idle_db_count", label: "Idle DBs", format: "int" },
   { key: "sqlserver_start_time_local", label: "Start time (server clock)" },
