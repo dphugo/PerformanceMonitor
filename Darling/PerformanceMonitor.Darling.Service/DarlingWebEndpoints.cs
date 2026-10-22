@@ -5898,8 +5898,8 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
     /// may read <c>collect.query_store_interval_wide</c> (V145) instead of deduping raw — decided here, in the
     /// runner, BEFORE <see cref="ComposeCompiler.Compile"/> runs, because the compiler stays pure and never
     /// opens a connection. Reuses the pure <see cref="QueryStoreIntervalWide.UseTable"/> decision (through
-    /// <see cref="QueryStoreIntervalWide.ReadsTableAsync"/>, which also runs clause 6 — no legacy row in the
-    /// window — and the literal-end-before-applied_through refusal) for EVERY server in scope: a fleet panel
+    /// <see cref="QueryStoreIntervalWide.ReadsTableAsync"/>, which also applies the literal-end-before-applied_through
+    /// refusal; clause 6, the legacy-row probe, is not asked for here, because the composed panels read the newest snapshot per interval) for EVERY server in scope: a fleet panel
     /// (null/empty <paramref name="serverScope"/>) must pass for every server the store has rows for, or the
     /// hybrid would silently under-read a server whose table coverage lags. Any fault, a schema below V145, or
     /// a refused clause on any server in scope makes the whole panel raw — every input here leans toward raw,
@@ -5987,7 +5987,7 @@ internal static readonly IReadOnlySet<string> CancellationAllowlist = new HashSe
 
                 var plan = await QueryStoreIntervalWide.ResolveReadAsync(
                     connection, serverId, start, end, literalWindowEnd, ComposeQueryStoreWideMinWindow,
-                    McpCommandDeadlines.ReadSeconds, ReadScope.Current?.Logger, cancellationToken, storeWide);
+                    McpCommandDeadlines.ReadSeconds, ReadScope.Current?.Logger, legacyRows: QueryStoreIntervalWide.LegacyRows.Allow, cancellationToken, storeWide: storeWide);
                 if (!plan.UseTable)
                 {
                     if (plan.DecisionFailed)
